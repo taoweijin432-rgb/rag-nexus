@@ -1,0 +1,168 @@
+-- 专家索引派生表初始化脚本。
+--
+-- 重要边界：本脚本只能在派生索引库执行。演示环境没有单独的索引库配置时，
+-- CLI 会使用 DB_NAME；生产环境必须通过 INDEX_DB_NAME 指向独立 Schema。
+-- 所有表均不存姓名、电话、邮箱、微信、身份证、银行卡、报价或附件 URL。
+
+CREATE TABLE IF NOT EXISTS expert_index_batch (
+    id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+    batch_no VARCHAR(64) NOT NULL,
+    run_mode VARCHAR(16) NOT NULL COMMENT 'full/incremental/replay/single',
+    status VARCHAR(16) NOT NULL COMMENT 'running/success/failed/partial',
+    cursor_updated_at DATETIME(6) NULL,
+    cursor_id BIGINT UNSIGNED NULL,
+    extracted_count INT UNSIGNED NOT NULL DEFAULT 0,
+    stage_count INT UNSIGNED NOT NULL DEFAULT 0,
+    chunk_count INT UNSIGNED NOT NULL DEFAULT 0,
+    rejected_count INT UNSIGNED NOT NULL DEFAULT 0,
+    error_summary JSON NULL,
+    started_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+    finished_at DATETIME(6) NULL,
+    PRIMARY KEY (id),
+    UNIQUE KEY uk_expert_index_batch_no (batch_no)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+CREATE TABLE IF NOT EXISTS expert_index_stage (
+    expert_id BIGINT UNSIGNED NOT NULL,
+    serial_number VARCHAR(64) NULL,
+    company_name_raw VARCHAR(512) NULL,
+    company_name_norm VARCHAR(512) NULL,
+    company_normalization_status VARCHAR(32) NOT NULL DEFAULT 'unknown',
+    role_name_raw VARCHAR(256) NULL,
+    role_code VARCHAR(128) NULL,
+    role_level VARCHAR(64) NULL,
+    background_clean MEDIUMTEXT NULL,
+    school_names_json JSON NULL,
+    work_years DECIMAL(5,2) NULL,
+    source_hash CHAR(64) NOT NULL,
+    source_updated_at DATETIME(6) NULL,
+    data_version VARCHAR(64) NOT NULL,
+    stage_status VARCHAR(16) NOT NULL DEFAULT 'ready',
+    reject_reason VARCHAR(512) NULL,
+    build_batch_id BIGINT UNSIGNED NOT NULL,
+    created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+    updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6)
+        ON UPDATE CURRENT_TIMESTAMP(6),
+    PRIMARY KEY (expert_id),
+    KEY idx_expert_stage_batch (build_batch_id),
+    KEY idx_expert_stage_source_updated (source_updated_at, expert_id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+CREATE TABLE IF NOT EXISTS expert_index_employment_stage (
+    id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+    expert_id BIGINT UNSIGNED NOT NULL,
+    source_table VARCHAR(128) NOT NULL,
+    source_record_id VARCHAR(128) NOT NULL,
+    source_item_key VARCHAR(128) NOT NULL,
+    company_name_raw VARCHAR(512) NULL,
+    company_name_norm VARCHAR(512) NULL,
+    company_normalization_status VARCHAR(32) NOT NULL DEFAULT 'unknown',
+    role_name_raw VARCHAR(256) NULL,
+    role_code VARCHAR(128) NULL,
+    role_level VARCHAR(64) NULL,
+    start_month CHAR(7) NULL,
+    end_month CHAR(7) NULL,
+    is_current TINYINT(1) NULL,
+    responsibilities_clean MEDIUMTEXT NULL,
+    achievements_clean MEDIUMTEXT NULL,
+    industry_codes_json JSON NOT NULL,
+    topic_codes_json JSON NOT NULL,
+    parse_status VARCHAR(32) NOT NULL DEFAULT 'complete',
+    source_hash CHAR(64) NOT NULL,
+    source_updated_at DATETIME(6) NULL,
+    data_version VARCHAR(64) NOT NULL,
+    build_batch_id BIGINT UNSIGNED NOT NULL,
+    created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+    updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6)
+        ON UPDATE CURRENT_TIMESTAMP(6),
+    PRIMARY KEY (id),
+    UNIQUE KEY uk_expert_emp_source (source_table, source_record_id, source_item_key),
+    KEY idx_expert_emp_expert (expert_id),
+    KEY idx_expert_emp_source_updated (source_updated_at, source_record_id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+CREATE TABLE IF NOT EXISTS expert_index_project_stage (
+    id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+    expert_id BIGINT UNSIGNED NOT NULL,
+    source_table VARCHAR(128) NOT NULL,
+    source_record_id VARCHAR(128) NOT NULL,
+    source_item_key VARCHAR(128) NOT NULL,
+    project_name VARCHAR(512) NULL,
+    company_or_client_raw VARCHAR(512) NULL,
+    company_or_client_norm VARCHAR(512) NULL,
+    company_normalization_status VARCHAR(32) NOT NULL DEFAULT 'unknown',
+    project_role VARCHAR(256) NULL,
+    start_month CHAR(7) NULL,
+    end_month CHAR(7) NULL,
+    objective_clean MEDIUMTEXT NULL,
+    actions_clean MEDIUMTEXT NULL,
+    results_clean MEDIUMTEXT NULL,
+    industry_codes_json JSON NOT NULL,
+    topic_codes_json JSON NOT NULL,
+    parse_status VARCHAR(32) NOT NULL DEFAULT 'complete',
+    source_hash CHAR(64) NOT NULL,
+    source_updated_at DATETIME(6) NULL,
+    data_version VARCHAR(64) NOT NULL,
+    build_batch_id BIGINT UNSIGNED NOT NULL,
+    created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+    updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6)
+        ON UPDATE CURRENT_TIMESTAMP(6),
+    PRIMARY KEY (id),
+    UNIQUE KEY uk_expert_project_source (source_table, source_record_id, source_item_key),
+    KEY idx_expert_project_expert (expert_id),
+    KEY idx_expert_project_source_updated (source_updated_at, source_record_id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+CREATE TABLE IF NOT EXISTS expert_chunk (
+    id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+    chunk_id VARCHAR(256) NOT NULL COMMENT '稳定业务 Chunk ID',
+    expert_id BIGINT UNSIGNED NOT NULL,
+    serial_number VARCHAR(64) NULL,
+    chunk_type VARCHAR(32) NOT NULL,
+    chunk_subtype VARCHAR(32) NULL,
+    chunk_index SMALLINT UNSIGNED NOT NULL DEFAULT 0,
+    chunk_total SMALLINT UNSIGNED NOT NULL DEFAULT 1,
+    chunk_text MEDIUMTEXT NOT NULL,
+    char_count INT UNSIGNED NOT NULL,
+    token_count_estimate INT UNSIGNED NULL,
+    metadata_json JSON NOT NULL,
+    source_table VARCHAR(128) NOT NULL,
+    source_record_id VARCHAR(128) NOT NULL,
+    source_item_key VARCHAR(128) NOT NULL,
+    source_field VARCHAR(128) NOT NULL,
+    source_field_id VARCHAR(256) NOT NULL,
+    source_version VARCHAR(64) NOT NULL,
+    source_updated_at DATETIME(6) NULL,
+    source_hash CHAR(64) NOT NULL,
+    content_hash CHAR(64) NOT NULL,
+    company_name_norm VARCHAR(512) NULL,
+    role_code VARCHAR(128) NULL,
+    start_month CHAR(7) NULL,
+    end_month CHAR(7) NULL,
+    is_current TINYINT(1) NULL,
+    industry_codes_json JSON NOT NULL,
+    topic_codes_json JSON NOT NULL,
+    origin_type VARCHAR(32) NOT NULL,
+    verification_status VARCHAR(32) NOT NULL,
+    weight_tier CHAR(1) NOT NULL,
+    chunk_policy_version VARCHAR(32) NOT NULL,
+    metadata_schema_version VARCHAR(32) NOT NULL,
+    dictionary_version VARCHAR(32) NOT NULL,
+    data_version VARCHAR(64) NOT NULL,
+    is_active TINYINT(1) NOT NULL DEFAULT 1,
+    build_batch_id BIGINT UNSIGNED NOT NULL,
+    created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+    updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6)
+        ON UPDATE CURRENT_TIMESTAMP(6),
+    PRIMARY KEY (id),
+    UNIQUE KEY uk_expert_chunk_id (chunk_id),
+    KEY idx_expert_chunk_expert_active (expert_id, is_active),
+    KEY idx_expert_chunk_type_active (chunk_type, is_active),
+    KEY idx_expert_chunk_source (source_table, source_record_id, source_item_key),
+    KEY idx_expert_chunk_content_hash (content_hash),
+    CONSTRAINT chk_expert_chunk_position CHECK (chunk_index < chunk_total),
+    CONSTRAINT chk_expert_chunk_type CHECK (
+        chunk_type IN ('profile_summary', 'employment', 'project')
+    )
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
