@@ -12,7 +12,6 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-
 # 四种版本各自管理不同兼容边界，不能合并成一个含义模糊的 version。
 CHUNK_POLICY_VERSION = "1.2"
 METADATA_SCHEMA_VERSION = "1.0"
@@ -89,12 +88,12 @@ class Settings:
     dictionary_version: str = DICTIONARY_VERSION
 
     @classmethod
-    def from_env(cls) -> "Settings":
-        """从环境变量构造配置，并对缺失密码给出明确错误。"""
+    def from_env(cls) -> Settings:
+        """从环境变量构造配置；未设置密码变量时才拒绝，允许本地空密码。"""
 
         load_env_file()
-        base_password = os.getenv("DB_PASSWORD", "")
-        if not base_password:
+        base_password = os.getenv("DB_PASSWORD")
+        if base_password is None:
             raise RuntimeError("缺少 DB_PASSWORD，无法连接 MySQL")
 
         source = DatabaseConfig(
@@ -112,4 +111,3 @@ class Settings:
             database=os.getenv("INDEX_DB_NAME", os.getenv("DB_NAME", "expert_demo")),
         )
         return cls(source_db=source, index_db=index)
-

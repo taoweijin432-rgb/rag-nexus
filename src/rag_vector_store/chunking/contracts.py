@@ -123,3 +123,84 @@ class EmbeddedPreparedChunk(PreparedChunk):
         if not all(math.isfinite(item) for item in normalized):
             raise ValueError("embedding 必须只包含有限浮点数")
         return normalized
+
+from pydantic import BaseModel, ConfigDict, Field, field_validator
+
+from .input_contract import (
+    EXPERT_CHUNK_CONTRACT_VERSION,
+    ContractPreparedChunk,
+    EmbeddedContractPreparedChunk,
+    ExpertChunkEmbeddingInput,
+    ExpertChunkMetadata,
+    ExpertChunkSource,
+    ExpertChunkVersions,
+)
+
+__all__ = [
+    "EXPERT_CHUNK_CONTRACT_VERSION",
+    "ContractPreparedChunk",
+    "EmbeddedContractPreparedChunk",
+    "EmbeddedPreparedChunk",
+    "ExpertChunkEmbeddingInput",
+    "ExpertChunkMetadata",
+    "ExpertChunkSource",
+    "ExpertChunkVersions",
+    "PreparedChunk",
+    "SearchHit",
+    "build_vector_doc_id",
+]
+
+
+def build_vector_doc_id(chunk_id: str, embedding_model_version: str) -> str:
+    """根据业务 Chunk ID 和模型版本生成稳定的向量实体主键。
+
+    主键格式为 ``{chunk_id}:emb:{embedding_model_version}``。模型版本进入向量
+    身份是为了避免不同向量空间覆盖同一个 Entity；业务 Chunk 本身的
+    ``chunk_id`` 不随模型升级改变。长度和 UTF-8 容量由 Contract/Mapper 继续校验。
+    """
+
+    if not isinstance(chunk_id, str) or not chunk_id.strip():
+        raise ValueError("chunk_id 必须是非空字符串")
+    if not isinstance(embedding_model_version, str) or not embedding_model_version.strip():
+        raise ValueError("embedding_model_version 必须是非空字符串")
+    return f"{chunk_id}:emb:{embedding_model_version}"
+
+
+class SearchHit(BaseModel):
+    """Milvus 基础向量检索返回的稳定结果契约。
+
+    Repository 将 SDK 的不稳定返回结构转换成该模型后，业务层只依赖这些字段；
+    结果正文只用于返回命中内容，异常摘要不会回显完整输入或凭据。
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    vector_doc_id: str = Field(min_length=1)
+    expert_id: int = Field(ge=1)
+    chunk_id: str = Field(min_length=1)
+    chunk_type: str = Field(min_length=1)
+    chunk_text: str = Field(min_length=1)
+    score: float
+
+    @field_validator(
+        "vector_doc_id",
+        "chunk_id",
+        "chunk_type",
+        "chunk_text",
+    )
+    @classmethod
+    def reject_whitespace_only_values(cls, value: str) -> str:
+        """拒绝检索结果中的空白标识和正文。"""
+
+        if not value.strip():
+            raise ValueError("检索结果字段不能只包含空白字符")
+        return value
+
+    @field_validator("score")
+    @classmethod
+    def validate_score(cls, value: float) -> float:
+        """确保 Milvus distance/score 是有限数值。"""
+
+        if not math.isfinite(value):
+            raise ValueError("检索结果 score 必须是有限数值")
+        return value

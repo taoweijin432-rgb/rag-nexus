@@ -16,7 +16,7 @@ from pathlib import Path
 from expert_index.chunk_builder import ChunkFactory
 from expert_index.config import DatabaseConfig, Settings
 from expert_index.exporter import export_jsonl
-from expert_index.models import ExpertAggregate, ExpertSource, EmploymentSource, ProjectSource
+from expert_index.models import EmploymentSource, ExpertAggregate, ExpertSource, ProjectSource
 from expert_index.normalize import clean_text, normalize_aggregate, pii_hits, sha256_value
 from expert_index.source import (
     _employment_status,
@@ -37,7 +37,7 @@ def _settings() -> Settings:
 def _aggregate(long_employment: bool = False) -> ExpertAggregate:
     """返回含三类来源的虚构专家快照。"""
 
-    when = datetime(2026, 8, 11, 10, 0, 0)
+    when = datetime(2026, 8, 11, 10, 0, 0)  # noqa: DTZ001
     profile = ExpertSource(
         expert_id=24,
         serial_number="EXP000024",
@@ -59,8 +59,8 @@ def _aggregate(long_employment: bool = False) -> ExpertAggregate:
         source_item_key="1001",
         company="京东零售集团有限公司",
         role="运营负责人",
-        start_date=datetime(2018, 3, 1),
-        end_date=datetime(2021, 6, 1),
+        start_date=datetime(2018, 3, 1),  # noqa: DTZ001
+        end_date=datetime(2021, 6, 1),  # noqa: DTZ001
         description=responsibility,
         responsibilities="负责酒水采销。",
         achievements="年度GMV达到5000万元。",
@@ -76,8 +76,8 @@ def _aggregate(long_employment: bool = False) -> ExpertAggregate:
         project_name="组合投放优化",
         company="京东零售集团有限公司",
         project_role="项目负责人",
-        start_date=datetime(2024, 1, 1),
-        end_date=datetime(2024, 6, 1),
+        start_date=datetime(2024, 1, 1),  # noqa: DTZ001
+        end_date=datetime(2024, 6, 1),  # noqa: DTZ001
         description="提升广告投放效率。",
         responsibilities="按人群和素材分层测试，线索转化率提升18%。",
         results="线索转化率提升18%。",
@@ -190,7 +190,7 @@ class ExporterTest(unittest.TestCase):
     """验证 MySQL 行到固定 JSONL 契约的映射。"""
 
     def test_export_jsonl(self) -> None:
-        now = datetime(2026, 8, 11, 10, 0, 0)
+        now = datetime(2026, 8, 11, 10, 0, 0)  # noqa: DTZ001
         text = "[专家能力概述]\n核心背景：虚构测试资料"
         row = {
             "chunk_id": "expert:24:profile_summary:24:0",

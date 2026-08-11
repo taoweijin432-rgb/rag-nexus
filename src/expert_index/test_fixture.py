@@ -13,7 +13,6 @@ import pymysql
 
 from .config import DatabaseConfig
 
-
 # 固定唯一编号使重复执行具有幂等性，也让清理测试数据时可以精确定位。
 TEST_EXPERT_SERIAL = "TST2026081100000001"
 TEST_COMPANY = "星瀚智检（流程测试）科技有限公司"

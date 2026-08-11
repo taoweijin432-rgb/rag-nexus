@@ -8,14 +8,13 @@
 from __future__ import annotations
 
 import re
+from collections.abc import Iterable
 from datetime import datetime
-from typing import Iterable
 from zoneinfo import ZoneInfo
 
 from .config import Settings
 from .models import ChunkRecord, EmploymentStage, ProfileStage, ProjectStage
 from .normalize import sha256_value
-
 
 HARD_LIMITS = {"profile_summary": 600, "employment": 900, "project": 1000}
 

@@ -18,7 +18,6 @@ from .pipeline import ExpertIndexPipeline
 from .repository import MySQLIndexRepository
 from .test_fixture import ensure_complete_test_expert
 
-
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_DDL = PROJECT_ROOT / "sql" / "001_create_expert_index_tables.sql"
 
@@ -34,7 +33,10 @@ def build_parser() -> argparse.ArgumentParser:
 
     build = sub.add_parser("build", help="完整重建一位专家")
     build.add_argument("--expert-id", type=int, required=True)
-    build.add_argument("--data-version", default=datetime.now().strftime("%Y%m%d_01"))
+    build.add_argument(
+        "--data-version",
+        default=datetime.now().astimezone().strftime("%Y%m%d_01"),
+    )
     build.add_argument("--batch-no")
 
     export = sub.add_parser("export", help="导出符合向量化输入契约的 JSONL")

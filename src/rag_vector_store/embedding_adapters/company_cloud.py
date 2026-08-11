@@ -1,5 +1,9 @@
 """公司云端 Embedding API 适配器。
 
+本模块位于稳定的 ``EmbeddingModel`` Protocol 与外部 HTTP 服务之间，只负责把
+环境配置转换为请求、解析响应并做网络/向量防御性校验。Contract 校验、幂等、
+Task State 和 Milvus 写入不在这里处理。
+
 当前适配器按照约定的 HTTP JSON 协议调用云端服务：
 
 请求：
@@ -11,8 +15,8 @@
     {"data": [{"index": 0, "embedding": [0.1, 0.2]}]}
 
 API 地址、模型名和密钥全部从环境变量读取。具体公司 API 如果使用不同的
-请求或响应字段，只需要替换本适配器，不需要修改 EmbeddingModel、ingestion
-或 Milvus repository。
+请求或响应字段，只需要替换本适配器，不需要修改 EmbeddingModel、Contract
+ingestion 或 Milvus Repository。
 """
 
 from __future__ import annotations
@@ -92,7 +96,11 @@ class CompanyCloudEmbeddingSettings:
 
 
 class CompanyCloudEmbeddingModel(EmbeddingModel):
-    """通过公司云端 HTTP API 批量生成 Embedding。"""
+    """通过公司云端 HTTP API 批量生成 Embedding。
+
+    适配器保持输入文本顺序，并在接受响应前检查数量、索引、有限数值和批内
+    dimension；它不做重试或文本清洗，调用方可以据异常决定是否重试任务。
+    """
 
     def __init__(
         self,
@@ -138,7 +146,11 @@ class CompanyCloudEmbeddingModel(EmbeddingModel):
         return self.settings.model_version
 
     def embed(self, texts: Sequence[str]) -> list[list[float]]:
-        """调用云端 API，并返回与输入顺序一致的向量列表。"""
+        """调用云端 API，并返回与输入顺序一致的向量列表。
+
+        API 若返回 ``index``，解析器会按 index 复原顺序；若返回维度与此前已
+        观测值不一致，则拒绝本次结果，避免同一模型实例混入不同向量空间。
+        """
 
         input_texts = list(texts)
         _validate_input_texts(input_texts)
@@ -162,10 +174,14 @@ class CompanyCloudEmbeddingModel(EmbeddingModel):
             method="POST",
         )
 
+        # 请求体只包含 Worker 传入的 chunk_text；认证信息放在进程内存的 Header，
+        # 不进入报告、异常或返回对象。
         response_body = self._request(request)
         embeddings = _parse_embeddings(response_body)
         _validate_embeddings(input_texts, embeddings)
 
+        # 首次响应确定运行时维度，后续响应必须保持一致；Contract Worker 还会
+        # 按正式预期维度进行最后一道校验。
         actual_dimension = len(embeddings[0])
         if self._dimension is not None and self._dimension != actual_dimension:
             raise CompanyCloudEmbeddingError(
@@ -191,7 +207,11 @@ class CompanyCloudEmbeddingModel(EmbeddingModel):
 
 
 def _parse_embeddings(response_body: bytes) -> list[list[float]]:
-    """解析约定的 data[].embedding 响应结构。"""
+    """解析约定的 ``data[].embedding`` 响应结构。
+
+    外部 API 响应不视为可信输入：缺字段、空向量、非数值、非有限值和重复 index
+    都会阻止该批次继续，避免部分结果按错误顺序写入。
+    """
 
     try:
         payload = json.loads(response_body.decode("utf-8"))

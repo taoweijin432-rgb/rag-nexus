@@ -1,7 +1,33 @@
-"""用于 chunk 向量化并写入 Milvus 的可组合基础模块。"""
+"""Contract 与历史兼容入口共存的向量化公共 API。"""
 
-from .chunking import ChunkBuilder, EmbeddedPreparedChunk, PreparedChunk
-from .config import MilvusSettings
+from .chunking import (
+    EXPECTED_EMBEDDING_DIMENSION,
+    EXPERT_CHUNK_CONTRACT_VERSION,
+    ChunkBuilder,
+    ContractEmbeddingResult,
+    ContractEmbeddingWorker,
+    ContractPreparedChunk,
+    ContractValidationError,
+    ContractValidator,
+    EmbeddedContractPreparedChunk,
+    EmbeddedPreparedChunk,
+    EmbeddingEligibilityError,
+    EmbeddingEligibilityValidator,
+    ExpertChunkEmbeddingInput,
+    ExpertChunkMetadata,
+    ExpertChunkSource,
+    ExpertChunkVersions,
+    JsonlExpertChunkReader,
+    JsonlReadResult,
+    JsonlRecordError,
+    PreparedChunk,
+    SearchHit,
+    SkippedContractChunk,
+    build_vector_doc_id,
+    compare_contract_output_schema,
+    expected_contract_output_fields,
+)
+from .config import MilvusSettings, MySQLSettings
 from .embedding import EmbeddingModel
 from .embedding_adapters import (
     CompanyCloudEmbeddingError,
@@ -9,11 +35,38 @@ from .embedding_adapters import (
     CompanyCloudEmbeddingSettings,
 )
 from .ingestion import ChunkIngestionService, IngestionResult
+from .milvus.contract import (
+    CONTRACT_SCALAR_INDEX_FIELDS,
+    CONTRACT_VECTOR_DIMENSION,
+    CONTRACT_VECTOR_DOC_ID_MAX_BYTES,
+    MilvusExpertChunkEntity,
+    MilvusFieldSpec,
+    MilvusRowMapper,
+    contract_milvus_field_specs,
+)
+from .milvus.repository import (
+    MilvusVectorRepository as ContractMilvusVectorRepository,
+)
 from .models import Chunk, EmbeddedChunk, MutationResult
+from .mysql import (
+    MYSQL_EXPERT_CHUNK_SELECT_COLUMNS,
+    MySQLConnection,
+    MySQLConnectionError,
+    MySqlExpertChunkReader,
+    MySQLReadError,
+    MySQLReadResult,
+    MySQLRowMappingError,
+)
 from .ports import ChunkRepository
 from .repository import MilvusVectorRepository
 
 __all__ = [
+    "CONTRACT_SCALAR_INDEX_FIELDS",
+    "CONTRACT_VECTOR_DIMENSION",
+    "CONTRACT_VECTOR_DOC_ID_MAX_BYTES",
+    "EXPECTED_EMBEDDING_DIMENSION",
+    "EXPERT_CHUNK_CONTRACT_VERSION",
+    "MYSQL_EXPERT_CHUNK_SELECT_COLUMNS",
     "Chunk",
     "ChunkBuilder",
     "ChunkIngestionService",
@@ -21,12 +74,44 @@ __all__ = [
     "CompanyCloudEmbeddingError",
     "CompanyCloudEmbeddingModel",
     "CompanyCloudEmbeddingSettings",
+    "ContractEmbeddingResult",
+    "ContractEmbeddingWorker",
+    "ContractMilvusVectorRepository",
+    "ContractPreparedChunk",
+    "ContractValidationError",
+    "ContractValidator",
     "EmbeddedChunk",
+    "EmbeddedContractPreparedChunk",
     "EmbeddedPreparedChunk",
+    "EmbeddingEligibilityError",
+    "EmbeddingEligibilityValidator",
     "EmbeddingModel",
+    "ExpertChunkEmbeddingInput",
+    "ExpertChunkMetadata",
+    "ExpertChunkSource",
+    "ExpertChunkVersions",
     "IngestionResult",
+    "JsonlExpertChunkReader",
+    "JsonlReadResult",
+    "JsonlRecordError",
+    "MilvusExpertChunkEntity",
+    "MilvusFieldSpec",
+    "MilvusRowMapper",
     "MilvusSettings",
     "MilvusVectorRepository",
     "MutationResult",
+    "MySQLConnection",
+    "MySQLConnectionError",
+    "MySQLReadError",
+    "MySQLReadResult",
+    "MySQLRowMappingError",
+    "MySQLSettings",
+    "MySqlExpertChunkReader",
     "PreparedChunk",
+    "SearchHit",
+    "SkippedContractChunk",
+    "build_vector_doc_id",
+    "compare_contract_output_schema",
+    "contract_milvus_field_specs",
+    "expected_contract_output_fields",
 ]

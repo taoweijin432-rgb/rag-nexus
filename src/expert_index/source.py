@@ -13,7 +13,7 @@ from typing import Any
 import pymysql
 
 from .config import DatabaseConfig
-from .models import ExpertAggregate, ExpertSource, EmploymentSource, ProjectSource
+from .models import EmploymentSource, ExpertAggregate, ExpertSource, ProjectSource
 
 
 class ExpertNotFoundError(LookupError):

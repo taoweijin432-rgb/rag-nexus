@@ -12,7 +12,6 @@ from .chunk_builder import HARD_LIMITS
 from .models import ChunkRecord
 from .normalize import pii_hits, sha256_value
 
-
 _CODE = re.compile(r"^[a-z][a-z0-9_]*$")
 _MONTH = re.compile(r"^\d{4}-(0[1-9]|1[0-2])$")
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
@@ -91,7 +90,9 @@ def _validate_one(chunk: ChunkRecord) -> None:
             fail("employment 缺少公司")
         if not metadata["role_name_raw"] or not chunk.start_month or chunk.is_current is None:
             fail("employment 缺少岗位、开始月份或任职状态")
-    if chunk.chunk_type == "project" and chunk.verification_status == "source_evidence":
-        if not metadata.get("project_name") or not metadata.get("project_role"):
-            fail("project 缺少项目名或项目角色")
-
+    if (
+        chunk.chunk_type == "project"
+        and chunk.verification_status == "source_evidence"
+        and (not metadata.get("project_name") or not metadata.get("project_role"))
+    ):
+        fail("project 缺少项目名或项目角色")

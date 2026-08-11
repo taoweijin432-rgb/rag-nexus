@@ -11,8 +11,9 @@ import html
 import json
 import re
 import unicodedata
+from collections.abc import Iterable
 from datetime import date, datetime
-from typing import Any, Iterable
+from typing import Any
 
 from .models import (
     EmploymentSource,
@@ -22,7 +23,6 @@ from .models import (
     ProjectSource,
     ProjectStage,
 )
-
 
 # 正则只用于“识别并删除”，命中日志只能记录类别和数量，绝不能打印原值。
 PII_PATTERNS: dict[str, re.Pattern[str]] = {

@@ -106,6 +106,5 @@ class ExpertIndexPipeline:
 def _batch_no(expert_id: int) -> str:
     """批次号包含专家 ID 和微秒时间，便于重放与排障。"""
 
-    timestamp = datetime.now().strftime("%Y%m%d%H%M%S%f")
+    timestamp = datetime.now().astimezone().strftime("%Y%m%d%H%M%S%f")
     return f"single_{expert_id}_{timestamp}"
-
