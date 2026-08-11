@@ -1,0 +1,328 @@
+"""公司云端 Embedding API 适配器。
+
+当前适配器按照约定的 HTTP JSON 协议调用云端服务：
+
+请求：
+    POST {EMBEDDING_API_URL}
+    Authorization: Bearer {EMBEDDING_API_KEY}
+    {"model": "text-embedding-v4", "input": ["文本一", "文本二"]}
+
+响应：
+    {"data": [{"index": 0, "embedding": [0.1, 0.2]}]}
+
+API 地址、模型名和密钥全部从环境变量读取。具体公司 API 如果使用不同的
+请求或响应字段，只需要替换本适配器，不需要修改 EmbeddingModel、ingestion
+或 Milvus repository。
+"""
+
+from __future__ import annotations
+
+import json
+import math
+import os
+from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass, field
+from numbers import Real
+from typing import Any
+from urllib.error import HTTPError, URLError
+from urllib.request import Request, urlopen
+
+from ..embedding import EmbeddingModel
+
+
+class CompanyCloudEmbeddingError(RuntimeError):
+    """公司云端 Embedding 调用或响应校验失败。"""
+
+
+@dataclass(frozen=True)
+class CompanyCloudEmbeddingSettings:
+    """公司云端 Embedding API 的非敏感配置和密钥配置。"""
+
+    api_url: str
+    api_key: str = field(repr=False)
+    model: str = "text-embedding-v4"
+    model_alias: str = "text-embedding-v4"
+    model_version: str | None = None
+    expected_dimension: int | None = None
+    timeout: float = 60.0
+
+    def __post_init__(self) -> None:
+        """校验配置，避免把无效配置带到网络请求阶段。"""
+
+        if not isinstance(self.api_url, str) or not self.api_url.strip():
+            raise ValueError("EMBEDDING_API_URL 不能为空")
+        if not isinstance(self.api_key, str) or not self.api_key.strip():
+            raise ValueError("EMBEDDING_API_KEY 不能为空")
+        if not isinstance(self.model, str) or not self.model.strip():
+            raise ValueError("EMBEDDING_MODEL 不能为空")
+        if not isinstance(self.model_alias, str) or not self.model_alias.strip():
+            raise ValueError("EMBEDDING_MODEL_ALIAS 不能为空")
+        if self.model_version is not None and not self.model_version.strip():
+            raise ValueError("EMBEDDING_MODEL_VERSION 不能为空字符串")
+        if self.expected_dimension is not None and (
+            isinstance(self.expected_dimension, bool)
+            or not isinstance(self.expected_dimension, int)
+            or self.expected_dimension < 1
+        ):
+            raise ValueError("EMBEDDING_DIMENSION 必须是正整数")
+        if isinstance(self.timeout, bool) or self.timeout <= 0:
+            raise ValueError("EMBEDDING_TIMEOUT 必须是正数")
+
+    @classmethod
+    def from_env(
+        cls,
+        environ: Mapping[str, str] | None = None,
+    ) -> CompanyCloudEmbeddingSettings:
+        """从环境变量创建云端 Embedding 配置。"""
+
+        env = os.environ if environ is None else environ
+        timeout_text = _optional(env, "EMBEDDING_TIMEOUT")
+        dimension_text = _optional(env, "EMBEDDING_DIMENSION")
+        return cls(
+            api_url=_required(env, "EMBEDDING_API_URL"),
+            api_key=_required(env, "EMBEDDING_API_KEY"),
+            model=_get(env, "EMBEDDING_MODEL", "text-embedding-v4"),
+            model_alias=_get(env, "EMBEDDING_MODEL_ALIAS", "text-embedding-v4"),
+            model_version=_optional(env, "EMBEDDING_MODEL_VERSION"),
+            expected_dimension=(
+                None if dimension_text is None else _parse_dimension(dimension_text)
+            ),
+            timeout=60.0 if timeout_text is None else _parse_timeout(timeout_text),
+        )
+
+
+class CompanyCloudEmbeddingModel(EmbeddingModel):
+    """通过公司云端 HTTP API 批量生成 Embedding。"""
+
+    def __init__(
+        self,
+        settings: CompanyCloudEmbeddingSettings,
+        *,
+        opener: Callable[..., Any] = urlopen,
+    ) -> None:
+        self.settings = settings
+        self._opener = opener
+        self._dimension = settings.expected_dimension
+
+    @classmethod
+    def from_env(
+        cls,
+        environ: Mapping[str, str] | None = None,
+        *,
+        opener: Callable[..., Any] = urlopen,
+    ) -> CompanyCloudEmbeddingModel:
+        """从环境变量创建公司云端 Embedding 模型。"""
+
+        return cls(CompanyCloudEmbeddingSettings.from_env(environ), opener=opener)
+
+    @property
+    def dimension(self) -> int:
+        """返回已配置并会由真实响应再次校验的向量维度。"""
+
+        if self._dimension is None:
+            raise CompanyCloudEmbeddingError(
+                "尚未获得 Embedding dimension，请先调用一次 embed"
+            )
+        return self._dimension
+
+    @property
+    def model_alias(self) -> str:
+        """返回业务侧使用的模型别名。"""
+
+        return self.settings.model_alias
+
+    @property
+    def model_version(self) -> str | None:
+        """返回配置中的模型版本；API 未提供时保持为空。"""
+
+        return self.settings.model_version
+
+    def embed(self, texts: Sequence[str]) -> list[list[float]]:
+        """调用云端 API，并返回与输入顺序一致的向量列表。"""
+
+        input_texts = list(texts)
+        _validate_input_texts(input_texts)
+        if not input_texts:
+            return []
+
+        request = Request(
+            self.settings.api_url,
+            data=json.dumps(
+                {
+                    "model": self.settings.model,
+                    "input": input_texts,
+                },
+                ensure_ascii=False,
+            ).encode("utf-8"),
+            headers={
+                "Accept": "application/json",
+                "Authorization": f"Bearer {self.settings.api_key}",
+                "Content-Type": "application/json",
+            },
+            method="POST",
+        )
+
+        response_body = self._request(request)
+        embeddings = _parse_embeddings(response_body)
+        _validate_embeddings(input_texts, embeddings)
+
+        actual_dimension = len(embeddings[0])
+        if self._dimension is not None and self._dimension != actual_dimension:
+            raise CompanyCloudEmbeddingError(
+                "同一个 Embedding 模型返回了不一致的 dimension"
+            )
+        self._dimension = actual_dimension
+        return embeddings
+
+    def _request(self, request: Request) -> bytes:
+        """发送 HTTP 请求，并将底层网络异常转换为安全的业务异常。"""
+
+        try:
+            with self._opener(request, timeout=self.settings.timeout) as response:
+                return response.read()
+        except HTTPError as exc:
+            if exc.code in (401, 403):
+                raise CompanyCloudEmbeddingError("Embedding API 认证失败") from exc
+            raise CompanyCloudEmbeddingError(
+                f"Embedding API 返回 HTTP {exc.code}"
+            ) from exc
+        except (TimeoutError, URLError, OSError) as exc:
+            raise CompanyCloudEmbeddingError("Embedding API 连接或请求超时") from exc
+
+
+def _parse_embeddings(response_body: bytes) -> list[list[float]]:
+    """解析约定的 data[].embedding 响应结构。"""
+
+    try:
+        payload = json.loads(response_body.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise CompanyCloudEmbeddingError("Embedding API 返回的 JSON 无法解析") from exc
+
+    if not isinstance(payload, Mapping) or not isinstance(payload.get("data"), list):
+        raise CompanyCloudEmbeddingError(
+            "Embedding API 响应缺少合法的 data 列表"
+        )
+
+    data = payload["data"]
+    embeddings: list[list[float]] = []
+    indexed_embeddings: list[tuple[int, list[float]]] = []
+    has_index = []
+
+    for item in data:
+        if not isinstance(item, Mapping) or not isinstance(item.get("embedding"), list):
+            raise CompanyCloudEmbeddingError(
+                "Embedding API 响应中的 embedding 必须是列表"
+            )
+        raw_embedding = item["embedding"]
+        if not raw_embedding:
+            raise CompanyCloudEmbeddingError("Embedding API 返回了空 embedding")
+
+        vector: list[float] = []
+        for value in raw_embedding:
+            if isinstance(value, bool) or not isinstance(value, Real):
+                raise CompanyCloudEmbeddingError(
+                    "Embedding API 返回的 embedding 元素必须是数值"
+                )
+            number = float(value)
+            if not math.isfinite(number):
+                raise CompanyCloudEmbeddingError(
+                    "Embedding API 返回的 embedding 只能包含有限数值"
+                )
+            vector.append(number)
+
+        raw_index = item.get("index")
+        has_index.append(raw_index is not None)
+        if raw_index is not None:
+            if isinstance(raw_index, bool) or not isinstance(raw_index, int):
+                raise CompanyCloudEmbeddingError(
+                    "Embedding API 响应中的 index 必须是整数"
+                )
+            indexed_embeddings.append((raw_index, vector))
+        embeddings.append(vector)
+
+    if any(has_index) and not all(has_index):
+        raise CompanyCloudEmbeddingError(
+            "Embedding API 响应中的 index 字段不完整"
+        )
+    if all(has_index) and indexed_embeddings:
+        indexes = [index for index, _ in indexed_embeddings]
+        if len(indexes) != len(set(indexes)):
+            raise CompanyCloudEmbeddingError(
+                "Embedding API 响应中的 index 存在重复值"
+            )
+        embeddings = [vector for _, vector in sorted(indexed_embeddings)]
+
+    return embeddings
+
+
+def _validate_input_texts(texts: Sequence[str]) -> None:
+    """校验发送给云端 API 的文本输入。"""
+
+    for text in texts:
+        if not isinstance(text, str) or not text.strip():
+            raise ValueError("Embedding 输入文本必须是非空字符串")
+
+
+def _validate_embeddings(texts: Sequence[str], embeddings: Sequence[Sequence[float]]) -> None:
+    """校验返回数量和同一批次内的向量维度。"""
+
+    if len(texts) != len(embeddings):
+        raise CompanyCloudEmbeddingError(
+            "Embedding API 返回数量与输入文本数量不一致"
+        )
+    if not embeddings:
+        raise CompanyCloudEmbeddingError("Embedding API 未返回向量")
+
+    dimension = len(embeddings[0])
+    if dimension < 1:
+        raise CompanyCloudEmbeddingError("Embedding API 返回了空 embedding")
+    if any(len(embedding) != dimension for embedding in embeddings[1:]):
+        raise CompanyCloudEmbeddingError(
+            "同一个 Embedding batch 中的向量 dimension 不一致"
+        )
+
+
+def _required(environ: Mapping[str, str], name: str) -> str:
+    """读取必填环境变量，但不在异常中暴露变量值。"""
+
+    value = environ.get(name)
+    if value is None or not value.strip():
+        raise ValueError(f"缺少环境变量 {name}")
+    return value.strip()
+
+
+def _optional(environ: Mapping[str, str], name: str) -> str | None:
+    """读取可选环境变量。"""
+
+    value = environ.get(name)
+    return None if value is None or not value.strip() else value.strip()
+
+
+def _get(environ: Mapping[str, str], name: str, default: str) -> str:
+    """读取带默认值的环境变量。"""
+
+    return _optional(environ, name) or default
+
+
+def _parse_timeout(value: str) -> float:
+    """解析超时时间，并拒绝非正数。"""
+
+    try:
+        timeout = float(value)
+    except ValueError as exc:
+        raise ValueError("EMBEDDING_TIMEOUT 必须是数字") from exc
+    if timeout <= 0:
+        raise ValueError("EMBEDDING_TIMEOUT 必须是正数")
+    return timeout
+
+
+def _parse_dimension(value: str) -> int:
+    """解析预期向量维度，供首次调用前的 ingestion 初始化使用。"""
+
+    try:
+        dimension = int(value)
+    except ValueError as exc:
+        raise ValueError("EMBEDDING_DIMENSION 必须是正整数") from exc
+    if dimension < 1:
+        raise ValueError("EMBEDDING_DIMENSION 必须是正整数")
+    return dimension
