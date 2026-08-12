@@ -7,6 +7,11 @@ from urllib.error import HTTPError
 import pytest
 
 from rag_vector_store import (
+    FORMAL_EMBEDDING_DIMENSION,
+    FORMAL_EMBEDDING_MODEL,
+    FORMAL_EMBEDDING_MODEL_ALIAS,
+    FORMAL_EMBEDDING_MODEL_SPACE_ID,
+    FORMAL_EMBEDDING_MODEL_VERSION,
     CompanyCloudEmbeddingError,
     CompanyCloudEmbeddingModel,
     CompanyCloudEmbeddingSettings,
@@ -48,13 +53,38 @@ def make_recording_opener(payload: object, requests: list[object]) -> Callable[.
     return opener
 
 
-def settings() -> CompanyCloudEmbeddingSettings:
+def settings(*, expected_dimension: int | None = None) -> CompanyCloudEmbeddingSettings:
     """创建不包含真实密钥的测试配置。"""
 
     return CompanyCloudEmbeddingSettings(
         api_url="https://embedding.example.test/v1/embeddings",
         api_key="unit-test-key",
+        expected_dimension=expected_dimension,
     )
+
+
+def test_formal_embedding_defaults_identify_the_project_model_space() -> None:
+    configured = CompanyCloudEmbeddingSettings(
+        api_url="https://embedding.example.test/v1/embeddings",
+        api_key="unit-test-key",
+    )
+
+    assert configured.model == FORMAL_EMBEDDING_MODEL
+    assert configured.model_alias == FORMAL_EMBEDDING_MODEL_ALIAS
+    assert configured.model_version == FORMAL_EMBEDDING_MODEL_VERSION
+    assert configured.expected_dimension == FORMAL_EMBEDDING_DIMENSION
+
+    model = CompanyCloudEmbeddingModel(configured)
+    assert model.model_space_id == FORMAL_EMBEDDING_MODEL_SPACE_ID
+
+
+def test_formal_embedding_rejects_placeholder_model_version() -> None:
+    with pytest.raises(ValueError, match="dev-unknown"):
+        CompanyCloudEmbeddingSettings(
+            api_url="https://embedding.example.test/v1/embeddings",
+            api_key="unit-test-key",
+            model_version="dev-unknown",
+        )
 
 
 def test_company_cloud_embedding_supports_batch_and_discovers_dimension() -> None:
@@ -74,7 +104,7 @@ def test_company_cloud_embedding_supports_batch_and_discovers_dimension() -> Non
 
     assert embeddings == [[0.1, 0.2, 0.3], [0.4, 0.5, 0.6]]
     assert model.dimension == 3
-    assert model.model_alias == "text-embedding-v4"
+    assert model.model_alias == FORMAL_EMBEDDING_MODEL_ALIAS
 
 
 def test_company_cloud_embedding_builds_the_agreed_http_request() -> None:

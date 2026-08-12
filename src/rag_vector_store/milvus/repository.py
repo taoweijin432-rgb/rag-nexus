@@ -15,16 +15,16 @@ from numbers import Real
 from threading import Lock
 from typing import Any
 
-from ..chunking.contracts import (
-    EmbeddedContractPreparedChunk,
-    SearchHit,
-)
+from expert_contracts.models import EmbeddedContractPreparedChunk
+
 from ..config import MilvusSettings
-from ..models import MutationResult
+from ..model_space import is_placeholder_model_version
+from ..models import MutationResult, SearchHit
 from .compatibility import (
     compare_contract_indexes as compare_contract_indexes_definition,
 )
 from .compatibility import (
+    compare_model_space,
     compare_schema_specs,
 )
 from .contract import MilvusRowMapper
@@ -35,7 +35,7 @@ from .schemas import (
 )
 
 
-class MilvusVectorRepository:
+class ContractMilvusVectorRepository:
     """封装 Milvus 连接、Schema 管理和 CRUD 写操作。
 
     SDK client 会在第一次操作时延迟创建。传入 ``client`` 适合测试，或适合由
@@ -52,6 +52,10 @@ class MilvusVectorRepository:
         client: Any | None = None,
         allow_collection_creation: bool = True,
     ) -> None:
+        if settings.schema_mode != "contract":
+            raise ValueError(
+                "ContractMilvusVectorRepository 要求 MILVUS_SCHEMA_MODE=contract"
+            )
         self.settings = settings
         self._vector_dimension: int | None = None
         self._client = client
@@ -192,13 +196,17 @@ class MilvusVectorRepository:
         if not items:
             return MutationResult(affected_count=0)
         if not all(isinstance(item, EmbeddedContractPreparedChunk) for item in items):
-            raise TypeError("MilvusVectorRepository 只接受 EmbeddedContractPreparedChunk")
+            raise TypeError(
+                "ContractMilvusVectorRepository 只接受 EmbeddedContractPreparedChunk"
+            )
 
         self._ensure_dimension_from_records(items)
+        self._validate_batch_model_space(items)
         dimension = self._vector_dimension
         if dimension is None:  # 理论上不会发生，防止未来修改破坏维度约束
             raise ValueError("vector dimension is not configured")
         self.initialize(dimension)
+        self._validate_existing_model_space(items[0])
         rows = self._to_rows(items)
         response = self._get_client().upsert(
             collection_name=self.settings.collection_name,
@@ -321,7 +329,8 @@ class MilvusVectorRepository:
                 from pymilvus import MilvusClient
             except ImportError as exc:  # pragma: no cover - 依赖已在 pyproject 中声明
                 raise RuntimeError(
-                    "pymilvus is required to use MilvusVectorRepository; run `uv sync` first"
+                    "pymilvus is required to use ContractMilvusVectorRepository; "
+                    "run `uv sync` first"
                 ) from exc
             self._client = MilvusClient(**self.settings.client_kwargs)
         return self._client
@@ -361,6 +370,65 @@ class MilvusVectorRepository:
                     f"embedding dimension mismatch for chunk {record.chunk_id!r}: "
                     f"expected {self._vector_dimension}, got {len(record.embedding)}"
                 )
+
+    @staticmethod
+    def _validate_batch_model_space(
+        records: Sequence[EmbeddedContractPreparedChunk],
+    ) -> None:
+        """在任何 Collection 操作前拒绝批内混用模型空间。"""
+
+        first = records[0]
+        if is_placeholder_model_version(first.embedding_model_version):
+            raise ValueError("正式 Contract 写入禁止使用 embedding_model_version=dev-unknown")
+        difference = compare_model_space(
+            [
+                {
+                    "embedding_model_alias": record.embedding_model_alias,
+                    "embedding_model_version": record.embedding_model_version,
+                    "embedding_dim": record.embedding_dim,
+                }
+                for record in records
+            ],
+            embedding_model_alias=first.embedding_model_alias,
+            embedding_model_version=first.embedding_model_version,
+            embedding_dimension=first.embedding_dim,
+        )
+        if not difference.compatible:
+            raise ValueError(
+                "同一 mutation batch 不能混用 Embedding model-space: "
+                f"{json.dumps(difference.as_dict(), ensure_ascii=False, sort_keys=True)}"
+            )
+
+    def _validate_existing_model_space(
+        self,
+        record: EmbeddedContractPreparedChunk,
+    ) -> None:
+        """在 upsert 前确认已有 Entity 与本批次属于同一模型空间。"""
+
+        rows = self._get_client().query(
+            collection_name=self.settings.collection_name,
+            filter="",
+            output_fields=[
+                "embedding_model_alias",
+                "embedding_model_version",
+                "embedding_dim",
+            ],
+            consistency_level="Strong",
+            **self._timeout_kwargs(),
+        )
+        if not isinstance(rows, list) or not all(isinstance(row, Mapping) for row in rows):
+            raise TypeError("Milvus model-space query 返回了非法 Entity 列表")
+        difference = compare_model_space(
+            rows,
+            embedding_model_alias=record.embedding_model_alias,
+            embedding_model_version=record.embedding_model_version,
+            embedding_dimension=record.embedding_dim,
+        )
+        if not difference.compatible:
+            raise ValueError(
+                "Milvus Collection 已有 Entity 与当前 Embedding model-space 不一致: "
+                f"{json.dumps(difference.as_dict(), ensure_ascii=False, sort_keys=True)}"
+            )
 
     def _build_schema(self, vector_dimension: int | None) -> Any:
         """构造正式 Contract Schema，不修改任何已有 Collection。"""

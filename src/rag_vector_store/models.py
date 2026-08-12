@@ -1,59 +1,10 @@
-"""chunk 生成方、向量模型和 repository 之间共享的数据协议。"""
+"""正式 Contract ingestion 和 Milvus 查询使用的稳定结果模型。"""
 
 from __future__ import annotations
 
-import json
 import math
-from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
-
-
-class Chunk(BaseModel):
-    """chunk 生成模块使用的稳定接口协议。
-
-    chunk 生成逻辑只需要提供应用内唯一的 ``chunk_id`` 和待向量化文本。
-    解析器或切分器的专有信息应放入 ``metadata``，这样协议就不会绑定某个
-    具体的解析器或切分策略。
-    """
-
-    model_config = ConfigDict(extra="forbid")
-
-    chunk_id: str = Field(min_length=1, description="chunk 的稳定唯一标识")
-    text: str = Field(min_length=1, description="传给 embedding 模型的文本")
-    metadata: dict[str, Any] = Field(default_factory=dict)
-
-    @field_validator("chunk_id", "text")
-    @classmethod
-    def reject_whitespace_only_values(cls, value: str) -> str:
-        if not value.strip():
-            raise ValueError("chunk_id and text must not contain only whitespace")
-        return value
-
-    @field_validator("metadata")
-    @classmethod
-    def validate_json_metadata(cls, value: dict[str, Any]) -> dict[str, Any]:
-        """提前拦截无法写入 Milvus JSON 字段的值。"""
-
-        try:
-            json.dumps(value, ensure_ascii=False, allow_nan=False)
-        except (TypeError, ValueError) as exc:
-            raise ValueError("metadata must be JSON serializable") from exc
-        return value
-
-
-class EmbeddedChunk(Chunk):
-    """文本已经转换为稠密浮点向量后的 chunk。"""
-
-    embedding: list[float] = Field(min_length=1)
-
-    @field_validator("embedding")
-    @classmethod
-    def validate_embedding_values(cls, value: list[float]) -> list[float]:
-        normalized = [float(item) for item in value]
-        if not all(math.isfinite(item) for item in normalized):
-            raise ValueError("embedding must contain only finite numbers")
-        return normalized
 
 
 class MutationResult(BaseModel):
@@ -61,3 +12,42 @@ class MutationResult(BaseModel):
 
     affected_count: int = Field(ge=0)
     primary_keys: list[str] = Field(default_factory=list)
+
+
+class SearchHit(BaseModel):
+    """Milvus 基础向量检索返回的稳定结果契约。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    vector_doc_id: str = Field(min_length=1)
+    expert_id: int = Field(ge=1)
+    chunk_id: str = Field(min_length=1)
+    chunk_type: str = Field(min_length=1)
+    chunk_text: str = Field(min_length=1)
+    score: float
+
+    @field_validator(
+        "vector_doc_id",
+        "chunk_id",
+        "chunk_type",
+        "chunk_text",
+    )
+    @classmethod
+    def reject_whitespace_only_values(cls, value: str) -> str:
+        """拒绝检索结果中的空白标识和正文。"""
+
+        if not value.strip():
+            raise ValueError("检索结果字段不能只包含空白字符")
+        return value
+
+    @field_validator("score")
+    @classmethod
+    def validate_score(cls, value: float) -> float:
+        """确保 Milvus distance/score 是有限数值。"""
+
+        if not math.isfinite(value):
+            raise ValueError("检索结果 score 必须是有限数值")
+        return value
+
+
+__all__ = ["MutationResult", "SearchHit"]

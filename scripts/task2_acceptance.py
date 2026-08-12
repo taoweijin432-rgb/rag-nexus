@@ -170,6 +170,7 @@ def _new_report(args: argparse.Namespace) -> dict[str, Any]:
             "model": None,
             "model_alias": None,
             "model_version": None,
+            "model_space_id": None,
             "configured_dimension": None,
             "observed_dimensions": [],
         },
@@ -280,10 +281,10 @@ def _load_settings(collection: str, report: dict[str, Any]) -> MilvusSettings:
     if collection in _PROTECTED_COLLECTIONS:
         _fail(report, f"受保护 Collection 不允许写入: {collection}", "collection_precondition")
     settings = MilvusSettings.from_env().model_copy(update={"collection_name": collection})
-    if settings.schema_mode != "expert":
+    if settings.schema_mode != "contract":
         _fail(
             report,
-            "Task 2 必须使用 MILVUS_SCHEMA_MODE=expert",
+            "Task 2 必须使用 MILVUS_SCHEMA_MODE=contract",
             "collection_precondition",
         )
     return settings
@@ -373,7 +374,8 @@ def _build_embedding_worker(
     embedding_report = report["embedding"]
     embedding_report["model"] = model.settings.model
     embedding_report["model_alias"] = model.model_alias
-    embedding_report["model_version"] = model.model_version or "dev-unknown"
+    embedding_report["model_version"] = model.model_version
+    embedding_report["model_space_id"] = model.model_space_id
     embedding_report["configured_dimension"] = model.settings.expected_dimension
     actual_dimension = report["collection"]["actual_vector_dimension"]
     if model.settings.expected_dimension not in (None, actual_dimension):
@@ -385,7 +387,7 @@ def _build_embedding_worker(
     worker = ContractEmbeddingWorker(
         model,
         embedding_model_alias=model.model_alias,
-        embedding_model_version=model.model_version or "dev-unknown",
+        embedding_model_version=model.model_version,
         expected_dimension=EXPECTED_EMBEDDING_DIMENSION,
     )
     return model, worker

@@ -16,9 +16,6 @@ from rag_vector_store import (
     ContractIngestionService,
     MutationResult,
 )
-from rag_vector_store.chunking.input_contract import (
-    ExpertChunkEmbeddingInput as RagExpertChunkEmbeddingInput,
-)
 
 
 class FakeEmbeddingModel:
@@ -160,7 +157,3 @@ def test_mapping_adapter_rejects_deprecated_source_record_id() -> None:
 
     with pytest.raises(ExpertChunkMappingError, match="source_record_id"):
         ExpertChunkMappingAdapter().from_mapping(mapping)
-
-
-def test_rag_input_contract_export_is_the_shared_model() -> None:
-    assert RagExpertChunkEmbeddingInput is ExpertChunkEmbeddingInput

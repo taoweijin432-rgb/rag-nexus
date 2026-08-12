@@ -4,32 +4,31 @@ import hashlib
 import json
 from collections.abc import Sequence
 from datetime import datetime, timezone
-from io import StringIO
 from pathlib import Path
 
 import pytest
 
+from expert_contracts import adapt_expert_chunk_mapping
+from expert_contracts.models import ExpertChunkEmbeddingInput
 from rag_vector_store import (
     ContractEmbeddingWorker,
     ContractValidationError,
     ContractValidator,
     EmbeddingEligibilityValidator,
-    ExpertChunkEmbeddingInput,
-    JsonlExpertChunkReader,
     compare_contract_output_schema,
 )
 
 FIXTURE_PATH = (
     Path(__file__).resolve().parents[1]
     / "fixtures"
-    / "expert_chunk_embedding_input_v1.jsonl"
+    / "expert_chunk_embedding_input_v2.jsonl"
 )
 
 
 class FakeContractEmbeddingModel:
     dimension = 1024
-    model_alias = "text-embedding-v4"
-    model_version = "dev-unknown"
+    model_alias = "alibaba-bailian:text-embedding-v4"
+    model_version = "v1"
 
     def __init__(self, mode: str = "valid") -> None:
         self.mode = mode
@@ -47,9 +46,12 @@ class FakeContractEmbeddingModel:
 
 
 def fixture_records() -> list[ExpertChunkEmbeddingInput]:
-    result = JsonlExpertChunkReader().read(FIXTURE_PATH)
-    assert result.errors == []
-    return list(result.records)
+    with FIXTURE_PATH.open(encoding="utf-8") as stream:
+        return [
+            adapt_expert_chunk_mapping(json.loads(line))
+            for line in stream
+            if line.strip()
+        ]
 
 
 def fixture_payload(chunk_type: str = "profile_summary") -> dict[str, object]:
@@ -71,12 +73,10 @@ def fixed_clock() -> datetime:
 
 
 def test_three_contract_fixture_types_pass() -> None:
-    result = JsonlExpertChunkReader().read(FIXTURE_PATH)
+    records = fixture_records()
 
-    assert result.input_count == 3
-    assert result.valid_count == 3
-    assert result.errors == []
-    assert [record.chunk_type for record in result.records] == [
+    assert len(records) == 3
+    assert [record.chunk_type for record in records] == [
         "profile_summary",
         "employment",
         "project",
@@ -222,7 +222,7 @@ def test_vector_doc_id_is_preserved_across_embedding_model_versions() -> None:
     first_model = FakeContractEmbeddingModel()
     first_worker = ContractEmbeddingWorker(first_model, clock=fixed_clock)
     second_model = FakeContractEmbeddingModel()
-    second_model.model_version = "dev-model-v2"
+    second_model.model_version = "v2"
     second_worker = ContractEmbeddingWorker(second_model, clock=fixed_clock)
 
     first = first_worker.embed(records).embedded_chunks
@@ -235,8 +235,8 @@ def test_vector_doc_id_is_preserved_across_embedding_model_versions() -> None:
         embedded.vector_doc_id == source.vector_doc_id
         for source, embedded in zip(records, second)
     )
-    assert {record.embedding_model_version for record in first} == {"dev-unknown"}
-    assert {record.embedding_model_version for record in second} == {"dev-model-v2"}
+    assert {record.embedding_model_version for record in first} == {"v1"}
+    assert {record.embedding_model_version for record in second} == {"v2"}
 
 
 def test_metadata_source_versions_are_preserved_and_only_text_is_embedded() -> None:
@@ -254,19 +254,6 @@ def test_metadata_source_versions_are_preserved_and_only_text_is_embedded() -> N
         assert embedded.content_hash == source.content_hash
         assert embedded.vector_doc_id == source.vector_doc_id
         assert embedded.embedding_dim == 1024
-
-
-def test_jsonl_reader_rejects_non_finite_value_without_dropping_next_line() -> None:
-    valid_line = json.dumps(fixture_payload(), ensure_ascii=False)
-    invalid_line = valid_line.replace('"char_count": 47', '"char_count": NaN')
-    stream = StringIO(f"{invalid_line}\n{valid_line}\n")
-
-    result = JsonlExpertChunkReader().read_stream(stream)
-
-    assert result.input_count == 2
-    assert result.valid_count == 1
-    assert len(result.errors) == 1
-    assert "NaN" in result.errors[0].message
 
 
 def test_schema_gap_detects_missing_nested_contract_fields() -> None:

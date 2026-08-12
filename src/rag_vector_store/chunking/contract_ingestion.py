@@ -6,13 +6,17 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Literal, Protocol
 
+from expert_contracts.models import (
+    EmbeddedContractPreparedChunk,
+    ExpertChunkEmbeddingInput,
+)
+
 from ..models import MutationResult
 from .contract_pipeline import (
     ContractEmbeddingResult,
     ContractEmbeddingWorker,
     SkippedContractChunk,
 )
-from .input_contract import EmbeddedContractPreparedChunk, ExpertChunkEmbeddingInput
 
 __all__ = [
     "ContractIngestionError",

@@ -1,43 +1,38 @@
-"""Contract 与历史兼容入口共存的向量化公共 API。"""
+"""正式 Expert Chunk Contract v2 的向量化与 Milvus 公共 API。"""
+
+from expert_contracts import (
+    EXPERT_CHUNK_CONTRACT_VERSION,
+    ContractPreparedChunk,
+    EmbeddedContractPreparedChunk,
+    ExpertChunkEmbeddingInput,
+    ExpertChunkMetadata,
+    ExpertChunkSource,
+    ExpertChunkVersions,
+)
 
 from .chunking import (
     EXPECTED_EMBEDDING_DIMENSION,
-    EXPERT_CHUNK_CONTRACT_VERSION,
-    ChunkBuilder,
     ContractEmbeddingResult,
     ContractEmbeddingWorker,
     ContractIngestionError,
     ContractIngestionResult,
     ContractIngestionService,
-    ContractPreparedChunk,
     ContractRepository,
     ContractValidationError,
     ContractValidator,
-    EmbeddedContractPreparedChunk,
-    EmbeddedPreparedChunk,
     EmbeddingEligibilityError,
     EmbeddingEligibilityValidator,
-    ExpertChunkEmbeddingInput,
-    ExpertChunkMetadata,
-    ExpertChunkSource,
-    ExpertChunkVersions,
-    JsonlExpertChunkReader,
-    JsonlReadResult,
-    JsonlRecordError,
-    PreparedChunk,
-    SearchHit,
     SkippedContractChunk,
     compare_contract_output_schema,
     expected_contract_output_fields,
 )
-from .config import MilvusSettings, MySQLSettings
+from .config import MilvusSettings
 from .embedding import EmbeddingModel
 from .embedding_adapters import (
     CompanyCloudEmbeddingError,
     CompanyCloudEmbeddingModel,
     CompanyCloudEmbeddingSettings,
 )
-from .ingestion import ChunkIngestionService, IngestionResult
 from .milvus.contract import (
     CONTRACT_SCALAR_INDEX_FIELDS,
     CONTRACT_VECTOR_DIMENSION,
@@ -47,21 +42,17 @@ from .milvus.contract import (
     MilvusRowMapper,
     contract_milvus_field_specs,
 )
-from .milvus.repository import (
-    MilvusVectorRepository as ContractMilvusVectorRepository,
+from .milvus.repository import ContractMilvusVectorRepository
+from .model_space import (
+    FORMAL_EMBEDDING_DIMENSION,
+    FORMAL_EMBEDDING_MODEL,
+    FORMAL_EMBEDDING_MODEL_ALIAS,
+    FORMAL_EMBEDDING_MODEL_SPACE_ID,
+    FORMAL_EMBEDDING_MODEL_VERSION,
+    FORMAL_EMBEDDING_PROVIDER,
+    build_model_space_id,
 )
-from .models import Chunk, EmbeddedChunk, MutationResult
-from .mysql import (
-    MYSQL_EXPERT_CHUNK_SELECT_COLUMNS,
-    MySQLConnection,
-    MySQLConnectionError,
-    MySqlExpertChunkReader,
-    MySQLReadError,
-    MySQLReadResult,
-    MySQLRowMappingError,
-)
-from .ports import ChunkRepository
-from .repository import MilvusVectorRepository
+from .models import MutationResult, SearchHit
 
 __all__ = [
     "CONTRACT_SCALAR_INDEX_FIELDS",
@@ -69,11 +60,12 @@ __all__ = [
     "CONTRACT_VECTOR_DOC_ID_MAX_BYTES",
     "EXPECTED_EMBEDDING_DIMENSION",
     "EXPERT_CHUNK_CONTRACT_VERSION",
-    "MYSQL_EXPERT_CHUNK_SELECT_COLUMNS",
-    "Chunk",
-    "ChunkBuilder",
-    "ChunkIngestionService",
-    "ChunkRepository",
+    "FORMAL_EMBEDDING_DIMENSION",
+    "FORMAL_EMBEDDING_MODEL",
+    "FORMAL_EMBEDDING_MODEL_ALIAS",
+    "FORMAL_EMBEDDING_MODEL_SPACE_ID",
+    "FORMAL_EMBEDDING_MODEL_VERSION",
+    "FORMAL_EMBEDDING_PROVIDER",
     "CompanyCloudEmbeddingError",
     "CompanyCloudEmbeddingModel",
     "CompanyCloudEmbeddingSettings",
@@ -87,9 +79,7 @@ __all__ = [
     "ContractRepository",
     "ContractValidationError",
     "ContractValidator",
-    "EmbeddedChunk",
     "EmbeddedContractPreparedChunk",
-    "EmbeddedPreparedChunk",
     "EmbeddingEligibilityError",
     "EmbeddingEligibilityValidator",
     "EmbeddingModel",
@@ -97,26 +87,14 @@ __all__ = [
     "ExpertChunkMetadata",
     "ExpertChunkSource",
     "ExpertChunkVersions",
-    "IngestionResult",
-    "JsonlExpertChunkReader",
-    "JsonlReadResult",
-    "JsonlRecordError",
     "MilvusExpertChunkEntity",
     "MilvusFieldSpec",
     "MilvusRowMapper",
     "MilvusSettings",
-    "MilvusVectorRepository",
     "MutationResult",
-    "MySQLConnection",
-    "MySQLConnectionError",
-    "MySQLReadError",
-    "MySQLReadResult",
-    "MySQLRowMappingError",
-    "MySQLSettings",
-    "MySqlExpertChunkReader",
-    "PreparedChunk",
     "SearchHit",
     "SkippedContractChunk",
+    "build_model_space_id",
     "compare_contract_output_schema",
     "contract_milvus_field_specs",
     "expected_contract_output_fields",

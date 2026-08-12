@@ -1,32 +1,31 @@
-"""专家 Chunk v2.0.0 契约的校验、读取与向量化消费链。
+"""专家 Chunk v2.0.0 契约的校验、资格判断与向量化消费链。
 
-本模块位于输入 Reader 与 ContractIngestionService 之间：它负责把结构化输入
-校验成可消费记录、执行 Eligibility 判断，并把唯一的 ``chunk_text`` 交给
-EmbeddingModel。它不负责 MySQL 连接、任务状态持久化、增量游标或 Milvus 写入。
+本模块负责把正式 Contract 校验成可消费记录、执行 Eligibility 判断，并把唯一的
+``chunk_text`` 交给 EmbeddingModel。它不负责输入 Mapping 适配、MySQL 连接、任务
+状态持久化、增量游标或 Milvus 写入。
 """
 
 from __future__ import annotations
 
 import hashlib
-import json
 import math
 import re
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from numbers import Real
-from pathlib import Path
-from typing import Any, TextIO
+from typing import Any
 
 from pydantic import ValidationError
 
-from ..embedding import EmbeddingModel
-from ..milvus.contract import contract_milvus_field_specs
-from .input_contract import (
+from expert_contracts.models import (
     ContractPreparedChunk,
     EmbeddedContractPreparedChunk,
     ExpertChunkEmbeddingInput,
 )
+
+from ..embedding import EmbeddingModel
+from ..milvus.contract import contract_milvus_field_specs
 
 EXPECTED_EMBEDDING_DIMENSION = 1024
 
@@ -72,30 +71,6 @@ class ContractValidationError(ValueError):
 
 class EmbeddingEligibilityError(ValueError):
     """记录通过契约校验，但不允许进入正式向量化链路。"""
-
-
-@dataclass(frozen=True)
-class JsonlRecordError:
-    """一行 JSONL 的安全错误信息，不携带完整 Chunk 正文。"""
-
-    line_number: int
-    message: str
-    chunk_id: str | None = None
-
-
-@dataclass(frozen=True)
-class JsonlReadResult:
-    """JSONL 读取结果，成功记录和错误记录彼此独立。"""
-
-    input_count: int
-    records: list[ContractPreparedChunk]
-    errors: list[JsonlRecordError]
-
-    @property
-    def valid_count(self) -> int:
-        """返回通过完整契约校验的记录数。"""
-
-        return len(self.records)
 
 
 @dataclass(frozen=True)
@@ -246,70 +221,6 @@ class EmbeddingEligibilityValidator:
         reason = self.get_skip_reason(record)
         if reason is not None:
             raise EmbeddingEligibilityError(reason)
-
-
-class JsonlExpertChunkReader:
-    """逐行读取 UTF-8 JSONL，并让每条记录独立成功或失败。
-
-    Reader 只负责解析和调用 ContractValidator，不做清洗、截断或默认值填充。
-    单行错误会进入 ``errors``，不会阻止其它行被统计；调用方可据此决定是否
-    fail-closed，而不是把坏数据静默丢弃。
-    """
-
-    def __init__(self, validator: ContractValidator | None = None) -> None:
-        self.validator = validator or ContractValidator()
-
-    def read(self, path: str | Path) -> JsonlReadResult:
-        """从 UTF-8 JSONL 文件读取契约记录。"""
-
-        with Path(path).open("r", encoding="utf-8", newline="") as stream:
-            return self.read_stream(stream)
-
-    def read_stream(self, stream: TextIO) -> JsonlReadResult:
-        """从文本流读取，便于测试和上层适配器复用。"""
-
-        records: list[ContractPreparedChunk] = []
-        errors: list[JsonlRecordError] = []
-        input_count = 0
-
-        for line_number, line in enumerate(stream, start=1):
-            input_count += 1
-            chunk_id: str | None = None
-            try:
-                if not line.strip():
-                    raise ValueError("JSONL 不允许空行")
-                payload = json.loads(
-                    line,
-                    parse_constant=_reject_non_finite_json_constant,
-                    object_pairs_hook=_reject_duplicate_json_keys,
-                )
-                if not isinstance(payload, Mapping):
-                    raise TypeError("每行 JSON 根节点必须是对象")
-                raw_chunk_id = payload.get("chunk_id")
-                if isinstance(raw_chunk_id, str):
-                    chunk_id = raw_chunk_id
-                # 每行独立校验，错误记录保留安全定位信息；不会把一行的异常扩大
-                # 为整个文件的解析失败，也不会把正文放进 JsonlRecordError。
-                records.append(self.validator.validate_mapping(payload))
-            except (
-                ContractValidationError,
-                json.JSONDecodeError,
-                TypeError,
-                ValueError,
-            ) as exc:
-                errors.append(
-                    JsonlRecordError(
-                        line_number=line_number,
-                        chunk_id=chunk_id,
-                        message=str(exc),
-                    )
-                )
-
-        return JsonlReadResult(
-            input_count=input_count,
-            records=records,
-            errors=errors,
-        )
 
 
 class ContractEmbeddingWorker:
@@ -551,23 +462,6 @@ def _utc_now() -> datetime:
     """返回带时区的当前 UTC 时间。"""
 
     return datetime.now(timezone.utc)
-
-
-def _reject_non_finite_json_constant(value: str) -> None:
-    """拒绝 JSON 标准之外的 NaN 和 Infinity。"""
-
-    raise ValueError(f"JSON 不允许非有限数值 {value}")
-
-
-def _reject_duplicate_json_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
-    """拒绝重复键，避免同一字段在解析时被静默覆盖。"""
-
-    result: dict[str, Any] = {}
-    for key, value in pairs:
-        if key in result:
-            raise ValueError(f"JSON 对象包含重复字段 {key!r}")
-        result[key] = value
-    return result
 
 
 def _safe_validation_message(exc: ValidationError) -> str:

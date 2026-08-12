@@ -1,6 +1,5 @@
-"""Expert Chunk 的兼容类型、正式 Contract 校验与 Embedding 边界。"""
+"""正式 Contract 校验、Embedding 与单条 ingestion 边界。"""
 
-from .builder import ChunkBuilder
 from .contract_ingestion import (
     ContractIngestionError,
     ContractIngestionResult,
@@ -15,52 +14,23 @@ from .contract_pipeline import (
     ContractValidator,
     EmbeddingEligibilityError,
     EmbeddingEligibilityValidator,
-    JsonlExpertChunkReader,
-    JsonlReadResult,
-    JsonlRecordError,
     SkippedContractChunk,
     compare_contract_output_schema,
     expected_contract_output_fields,
 )
-from .contracts import (
-    EXPERT_CHUNK_CONTRACT_VERSION,
-    ContractPreparedChunk,
-    EmbeddedContractPreparedChunk,
-    EmbeddedPreparedChunk,
-    ExpertChunkEmbeddingInput,
-    ExpertChunkMetadata,
-    ExpertChunkSource,
-    ExpertChunkVersions,
-    PreparedChunk,
-    SearchHit,
-)
 
 __all__ = [
     "EXPECTED_EMBEDDING_DIMENSION",
-    "EXPERT_CHUNK_CONTRACT_VERSION",
-    "ChunkBuilder",
     "ContractEmbeddingResult",
     "ContractEmbeddingWorker",
     "ContractIngestionError",
     "ContractIngestionResult",
     "ContractIngestionService",
-    "ContractPreparedChunk",
     "ContractRepository",
     "ContractValidationError",
     "ContractValidator",
-    "EmbeddedContractPreparedChunk",
-    "EmbeddedPreparedChunk",
     "EmbeddingEligibilityError",
     "EmbeddingEligibilityValidator",
-    "ExpertChunkEmbeddingInput",
-    "ExpertChunkMetadata",
-    "ExpertChunkSource",
-    "ExpertChunkVersions",
-    "JsonlExpertChunkReader",
-    "JsonlReadResult",
-    "JsonlRecordError",
-    "PreparedChunk",
-    "SearchHit",
     "SkippedContractChunk",
     "compare_contract_output_schema",
     "expected_contract_output_fields",

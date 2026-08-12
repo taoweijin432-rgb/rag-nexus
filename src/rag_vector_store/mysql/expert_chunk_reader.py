@@ -16,10 +16,11 @@ from typing import Any
 
 from pydantic import ValidationError
 
-from ..chunking.contracts import (
+from expert_contracts.models import (
     EXPERT_CHUNK_CONTRACT_VERSION,
     ExpertChunkEmbeddingInput,
 )
+
 from ..config import MySQLSettings
 from .connection import MySQLConnection
 

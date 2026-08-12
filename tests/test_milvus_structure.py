@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from typing import Any
 
+import pytest
+
 from rag_vector_store.config import MilvusSettings
 from rag_vector_store.milvus.compatibility import (
     compare_model_space,
@@ -64,6 +66,15 @@ def _contract_settings() -> MilvusSettings:
         metric_type="COSINE",
         index_params={"M": 16, "efConstruction": 200},
     )
+
+
+def test_contract_schema_mode_is_the_only_runtime_mode() -> None:
+    assert MilvusSettings().schema_mode == "contract"
+    assert MilvusSettings.from_env({}).schema_mode == "contract"
+    with pytest.raises(ValueError):
+        MilvusSettings(schema_mode="legacy")
+    with pytest.raises(ValueError):
+        MilvusSettings(schema_mode="expert")
 
 
 def _description_from_specs(specs: tuple[Any, ...]) -> dict[str, Any]:
@@ -140,7 +151,7 @@ def test_schema_compatibility_is_fail_closed_and_model_space_is_explicit() -> No
             }
         ],
         embedding_model_alias="text-embedding-v4",
-        embedding_model_version="dev-unknown",
+        embedding_model_version="v1",
         embedding_dimension=1024,
     )
     assert model_difference.compatible is False

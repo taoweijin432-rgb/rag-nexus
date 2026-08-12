@@ -1,4 +1,4 @@
-"""具体的 Embedding 模型适配器。"""
+"""阿里云百炼 Embedding 模型适配器。"""
 
 from .company_cloud import (
     CompanyCloudEmbeddingError,

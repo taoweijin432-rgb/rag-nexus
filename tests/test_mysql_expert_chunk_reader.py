@@ -9,10 +9,10 @@ from zoneinfo import ZoneInfo
 
 from pydantic import SecretStr
 
-from rag_vector_store import (
+from rag_vector_store.config import MySQLSettings
+from rag_vector_store.mysql import (
     MYSQL_EXPERT_CHUNK_SELECT_COLUMNS,
     MySqlExpertChunkReader,
-    MySQLSettings,
 )
 
 

@@ -13,15 +13,16 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, SecretStr, model_validator
 
-SchemaMode = Literal["legacy", "expert"]
+# 运行时只允许正式 Contract v2；旧兼容模式已退役。
+SchemaMode = Literal["contract"]
 
 
 class MilvusSettings(BaseModel):
-    """供 :class:`MilvusVectorRepository` 使用的连接和集合配置。
+    """供正式 Contract Milvus Repository 使用的连接和集合配置。
 
     ``from_env`` 显式读取环境变量，不依赖 dotenv 加载器。这样可以让密钥只存在
     于进程环境中，也不会把模块绑定到某一种部署方式。Collection 名称和索引参数
-    也属于配置的一部分，Repository 会在写入前进行兼容性检查。
+    也属于配置的一部分；Repository 会在写入前进行兼容性检查。
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -37,16 +38,7 @@ class MilvusSettings(BaseModel):
         default="expert_candidates_v12_contract_dev",
         min_length=1,
     )
-    schema_mode: SchemaMode = "legacy"
-    chunk_id_field: str = Field(default="chunk_id", min_length=1)
-    text_field: str = Field(default="text", min_length=1)
-    embedding_field: str = Field(default="embedding", min_length=1)
-    metadata_field: str = Field(default="metadata", min_length=1)
-    chunk_id_max_length: int = Field(default=512, ge=1, le=65535)
-    text_max_length: int = Field(default=65535, ge=1, le=65535)
-    expert_vector_doc_id_max_length: int = Field(default=256, ge=1, le=65535)
-    expert_chunk_id_max_length: int = Field(default=256, ge=1, le=65535)
-    expert_chunk_text_max_length: int = Field(default=16384, ge=1, le=65535)
+    schema_mode: SchemaMode = "contract"
     index_type: str = Field(default="AUTOINDEX", min_length=1)
     metric_type: str = Field(default="COSINE", min_length=1)
     index_params: dict[str, Any] = Field(default_factory=dict)
@@ -97,7 +89,7 @@ class MilvusSettings(BaseModel):
                 "MILVUS_COLLECTION_NAME",
                 "expert_candidates_v12_contract_dev",
             ),
-            "schema_mode": _get(env, "MILVUS_SCHEMA_MODE", "legacy"),
+            "schema_mode": _get(env, "MILVUS_SCHEMA_MODE", "contract"),
             "index_type": _get(env, "MILVUS_INDEX_TYPE", "AUTOINDEX"),
             "metric_type": _get(env, "MILVUS_METRIC_TYPE", "COSINE"),
         }

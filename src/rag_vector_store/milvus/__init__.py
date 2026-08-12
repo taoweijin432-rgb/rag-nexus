@@ -16,18 +16,18 @@ from .contract import (
     contract_milvus_field_specs,
 )
 from .indexes import IndexSpec, build_index_params, index_specs, vector_index_spec
-from .repository import MilvusVectorRepository
+from .repository import ContractMilvusVectorRepository
 
 __all__ = [
     "CONTRACT_SCALAR_INDEX_FIELDS",
     "CONTRACT_VECTOR_DIMENSION",
     "CONTRACT_VECTOR_DOC_ID_MAX_BYTES",
     "CollectionCompatibilityResult",
+    "ContractMilvusVectorRepository",
     "IndexSpec",
     "MilvusExpertChunkEntity",
     "MilvusFieldSpec",
     "MilvusRowMapper",
-    "MilvusVectorRepository",
     "build_index_params",
     "compare_contract_indexes",
     "compare_model_space",

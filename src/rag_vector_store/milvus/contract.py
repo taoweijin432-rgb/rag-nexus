@@ -14,7 +14,8 @@ from collections.abc import Mapping, Sequence
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
-from ..chunking.input_contract import EmbeddedContractPreparedChunk
+from expert_contracts.models import EmbeddedContractPreparedChunk
+
 from .schemas.contract import (
     CONTRACT_SCALAR_INDEX_FIELDS,
     CONTRACT_VECTOR_DIMENSION,

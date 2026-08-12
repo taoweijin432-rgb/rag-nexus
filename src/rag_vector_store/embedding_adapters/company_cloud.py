@@ -1,10 +1,10 @@
-"""公司云端 Embedding API 适配器。
+"""阿里云百炼 Embedding API 适配器。
 
-本模块位于稳定的 ``EmbeddingModel`` Protocol 与外部 HTTP 服务之间，只负责把
-环境配置转换为请求、解析响应并做网络/向量防御性校验。Contract 校验、幂等、
-Task State 和 Milvus 写入不在这里处理。
+本模块位于稳定的 ``EmbeddingModel`` Protocol 与阿里云百炼 HTTP 服务之间，只负责
+把环境配置转换为请求、解析响应并做网络/向量防御性校验。Contract 校验、幂等、
+Task State 和 Milvus 写入不在这里处理。类名保留 ``CompanyCloud`` 以兼容既有导出。
 
-当前适配器按照约定的 HTTP JSON 协议调用云端服务：
+当前适配器按照阿里云百炼约定的 HTTP JSON 协议调用服务：
 
 请求：
     POST {EMBEDDING_API_URL}
@@ -32,22 +32,31 @@ from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 from ..embedding import EmbeddingModel
+from ..model_space import (
+    FORMAL_EMBEDDING_DIMENSION,
+    FORMAL_EMBEDDING_MODEL,
+    FORMAL_EMBEDDING_MODEL_ALIAS,
+    FORMAL_EMBEDDING_MODEL_VERSION,
+    build_model_space_id,
+    is_placeholder_model_version,
+)
 
 
 class CompanyCloudEmbeddingError(RuntimeError):
-    """公司云端 Embedding 调用或响应校验失败。"""
+    """阿里云百炼 Embedding 调用或响应校验失败。"""
 
 
 @dataclass(frozen=True)
 class CompanyCloudEmbeddingSettings:
-    """公司云端 Embedding API 的非敏感配置和密钥配置。"""
+    """阿里云百炼 Embedding API 的非敏感配置和密钥配置。"""
 
     api_url: str
     api_key: str = field(repr=False)
-    model: str = "text-embedding-v4"
-    model_alias: str = "text-embedding-v4"
-    model_version: str | None = None
-    expected_dimension: int | None = None
+    model: str = FORMAL_EMBEDDING_MODEL
+    model_alias: str = FORMAL_EMBEDDING_MODEL_ALIAS
+    # 这是项目侧模型空间版本，不冒充供应商内部 revision。
+    model_version: str | None = FORMAL_EMBEDDING_MODEL_VERSION
+    expected_dimension: int | None = FORMAL_EMBEDDING_DIMENSION
     timeout: float = 60.0
 
     def __post_init__(self) -> None:
@@ -63,6 +72,8 @@ class CompanyCloudEmbeddingSettings:
             raise ValueError("EMBEDDING_MODEL_ALIAS 不能为空")
         if self.model_version is not None and not self.model_version.strip():
             raise ValueError("EMBEDDING_MODEL_VERSION 不能为空字符串")
+        if is_placeholder_model_version(self.model_version):
+            raise ValueError("正式 Embedding 配置禁止使用 dev-unknown")
         if self.expected_dimension is not None and (
             isinstance(self.expected_dimension, bool)
             or not isinstance(self.expected_dimension, int)
@@ -85,18 +96,27 @@ class CompanyCloudEmbeddingSettings:
         return cls(
             api_url=_required(env, "EMBEDDING_API_URL"),
             api_key=_required(env, "EMBEDDING_API_KEY"),
-            model=_get(env, "EMBEDDING_MODEL", "text-embedding-v4"),
-            model_alias=_get(env, "EMBEDDING_MODEL_ALIAS", "text-embedding-v4"),
-            model_version=_optional(env, "EMBEDDING_MODEL_VERSION"),
+            model=_get(env, "EMBEDDING_MODEL", FORMAL_EMBEDDING_MODEL),
+            model_alias=_get(
+                env,
+                "EMBEDDING_MODEL_ALIAS",
+                FORMAL_EMBEDDING_MODEL_ALIAS,
+            ),
+            model_version=(
+                _optional(env, "EMBEDDING_MODEL_VERSION")
+                or FORMAL_EMBEDDING_MODEL_VERSION
+            ),
             expected_dimension=(
-                None if dimension_text is None else _parse_dimension(dimension_text)
+                FORMAL_EMBEDDING_DIMENSION
+                if dimension_text is None
+                else _parse_dimension(dimension_text)
             ),
             timeout=60.0 if timeout_text is None else _parse_timeout(timeout_text),
         )
 
 
 class CompanyCloudEmbeddingModel(EmbeddingModel):
-    """通过公司云端 HTTP API 批量生成 Embedding。
+    """通过阿里云百炼兼容 HTTP API 批量生成 Embedding。
 
     适配器保持输入文本顺序，并在接受响应前检查数量、索引、有限数值和批内
     dimension；它不做重试或文本清洗，调用方可以据异常决定是否重试任务。
@@ -119,7 +139,7 @@ class CompanyCloudEmbeddingModel(EmbeddingModel):
         *,
         opener: Callable[..., Any] = urlopen,
     ) -> CompanyCloudEmbeddingModel:
-        """从环境变量创建公司云端 Embedding 模型。"""
+        """从环境变量创建阿里云百炼 Embedding 模型。"""
 
         return cls(CompanyCloudEmbeddingSettings.from_env(environ), opener=opener)
 
@@ -128,9 +148,7 @@ class CompanyCloudEmbeddingModel(EmbeddingModel):
         """返回已配置并会由真实响应再次校验的向量维度。"""
 
         if self._dimension is None:
-            raise CompanyCloudEmbeddingError(
-                "尚未获得 Embedding dimension，请先调用一次 embed"
-            )
+            raise CompanyCloudEmbeddingError("尚未获得 Embedding dimension")
         return self._dimension
 
     @property
@@ -141,9 +159,24 @@ class CompanyCloudEmbeddingModel(EmbeddingModel):
 
     @property
     def model_version(self) -> str | None:
-        """返回配置中的模型版本；API 未提供时保持为空。"""
+        """返回项目侧模型空间版本，不声称是供应商内部 revision。"""
 
         return self.settings.model_version
+
+    @property
+    def model_space_id(self) -> str:
+        """返回当前模型、维度和版本组成的稳定模型空间标识。"""
+
+        if self.model_version is None:
+            raise CompanyCloudEmbeddingError("Embedding model version 未配置")
+        try:
+            return build_model_space_id(
+                model_alias=self.model_alias,
+                dimension=self.dimension,
+                model_version=self.model_version,
+            )
+        except ValueError as exc:
+            raise CompanyCloudEmbeddingError("Embedding model-space 配置无效") from exc
 
     def embed(self, texts: Sequence[str]) -> list[list[float]]:
         """调用云端 API，并返回与输入顺序一致的向量列表。

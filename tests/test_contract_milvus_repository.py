@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from collections.abc import Sequence
 from datetime import datetime, timezone
 from pathlib import Path
@@ -8,12 +9,12 @@ from typing import Any
 import pytest
 from pymilvus import DataType
 
+from expert_contracts import adapt_expert_chunk_mapping
 from rag_vector_store import (
     CONTRACT_SCALAR_INDEX_FIELDS,
     ContractEmbeddingWorker,
     ContractMilvusVectorRepository,
     EmbeddedContractPreparedChunk,
-    JsonlExpertChunkReader,
     MilvusRowMapper,
     MilvusSettings,
     SearchHit,
@@ -22,14 +23,14 @@ from rag_vector_store import (
 FIXTURE_PATH = (
     Path(__file__).resolve().parents[1]
     / "fixtures"
-    / "expert_chunk_embedding_input_v1.jsonl"
+    / "expert_chunk_embedding_input_v2.jsonl"
 )
 
 
 class FakeEmbeddingModel:
     dimension = 1024
-    model_alias = "text-embedding-v4"
-    model_version = "dev-unknown"
+    model_alias = "alibaba-bailian:text-embedding-v4"
+    model_version = "v1"
 
     def embed(self, texts: Sequence[str]) -> list[list[float]]:
         return [[0.1] * 1024 for _ in texts]
@@ -132,11 +133,16 @@ class FakeContractMilvusClient:
 
 
 def embedded_contract_chunks() -> list[EmbeddedContractPreparedChunk]:
-    read_result = JsonlExpertChunkReader().read(FIXTURE_PATH)
+    with FIXTURE_PATH.open(encoding="utf-8") as stream:
+        records = [
+            adapt_expert_chunk_mapping(json.loads(line))
+            for line in stream
+            if line.strip()
+        ]
     result = ContractEmbeddingWorker(
         FakeEmbeddingModel(),
         clock=lambda: datetime(2026, 8, 11, 12, 0, tzinfo=timezone.utc),
-    ).embed(read_result.records)
+    ).embed(records)
     return result.embedded_chunks
 
 
@@ -199,6 +205,13 @@ def test_contract_schema_uses_json_nullable_and_1024_dimension() -> None:
     assert fields["company_name_norm"].nullable is True
     assert fields["is_current"].nullable is True
     assert fields["start_month"].dtype == DataType.VARCHAR
+
+
+def test_contract_repository_requires_contract_schema_mode() -> None:
+    settings = contract_settings().model_copy(update={"schema_mode": "legacy"})
+
+    with pytest.raises(ValueError, match="MILVUS_SCHEMA_MODE=contract"):
+        ContractMilvusVectorRepository(settings, vector_dimension=1024, client=object())
 
 
 def test_missing_contract_collection_creates_schema_and_all_indexes() -> None:
@@ -279,6 +292,59 @@ def test_contract_repository_upsert_uses_row_mapper() -> None:
     assert rows[1]["source_ext"] == chunks[1].source.model_dump(mode="json")
     assert rows[2]["versions_ext"] == chunks[2].versions.model_dump(mode="json")
     assert client.drop_calls == []
+
+
+def test_contract_repository_rejects_mixed_batch_model_space_before_upsert() -> None:
+    client = FakeContractMilvusClient(exists=True)
+    repository = ContractMilvusVectorRepository(
+        contract_settings(),
+        vector_dimension=1024,
+        client=client,
+    )
+    client.description = repository._build_schema(1024).to_dict()
+    chunks = embedded_contract_chunks()
+    chunks[1] = chunks[1].model_copy(update={"embedding_model_version": "v2"})
+
+    with pytest.raises(ValueError, match="不能混用 Embedding model-space"):
+        repository.upsert_batch(chunks)
+
+    assert client.upsert_calls == []
+
+
+def test_contract_repository_rejects_existing_mismatched_model_space() -> None:
+    client = FakeContractMilvusClient(exists=True)
+    repository = ContractMilvusVectorRepository(
+        contract_settings(),
+        vector_dimension=1024,
+        client=client,
+    )
+    client.description = repository._build_schema(1024).to_dict()
+    client.rows["old-model-row"] = {
+        "embedding_model_alias": "alibaba-bailian:text-embedding-v4",
+        "embedding_model_version": "v0",
+        "embedding_dim": 1024,
+    }
+
+    with pytest.raises(ValueError, match="已有 Entity 与当前 Embedding model-space"):
+        repository.upsert_batch(embedded_contract_chunks())
+
+    assert client.upsert_calls == []
+
+
+def test_contract_repository_rejects_placeholder_model_version() -> None:
+    client = FakeContractMilvusClient(exists=True)
+    repository = ContractMilvusVectorRepository(
+        contract_settings(),
+        vector_dimension=1024,
+        client=client,
+    )
+    chunks = embedded_contract_chunks()
+    chunks[0] = chunks[0].model_copy(update={"embedding_model_version": "dev-unknown"})
+
+    with pytest.raises(ValueError, match="禁止使用 embedding_model_version=dev-unknown"):
+        repository.upsert_batch(chunks)
+
+    assert client.upsert_calls == []
 
 
 def test_contract_repository_search_preserves_search_hit_and_filter() -> None:

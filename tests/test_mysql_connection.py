@@ -6,7 +6,8 @@ import pytest
 from pydantic import SecretStr
 
 from expert_index.config import DatabaseConfig
-from rag_vector_store import MySQLConnection, MySQLConnectionError, MySQLSettings
+from rag_vector_store.config import MySQLSettings
+from rag_vector_store.mysql import MySQLConnection, MySQLConnectionError
 
 
 class FakeConnection:
