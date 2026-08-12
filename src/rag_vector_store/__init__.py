@@ -27,7 +27,6 @@ from .chunking import (
     PreparedChunk,
     SearchHit,
     SkippedContractChunk,
-    build_vector_doc_id,
     compare_contract_output_schema,
     expected_contract_output_fields,
 )
@@ -118,7 +117,6 @@ __all__ = [
     "PreparedChunk",
     "SearchHit",
     "SkippedContractChunk",
-    "build_vector_doc_id",
     "compare_contract_output_schema",
     "contract_milvus_field_specs",
     "expected_contract_output_fields",

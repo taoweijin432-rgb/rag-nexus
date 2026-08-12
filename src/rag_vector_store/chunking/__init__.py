@@ -33,7 +33,6 @@ from .contracts import (
     ExpertChunkVersions,
     PreparedChunk,
     SearchHit,
-    build_vector_doc_id,
 )
 
 __all__ = [
@@ -63,7 +62,6 @@ __all__ = [
     "PreparedChunk",
     "SearchHit",
     "SkippedContractChunk",
-    "build_vector_doc_id",
     "compare_contract_output_schema",
     "expected_contract_output_fields",
 ]

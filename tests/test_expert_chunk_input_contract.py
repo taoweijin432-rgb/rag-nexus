@@ -83,26 +83,48 @@ def test_three_contract_fixture_types_pass() -> None:
     ]
 
 
-def test_generated_json_schema_is_strict_contract_v100() -> None:
+def test_generated_json_schema_is_strict_contract_v200() -> None:
     schema = ExpertChunkEmbeddingInput.model_json_schema()
 
     assert schema["additionalProperties"] is False
-    assert schema["properties"]["contract_version"]["const"] == "1.0.0"
-    assert "vector_doc_id" not in schema["properties"]
+    assert schema["properties"]["contract_version"]["const"] == "2.0.0"
+    assert "vector_doc_id" in schema["properties"]
     assert set(schema["required"]) >= {
         "metadata",
         "source",
         "versions",
         "serial_number",
+        "vector_doc_id",
     }
+    assert "vector_doc_id" in schema["$defs"]["ExpertChunkMetadata"]["required"]
 
 
 def test_contract_version_error_is_rejected() -> None:
     payload = fixture_payload()
-    payload["contract_version"] = "2.0.0"
+    payload["contract_version"] = "1.0.0"
 
     with pytest.raises(ContractValidationError, match="contract_version"):
         ContractValidator().validate_mapping(payload)
+
+
+def test_vector_doc_id_is_required_and_must_match_metadata() -> None:
+    missing_top_level = fixture_payload()
+    del missing_top_level["vector_doc_id"]
+
+    with pytest.raises(ContractValidationError, match="vector_doc_id"):
+        ContractValidator().validate_mapping(missing_top_level)
+
+    mismatched = fixture_payload()
+    mismatched["vector_doc_id"] = "expert:900001:profile_summary:other-source:0"
+
+    with pytest.raises(ContractValidationError, match="metadata.vector_doc_id"):
+        ContractValidator().validate_mapping(mismatched)
+
+    missing_metadata = fixture_payload()
+    del missing_metadata["metadata"]["vector_doc_id"]
+
+    with pytest.raises(ContractValidationError, match="vector_doc_id"):
+        ContractValidator().validate_mapping(missing_metadata)
 
 
 def test_content_hash_error_is_rejected() -> None:
@@ -192,21 +214,26 @@ def test_non_finite_embedding_is_rejected(mode: str) -> None:
         worker.embed([fixture_records()[0]])
 
 
-def test_vector_doc_id_is_stable_and_generated_after_embedding() -> None:
+def test_vector_doc_id_is_preserved_across_embedding_model_versions() -> None:
     records = fixture_records()
-    worker = ContractEmbeddingWorker(FakeContractEmbeddingModel(), clock=fixed_clock)
+    first_model = FakeContractEmbeddingModel()
+    first_worker = ContractEmbeddingWorker(first_model, clock=fixed_clock)
+    second_model = FakeContractEmbeddingModel()
+    second_model.model_version = "dev-model-v2"
+    second_worker = ContractEmbeddingWorker(second_model, clock=fixed_clock)
 
-    first = worker.embed(records).embedded_chunks
-    second = worker.embed(records).embedded_chunks
+    first = first_worker.embed(records).embedded_chunks
+    second = second_worker.embed(records).embedded_chunks
 
     assert [record.vector_doc_id for record in first] == [
-        record.vector_doc_id for record in second
+        record.vector_doc_id for record in records
     ]
     assert all(
-        record.vector_doc_id
-        == f"{record.chunk_id}:emb:{record.embedding_model_version}"
-        for record in first
+        embedded.vector_doc_id == source.vector_doc_id
+        for source, embedded in zip(records, second)
     )
+    assert {record.embedding_model_version for record in first} == {"dev-unknown"}
+    assert {record.embedding_model_version for record in second} == {"dev-model-v2"}
 
 
 def test_metadata_source_versions_are_preserved_and_only_text_is_embedded() -> None:
@@ -222,6 +249,7 @@ def test_metadata_source_versions_are_preserved_and_only_text_is_embedded() -> N
         assert embedded.source.model_dump() == source.source.model_dump()
         assert embedded.versions.model_dump() == source.versions.model_dump()
         assert embedded.content_hash == source.content_hash
+        assert embedded.vector_doc_id == source.vector_doc_id
         assert embedded.embedding_dim == 1024
 
 

@@ -167,6 +167,16 @@ def test_milvus_row_mapper_preserves_scalars_and_nested_contracts() -> None:
     assert entity.embedding_dim == 1024
 
 
+def test_milvus_row_mapper_round_trip_preserves_upstream_vector_doc_id() -> None:
+    chunk = embedded_contract_chunks()[1]
+    entity = MilvusRowMapper().to_entity(chunk)
+
+    restored = MilvusRowMapper().from_row(entity.model_dump(mode="python"))
+
+    assert restored.vector_doc_id == chunk.vector_doc_id
+    assert restored.metadata.vector_doc_id == chunk.vector_doc_id
+
+
 def test_contract_schema_uses_json_nullable_and_1024_dimension() -> None:
     repository = ContractMilvusVectorRepository(
         contract_settings(),

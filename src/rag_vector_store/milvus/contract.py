@@ -14,7 +14,6 @@ from collections.abc import Mapping, Sequence
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
-from ..chunking.contracts import build_vector_doc_id
 from ..chunking.input_contract import EmbeddedContractPreparedChunk
 from .schemas.contract import (
     CONTRACT_SCALAR_INDEX_FIELDS,
@@ -110,8 +109,8 @@ class MilvusExpertChunkEntity(BaseModel):
 class MilvusRowMapper:
     """将 ``EmbeddedContractPreparedChunk`` 无损映射为 Milvus 行。
 
-    Mapper 负责主键规则复核、字段投影、JSON 快照和存储容量检查；不负责调用
-    Embedding、修改输入对象或执行 Milvus CRUD。
+    Mapper 负责上游主键透传、字段投影、JSON 快照和存储容量检查；不负责调用
+    Embedding、生成或重算主键、修改输入对象或执行 Milvus CRUD。
     """
 
     def to_entity(
@@ -122,12 +121,6 @@ class MilvusRowMapper:
 
         if not isinstance(chunk, EmbeddedContractPreparedChunk):
             raise TypeError("MilvusRowMapper 只接受 EmbeddedContractPreparedChunk")
-        expected_vector_doc_id = build_vector_doc_id(
-            chunk.chunk_id,
-            chunk.embedding_model_version,
-        )
-        if chunk.vector_doc_id != expected_vector_doc_id:
-            raise ValueError("vector_doc_id 不符合统一生成规则")
 
         # scalar projection 服务于高频过滤；完整对象另存为 JSON，不能因为只投影
         # 过滤字段就丢失 source/versions 中的追溯信息。
@@ -221,6 +214,7 @@ class MilvusRowMapper:
         payload = {
             "contract_version": row.get("contract_version"),
             "chunk_id": row.get("chunk_id"),
+            "vector_doc_id": row.get("vector_doc_id"),
             "expert_id": row.get("expert_id"),
             "serial_number": row.get("serial_number"),
             "chunk_type": row.get("chunk_type"),
@@ -235,7 +229,6 @@ class MilvusRowMapper:
             "versions": dict(versions),
             "is_active": row.get("is_active"),
             "updated_at": row.get("updated_at"),
-            "vector_doc_id": row.get("vector_doc_id"),
             "embedding": row.get("embedding"),
             "embedding_dim": row.get("embedding_dim"),
             "embedding_model_alias": row.get("embedding_model_alias"),

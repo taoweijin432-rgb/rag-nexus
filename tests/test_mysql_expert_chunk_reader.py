@@ -46,6 +46,7 @@ class FakeConnection:
 
 def _metadata() -> dict[str, object]:
     return {
+        "vector_doc_id": "expert:7:employment:description-0:0",
         "company_name_raw": "Example Co",
         "company_name_norm": "example_co",
         "company_normalization_status": "verified",
@@ -94,7 +95,7 @@ def _row(
         "source_hash": "a" * 64,
         "content_hash": content_hash or hashlib.sha256(b"unchanged text").hexdigest(),
         "chunk_policy_version": "chunk-v1",
-        "metadata_schema_version": "metadata-v1",
+        "metadata_schema_version": "metadata-v2",
         "dictionary_version": "dict-v1",
         "data_version": "data-v1",
         "is_active": is_active,
@@ -126,6 +127,7 @@ def test_reader_maps_mysql_row_without_using_id_as_chunk_id() -> None:
     assert result.errors == []
     record = result.records[0]
     assert record.chunk_id == "expert:7:employment:source:0"
+    assert record.vector_doc_id == record.metadata.vector_doc_id
     assert not hasattr(record, "id")
     assert record.content_hash == "b" * 64
     assert record.chunk_text == "unchanged text"

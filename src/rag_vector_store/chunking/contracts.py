@@ -147,23 +147,7 @@ __all__ = [
     "ExpertChunkVersions",
     "PreparedChunk",
     "SearchHit",
-    "build_vector_doc_id",
 ]
-
-
-def build_vector_doc_id(chunk_id: str, embedding_model_version: str) -> str:
-    """根据业务 Chunk ID 和模型版本生成稳定的向量实体主键。
-
-    主键格式为 ``{chunk_id}:emb:{embedding_model_version}``。模型版本进入向量
-    身份是为了避免不同向量空间覆盖同一个 Entity；业务 Chunk 本身的
-    ``chunk_id`` 不随模型升级改变。长度和 UTF-8 容量由 Contract/Mapper 继续校验。
-    """
-
-    if not isinstance(chunk_id, str) or not chunk_id.strip():
-        raise ValueError("chunk_id 必须是非空字符串")
-    if not isinstance(embedding_model_version, str) or not embedding_model_version.strip():
-        raise ValueError("embedding_model_version 必须是非空字符串")
-    return f"{chunk_id}:emb:{embedding_model_version}"
 
 
 class SearchHit(BaseModel):

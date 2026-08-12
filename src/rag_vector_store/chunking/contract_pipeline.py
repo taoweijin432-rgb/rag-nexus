@@ -1,4 +1,4 @@
-"""专家 Chunk v1.0.0 契约的校验、读取与向量化消费链。
+"""专家 Chunk v2.0.0 契约的校验、读取与向量化消费链。
 
 本模块位于输入 Reader 与 ContractIngestionService 之间：它负责把结构化输入
 校验成可消费记录、执行 Eligibility 判断，并把唯一的 ``chunk_text`` 交给
@@ -22,7 +22,6 @@ from pydantic import ValidationError
 
 from ..embedding import EmbeddingModel
 from ..milvus.contract import contract_milvus_field_specs
-from .contracts import build_vector_doc_id
 from .input_contract import (
     ContractPreparedChunk,
     EmbeddedContractPreparedChunk,
@@ -68,7 +67,7 @@ _PII_PATTERNS = (
 
 
 class ContractValidationError(ValueError):
-    """输入记录不符合 v1.0.0 数据契约。"""
+    """输入记录不符合 v2.0.0 数据契约。"""
 
 
 class EmbeddingEligibilityError(ValueError):
@@ -316,8 +315,8 @@ class JsonlExpertChunkReader:
 class ContractEmbeddingWorker:
     """只把通过校验且符合资格的 ``chunk_text`` 交给 EmbeddingModel。
 
-    Worker 负责批量调用和响应防御性校验，输出带模型空间与 ``vector_doc_id`` 的
-    Embedded Contract。它不负责任务级幂等；是否跳过调用由
+    Worker 负责批量调用和响应防御性校验，输出带模型空间并保留上游
+    ``vector_doc_id`` 的 Embedded Contract。它不负责任务级幂等；是否跳过调用由
     ``ContractIngestionService`` 在调用 Worker 之前决定。
     """
 
@@ -397,10 +396,6 @@ class ContractEmbeddingWorker:
             embedded.append(
                 EmbeddedContractPreparedChunk(
                     **record.model_dump(),
-                    vector_doc_id=build_vector_doc_id(
-                        record.chunk_id,
-                        self.embedding_model_version,
-                    ),
                     embedding=embedding,
                     embedding_dim=len(embedding),
                     embedding_model_alias=self.embedding_model_alias,

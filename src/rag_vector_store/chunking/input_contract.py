@@ -1,4 +1,4 @@
-"""专家 Chunk 向量化输入契约 v1.0.0 的强类型定义。
+"""专家 Chunk 向量化输入契约 v2.0.0 的强类型定义。
 
 这是上游 Chunk Builder 与本项目之间的正式边界：本模块只负责表达字段类型、
 枚举、长度和时间格式，不负责从 MySQL/JSONL 读取、不负责生成 Chunk、也不负责
@@ -14,7 +14,9 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
-EXPERT_CHUNK_CONTRACT_VERSION = "1.0.0"
+EXPERT_CHUNK_CONTRACT_VERSION = "2.0.0"
+
+_VECTOR_DOC_ID_MAX_BYTES = 2048
 
 ChunkType = Literal["profile_summary", "employment", "project"]
 ChunkSubtype = Literal[
@@ -65,6 +67,7 @@ class ExpertChunkMetadata(_ContractModel):
     表示上游明确没有该值，不能在 Reader 或 Writer 中被替换为空字符串或默认值。
     """
 
+    vector_doc_id: str = Field(..., min_length=1, max_length=_VECTOR_DOC_ID_MAX_BYTES)
     project_name: str | None = Field(default=None, max_length=512)
     project_role: str | None = Field(default=None, max_length=256)
     company_name_raw: str | None = Field(..., max_length=512)
@@ -92,6 +95,13 @@ class ExpertChunkMetadata(_ContractModel):
         if value != sorted(set(value)):
             raise ValueError("industry_codes/topic_codes 必须去重并按字典序升序排列")
         return value
+
+    @field_validator("vector_doc_id")
+    @classmethod
+    def validate_vector_doc_id_capacity(cls, value: str) -> str:
+        """校验上游主键不超过正式 Milvus 的 UTF-8 字节容量。"""
+
+        return _validate_vector_doc_id_capacity(value)
 
 
 class ExpertChunkSource(_ContractModel):
@@ -135,9 +145,9 @@ class ExpertChunkVersions(_ContractModel):
 class ExpertChunkEmbeddingInput(_ContractModel):
     """一条待向量化的正式 ``expert_chunk`` 输入记录。
 
-    该对象是进入 Contract Validator 的唯一正式输入形态。它刻意不包含
-    ``vector_doc_id`` 和 ``embedding``：前者要在模型空间确定后生成，后者由
-    Embedding Worker 产生，避免上游伪造存储主键或向量结果。
+    该对象是进入 Contract Validator 的唯一正式输入形态。``vector_doc_id``
+    由上游 ``expert_index`` 生成并作为顶层必填字段传入；``embedding`` 仍由
+    Embedding Worker 产生。Metadata 中保留同一主键快照，便于无损追溯。
     """
 
     model_config = ConfigDict(
@@ -146,12 +156,13 @@ class ExpertChunkEmbeddingInput(_ContractModel):
         title="Expert Chunk Embedding Input",
         json_schema_extra={
             "$id": "https://internal.example/schemas/"
-            "expert_chunk_embedding_input-1.0.0.json"
+            "expert_chunk_embedding_input-2.0.0.json"
         },
     )
 
-    contract_version: Literal["1.0.0"]
+    contract_version: Literal["2.0.0"]
     chunk_id: str = Field(..., min_length=1, max_length=256, pattern=_CHUNK_ID_PATTERN)
+    vector_doc_id: str = Field(..., min_length=1, max_length=_VECTOR_DOC_ID_MAX_BYTES)
     expert_id: int = Field(..., ge=1)
     serial_number: str | None = Field(..., max_length=64)
     chunk_type: ChunkType
@@ -175,6 +186,13 @@ class ExpertChunkEmbeddingInput(_ContractModel):
         _validate_timezone_datetime(value, "updated_at")
         return value
 
+    @field_validator("vector_doc_id")
+    @classmethod
+    def validate_vector_doc_id_capacity(cls, value: str) -> str:
+        """校验上游主键不超过正式 Milvus 的 UTF-8 字节容量。"""
+
+        return _validate_vector_doc_id_capacity(value)
+
     @model_validator(mode="after")
     def validate_contract_version(self) -> ExpertChunkEmbeddingInput:
         """保留模型级扩展点，并显式确认契约版本。"""
@@ -183,6 +201,8 @@ class ExpertChunkEmbeddingInput(_ContractModel):
             raise ValueError(
                 f"contract_version 必须是 {EXPERT_CHUNK_CONTRACT_VERSION}"
             )
+        if self.metadata.vector_doc_id != self.vector_doc_id:
+            raise ValueError("metadata.vector_doc_id 必须与顶层 vector_doc_id 一致")
         return self
 
 
@@ -197,11 +217,10 @@ class ContractPreparedChunk(ExpertChunkEmbeddingInput):
 class EmbeddedContractPreparedChunk(ContractPreparedChunk):
     """保留完整输入契约并附加向量化输出字段的记录。
 
-    ``vector_doc_id`` 按 ``chunk_id + embedding_model_version`` 生成；因此模型
-    空间变化会产生新的输出身份，而不会覆盖业务 Chunk 的稳定 ``chunk_id``。
+    ``vector_doc_id`` 继承自输入 Contract，由上游生成并在向量化过程中原样保留。
+    Embedding 模型版本变化不改变该业务存储主键。
     """
 
-    vector_doc_id: str = Field(..., min_length=1, max_length=512)
     embedding: list[float] = Field(..., min_length=1)
     embedding_dim: int = Field(..., ge=1)
     embedding_model_alias: str = Field(..., min_length=1, max_length=128)
@@ -245,3 +264,13 @@ def _validate_timezone_datetime(value: str, field_name: str) -> None:
         raise ValueError(f"{field_name} 必须是合法的 ISO 8601 时间") from exc
     if parsed.tzinfo is None or parsed.utcoffset() is None:
         raise ValueError(f"{field_name} 必须包含时区")
+
+
+def _validate_vector_doc_id_capacity(value: str) -> str:
+    """统一校验上游主键的 Milvus UTF-8 字节容量。"""
+
+    if len(value.encode("utf-8")) > _VECTOR_DOC_ID_MAX_BYTES:
+        raise ValueError(
+            f"vector_doc_id 超过 Milvus VARCHAR 实现容量 {_VECTOR_DOC_ID_MAX_BYTES} bytes"
+        )
+    return value

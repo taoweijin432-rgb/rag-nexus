@@ -197,6 +197,7 @@ class MySqlExpertChunkReader:
             payload: dict[str, Any] = {
                 "contract_version": EXPERT_CHUNK_CONTRACT_VERSION,
                 "chunk_id": values["chunk_id"],
+                "vector_doc_id": metadata.get("vector_doc_id"),
                 "expert_id": values["expert_id"],
                 "serial_number": values["serial_number"],
                 "chunk_type": values["chunk_type"],

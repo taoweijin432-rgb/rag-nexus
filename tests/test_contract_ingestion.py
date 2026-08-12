@@ -88,9 +88,11 @@ def make_record() -> ExpertChunkEmbeddingInput:
     """构造当前正式 Contract 的最小合法内存对象。"""
 
     text = "[专家能力概述]\n虚构测试专家具备知识检索系统建设经验。"
+    vector_doc_id = "expert:900001:profile_summary:900001:0"
     return ExpertChunkEmbeddingInput(
-        contract_version="1.0.0",
+        contract_version="2.0.0",
         chunk_id="expert:900001:profile_summary:test-profile:0",
+        vector_doc_id=vector_doc_id,
         expert_id=900001,
         serial_number="DEV900001",
         chunk_type="profile_summary",
@@ -101,6 +103,7 @@ def make_record() -> ExpertChunkEmbeddingInput:
         char_count=len(text),
         content_hash=hashlib.sha256(text.encode("utf-8")).hexdigest(),
         metadata={
+            "vector_doc_id": vector_doc_id,
             "company_name_raw": None,
             "company_name_norm": None,
             "company_normalization_status": None,
@@ -129,7 +132,7 @@ def make_record() -> ExpertChunkEmbeddingInput:
         versions={
             "data_version": "dev_20260812_01",
             "chunk_policy_version": "1.2",
-            "metadata_schema_version": "1.0",
+            "metadata_schema_version": "2.0",
             "dictionary_version": "dev_2026.08",
         },
         is_active=True,
@@ -175,7 +178,7 @@ def test_ingest_one_embedded_and_only_embeds_chunk_text() -> None:
 
     assert result.status == "embedded"
     assert result.chunk_id == record.chunk_id
-    assert result.vector_doc_id == f"{record.chunk_id}:emb:fake-v1"
+    assert result.vector_doc_id == record.vector_doc_id
     assert result.affected_count == 1
     assert result.skip_reason is None
     assert model.calls == [[record.chunk_text]]
