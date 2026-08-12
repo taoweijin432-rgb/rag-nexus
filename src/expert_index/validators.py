@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import re
 
-from .chunk_builder import HARD_LIMITS
+from .chunk_builder import HARD_LIMITS, build_vector_doc_id
 from .models import ChunkRecord
 from .normalize import pii_hits, sha256_value
 
@@ -76,6 +76,7 @@ def _validate_one(chunk: ChunkRecord) -> None:
 
     metadata = chunk.metadata
     required = {
+        "vector_doc_id",
         "company_name_raw", "company_name_norm", "company_normalization_status",
         "role_name_raw", "role_code", "role_level", "start_month", "end_month",
         "is_current", "industry_codes", "topic_codes", "origin_type",
@@ -83,6 +84,14 @@ def _validate_one(chunk: ChunkRecord) -> None:
     }
     if not required.issubset(metadata):
         fail(f"metadata 缺少字段={sorted(required - set(metadata))}")
+    expected_vector_doc_id = build_vector_doc_id(
+        expert_id=chunk.expert_id,
+        chunk_type=chunk.chunk_type,
+        source_field_id=chunk.source_field_id,
+        chunk_index=chunk.chunk_index,
+    )
+    if metadata["vector_doc_id"] != expected_vector_doc_id:
+        fail("metadata.vector_doc_id 不符合统一生成规则")
     if metadata["company_name_norm"] != chunk.company_name_norm:
         fail("metadata 与显式 company_name_norm 不一致")
     if metadata["role_code"] != chunk.role_code:

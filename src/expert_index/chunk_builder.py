@@ -19,6 +19,22 @@ from .normalize import sha256_value
 HARD_LIMITS = {"profile_summary": 600, "employment": 900, "project": 1000}
 
 
+def build_vector_doc_id(
+    *,
+    expert_id: int,
+    chunk_type: str,
+    source_field_id: str,
+    chunk_index: int,
+) -> str:
+    """按产品规则生成 Milvus 记录的稳定唯一标识。
+
+    产品公式中的旧 ``source_record_id`` 已由新溯源契约的 ``source_field_id``
+    等价替代。该 ID 只依赖业务来源和分片位置，因此重复构建同一 Chunk 时保持稳定。
+    """
+
+    return f"expert:{expert_id}:{chunk_type}:{source_field_id}:{chunk_index}"
+
+
 class ChunkFactory:
     """把一位专家的三类 Stage 对象转换为完整 Chunk 集合。"""
 
@@ -282,6 +298,16 @@ class ChunkFactory:
         """集中生成 ID、哈希和版本，避免三类 Builder 产生细微漂移。"""
 
         normalized = text.strip()
+        vector_doc_id = build_vector_doc_id(
+            expert_id=expert_id,
+            chunk_type=chunk_type,
+            source_field_id=source_field_id,
+            chunk_index=chunk_index,
+        )
+        # _metadata() 为同一来源的所有拆分片段提供公共业务 Metadata；这里为每一个
+        # 最终片段复制字典并补入包含 chunk_index 的唯一 vector_doc_id，避免长文本
+        # 拆分后多个 Chunk 共用同一个 Milvus 主键。
+        record_metadata = {**metadata, "vector_doc_id": vector_doc_id}
         return ChunkRecord(
             chunk_id=f"expert:{expert_id}:{chunk_type}:{source_item_key}:{chunk_index}",
             expert_id=expert_id,
@@ -292,7 +318,7 @@ class ChunkFactory:
             chunk_total=chunk_total,
             chunk_text=normalized,
             char_count=len(normalized),
-            metadata=metadata,
+            metadata=record_metadata,
             source_table=source_table,
             source_field=source_field,
             source_field_id=source_field_id,

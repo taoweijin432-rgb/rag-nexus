@@ -11,6 +11,7 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 from .config import CONTRACT_VERSION
+from .chunk_builder import build_vector_doc_id
 from .normalize import sha256_value
 
 
@@ -42,6 +43,16 @@ def row_to_contract(row: dict[str, object], timezone_name: str) -> dict[str, obj
     metadata = row["metadata_json"]
     if isinstance(metadata, str):
         metadata = json.loads(metadata)
+    if not isinstance(metadata, dict):
+        raise TypeError(f"{row['chunk_id']} metadata_json 必须是 JSON 对象")
+    expected_vector_doc_id = build_vector_doc_id(
+        expert_id=int(row["expert_id"]),
+        chunk_type=str(row["chunk_type"]),
+        source_field_id=str(row["source_field_id"]),
+        chunk_index=int(row["chunk_index"]),
+    )
+    if metadata.get("vector_doc_id") != expected_vector_doc_id:
+        raise ValueError(f"{row['chunk_id']} metadata.vector_doc_id 不一致")
     return {
         "contract_version": CONTRACT_VERSION,
         "chunk_id": row["chunk_id"],

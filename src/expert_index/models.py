@@ -164,7 +164,7 @@ class ChunkRecord:
     chunk_total: int  # 同一 source_item_key 切分出的子块总数。
     chunk_text: str  # 最终供 Embedding 使用的标准文本。
     char_count: int  # chunk_text 的 Unicode 字符数。
-    metadata: dict[str, Any]  # 结构化 Metadata，落库时序列化到 metadata_json。
+    metadata: dict[str, Any]  # 结构化 Metadata；必须含 vector_doc_id，落库到 metadata_json。
     source_table: str  # 物理来源表名。
     source_field: str  # 参与生成该 Chunk 的源列名组合，例如 company+job_name+background。
     source_field_id: str  # 来源行主键 ID，用于回查 source_table 中的具体记录。

@@ -14,9 +14,11 @@ from typing import Any
 
 # 四种版本各自管理不同兼容边界，不能合并成一个含义模糊的 version。
 CHUNK_POLICY_VERSION = "1.2"
-METADATA_SCHEMA_VERSION = "1.0"
+# Metadata 新增 Milvus 主键 ``vector_doc_id``，属于必填字段变更，因此升级主版本。
+METADATA_SCHEMA_VERSION = "2.0"
 DICTIONARY_VERSION = "2026.08"
-CONTRACT_VERSION = "1.0.0"
+# v2 将 ``vector_doc_id`` 设为 Metadata 必填字段，并采用新版来源追溯字段。
+CONTRACT_VERSION = "2.0.0"
 
 _ENV_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 

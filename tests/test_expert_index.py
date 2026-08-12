@@ -194,6 +194,17 @@ class ChunkFactoryTest(unittest.TestCase):
         self.assertEqual({"profile_summary", "employment", "project"}, {c.chunk_type for c in chunks})
         self.assertTrue(all(c.content_hash == sha256_value(c.chunk_text) for c in chunks))
         self.assertTrue(all(c.chunk_id.startswith("expert:24:") for c in chunks))
+        self.assertTrue(
+            all(
+                c.metadata["vector_doc_id"]
+                == f"expert:{c.expert_id}:{c.chunk_type}:{c.source_field_id}:{c.chunk_index}"
+                for c in chunks
+            )
+        )
+        self.assertEqual(
+            len(chunks),
+            len({c.metadata["vector_doc_id"] for c in chunks}),
+        )
         self.assertNotIn("fake@example.com", "\n".join(c.chunk_text for c in chunks))
 
     def test_long_employment_splits_but_keeps_source_key(self) -> None:
@@ -208,6 +219,10 @@ class ChunkFactoryTest(unittest.TestCase):
         self.assertEqual({"1001"}, {chunk.source_item_key for chunk in employment})
         self.assertTrue(all(chunk.char_count <= 900 for chunk in employment))
         self.assertEqual(list(range(len(employment))), [chunk.chunk_index for chunk in employment])
+        self.assertEqual(
+            len(employment),
+            len({chunk.metadata["vector_doc_id"] for chunk in employment}),
+        )
 
     def test_unknown_employment_status_becomes_partial(self) -> None:
         """is_employed=0 对应 None，不能作为当前/历史任职的硬证据。"""
@@ -269,7 +284,11 @@ class ExporterTest(unittest.TestCase):
             "chunk_text": text,
             "char_count": len(text),
             "content_hash": sha256_value(text),
-            "metadata_json": json.dumps({"industry_codes": [], "topic_codes": []}),
+            "metadata_json": json.dumps({
+                "vector_doc_id": "expert:24:profile_summary:24:0",
+                "industry_codes": [],
+                "topic_codes": [],
+            }),
             "source_table": "experts",
             "source_field": "company+job_name+background",
             "source_field_id": "24",
@@ -278,7 +297,7 @@ class ExporterTest(unittest.TestCase):
             "source_updated_at": now,
             "source_hash": "a" * 64,
             "chunk_policy_version": "1.2",
-            "metadata_schema_version": "1.0",
+            "metadata_schema_version": "2.0",
             "dictionary_version": "2026.08",
             "data_version": "20260811_01",
             "is_active": 1,
@@ -288,11 +307,15 @@ class ExporterTest(unittest.TestCase):
             path = Path(directory) / "chunks.jsonl"
             self.assertEqual(1, export_jsonl([row], path, "Asia/Shanghai"))
             contract = json.loads(path.read_text(encoding="utf-8"))
-        self.assertEqual("1.0.0", contract["contract_version"])
+        self.assertEqual("2.0.0", contract["contract_version"])
         self.assertEqual(text, contract["chunk_text"])
         self.assertNotIn("source_record_id", contract["source"])
         self.assertEqual("company+job_name+background", contract["source"]["source_field"])
         self.assertEqual("24", contract["source"]["source_field_id"])
+        self.assertEqual(
+            "expert:24:profile_summary:24:0",
+            contract["metadata"]["vector_doc_id"],
+        )
         self.assertEqual("20260811_01", contract["versions"]["data_version"])
 
 
