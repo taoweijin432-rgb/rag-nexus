@@ -60,7 +60,7 @@ class ProjectFixture:
     description: str
 
 
-# 三段任职覆盖“当前 + 两段历史”，用于验证多个 source_record_id 仍属于同一专家。
+# 三段任职覆盖“当前 + 两段历史”，用于验证多个 source_field_id 仍属于同一专家。
 WORK_FIXTURES = (
     WorkFixture(
         company=TEST_COMPANY,
@@ -96,7 +96,7 @@ WORK_FIXTURES = (
 )
 
 
-# 三个项目属于不同 source_record_id；正文均显式给出角色、目标、动作和结果。
+# 三个项目属于不同 source_field_id；正文均显式给出角色、目标、动作和结果。
 PROJECT_FIXTURES = (
     ProjectFixture(
         company=TEST_COMPANY,

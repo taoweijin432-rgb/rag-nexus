@@ -57,10 +57,9 @@ def row_to_contract(row: dict[str, object], timezone_name: str) -> dict[str, obj
         "metadata": metadata,
         "source": {
             "source_table": row["source_table"],
-            "source_record_id": row["source_record_id"],
-            "source_item_key": row["source_item_key"],
             "source_field": row["source_field"],
             "source_field_id": row["source_field_id"],
+            "source_item_key": row["source_item_key"],
             "source_version": row["source_version"],
             "source_updated_at": _iso(row["source_updated_at"], timezone_name),
             "source_hash": row["source_hash"],
@@ -85,4 +84,3 @@ def _iso(value: object, timezone_name: str) -> str | None:
         raise TypeError(f"期望 datetime，实际为 {type(value).__name__}")
     aware = value if value.tzinfo else value.replace(tzinfo=ZoneInfo(timezone_name))
     return aware.isoformat(timespec="microseconds")
-

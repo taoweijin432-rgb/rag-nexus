@@ -51,9 +51,10 @@ CREATE TABLE IF NOT EXISTS expert_index_stage (
 CREATE TABLE IF NOT EXISTS expert_index_employment_stage (
     id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
     expert_id BIGINT UNSIGNED NOT NULL,
-    source_table VARCHAR(128) NOT NULL,
-    source_record_id VARCHAR(128) NOT NULL,
-    source_item_key VARCHAR(128) NOT NULL,
+    source_table VARCHAR(128) NOT NULL COMMENT '物理来源表名',
+    source_field VARCHAR(512) NOT NULL COMMENT '参与生成 Chunk 的源列名，+拼接',
+    source_field_id VARCHAR(128) NOT NULL COMMENT '来源行主键 ID',
+    source_item_key VARCHAR(128) NOT NULL COMMENT '稳定业务项键',
     company_name_raw VARCHAR(512) NULL,
     company_name_norm VARCHAR(512) NULL,
     company_normalization_status VARCHAR(32) NOT NULL DEFAULT 'unknown',
@@ -76,17 +77,18 @@ CREATE TABLE IF NOT EXISTS expert_index_employment_stage (
     updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6)
         ON UPDATE CURRENT_TIMESTAMP(6),
     PRIMARY KEY (id),
-    UNIQUE KEY uk_expert_emp_source (source_table, source_record_id, source_item_key),
+    UNIQUE KEY uk_expert_emp_source (source_table, source_field_id, source_item_key),
     KEY idx_expert_emp_expert (expert_id),
-    KEY idx_expert_emp_source_updated (source_updated_at, source_record_id)
+    KEY idx_expert_emp_source_updated (source_updated_at, source_field_id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
 CREATE TABLE IF NOT EXISTS expert_index_project_stage (
     id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
     expert_id BIGINT UNSIGNED NOT NULL,
-    source_table VARCHAR(128) NOT NULL,
-    source_record_id VARCHAR(128) NOT NULL,
-    source_item_key VARCHAR(128) NOT NULL,
+    source_table VARCHAR(128) NOT NULL COMMENT '物理来源表名',
+    source_field VARCHAR(512) NOT NULL COMMENT '参与生成 Chunk 的源列名，+拼接',
+    source_field_id VARCHAR(128) NOT NULL COMMENT '来源行主键 ID',
+    source_item_key VARCHAR(128) NOT NULL COMMENT '稳定业务项键',
     project_name VARCHAR(512) NULL,
     company_or_client_raw VARCHAR(512) NULL,
     company_or_client_norm VARCHAR(512) NULL,
@@ -108,9 +110,9 @@ CREATE TABLE IF NOT EXISTS expert_index_project_stage (
     updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6)
         ON UPDATE CURRENT_TIMESTAMP(6),
     PRIMARY KEY (id),
-    UNIQUE KEY uk_expert_project_source (source_table, source_record_id, source_item_key),
+    UNIQUE KEY uk_expert_project_source (source_table, source_field_id, source_item_key),
     KEY idx_expert_project_expert (expert_id),
-    KEY idx_expert_project_source_updated (source_updated_at, source_record_id)
+    KEY idx_expert_project_source_updated (source_updated_at, source_field_id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
 CREATE TABLE IF NOT EXISTS expert_chunk (
@@ -126,11 +128,10 @@ CREATE TABLE IF NOT EXISTS expert_chunk (
     char_count INT UNSIGNED NOT NULL,
     token_count_estimate INT UNSIGNED NULL,
     metadata_json JSON NOT NULL,
-    source_table VARCHAR(128) NOT NULL,
-    source_record_id VARCHAR(128) NOT NULL,
-    source_item_key VARCHAR(128) NOT NULL,
-    source_field VARCHAR(128) NOT NULL,
-    source_field_id VARCHAR(256) NOT NULL,
+    source_table VARCHAR(128) NOT NULL COMMENT '物理来源表名',
+    source_field VARCHAR(512) NOT NULL COMMENT '参与生成 Chunk 的源列名，+拼接',
+    source_field_id VARCHAR(128) NOT NULL COMMENT '来源行主键 ID',
+    source_item_key VARCHAR(128) NOT NULL COMMENT '稳定业务项键',
     source_version VARCHAR(64) NOT NULL,
     source_updated_at DATETIME(6) NULL,
     source_hash CHAR(64) NOT NULL,
@@ -158,11 +159,10 @@ CREATE TABLE IF NOT EXISTS expert_chunk (
     UNIQUE KEY uk_expert_chunk_id (chunk_id),
     KEY idx_expert_chunk_expert_active (expert_id, is_active),
     KEY idx_expert_chunk_type_active (chunk_type, is_active),
-    KEY idx_expert_chunk_source (source_table, source_record_id, source_item_key),
+    KEY idx_expert_chunk_source (source_table, source_field_id, source_item_key),
     KEY idx_expert_chunk_content_hash (content_hash),
     CONSTRAINT chk_expert_chunk_position CHECK (chunk_index < chunk_total),
     CONSTRAINT chk_expert_chunk_type CHECK (
         chunk_type IN ('profile_summary', 'employment', 'project')
     )
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
-

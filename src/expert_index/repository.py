@@ -161,16 +161,17 @@ class MySQLIndexRepository:
         cursor.execute(
             """
             INSERT INTO expert_index_employment_stage(
-                expert_id, source_table, source_record_id, source_item_key,
+                expert_id, source_table, source_field, source_field_id, source_item_key,
                 company_name_raw, company_name_norm, company_normalization_status,
                 role_name_raw, role_code, role_level, start_month, end_month, is_current,
                 responsibilities_clean, achievements_clean, industry_codes_json,
                 topic_codes_json, parse_status, source_hash, source_updated_at,
                 data_version, build_batch_id
-            ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+            ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
             """,
             (
-                item.expert_id, item.source_table, item.source_record_id, item.source_item_key,
+                item.expert_id, item.source_table, item.source_field, item.source_field_id,
+                item.source_item_key,
                 item.company_name_raw, item.company_name_norm,
                 item.company_normalization_status, item.role_name_raw, item.role_code,
                 item.role_level, item.start_month, item.end_month, item.is_current,
@@ -186,17 +187,19 @@ class MySQLIndexRepository:
         cursor.execute(
             """
             INSERT INTO expert_index_project_stage(
-                expert_id, source_table, source_record_id, source_item_key, project_name,
+                expert_id, source_table, source_field, source_field_id, source_item_key,
+                project_name,
                 company_or_client_raw, company_or_client_norm,
                 company_normalization_status, project_role, start_month, end_month,
                 objective_clean, actions_clean, results_clean, industry_codes_json,
                 topic_codes_json, parse_status, source_hash, source_updated_at,
                 data_version, build_batch_id
-            ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+            ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
             """,
             (
-                item.expert_id, item.source_table, item.source_record_id, item.source_item_key,
-                item.project_name, item.company_or_client_raw, item.company_or_client_norm,
+                item.expert_id, item.source_table, item.source_field, item.source_field_id,
+                item.source_item_key, item.project_name, item.company_or_client_raw,
+                item.company_or_client_norm,
                 item.company_normalization_status, item.project_role, item.start_month,
                 item.end_month, item.objective_clean, item.actions_clean, item.results_clean,
                 _json(list(item.industry_codes)), _json(list(item.topic_codes)),
@@ -212,16 +215,18 @@ class MySQLIndexRepository:
             INSERT INTO expert_chunk(
                 chunk_id, expert_id, serial_number, chunk_type, chunk_subtype,
                 chunk_index, chunk_total, chunk_text, char_count, token_count_estimate,
-                metadata_json, source_table, source_record_id, source_item_key,
-                source_field, source_field_id, source_version, source_updated_at,
+                metadata_json, source_table, source_field, source_field_id, source_item_key,
+                source_version, source_updated_at,
                 source_hash, content_hash, company_name_norm, role_code, start_month,
                 end_month, is_current, industry_codes_json, topic_codes_json,
                 origin_type, verification_status, weight_tier, chunk_policy_version,
                 metadata_schema_version, dictionary_version, data_version,
                 is_active, build_batch_id
             ) VALUES (
-                %s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,
-                %s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,1,%s
+                %s,%s,%s,%s,%s,%s,%s,%s,%s,%s,
+                %s,%s,%s,%s,%s,%s,%s,%s,%s,%s,
+                %s,%s,%s,%s,%s,%s,%s,%s,%s,%s,
+                %s,%s,%s,1,%s
             )
             ON DUPLICATE KEY UPDATE
                 serial_number=VALUES(serial_number), chunk_type=VALUES(chunk_type),
@@ -229,8 +234,8 @@ class MySQLIndexRepository:
                 chunk_total=VALUES(chunk_total), chunk_text=VALUES(chunk_text),
                 char_count=VALUES(char_count), token_count_estimate=VALUES(token_count_estimate),
                 metadata_json=VALUES(metadata_json), source_table=VALUES(source_table),
-                source_record_id=VALUES(source_record_id), source_item_key=VALUES(source_item_key),
                 source_field=VALUES(source_field), source_field_id=VALUES(source_field_id),
+                source_item_key=VALUES(source_item_key),
                 source_version=VALUES(source_version), source_updated_at=VALUES(source_updated_at),
                 source_hash=VALUES(source_hash), content_hash=VALUES(content_hash),
                 company_name_norm=VALUES(company_name_norm), role_code=VALUES(role_code),
@@ -247,8 +252,8 @@ class MySQLIndexRepository:
                 item.chunk_id, item.expert_id, item.serial_number, item.chunk_type,
                 item.chunk_subtype, item.chunk_index, item.chunk_total, item.chunk_text,
                 item.char_count, max(1, item.char_count // 2), _json(item.metadata),
-                item.source_table, item.source_record_id, item.source_item_key,
-                item.source_field, item.source_field_id, item.source_version,
+                item.source_table, item.source_field, item.source_field_id,
+                item.source_item_key, item.source_version,
                 item.source_updated_at, item.source_hash, item.content_hash,
                 item.company_name_norm, item.role_code, item.start_month, item.end_month,
                 item.is_current, _json(list(item.industry_codes)), _json(list(item.topic_codes)),
@@ -278,15 +283,15 @@ class MySQLIndexRepository:
         sql = f"""
             SELECT chunk_id, expert_id, serial_number, chunk_type, chunk_subtype,
                    chunk_index, chunk_total, chunk_text, char_count, content_hash,
-                   metadata_json, source_table, source_record_id, source_item_key,
-                   source_field, source_field_id, source_version, source_updated_at,
+                   metadata_json, source_table, source_field, source_field_id,
+                   source_item_key, source_version, source_updated_at,
                    source_hash, chunk_policy_version, metadata_schema_version,
                    dictionary_version, data_version, is_active, updated_at,
                    verification_status, weight_tier
             FROM expert_chunk
             WHERE expert_id=%s AND is_active=1 {eligibility}
             ORDER BY FIELD(chunk_type,'profile_summary','employment','project'),
-                     source_record_id, chunk_index
+                     source_field_id, chunk_index
         """
         connection = pymysql.connect(**self.config.as_kwargs(autocommit=True))
         try:

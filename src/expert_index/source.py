@@ -7,7 +7,6 @@
 
 from __future__ import annotations
 
-import re
 from typing import Any
 
 import pymysql
@@ -35,7 +34,7 @@ class MySQLSourceAdapter:
         try:
             with connection.cursor() as cursor:
                 profile = self._load_profile(cursor, expert_id)
-                employments = self._load_employments(cursor, profile)
+                employments = self._load_employments(cursor, profile.id)
                 projects = self._load_projects(cursor, expert_id)
         finally:
             connection.close()
@@ -58,40 +57,33 @@ class MySQLSourceAdapter:
         if row is None:
             raise ExpertNotFoundError(f"专家 {expert_id} 不存在或已删除")
         return ExpertSource(
-            expert_id=int(row["id"]),
+            id=int(row["id"]),
             serial_number=row.get("serial_number"),
             company=row.get("company"),
-            role=row.get("job_name"),
+            job_name=row.get("job_name"),
             background=row.get("background"),
-            education=row.get("edu_experience"),
+            edu_experience=row.get("edu_experience"),
             work_years=float(row["work_years"]) if row.get("work_years") is not None else None,
             updated_at=row.get("updated_at"),
             created_at=row.get("created_at"),
         )
 
-    def _load_employments(self, cursor: Any, profile: ExpertSource) -> list[EmploymentSource]:
+    def _load_employments(self, cursor: Any, expert_id: int) -> list[EmploymentSource]:
         # 新表明确提供 expert_id，不再经过 relate_id 或 resume_id 猜测关联关系。
-        rows = self._query_employment_rows(cursor, profile.expert_id)
+        rows = self._query_employment_rows(cursor, expert_id)
         result: list[EmploymentSource] = []
         for row in rows:
-            responsibilities, achievements = _parse_employment_description(
-                row.get("work_description")
-            )
             result.append(EmploymentSource(
-                expert_id=profile.expert_id,
-                source_table="experts_work_experience",
-                source_record_id=str(row["id"]),
-                source_item_key=str(row["id"]),
-                company=row.get("company_name"),
-                role=row.get("position_title"),
+                # Source 模型只承接 SELECT 返回的真实列；正文解析在
+                # normalize.py 进入 Stage 时完成，不在 Source 层增加派生字段。
+                id=int(row["id"]),
+                expert_id=int(row["expert_id"]),
+                company_name=row.get("company_name"),
+                position_title=row.get("position_title"),
                 start_date=row.get("start_date"),
                 end_date=row.get("end_date"),
-                # 若工作内容包含显式标签，则分别承接职责和成果；普通自由文本仍完整
-                # 进入职责字段，不会因为解析失败而丢失。
-                description=None,
-                responsibilities=responsibilities,
-                achievements=achievements,
-                is_current=_employment_status(row.get("is_employed")),
+                work_description=row.get("work_description"),
+                is_employed=row.get("is_employed"),
                 updated_at=row.get("updated_at"),
                 created_at=row.get("created_at"),
             ))
@@ -101,7 +93,7 @@ class MySQLSourceAdapter:
     def _query_employment_rows(cursor: Any, expert_id: int) -> list[dict[str, Any]]:
         cursor.execute(
             """
-            SELECT id, company_name, position_title, start_date, end_date,
+            SELECT id, expert_id, company_name, position_title, start_date, end_date,
                    work_description, is_employed, updated_at, created_at
             FROM experts_work_experience
             WHERE expert_id = %s AND deleted_at IS NULL
@@ -113,10 +105,11 @@ class MySQLSourceAdapter:
 
     @staticmethod
     def _load_projects(cursor: Any, expert_id: int) -> list[ProjectSource]:
-        # 新表 id 是自增主键，可直接作为稳定 source_item_key。
+        # 新表 id 是自增主键，进入 Stage 后会同时作为
+        # source_field_id 和稳定 source_item_key。
         cursor.execute(
             """
-            SELECT id, project_title, company_name, start_date, end_date,
+            SELECT id, expert_id, project_title, company_name, start_date, end_date,
                    work_description, updated_at, created_at
             FROM experts_project_experience
             WHERE expert_id = %s AND deleted_at IS NULL
@@ -126,88 +119,15 @@ class MySQLSourceAdapter:
         )
         result: list[ProjectSource] = []
         for row in cursor.fetchall():
-            role, objective, actions, results = _parse_project_description(
-                row.get("work_description")
-            )
             result.append(ProjectSource(
-                expert_id=expert_id,
-                source_table="experts_project_experience",
-                source_record_id=str(row["id"]),
-                source_item_key=str(row["id"]),
-                project_name=row.get("project_title"),
-                company=row.get("company_name"),
-                # 表没有独立项目角色列，仅接受 work_description 中明确写出的
-                # “项目角色：...”来源证据；没有标签时仍保持 None。
-                project_role=role,
+                id=int(row["id"]),
+                expert_id=int(row["expert_id"]),
+                project_title=row.get("project_title"),
+                company_name=row.get("company_name"),
                 start_date=row.get("start_date"),
                 end_date=row.get("end_date"),
-                description=objective,
-                responsibilities=actions,
-                results=results,
+                work_description=row.get("work_description"),
                 updated_at=row.get("updated_at"),
                 created_at=row.get("created_at"),
             ))
         return result
-
-
-def _employment_status(value: object) -> bool | None:
-    """按数据库字段注释映射：1=在职，2=不在职，其他值=未知。"""
-
-    if value == 1:
-        return True
-    if value == 2:
-        return False
-    return None
-
-
-def _parse_employment_description(value: object) -> tuple[str | None, str | None]:
-    """解析显式的工作职责/代表性成果标签；普通文本整体作为职责。"""
-
-    text = str(value).strip() if value is not None else ""
-    if not text:
-        return None, None
-    sections = _labeled_sections(text, ("工作职责", "代表性成果"))
-    if not sections:
-        return text, None
-    return sections.get("工作职责"), sections.get("代表性成果")
-
-
-def _parse_project_description(
-    value: object,
-) -> tuple[str | None, str | None, str | None, str | None]:
-    """从同一项目正文提取角色、目标、动作、结果四类显式来源事实。
-
-    只有带 ``标签：值`` 的文本才进入结构化字段。既有无标签项目仍把完整正文
-    当作项目工作内容，但项目角色保持空，因此会安全标记为 partial。
-    """
-
-    text = str(value).strip() if value is not None else ""
-    if not text:
-        return None, None, None, None
-    labels = ("项目角色", "项目目标", "关键动作", "项目结果")
-    sections = _labeled_sections(text, labels)
-    if not sections:
-        return None, None, text, None
-    return (
-        sections.get("项目角色"),
-        sections.get("项目目标"),
-        sections.get("关键动作"),
-        sections.get("项目结果"),
-    )
-
-
-def _labeled_sections(text: str, labels: tuple[str, ...]) -> dict[str, str]:
-    """确定性解析中文标签区段，支持区段值跨行且不改写任何事实。"""
-
-    alternation = "|".join(re.escape(label) for label in labels)
-    pattern = re.compile(
-        rf"(?:^|\n)\s*({alternation})\s*[：:]\s*(.*?)"
-        rf"(?=(?:\n\s*(?:{alternation})\s*[：:])|\Z)",
-        re.DOTALL,
-    )
-    result: dict[str, str] = {}
-    for match in pattern.finditer(text.replace("\r\n", "\n").replace("\r", "\n")):
-        cleaned = match.group(2).strip()
-        if cleaned:
-            result[match.group(1)] = cleaned
-    return result

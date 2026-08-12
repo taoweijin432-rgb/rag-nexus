@@ -160,6 +160,68 @@ def month_value(value: datetime | date | str | None) -> str | None:
     return f"{int(match.group(1)):04d}-{int(match.group(2)):02d}" if match else None
 
 
+def employment_status(value: object) -> bool | None:
+    """按源表注释标准化 is_employed：1=在职，2=不在职，其他=未知。"""
+
+    if value == 1:
+        return True
+    if value == 2:
+        return False
+    return None
+
+
+def parse_employment_description(value: object) -> tuple[str | None, str | None]:
+    """解析显式的工作职责/代表性成果标签；普通文本整体作为职责。"""
+
+    text = str(value).strip() if value is not None else ""
+    if not text:
+        return None, None
+    sections = _labeled_sections(text, ("工作职责", "代表性成果"))
+    if not sections:
+        return text, None
+    return sections.get("工作职责"), sections.get("代表性成果")
+
+
+def parse_project_description(
+    value: object,
+) -> tuple[str | None, str | None, str | None, str | None]:
+    """从同一项目原文提取角色、目标、动作、结果四类显式事实。
+
+    无标签正文整体作为项目动作，项目角色保持空，后续安全降级为 partial。
+    """
+
+    text = str(value).strip() if value is not None else ""
+    if not text:
+        return None, None, None, None
+    labels = ("项目角色", "项目目标", "关键动作", "项目结果")
+    sections = _labeled_sections(text, labels)
+    if not sections:
+        return None, None, text, None
+    return (
+        sections.get("项目角色"),
+        sections.get("项目目标"),
+        sections.get("关键动作"),
+        sections.get("项目结果"),
+    )
+
+
+def _labeled_sections(text: str, labels: tuple[str, ...]) -> dict[str, str]:
+    """确定性解析中文标签区段，支持跨行且不改写原始事实。"""
+
+    alternation = "|".join(re.escape(label) for label in labels)
+    pattern = re.compile(
+        rf"(?:^|\n)\s*({alternation})\s*[：:]\s*(.*?)"
+        rf"(?=(?:\n\s*(?:{alternation})\s*[：:])|\Z)",
+        re.DOTALL,
+    )
+    result: dict[str, str] = {}
+    for match in pattern.finditer(text.replace("\r\n", "\n").replace("\r", "\n")):
+        cleaned = match.group(2).strip()
+        if cleaned:
+            result[match.group(1)] = cleaned
+    return result
+
+
 def _codes(texts: Iterable[str], rules: dict[str, tuple[str, ...]]) -> tuple[str, ...]:
     """从当前来源文本提取有直接关键词证据的代码，并按字典序稳定输出。"""
 
@@ -177,19 +239,19 @@ def normalize_aggregate(
 
     profile = aggregate.profile
     company_raw, company_norm, company_status = normalize_company(profile.company)
-    role_raw, role_code, role_level = normalize_role(profile.role)
+    role_raw, role_code, role_level = normalize_role(profile.job_name)
     background = clean_text(profile.background) or None
     profile_allowed = {
-        "expert_id": profile.expert_id,
+        "expert_id": profile.id,
         "serial_number": clean_text(profile.serial_number) or None,
         "company": company_raw,
         "role": role_raw,
         "background": background,
-        "education": clean_text(profile.education) or None,
+        "education": clean_text(profile.edu_experience) or None,
         "work_years": profile.work_years,
     }
     profile_stage = ProfileStage(
-        expert_id=profile.expert_id,
+        expert_id=profile.id,
         serial_number=profile_allowed["serial_number"],
         company_name_raw=company_raw,
         company_name_norm=company_norm,
@@ -221,17 +283,19 @@ def normalize_aggregate(
 def _normalize_employment(item: EmploymentSource, *, data_version: str, build_batch_id: int) -> EmploymentStage:
     """标准化单段任职；成果仅接受显式来源标签解析值。"""
 
-    raw_company, norm_company, company_status = normalize_company(item.company)
-    raw_role, role_code, role_level = normalize_role(item.role)
-    parts = [clean_text(item.responsibilities), clean_text(item.description)]
-    responsibilities = "\n".join(dict.fromkeys(part for part in parts if part)) or None
+    raw_company, norm_company, company_status = normalize_company(item.company_name)
+    raw_role, role_code, role_level = normalize_role(item.position_title)
+    parsed_responsibilities, parsed_achievements = parse_employment_description(
+        item.work_description
+    )
+    responsibilities = clean_text(parsed_responsibilities) or None
     start_month, end_month = month_value(item.start_date), month_value(item.end_date)
     # 新表 is_employed 是权威标量：1=在职、2=不在职、其他未知。当前任职的
     # end_month 强制为空；历史任职即使缺结束时间也保留 false，不自行补日期。
-    is_current = item.is_current
+    is_current = employment_status(item.is_employed)
     if is_current is True:
         end_month = None
-    achievements = clean_text(item.achievements) or None
+    achievements = clean_text(parsed_achievements) or None
     evidence = [part for part in (raw_company, raw_role, responsibilities, achievements) if part]
     allowed = {
         "company": raw_company,
@@ -244,9 +308,13 @@ def _normalize_employment(item: EmploymentSource, *, data_version: str, build_ba
     }
     return EmploymentStage(
         expert_id=item.expert_id,
-        source_table=item.source_table,
-        source_record_id=item.source_record_id,
-        source_item_key=item.source_item_key,
+        source_table="experts_work_experience",
+        source_field=(
+            "company_name+position_title+start_date+end_date+"
+            "work_description+is_employed"
+        ),
+        source_field_id=str(item.id),
+        source_item_key=str(item.id),
         company_name_raw=raw_company,
         company_name_norm=norm_company,
         company_normalization_status=company_status,
@@ -260,7 +328,7 @@ def _normalize_employment(item: EmploymentSource, *, data_version: str, build_ba
         achievements_clean=achievements,
         industry_codes=_codes(evidence, INDUSTRY_RULES),
         topic_codes=_codes(evidence, TOPIC_RULES),
-        parse_status=item.parse_status,
+        parse_status="complete",
         source_hash=source_hash(allowed),
         source_updated_at=item.updated_at or item.created_at,
         data_version=data_version,
@@ -271,12 +339,15 @@ def _normalize_employment(item: EmploymentSource, *, data_version: str, build_ba
 def _normalize_project(item: ProjectSource, *, data_version: str, build_batch_id: int) -> ProjectStage:
     """标准化单个项目；角色和结果只能来自显式来源标签。"""
 
-    raw_company, norm_company, company_status = normalize_company(item.company)
-    project_name = clean_text(item.project_name) or None
-    project_role = clean_text(item.project_role) or None
-    objective = clean_text(item.description) or None
-    actions = clean_text(item.responsibilities) or None
-    results = clean_text(item.results) or None
+    raw_company, norm_company, company_status = normalize_company(item.company_name)
+    project_name = clean_text(item.project_title) or None
+    parsed_role, parsed_objective, parsed_actions, parsed_results = parse_project_description(
+        item.work_description
+    )
+    project_role = clean_text(parsed_role) or None
+    objective = clean_text(parsed_objective) or None
+    actions = clean_text(parsed_actions) or None
+    results = clean_text(parsed_results) or None
     evidence = [
         part for part in (project_name, raw_company, project_role, objective, actions, results) if part
     ]
@@ -292,9 +363,10 @@ def _normalize_project(item: ProjectSource, *, data_version: str, build_batch_id
     }
     return ProjectStage(
         expert_id=item.expert_id,
-        source_table=item.source_table,
-        source_record_id=item.source_record_id,
-        source_item_key=item.source_item_key,
+        source_table="experts_project_experience",
+        source_field="project_title+company_name+start_date+end_date+work_description",
+        source_field_id=str(item.id),
+        source_item_key=str(item.id),
         project_name=project_name,
         company_or_client_raw=raw_company,
         company_or_client_norm=norm_company,
@@ -307,7 +379,7 @@ def _normalize_project(item: ProjectSource, *, data_version: str, build_batch_id
         results_clean=results,
         industry_codes=_codes(evidence, INDUSTRY_RULES),
         topic_codes=_codes(evidence, TOPIC_RULES),
-        parse_status=item.parse_status,
+        parse_status="complete",
         source_hash=source_hash(allowed),
         source_updated_at=item.updated_at or item.created_at,
         data_version=data_version,
