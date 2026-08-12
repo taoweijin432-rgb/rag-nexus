@@ -64,7 +64,7 @@ def contract_milvus_field_specs(
         MilvusFieldSpec("weight_tier", "VARCHAR", max_length=4),
         MilvusFieldSpec("is_active", "BOOL"),
         MilvusFieldSpec("source_table", "VARCHAR", max_length=512),
-        MilvusFieldSpec("source_record_id", "VARCHAR", max_length=512),
+        MilvusFieldSpec("source_field_id", "VARCHAR", max_length=256),
         MilvusFieldSpec("source_item_key", "VARCHAR", max_length=512),
         MilvusFieldSpec("source_field", "VARCHAR", max_length=512),
         MilvusFieldSpec("source_hash", "VARCHAR", max_length=64),

@@ -148,7 +148,7 @@ def embedded_contract_chunks() -> list[EmbeddedContractPreparedChunk]:
 
 def contract_settings() -> MilvusSettings:
     return MilvusSettings(
-        collection_name="expert_candidates_v12_contract_dev",
+        collection_name="expert_candidates_v13_contract_dev",
         index_type="HNSW",
         metric_type="COSINE",
         index_params={"M": 16, "efConstruction": 200},
@@ -166,7 +166,8 @@ def test_milvus_row_mapper_preserves_scalars_and_nested_contracts() -> None:
     assert entity.company_name_norm == chunk.metadata.company_name_norm
     assert entity.role_code == chunk.metadata.role_code
     assert entity.source_table == chunk.source.source_table
-    assert entity.source_record_id == chunk.source.source_field_id
+    assert entity.source_field_id == chunk.source.source_field_id
+    assert "source_record_id" not in entity.model_dump()
     assert entity.chunk_policy_version == chunk.versions.chunk_policy_version
     assert entity.metadata_ext == chunk.metadata.model_dump(mode="json")
     assert entity.source_ext == chunk.source.model_dump(mode="json")
@@ -292,6 +293,10 @@ def test_contract_repository_upsert_uses_row_mapper() -> None:
     assert rows[1]["source_ext"] == chunks[1].source.model_dump(mode="json")
     assert rows[2]["versions_ext"] == chunks[2].versions.model_dump(mode="json")
     assert client.drop_calls == []
+    model_space_queries = [
+        call for call in client.query_calls if "embedding_model_alias" in call["output_fields"]
+    ]
+    assert model_space_queries[0]["filter"] == "embedding_dim >= 0"
 
 
 def test_contract_repository_rejects_mixed_batch_model_space_before_upsert() -> None:

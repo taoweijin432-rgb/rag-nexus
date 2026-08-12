@@ -9,7 +9,7 @@
     set -a; source .env; set +a
     uv run --no-sync python scripts/task2_acceptance.py \
         --input fixtures/expert_999641217.jsonl \
-        --collection expert_candidates_v12_contract_dev \
+        --collection expert_candidates_v13_contract_dev \
         --report reports/task2_acceptance.json
 """
 
@@ -42,7 +42,7 @@ from rag_vector_store.milvus.compatibility import datatype_name
 
 _PROJECT_ROOT = Path(__file__).resolve().parents[1]
 _DEFAULT_INPUT = _PROJECT_ROOT / "fixtures" / "expert_999641217.jsonl"
-_DEFAULT_COLLECTION = "expert_candidates_v12_contract_dev"
+_DEFAULT_COLLECTION = "expert_candidates_v13_contract_dev"
 _DEFAULT_REPORT = _PROJECT_ROOT / "reports" / "task2_acceptance.json"
 _DEFAULT_EXPECTED_COUNT = 7
 _MISSING_VECTOR_DOC_ID = "task2-acceptance:999641217:does-not-exist"
@@ -68,6 +68,7 @@ _QUERY_FIELDS = [
     "chunk_id",
     "expert_id",
     "chunk_type",
+    "source_field_id",
     "metadata_ext",
     "source_ext",
     "versions_ext",
@@ -625,6 +626,7 @@ def _matching_fields(
         "chunk_id": row.get("chunk_id") == record.chunk_id,
         "expert_id": row.get("expert_id") == record.expert_id,
         "chunk_type": row.get("chunk_type") == record.chunk_type,
+        "source_field_id": row.get("source_field_id") == record.source.source_field_id,
         "metadata": row.get("metadata_ext") == record.metadata.model_dump(mode="json"),
         "source": row.get("source_ext") == record.source.model_dump(mode="json"),
         "versions": row.get("versions_ext") == record.versions.model_dump(mode="json"),

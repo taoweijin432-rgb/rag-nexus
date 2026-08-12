@@ -43,7 +43,7 @@ CONTRACT_FIELD_NAMES = (
     "weight_tier",
     "is_active",
     "source_table",
-    "source_record_id",
+    "source_field_id",
     "source_item_key",
     "source_field",
     "source_hash",
@@ -61,7 +61,7 @@ CONTRACT_FIELD_NAMES = (
 
 def _contract_settings() -> MilvusSettings:
     return MilvusSettings(
-        collection_name="expert_candidates_v12_contract_dev",
+        collection_name="expert_candidates_v13_contract_dev",
         index_type="HNSW",
         metric_type="COSINE",
         index_params={"M": 16, "efConstruction": 200},
@@ -108,6 +108,10 @@ def test_contract_schema_provider_preserves_the_40_field_contract() -> None:
     assert tuple(spec.name for spec in specs) == CONTRACT_FIELD_NAMES
     assert specs[11].name == "embedding"
     assert specs[11].dim == 1024
+    source_field_id = next(spec for spec in specs if spec.name == "source_field_id")
+    assert source_field_id.datatype == "VARCHAR"
+    assert source_field_id.nullable is False
+    assert source_field_id.max_length == 256
 
 
 def test_index_provider_preserves_contract_vector_and_scalar_indexes() -> None:

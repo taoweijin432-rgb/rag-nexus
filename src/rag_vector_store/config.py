@@ -35,7 +35,7 @@ class MilvusSettings(BaseModel):
     timeout: float | None = Field(default=None, gt=0)
 
     collection_name: str = Field(
-        default="expert_candidates_v12_contract_dev",
+        default="expert_candidates_v13_contract_dev",
         min_length=1,
     )
     schema_mode: SchemaMode = "contract"
@@ -87,7 +87,7 @@ class MilvusSettings(BaseModel):
             "collection_name": _get(
                 env,
                 "MILVUS_COLLECTION_NAME",
-                "expert_candidates_v12_contract_dev",
+                "expert_candidates_v13_contract_dev",
             ),
             "schema_mode": _get(env, "MILVUS_SCHEMA_MODE", "contract"),
             "index_type": _get(env, "MILVUS_INDEX_TYPE", "AUTOINDEX"),

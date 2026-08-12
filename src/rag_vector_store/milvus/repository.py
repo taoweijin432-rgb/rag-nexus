@@ -407,7 +407,10 @@ class ContractMilvusVectorRepository:
 
         rows = self._get_client().query(
             collection_name=self.settings.collection_name,
-            filter="",
+            # Milvus 不允许在没有 limit 时使用空表达式；embedding_dim 是正式
+            # Contract 的非空正整数投影，用它做全量筛选可同时覆盖空 Collection，
+            # 并保留对已有所有 Entity 的 model-space 检查。
+            filter="embedding_dim >= 0",
             output_fields=[
                 "embedding_model_alias",
                 "embedding_model_version",
