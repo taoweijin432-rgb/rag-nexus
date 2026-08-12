@@ -121,7 +121,6 @@ def make_record() -> ExpertChunkEmbeddingInput:
         },
         source={
             "source_table": "dev_experts",
-            "source_record_id": "900001",
             "source_item_key": "test-profile",
             "source_field": "background",
             "source_field_id": "dev_experts:900001:background",

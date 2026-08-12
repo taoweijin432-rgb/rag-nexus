@@ -97,6 +97,9 @@ def test_generated_json_schema_is_strict_contract_v200() -> None:
         "vector_doc_id",
     }
     assert "vector_doc_id" in schema["$defs"]["ExpertChunkMetadata"]["required"]
+    source_schema = schema["$defs"]["ExpertChunkSource"]
+    assert "source_record_id" not in source_schema["properties"]
+    assert "source_field_id" in source_schema["required"]
 
 
 def test_contract_version_error_is_rejected() -> None:

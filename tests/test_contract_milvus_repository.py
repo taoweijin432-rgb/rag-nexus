@@ -160,6 +160,7 @@ def test_milvus_row_mapper_preserves_scalars_and_nested_contracts() -> None:
     assert entity.company_name_norm == chunk.metadata.company_name_norm
     assert entity.role_code == chunk.metadata.role_code
     assert entity.source_table == chunk.source.source_table
+    assert entity.source_record_id == chunk.source.source_field_id
     assert entity.chunk_policy_version == chunk.versions.chunk_policy_version
     assert entity.metadata_ext == chunk.metadata.model_dump(mode="json")
     assert entity.source_ext == chunk.source.model_dump(mode="json")

@@ -157,7 +157,9 @@ class MilvusRowMapper:
             weight_tier=chunk.metadata.weight_tier,
             is_active=chunk.is_active,
             source_table=chunk.source.source_table,
-            source_record_id=chunk.source.source_record_id,
+            # 物理 Collection 仍保留历史 source_record_id 列；Contract 已统一为
+            # source_field_id，因此这里只做存储列兼容投影，不向 Contract 暴露旧字段。
+            source_record_id=chunk.source.source_field_id,
             source_item_key=chunk.source.source_item_key,
             source_field=chunk.source.source_field,
             source_hash=chunk.source.source_hash,

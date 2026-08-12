@@ -86,7 +86,6 @@ def _row(
         "char_count": len("unchanged text"),
         "metadata_json": json.dumps(_metadata()) if metadata is None else metadata,
         "source_table": "resume_experience",
-        "source_record_id": "record-7",
         "source_item_key": "experience-0",
         "source_field": "description",
         "source_field_id": "description-0",
@@ -133,6 +132,8 @@ def test_reader_maps_mysql_row_without_using_id_as_chunk_id() -> None:
     assert record.chunk_text == "unchanged text"
     assert record.metadata.role_code == "software_engineer"
     assert record.source.source_hash == "a" * 64
+    assert record.source.source_field_id == "description-0"
+    assert not hasattr(record.source, "source_record_id")
     assert record.source.source_updated_at == "2026-08-11T16:28:36+08:00"
     assert record.versions.data_version == "data-v1"
     assert record.updated_at == "2026-08-11T16:28:47.391385+08:00"

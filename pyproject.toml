@@ -20,7 +20,7 @@ dev = [
 ]
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/expert_index", "src/rag_vector_store"]
+packages = ["src/expert_contracts", "src/expert_index", "src/rag_vector_store"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

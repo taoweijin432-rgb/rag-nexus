@@ -38,7 +38,6 @@ MYSQL_EXPERT_CHUNK_SELECT_COLUMNS = (
     "char_count",
     "metadata_json",
     "source_table",
-    "source_record_id",
     "source_item_key",
     "source_field",
     "source_field_id",
@@ -210,7 +209,6 @@ class MySqlExpertChunkReader:
                 "metadata": metadata,
                 "source": {
                     "source_table": values["source_table"],
-                    "source_record_id": values["source_record_id"],
                     "source_item_key": values["source_item_key"],
                     "source_field": values["source_field"],
                     "source_field_id": values["source_field_id"],
