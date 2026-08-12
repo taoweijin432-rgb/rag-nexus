@@ -1,6 +1,12 @@
 """Expert Chunk 的兼容类型、正式 Contract 校验与 Embedding 边界。"""
 
 from .builder import ChunkBuilder
+from .contract_ingestion import (
+    ContractIngestionError,
+    ContractIngestionResult,
+    ContractIngestionService,
+    ContractRepository,
+)
 from .contract_pipeline import (
     EXPECTED_EMBEDDING_DIMENSION,
     ContractEmbeddingResult,
@@ -36,7 +42,11 @@ __all__ = [
     "ChunkBuilder",
     "ContractEmbeddingResult",
     "ContractEmbeddingWorker",
+    "ContractIngestionError",
+    "ContractIngestionResult",
+    "ContractIngestionService",
     "ContractPreparedChunk",
+    "ContractRepository",
     "ContractValidationError",
     "ContractValidator",
     "EmbeddedContractPreparedChunk",
