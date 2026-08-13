@@ -28,9 +28,9 @@ class MilvusSettings(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     uri: str = Field(default="http://localhost:19530", min_length=1)
-    token: str | None = None
+    token: SecretStr | None = None
     user: str | None = None
-    password: str | None = None
+    password: SecretStr | None = None
     db_name: str | None = None
     timeout: float | None = Field(default=None, gt=0)
 
@@ -39,9 +39,11 @@ class MilvusSettings(BaseModel):
         min_length=1,
     )
     schema_mode: SchemaMode = "contract"
-    index_type: str = Field(default="AUTOINDEX", min_length=1)
+    index_type: str = Field(default="HNSW", min_length=1)
     metric_type: str = Field(default="COSINE", min_length=1)
-    index_params: dict[str, Any] = Field(default_factory=dict)
+    index_params: dict[str, Any] = Field(
+        default_factory=lambda: {"M": 16, "efConstruction": 200}
+    )
 
     @model_validator(mode="after")
     def validate_authentication(self) -> MilvusSettings:
@@ -59,10 +61,10 @@ class MilvusSettings(BaseModel):
 
         kwargs: dict[str, Any] = {"uri": self.uri}
         if self.token is not None:
-            kwargs["token"] = self.token
+            kwargs["token"] = self.token.get_secret_value()
         elif self.user is not None and self.password is not None:
             kwargs["user"] = self.user
-            kwargs["password"] = self.password
+            kwargs["password"] = self.password.get_secret_value()
         if self.db_name is not None:
             kwargs["db_name"] = self.db_name
         if self.timeout is not None:
@@ -90,7 +92,7 @@ class MilvusSettings(BaseModel):
                 "expert_candidates_v13_contract_dev",
             ),
             "schema_mode": _get(env, "MILVUS_SCHEMA_MODE", "contract"),
-            "index_type": _get(env, "MILVUS_INDEX_TYPE", "AUTOINDEX"),
+            "index_type": _get(env, "MILVUS_INDEX_TYPE", "HNSW"),
             "metric_type": _get(env, "MILVUS_METRIC_TYPE", "COSINE"),
         }
 

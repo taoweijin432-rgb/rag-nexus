@@ -717,7 +717,12 @@ def _record_failure(
 
 def _safe_error(exc: Exception) -> dict[str, str]:
     message = " ".join(str(exc).split())
-    for env_name in ("MILVUS_TOKEN", "MILVUS_PASSWORD", "EMBEDDING_API_KEY"):
+    for env_name in (
+        "MILVUS_TOKEN",
+        "MILVUS_PASSWORD",
+        "MYSQL_PASSWORD",
+        "EMBEDDING_API_KEY",
+    ):
         secret = os.environ.get(env_name)
         if secret:
             message = message.replace(secret, "<redacted>")
