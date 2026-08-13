@@ -133,16 +133,22 @@ class MySQLIndexRepository:
             INSERT INTO expert_index_stage(
                 expert_id, serial_number, company_name_raw, company_name_norm,
                 company_normalization_status, role_name_raw, role_code, role_level,
-                background_clean, school_names_json, work_years, source_hash,
+                job_status_norm, abroad_flag_norm, background_clean,
+                school_names_json, major_names_json, work_years,
+                eligible_for_recommendation, source_hash,
                 source_updated_at, data_version, stage_status, build_batch_id
-            ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,'ready',%s)
+            ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,'ready',%s)
             ON DUPLICATE KEY UPDATE
                 serial_number=VALUES(serial_number), company_name_raw=VALUES(company_name_raw),
                 company_name_norm=VALUES(company_name_norm),
                 company_normalization_status=VALUES(company_normalization_status),
                 role_name_raw=VALUES(role_name_raw), role_code=VALUES(role_code),
-                role_level=VALUES(role_level), background_clean=VALUES(background_clean),
-                school_names_json=VALUES(school_names_json), work_years=VALUES(work_years),
+                role_level=VALUES(role_level), job_status_norm=VALUES(job_status_norm),
+                abroad_flag_norm=VALUES(abroad_flag_norm),
+                background_clean=VALUES(background_clean),
+                school_names_json=VALUES(school_names_json),
+                major_names_json=VALUES(major_names_json), work_years=VALUES(work_years),
+                eligible_for_recommendation=VALUES(eligible_for_recommendation),
                 source_hash=VALUES(source_hash), source_updated_at=VALUES(source_updated_at),
                 data_version=VALUES(data_version), stage_status='ready', reject_reason=NULL,
                 build_batch_id=VALUES(build_batch_id)
@@ -150,8 +156,11 @@ class MySQLIndexRepository:
             (
                 item.expert_id, item.serial_number, item.company_name_raw, item.company_name_norm,
                 item.company_normalization_status, item.role_name_raw, item.role_code,
-                item.role_level, item.background_clean, _json(list(item.school_names)),
-                item.work_years, item.source_hash, item.source_updated_at, item.data_version,
+                item.role_level, item.job_status_norm, item.abroad_flag_norm,
+                item.background_clean, _json(list(item.school_names_raw)),
+                _json(list(item.major_names_raw)), item.work_years,
+                item.eligible_for_recommendation, item.source_hash,
+                item.source_updated_at, item.data_version,
                 item.build_batch_id,
             ),
         )
@@ -165,9 +174,9 @@ class MySQLIndexRepository:
                 company_name_raw, company_name_norm, company_normalization_status,
                 role_name_raw, role_code, role_level, start_month, end_month, is_current,
                 responsibilities_clean, achievements_clean, industry_codes_json,
-                topic_codes_json, parse_status, source_hash, source_updated_at,
+                topic_codes_json, source_hash, source_updated_at,
                 data_version, build_batch_id
-            ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+            ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
             """,
             (
                 item.expert_id, item.source_table, item.source_field, item.source_field_id,
@@ -177,8 +186,8 @@ class MySQLIndexRepository:
                 item.role_level, item.start_month, item.end_month, item.is_current,
                 item.responsibilities_clean, item.achievements_clean,
                 _json(list(item.industry_codes)), _json(list(item.topic_codes)),
-                item.parse_status, item.source_hash, item.source_updated_at,
-                item.data_version, item.build_batch_id,
+                item.source_hash, item.source_updated_at, item.data_version,
+                item.build_batch_id,
             ),
         )
 
@@ -190,21 +199,21 @@ class MySQLIndexRepository:
                 expert_id, source_table, source_field, source_field_id, source_item_key,
                 project_name,
                 company_or_client_raw, company_or_client_norm,
-                company_normalization_status, project_role, start_month, end_month,
+                company_normalization_status, start_month, end_month,
                 objective_clean, actions_clean, results_clean, industry_codes_json,
-                topic_codes_json, parse_status, source_hash, source_updated_at,
+                topic_codes_json, source_hash, source_updated_at,
                 data_version, build_batch_id
-            ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+            ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
             """,
             (
                 item.expert_id, item.source_table, item.source_field, item.source_field_id,
                 item.source_item_key, item.project_name, item.company_or_client_raw,
                 item.company_or_client_norm,
-                item.company_normalization_status, item.project_role, item.start_month,
+                item.company_normalization_status, item.start_month,
                 item.end_month, item.objective_clean, item.actions_clean, item.results_clean,
                 _json(list(item.industry_codes)), _json(list(item.topic_codes)),
-                item.parse_status, item.source_hash, item.source_updated_at,
-                item.data_version, item.build_batch_id,
+                item.source_hash, item.source_updated_at, item.data_version,
+                item.build_batch_id,
             ),
         )
 
@@ -213,53 +222,75 @@ class MySQLIndexRepository:
         cursor.execute(
             """
             INSERT INTO expert_chunk(
-                chunk_id, expert_id, serial_number, chunk_type, chunk_subtype,
+                chunk_id, vector_doc_id, expert_id, serial_number, chunk_type, chunk_subtype,
                 chunk_index, chunk_total, chunk_text, char_count, token_count_estimate,
-                metadata_json, source_table, source_field, source_field_id, source_item_key,
-                source_version, source_updated_at,
-                source_hash, content_hash, company_name_norm, role_code, start_month,
-                end_month, is_current, industry_codes_json, topic_codes_json,
+                source_table, source_field, source_field_id, source_item_key,
+                source_version, source_updated_at, source_hash, content_hash, metadata_hash,
+                company_name_raw, company_name_norm, role_name_raw, role_code, role_level,
+                job_status_norm, abroad_flag_norm, work_years, project_name,
+                start_month, end_month, is_current,
+                industry_codes, function_codes, topic_codes,
+                school_names_raw, major_names_raw, eligible_for_recommendation,
                 origin_type, verification_status, weight_tier, chunk_policy_version,
                 metadata_schema_version, dictionary_version, data_version,
+                embedding_model_alias, embedding_model_version, indexed_at,
                 is_active, build_batch_id
             ) VALUES (
                 %s,%s,%s,%s,%s,%s,%s,%s,%s,%s,
                 %s,%s,%s,%s,%s,%s,%s,%s,%s,%s,
                 %s,%s,%s,%s,%s,%s,%s,%s,%s,%s,
-                %s,%s,%s,1,%s
+                %s,%s,%s,%s,%s,%s,%s,%s,%s,%s,
+                %s,%s,%s,%s,%s,%s,%s,%s,%s,%s
             )
             ON DUPLICATE KEY UPDATE
-                serial_number=VALUES(serial_number), chunk_type=VALUES(chunk_type),
+                vector_doc_id=VALUES(vector_doc_id), serial_number=VALUES(serial_number),
+                chunk_type=VALUES(chunk_type),
                 chunk_subtype=VALUES(chunk_subtype), chunk_index=VALUES(chunk_index),
                 chunk_total=VALUES(chunk_total), chunk_text=VALUES(chunk_text),
                 char_count=VALUES(char_count), token_count_estimate=VALUES(token_count_estimate),
-                metadata_json=VALUES(metadata_json), source_table=VALUES(source_table),
-                source_field=VALUES(source_field), source_field_id=VALUES(source_field_id),
-                source_item_key=VALUES(source_item_key),
+                source_table=VALUES(source_table), source_field=VALUES(source_field),
+                source_field_id=VALUES(source_field_id), source_item_key=VALUES(source_item_key),
                 source_version=VALUES(source_version), source_updated_at=VALUES(source_updated_at),
                 source_hash=VALUES(source_hash), content_hash=VALUES(content_hash),
-                company_name_norm=VALUES(company_name_norm), role_code=VALUES(role_code),
+                metadata_hash=VALUES(metadata_hash),
+                company_name_raw=VALUES(company_name_raw),
+                company_name_norm=VALUES(company_name_norm),
+                role_name_raw=VALUES(role_name_raw), role_code=VALUES(role_code),
+                role_level=VALUES(role_level), job_status_norm=VALUES(job_status_norm),
+                abroad_flag_norm=VALUES(abroad_flag_norm), work_years=VALUES(work_years),
+                project_name=VALUES(project_name),
                 start_month=VALUES(start_month), end_month=VALUES(end_month),
-                is_current=VALUES(is_current), industry_codes_json=VALUES(industry_codes_json),
-                topic_codes_json=VALUES(topic_codes_json), origin_type=VALUES(origin_type),
+                is_current=VALUES(is_current), industry_codes=VALUES(industry_codes),
+                function_codes=VALUES(function_codes), topic_codes=VALUES(topic_codes),
+                school_names_raw=VALUES(school_names_raw),
+                major_names_raw=VALUES(major_names_raw),
+                eligible_for_recommendation=VALUES(eligible_for_recommendation),
+                origin_type=VALUES(origin_type),
                 verification_status=VALUES(verification_status), weight_tier=VALUES(weight_tier),
                 chunk_policy_version=VALUES(chunk_policy_version),
                 metadata_schema_version=VALUES(metadata_schema_version),
                 dictionary_version=VALUES(dictionary_version), data_version=VALUES(data_version),
-                is_active=1, build_batch_id=VALUES(build_batch_id)
+                is_active=VALUES(is_active), build_batch_id=VALUES(build_batch_id)
             """,
             (
-                item.chunk_id, item.expert_id, item.serial_number, item.chunk_type,
+                item.chunk_id, item.vector_doc_id, item.expert_id, item.serial_number, item.chunk_type,
                 item.chunk_subtype, item.chunk_index, item.chunk_total, item.chunk_text,
-                item.char_count, max(1, item.char_count // 2), _json(item.metadata),
-                item.source_table, item.source_field, item.source_field_id,
+                item.char_count, max(1, item.char_count // 2), item.source_table,
+                item.source_field, item.source_field_id,
                 item.source_item_key, item.source_version,
                 item.source_updated_at, item.source_hash, item.content_hash,
-                item.company_name_norm, item.role_code, item.start_month, item.end_month,
-                item.is_current, _json(list(item.industry_codes)), _json(list(item.topic_codes)),
+                item.metadata_hash, item.company_name_raw, item.company_name_norm,
+                item.role_name_raw, item.role_code, item.role_level, item.job_status_norm,
+                item.abroad_flag_norm, item.work_years, item.project_name,
+                item.start_month, item.end_month, item.is_current,
+                _json(list(item.industry_codes)), _json(list(item.function_codes)),
+                _json(list(item.topic_codes)), _json(list(item.school_names_raw)),
+                _json(list(item.major_names_raw)), item.eligible_for_recommendation,
                 item.origin_type, item.verification_status, item.weight_tier,
                 item.chunk_policy_version, item.metadata_schema_version,
-                item.dictionary_version, item.data_version, item.build_batch_id,
+                item.dictionary_version, item.data_version, item.embedding_model_alias,
+                item.embedding_model_version, item.indexed_at, item.is_active,
+                item.build_batch_id,
             ),
         )
 
@@ -279,15 +310,21 @@ class MySQLIndexRepository:
     def fetch_active_chunks(self, expert_id: int, *, eligible_only: bool = False) -> list[dict[str, Any]]:
         """读取导出所需固定列；可选择只取正式向量化允许的记录。"""
 
-        eligibility = " AND verification_status IN ('source_evidence','validated') AND weight_tier IN ('A','B')" if eligible_only else ""
+        eligibility = " AND verification_status IN ('verified','source_summary') AND weight_tier IN ('A','B')" if eligible_only else ""
         sql = f"""
-            SELECT chunk_id, expert_id, serial_number, chunk_type, chunk_subtype,
+            SELECT chunk_id, vector_doc_id, expert_id, serial_number, chunk_type, chunk_subtype,
                    chunk_index, chunk_total, chunk_text, char_count, content_hash,
-                   metadata_json, source_table, source_field, source_field_id,
+                   metadata_hash, source_table, source_field, source_field_id,
                    source_item_key, source_version, source_updated_at,
-                   source_hash, chunk_policy_version, metadata_schema_version,
-                   dictionary_version, data_version, is_active, updated_at,
-                   verification_status, weight_tier
+                   source_hash, company_name_raw, company_name_norm,
+                   role_name_raw, role_code, role_level, job_status_norm,
+                   abroad_flag_norm, work_years, project_name, start_month, end_month,
+                   is_current, industry_codes, function_codes, topic_codes,
+                   school_names_raw, major_names_raw, eligible_for_recommendation,
+                   origin_type, verification_status, weight_tier,
+                   chunk_policy_version, metadata_schema_version,
+                   dictionary_version, data_version, embedding_model_alias,
+                   embedding_model_version, indexed_at, is_active, updated_at
             FROM expert_chunk
             WHERE expert_id=%s AND is_active=1 {eligibility}
             ORDER BY FIELD(chunk_type,'profile_summary','employment','project'),

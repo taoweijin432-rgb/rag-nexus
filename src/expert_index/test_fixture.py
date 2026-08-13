@@ -1,7 +1,7 @@
 """测试环境完整专家 Fixture 的幂等写入器。
 
 本模块会写业务源表，因此不会被普通 ``build`` 隐式调用；只有操作者显式执行
-``seed-test-expert`` 才会运行。三张表在一个 MySQL 事务中创建或更新，任何失败都
+``seed-test-expert`` 才会运行。四张表在一个 MySQL 事务中创建或更新，任何失败都
 整体回滚。所有内容都带“流程测试/虚构”标记，不使用真实姓名或联系方式。
 """
 
@@ -58,6 +58,16 @@ class ProjectFixture:
     start_date: str
     end_date: str
     description: str
+
+
+@dataclass(frozen=True)
+class EducationFixture:
+    """一段虚构教育经历；学校和专业会进入 profile_summary Metadata。"""
+
+    school_name: str
+    major: str
+    start_date: str
+    end_date: str
 
 
 # 三段任职覆盖“当前 + 两段历史”，用于验证多个 source_field_id 仍属于同一专家。
@@ -132,6 +142,23 @@ PROJECT_FIXTURES = (
 )
 
 
+# 两段教育经历用于验证 education 表不会独立生成 Chunk，而会被聚合进画像 Metadata。
+EDUCATION_FIXTURES = (
+    EducationFixture(
+        school_name="华东流程测试大学",
+        major="信息管理与信息系统",
+        start_date="2010-09-01 00:00:00",
+        end_date="2014-06-01 00:00:00",
+    ),
+    EducationFixture(
+        school_name="国际流程测试商学院",
+        major="数字化管理",
+        start_date="2019-09-01 00:00:00",
+        end_date="2021-06-01 00:00:00",
+    ),
+)
+
+
 @dataclass(frozen=True)
 class TestFixtureResult:
     """可安全打印的 Fixture 主键结果；数组顺序与 Fixture 定义顺序一致。"""
@@ -139,11 +166,12 @@ class TestFixtureResult:
     expert_id: int
     work_experience_ids: tuple[int, ...]
     project_experience_ids: tuple[int, ...]
+    education_experience_ids: tuple[int, ...]
     serial_number: str = TEST_EXPERT_SERIAL
 
 
 def ensure_complete_test_expert(config: DatabaseConfig) -> TestFixtureResult:
-    """在测试库幂等创建一位主档、任职、项目均完整关联的虚构专家。"""
+    """在测试库幂等创建主档及工作、项目、教育经历均关联的虚构专家。"""
 
     connection = pymysql.connect(**config.as_kwargs())
     try:
@@ -153,10 +181,14 @@ def ensure_complete_test_expert(config: DatabaseConfig) -> TestFixtureResult:
             project_ids = tuple(
                 _upsert_project(cursor, expert_id, item) for item in PROJECT_FIXTURES
             )
+            education_ids = tuple(
+                _upsert_education(cursor, expert_id, item)
+                for item in EDUCATION_FIXTURES
+            )
         connection.commit()
-        return TestFixtureResult(expert_id, work_ids, project_ids)
+        return TestFixtureResult(expert_id, work_ids, project_ids, education_ids)
     except Exception:
-        # 三张源表必须保持全有或全无；失败时不允许留下孤立经历记录。
+        # 四张源表必须保持全有或全无；失败时不允许留下孤立经历记录。
         connection.rollback()
         raise
     finally:
@@ -182,6 +214,7 @@ def _upsert_expert(cursor: object) -> int:
             UPDATE experts
             SET name='流程测试专家A001', interview_nickname='流程测试专家',
                 company=%s, job_status=1, job_name=%s, background=%s,
+                contact_status=1, doubtful_flag=0, abroad_flag=1,
                 source_type=99, work_years=12, education='本科', gender=0,
                 email='', phone='', other_contacts='', deleted_at=NULL,
                 updated_at=CURRENT_TIMESTAMP(3)
@@ -195,11 +228,12 @@ def _upsert_expert(cursor: object) -> int:
         """
         INSERT INTO experts(
             serial_number, name, interview_nickname, company, job_status,
-            job_name, background, source_type, work_years, education, gender,
+            job_name, contact_status, doubtful_flag, abroad_flag,
+            background, source_type, work_years, education, gender,
             email, phone, other_contacts, created_at, updated_at
         ) VALUES (
             %s, '流程测试专家A001', '流程测试专家', %s, 1,
-            %s, %s, 99, 12, '本科', 0,
+            %s, 1, 0, 1, %s, 99, 12, '本科', 0,
             '', '', '', CURRENT_TIMESTAMP(3), CURRENT_TIMESTAMP(3)
         )
         """,
@@ -284,6 +318,45 @@ def _upsert_project(cursor: object, expert_id: int, item: ProjectFixture) -> int
         (
             item.company, item.start_date, item.end_date, item.title,
             item.description, expert_id,
+        ),
+    )
+    return int(cursor.lastrowid)
+
+
+def _upsert_education(cursor: object, expert_id: int, item: EducationFixture) -> int:
+    """按专家、学校和专业幂等创建/恢复一段虚构教育经历。"""
+
+    cursor.execute(
+        """
+        SELECT id FROM experts_education_experience
+        WHERE expert_id=%s AND school_name=%s AND major=%s
+        ORDER BY id LIMIT 1 FOR UPDATE
+        """,
+        (expert_id, item.school_name, item.major),
+    )
+    row = cursor.fetchone()
+    if row:
+        record_id = int(row["id"])
+        cursor.execute(
+            """
+            UPDATE experts_education_experience
+            SET start_date=%s, end_date=%s, deleted_at=NULL,
+                updated_at=CURRENT_TIMESTAMP
+            WHERE id=%s
+            """,
+            (item.start_date, item.end_date, record_id),
+        )
+        return record_id
+    cursor.execute(
+        """
+        INSERT INTO experts_education_experience(
+            expert_id, school_name, major, start_date, end_date,
+            created_at, updated_at
+        ) VALUES (%s, %s, %s, %s, %s, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+        """,
+        (
+            expert_id, item.school_name, item.major,
+            item.start_date, item.end_date,
         ),
     )
     return int(cursor.lastrowid)

@@ -12,11 +12,18 @@ import unittest
 from dataclasses import fields, replace
 from datetime import datetime
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 from expert_index.chunk_builder import ChunkFactory
 from expert_index.config import DatabaseConfig, Settings
 from expert_index.exporter import export_jsonl
-from expert_index.models import ExpertAggregate, ExpertSource, EmploymentSource, ProjectSource
+from expert_index.models import (
+    EducationSource,
+    EmploymentSource,
+    ExpertAggregate,
+    ExpertSource,
+    ProjectSource,
+)
 from expert_index.normalize import (
     clean_text,
     employment_status,
@@ -27,7 +34,13 @@ from expert_index.normalize import (
     sha256_value,
 )
 from expert_index.repository import MySQLIndexRepository
-from expert_index.test_fixture import PROJECT_FIXTURES, TEST_EXPERT_SERIAL, WORK_FIXTURES
+from expert_index.source import MySQLSourceAdapter
+from expert_index.test_fixture import (
+    EDUCATION_FIXTURES,
+    PROJECT_FIXTURES,
+    TEST_EXPERT_SERIAL,
+    WORK_FIXTURES,
+)
 from expert_index.validators import validate_chunks
 
 
@@ -41,17 +54,21 @@ def _settings() -> Settings:
 def _aggregate(long_employment: bool = False) -> ExpertAggregate:
     """返回含三类来源的虚构专家快照。"""
 
-    when = datetime(2026, 8, 11, 10, 0, 0)
+    when = datetime(2026, 8, 11, 10, 0, 0, tzinfo=ZoneInfo("Asia/Shanghai"))
     profile = ExpertSource(
         id=24,
         serial_number="EXP000024",
         company="京东零售集团有限公司",
+        job_status=1,
         job_name="运营负责人",
+        contact_status=1,
+        doubtful_flag=0,
+        abroad_flag=1,
         background="8年电商运营经验，邮箱 fake@example.com，手机号 13800138000。",
-        edu_experience=None,
         work_years=8,
         updated_at=when,
         created_at=when,
+        deleted_at=None,
     )
     responsibility = "负责品类规划、供应商管理，年度GMV达到5000万元。"
     if long_employment:
@@ -61,8 +78,8 @@ def _aggregate(long_employment: bool = False) -> ExpertAggregate:
         expert_id=24,
         company_name="京东零售集团有限公司",
         position_title="运营负责人",
-        start_date=datetime(2018, 3, 1),
-        end_date=datetime(2021, 6, 1),
+        start_date=datetime(2018, 3, 1, tzinfo=ZoneInfo("Asia/Shanghai")),
+        end_date=datetime(2021, 6, 1, tzinfo=ZoneInfo("Asia/Shanghai")),
         work_description=(
             f"工作职责：{responsibility}\n"
             "代表性成果：年度GMV达到5000万元。"
@@ -70,14 +87,15 @@ def _aggregate(long_employment: bool = False) -> ExpertAggregate:
         is_employed=2,
         updated_at=when,
         created_at=when,
+        deleted_at=None,
     )
     project = ProjectSource(
         id=2001,
         expert_id=24,
         project_title="组合投放优化",
         company_name="京东零售集团有限公司",
-        start_date=datetime(2024, 1, 1),
-        end_date=datetime(2024, 6, 1),
+        start_date=datetime(2024, 1, 1, tzinfo=ZoneInfo("Asia/Shanghai")),
+        end_date=datetime(2024, 6, 1, tzinfo=ZoneInfo("Asia/Shanghai")),
         work_description=(
             "项目角色：项目负责人\n"
             "项目目标：提升广告投放效率。\n"
@@ -86,8 +104,18 @@ def _aggregate(long_employment: bool = False) -> ExpertAggregate:
         ),
         updated_at=when,
         created_at=when,
+        deleted_at=None,
     )
-    return ExpertAggregate(profile, (employment,), (project,))
+    education = EducationSource(
+        id=3001,
+        expert_id=24,
+        school_name="华东流程测试大学",
+        major="信息管理与信息系统",
+        updated_at=when,
+        created_at=when,
+        deleted_at=None,
+    )
+    return ExpertAggregate(profile, (employment,), (project,), (education,))
 
 
 class CleanerTest(unittest.TestCase):
@@ -116,7 +144,8 @@ class SourceMappingTest(unittest.TestCase):
         self.assertEqual(
             {
                 "id", "serial_number", "company", "job_name", "background",
-                "edu_experience", "work_years", "updated_at", "created_at",
+                "job_status", "contact_status", "doubtful_flag", "abroad_flag",
+                "work_years", "updated_at", "created_at", "deleted_at",
             },
             {item.name for item in fields(ExpertSource)},
         )
@@ -124,6 +153,7 @@ class SourceMappingTest(unittest.TestCase):
             {
                 "id", "expert_id", "company_name", "position_title", "start_date",
                 "end_date", "work_description", "is_employed", "updated_at", "created_at",
+                "deleted_at",
             },
             {item.name for item in fields(EmploymentSource)},
         )
@@ -131,14 +161,23 @@ class SourceMappingTest(unittest.TestCase):
             {
                 "id", "expert_id", "project_title", "company_name", "start_date",
                 "end_date", "work_description", "updated_at", "created_at",
+                "deleted_at",
             },
             {item.name for item in fields(ProjectSource)},
+        )
+        self.assertEqual(
+            {
+                "id", "expert_id", "school_name", "major",
+                "updated_at", "created_at", "deleted_at",
+            },
+            {item.name for item in fields(EducationSource)},
         )
 
     def test_fixture_serial_fits_source_column(self) -> None:
         self.assertEqual(19, len(TEST_EXPERT_SERIAL))
         self.assertEqual(3, len(WORK_FIXTURES))
         self.assertEqual(3, len(PROJECT_FIXTURES))
+        self.assertEqual(2, len(EDUCATION_FIXTURES))
         self.assertEqual(3, len({(item.company, item.position) for item in WORK_FIXTURES}))
         self.assertEqual(3, len({item.title for item in PROJECT_FIXTURES}))
         for item in WORK_FIXTURES:
@@ -164,6 +203,27 @@ class SourceMappingTest(unittest.TestCase):
         )
         self.assertEqual("1001", employments[0].source_field_id)
         self.assertEqual("2001", projects[0].source_field_id)
+        self.assertEqual(("华东流程测试大学",), profile.school_names_raw)
+        self.assertEqual(("信息管理与信息系统",), profile.major_names_raw)
+        self.assertIs(profile.abroad_flag_norm, True)
+
+    def test_new_month_format_is_yyyymm(self) -> None:
+        """新标准不再保留年月之间的连字符。"""
+
+        _, employments, projects = normalize_aggregate(
+            _aggregate(), data_version="20260813_01", build_batch_id=1
+        )
+        self.assertEqual("201803", employments[0].start_month)
+        self.assertEqual("202106", employments[0].end_month)
+        self.assertEqual("202401", projects[0].start_month)
+
+    def test_deleted_fields_are_present_and_current_snapshot_is_clean(self) -> None:
+        """三个经历 Source 都承接 deleted_at；有效查询结果应为 None。"""
+
+        aggregate = _aggregate()
+        self.assertIsNone(aggregate.employments[0].deleted_at)
+        self.assertIsNone(aggregate.projects[0].deleted_at)
+        self.assertIsNone(aggregate.educations[0].deleted_at)
 
     def test_labeled_descriptions_are_source_parsed(self) -> None:
         responsibilities, achievements = parse_employment_description(
@@ -179,6 +239,28 @@ class SourceMappingTest(unittest.TestCase):
         self.assertEqual("建设智能检索。", objective)
         self.assertEqual("设计Chunk策略。", actions)
         self.assertEqual("召回率提升17%。", results)
+
+    def test_all_three_experience_queries_filter_deleted_at(self) -> None:
+        """工作、项目、教育三张经历表都只能返回未逻辑删除的当前快照。"""
+
+        class EmptyCursor:
+            def __init__(self) -> None:
+                self.sql: list[str] = []
+
+            def execute(self, sql: str, params: tuple[object, ...]) -> None:
+                self.sql.append(" ".join(sql.split()))
+
+            @staticmethod
+            def fetchall() -> tuple[()]:
+                return ()
+
+        cursor = EmptyCursor()
+        MySQLSourceAdapter._query_employment_rows(cursor, 24)
+        MySQLSourceAdapter._load_projects(cursor, 24)
+        MySQLSourceAdapter._load_educations(cursor, 24)
+        self.assertEqual(3, len(cursor.sql))
+        self.assertTrue(all("deleted_at IS NULL" in sql for sql in cursor.sql))
+        self.assertTrue(any("experts_education_experience" in sql for sql in cursor.sql))
 
 
 class ChunkFactoryTest(unittest.TestCase):
@@ -196,14 +278,14 @@ class ChunkFactoryTest(unittest.TestCase):
         self.assertTrue(all(c.chunk_id.startswith("expert:24:") for c in chunks))
         self.assertTrue(
             all(
-                c.metadata["vector_doc_id"]
+                c.vector_doc_id
                 == f"expert:{c.expert_id}:{c.chunk_type}:{c.source_field_id}:{c.chunk_index}"
                 for c in chunks
             )
         )
         self.assertEqual(
             len(chunks),
-            len({c.metadata["vector_doc_id"] for c in chunks}),
+            len({c.vector_doc_id for c in chunks}),
         )
         self.assertNotIn("fake@example.com", "\n".join(c.chunk_text for c in chunks))
 
@@ -221,11 +303,11 @@ class ChunkFactoryTest(unittest.TestCase):
         self.assertEqual(list(range(len(employment))), [chunk.chunk_index for chunk in employment])
         self.assertEqual(
             len(employment),
-            len({chunk.metadata["vector_doc_id"] for chunk in employment}),
+            len({chunk.vector_doc_id for chunk in employment}),
         )
 
-    def test_unknown_employment_status_becomes_partial(self) -> None:
-        """is_employed=0 对应 None，不能作为当前/历史任职的硬证据。"""
+    def test_unknown_employment_status_remains_null(self) -> None:
+        """is_employed=0 对应 None；V1.3 不再用 partial 表示解析质量。"""
 
         settings = _settings()
         aggregate = _aggregate()
@@ -238,7 +320,21 @@ class ChunkFactoryTest(unittest.TestCase):
         employment = [chunk for chunk in chunks if chunk.chunk_type == "employment"]
         validate_chunks(chunks)
         self.assertTrue(employment)
-        self.assertEqual({"partial"}, {chunk.verification_status for chunk in employment})
+        self.assertEqual({None}, {chunk.is_current for chunk in employment})
+        self.assertEqual({"verified"}, {chunk.verification_status for chunk in employment})
+
+    def test_metadata_hash_is_independent_from_content_hash(self) -> None:
+        """正文不变、业务 Metadata 变化时，只应改变 metadata_hash。"""
+
+        profile, _, _ = normalize_aggregate(
+            _aggregate(), data_version="20260813_01", build_batch_id=1
+        )
+        original = ChunkFactory(_settings()).build_profile(profile)[0]
+        changed = ChunkFactory(_settings()).build_profile(
+            replace(profile, school_names_raw=("另一所测试大学",))
+        )[0]
+        self.assertEqual(original.content_hash, changed.content_hash)
+        self.assertNotEqual(original.metadata_hash, changed.metadata_hash)
 
 
 class RepositoryMappingTest(unittest.TestCase):
@@ -266,12 +362,30 @@ class RepositoryMappingTest(unittest.TestCase):
         MySQLIndexRepository._insert_project(cursor, projects[0])
         MySQLIndexRepository._upsert_chunk(cursor, chunk)
 
+    def test_stale_chunks_are_deactivated_after_snapshot_rebuild(self) -> None:
+        """经历被逻辑删除后，其旧 chunk_id 不在新快照中，Repository 应停用旧行。"""
+
+        calls: list[tuple[str, tuple[object, ...]]] = []
+
+        class RecordingCursor:
+            @staticmethod
+            def execute(sql: str, params: tuple[object, ...]) -> None:
+                calls.append((" ".join(sql.split()), params))
+
+        MySQLIndexRepository._deactivate_stale_chunks(
+            RecordingCursor(), 24, ["expert:24:employment:1001:0"]
+        )
+        self.assertEqual(1, len(calls))
+        self.assertIn("SET is_active=0", calls[0][0])
+        self.assertIn("chunk_id NOT IN", calls[0][0])
+        self.assertEqual((24, "expert:24:employment:1001:0"), calls[0][1])
+
 
 class ExporterTest(unittest.TestCase):
     """验证 MySQL 行到固定 JSONL 契约的映射。"""
 
     def test_export_jsonl(self) -> None:
-        now = datetime(2026, 8, 11, 10, 0, 0)
+        now = datetime(2026, 8, 11, 10, 0, 0, tzinfo=ZoneInfo("Asia/Shanghai"))
         text = "[专家能力概述]\n核心背景：虚构测试资料"
         row = {
             "chunk_id": "expert:24:profile_summary:24:0",
@@ -284,20 +398,38 @@ class ExporterTest(unittest.TestCase):
             "chunk_text": text,
             "char_count": len(text),
             "content_hash": sha256_value(text),
-            "metadata_json": json.dumps({
-                "vector_doc_id": "expert:24:profile_summary:24:0",
-                "industry_codes": [],
-                "topic_codes": [],
-            }),
-            "source_table": "experts",
-            "source_field": "company+job_name+background",
+            "metadata_hash": "b" * 64,
+            "vector_doc_id": "expert:24:profile_summary:24:0",
+            "source_table": "experts+experts_education_experience",
+            "source_field": "company+job_name+background+school_name+major",
             "source_field_id": "24",
             "source_item_key": "24",
             "source_version": "2026-08-11T10:00:00+08:00",
             "source_updated_at": now,
             "source_hash": "a" * 64,
-            "chunk_policy_version": "1.2",
-            "metadata_schema_version": "2.0",
+            "company_name_raw": "虚构公司",
+            "company_name_norm": "虚构公司",
+            "role_name_raw": "产品经理",
+            "role_code": None,
+            "role_level": None,
+            "job_status_norm": None,
+            "abroad_flag_norm": 1,
+            "work_years": 8,
+            "project_name": None,
+            "start_month": None,
+            "end_month": None,
+            "is_current": None,
+            "industry_codes": "[]",
+            "function_codes": "[]",
+            "topic_codes": "[]",
+            "school_names_raw": '["华东流程测试大学"]',
+            "major_names_raw": '["信息管理与信息系统"]',
+            "eligible_for_recommendation": None,
+            "origin_type": "compressed_from_source",
+            "verification_status": "source_summary",
+            "weight_tier": "B",
+            "chunk_policy_version": "1.3",
+            "metadata_schema_version": "3.0",
             "dictionary_version": "2026.08",
             "data_version": "20260811_01",
             "is_active": 1,
@@ -307,10 +439,10 @@ class ExporterTest(unittest.TestCase):
             path = Path(directory) / "chunks.jsonl"
             self.assertEqual(1, export_jsonl([row], path, "Asia/Shanghai"))
             contract = json.loads(path.read_text(encoding="utf-8"))
-        self.assertEqual("2.0.0", contract["contract_version"])
+        self.assertEqual("3.0.0", contract["contract_version"])
         self.assertEqual(text, contract["chunk_text"])
         self.assertNotIn("source_record_id", contract["source"])
-        self.assertEqual("company+job_name+background", contract["source"]["source_field"])
+        self.assertEqual("company+job_name+background+school_name+major", contract["source"]["source_field"])
         self.assertEqual("24", contract["source"]["source_field_id"])
         self.assertEqual(
             "expert:24:profile_summary:24:0",

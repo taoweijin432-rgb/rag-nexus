@@ -9,12 +9,13 @@ from __future__ import annotations
 
 import re
 from collections.abc import Iterable
+from dataclasses import replace
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
 from .config import Settings
 from .models import ChunkRecord, EmploymentStage, ProfileStage, ProjectStage
-from .normalize import sha256_value
+from .normalize import canonical_json, sha256_value
 
 HARD_LIMITS = {"profile_summary": 600, "employment": 900, "project": 1000}
 
@@ -74,19 +75,6 @@ class ChunkFactory:
             if background:
                 lines.append(f"核心背景：{background}")
         text = "\n".join(lines)
-        metadata = _metadata(
-            company_raw=item.company_name_raw,
-            company_norm=item.company_name_norm,
-            company_status=item.company_normalization_status,
-            role_raw=item.role_name_raw,
-            role_code=item.role_code,
-            role_level=item.role_level,
-            industry_codes=(),
-            topic_codes=(),
-            origin_type="source_template",
-            verification_status="source_evidence",
-            weight_tier="B",
-        )
         return [
             self._record(
                 expert_id=item.expert_id,
@@ -94,21 +82,36 @@ class ChunkFactory:
                 chunk_type="profile_summary",
                 source_item_key=str(item.expert_id),
                 text=text,
-                metadata=metadata,
-                source_table="experts",
-                source_field="company+job_name+background",
+                # profile 同时压缩主档与教育表信息。source_field_id 仍使用专家 ID，
+                # 因为教育表是通过 expert_id 聚合，vector_doc_id 因而保持稳定。
+                source_table="experts+experts_education_experience",
+                source_field=(
+                    "company+job_status+job_name+contact_status+doubtful_flag+"
+                    "abroad_flag+background+work_years+school_name+major"
+                ),
                 source_field_id=str(item.expert_id),
                 source_updated_at=item.source_updated_at,
                 source_hash=item.source_hash,
+                company_name_raw=item.company_name_raw,
                 company_name_norm=item.company_name_norm,
+                role_name_raw=item.role_name_raw,
                 role_code=item.role_code,
+                role_level=item.role_level,
+                job_status_norm=item.job_status_norm,
+                abroad_flag_norm=item.abroad_flag_norm,
+                work_years=item.work_years,
+                project_name=None,
                 start_month=None,
                 end_month=None,
                 is_current=None,
                 industry_codes=(),
+                function_codes=(),
                 topic_codes=(),
-                origin_type="source_template",
-                verification_status="source_evidence",
+                school_names_raw=item.school_names_raw,
+                major_names_raw=item.major_names_raw,
+                eligible_for_recommendation=item.eligible_for_recommendation,
+                origin_type="compressed_from_source",
+                verification_status="source_summary",
                 weight_tier="B",
                 data_version=item.data_version,
                 build_batch_id=item.build_batch_id,
@@ -134,34 +137,6 @@ class ChunkFactory:
             ("代表性成果", item.achievements_clean, "achievement"),
         ]
         pieces = _render_pieces(header, sections, HARD_LIMITS["employment"])
-        # 即使源行能解析，也只有公司、岗位、开始月份和在职状态完整且日期不倒置时，
-        # 才能成为 A 级硬条件证据；is_employed=0 等未知枚举安全降级为 partial。
-        dates_valid = not (item.start_month and item.end_month and item.start_month > item.end_month)
-        complete = (
-            item.parse_status == "complete"
-            and bool(item.company_name_raw or item.company_name_norm)
-            and bool(item.role_name_raw)
-            and bool(item.start_month)
-            and item.is_current is not None
-            and dates_valid
-        )
-        verification = "source_evidence" if complete else "partial"
-        metadata = _metadata(
-            company_raw=item.company_name_raw,
-            company_norm=item.company_name_norm,
-            company_status=item.company_normalization_status,
-            role_raw=item.role_name_raw,
-            role_code=item.role_code,
-            role_level=item.role_level,
-            start_month=item.start_month,
-            end_month=item.end_month,
-            is_current=item.is_current,
-            industry_codes=item.industry_codes,
-            topic_codes=item.topic_codes,
-            origin_type="source_parsed",
-            verification_status=verification,
-            weight_tier="A",
-        )
         return [
             self._record(
                 expert_id=item.expert_id,
@@ -169,21 +144,31 @@ class ChunkFactory:
                 chunk_type="employment",
                 source_item_key=item.source_item_key,
                 text=text,
-                metadata=metadata,
                 source_table=item.source_table,
                 source_field=item.source_field,
                 source_field_id=item.source_field_id,
                 source_updated_at=item.source_updated_at,
                 source_hash=item.source_hash,
+                company_name_raw=item.company_name_raw,
                 company_name_norm=item.company_name_norm,
+                role_name_raw=item.role_name_raw,
                 role_code=item.role_code,
+                role_level=item.role_level,
+                job_status_norm=None,
+                abroad_flag_norm=None,
+                work_years=None,
+                project_name=None,
                 start_month=item.start_month,
                 end_month=item.end_month,
                 is_current=item.is_current,
                 industry_codes=item.industry_codes,
+                function_codes=(),
                 topic_codes=item.topic_codes,
+                school_names_raw=(),
+                major_names_raw=(),
+                eligible_for_recommendation=None,
                 origin_type="source_parsed",
-                verification_status=verification,
+                verification_status="verified",
                 weight_tier="A",
                 data_version=item.data_version,
                 build_batch_id=item.build_batch_id,
@@ -195,7 +180,7 @@ class ChunkFactory:
         ]
 
     def build_project(self, serial_number: str | None, item: ProjectStage) -> list[ChunkRecord]:
-        """生成单项目 Chunk；项目名或角色缺失时保留 partial 但不捏造占位值。"""
+        """生成单项目 Chunk；结构化字段缺失时保留空值，不捏造占位信息。"""
 
         if not any((item.project_name, item.objective_clean, item.actions_clean)):
             return []
@@ -204,7 +189,6 @@ class ChunkFactory:
         _append(header, "所属公司/客户", item.company_or_client_norm or item.company_or_client_raw)
         if item.start_month or item.end_month:
             _append(header, "时间", f"{item.start_month or '未知'}—{item.end_month or '未知'}")
-        _append(header, "专家角色", item.project_role)
         _append(header, "业务领域", "、".join(item.industry_codes) or None)
         sections = [
             # 正确源表没有目标/结果列，只有字段注释明确的“工作内容”。
@@ -213,26 +197,6 @@ class ChunkFactory:
             ("项目结果", item.results_clean, "result"),
         ]
         pieces = _render_pieces(header, sections, HARD_LIMITS["project"])
-        complete = item.parse_status == "complete" and bool(item.project_name and item.project_role)
-        verification = "source_evidence" if complete else "partial"
-        metadata = _metadata(
-            company_raw=item.company_or_client_raw,
-            company_norm=item.company_or_client_norm,
-            company_status=item.company_normalization_status,
-            role_raw=None,
-            role_code=None,
-            role_level=None,
-            start_month=item.start_month,
-            end_month=item.end_month,
-            is_current=None,
-            industry_codes=item.industry_codes,
-            topic_codes=item.topic_codes,
-            origin_type="source_parsed",
-            verification_status=verification,
-            weight_tier="A",
-            project_name=item.project_name,
-            project_role=item.project_role,
-        )
         return [
             self._record(
                 expert_id=item.expert_id,
@@ -240,21 +204,31 @@ class ChunkFactory:
                 chunk_type="project",
                 source_item_key=item.source_item_key,
                 text=text,
-                metadata=metadata,
                 source_table=item.source_table,
                 source_field=item.source_field,
                 source_field_id=item.source_field_id,
                 source_updated_at=item.source_updated_at,
                 source_hash=item.source_hash,
+                company_name_raw=item.company_or_client_raw,
                 company_name_norm=item.company_or_client_norm,
+                role_name_raw=None,
                 role_code=None,
+                role_level=None,
+                job_status_norm=None,
+                abroad_flag_norm=None,
+                work_years=None,
+                project_name=item.project_name,
                 start_month=item.start_month,
                 end_month=item.end_month,
                 is_current=None,
                 industry_codes=item.industry_codes,
+                function_codes=(),
                 topic_codes=item.topic_codes,
+                school_names_raw=(),
+                major_names_raw=(),
+                eligible_for_recommendation=None,
                 origin_type="source_parsed",
-                verification_status=verification,
+                verification_status="verified",
                 weight_tier="A",
                 data_version=item.data_version,
                 build_batch_id=item.build_batch_id,
@@ -273,19 +247,29 @@ class ChunkFactory:
         chunk_type: str,
         source_item_key: str,
         text: str,
-        metadata: dict[str, object],
         source_table: str,
         source_field: str,
         source_field_id: str,
         source_updated_at: datetime | None,
         source_hash: str,
+        company_name_raw: str | None,
         company_name_norm: str | None,
+        role_name_raw: str | None,
         role_code: str | None,
+        role_level: str | None,
+        job_status_norm: str | None,
+        abroad_flag_norm: bool | None,
+        work_years: float | None,
+        project_name: str | None,
         start_month: str | None,
         end_month: str | None,
         is_current: bool | None,
         industry_codes: tuple[str, ...],
+        function_codes: tuple[str, ...],
         topic_codes: tuple[str, ...],
+        school_names_raw: tuple[str, ...],
+        major_names_raw: tuple[str, ...],
+        eligible_for_recommendation: bool | None,
         origin_type: str,
         verification_status: str,
         weight_tier: str,
@@ -304,11 +288,11 @@ class ChunkFactory:
             source_field_id=source_field_id,
             chunk_index=chunk_index,
         )
-        # _metadata() 为同一来源的所有拆分片段提供公共业务 Metadata；这里为每一个
-        # 最终片段复制字典并补入包含 chunk_index 的唯一 vector_doc_id，避免长文本
-        # 拆分后多个 Chunk 共用同一个 Milvus 主键。
-        record_metadata = {**metadata, "vector_doc_id": vector_doc_id}
-        return ChunkRecord(
+        source_version = _iso_with_zone(source_updated_at, self.settings.timezone)
+        # metadata_hash 只覆盖最终会作为 Metadata 暴露的稳定扁平字段，不包含
+        # chunk_text/content_hash，因此可以独立识别“正文不变、Metadata 变化”。
+        # indexed_at 与 embedding 模型信息由下游回填，也不参与上游计算。
+        record = ChunkRecord(
             chunk_id=f"expert:{expert_id}:{chunk_type}:{source_item_key}:{chunk_index}",
             expert_id=expert_id,
             serial_number=serial_number,
@@ -318,22 +302,36 @@ class ChunkFactory:
             chunk_total=chunk_total,
             chunk_text=normalized,
             char_count=len(normalized),
-            metadata=record_metadata,
+            vector_doc_id=vector_doc_id,
             source_table=source_table,
             source_field=source_field,
             source_field_id=source_field_id,
             source_item_key=source_item_key,
-            source_version=_iso_with_zone(source_updated_at, self.settings.timezone),
+            source_version=source_version,
             source_updated_at=source_updated_at,
             source_hash=source_hash,
             content_hash=sha256_value(normalized),
+            # 先使用临时空值构造不可变对象，再由统一函数基于全部扁平字段计算。
+            # 这样 Validator 可复用完全相同的算法，避免两处字段清单发生漂移。
+            metadata_hash="",
+            company_name_raw=company_name_raw,
             company_name_norm=company_name_norm,
+            role_name_raw=role_name_raw,
             role_code=role_code,
+            role_level=role_level,
+            job_status_norm=job_status_norm,
+            abroad_flag_norm=abroad_flag_norm,
+            work_years=work_years,
+            project_name=project_name,
             start_month=start_month,
             end_month=end_month,
             is_current=is_current,
             industry_codes=industry_codes,
+            function_codes=function_codes,
             topic_codes=topic_codes,
+            school_names_raw=school_names_raw,
+            major_names_raw=major_names_raw,
+            eligible_for_recommendation=eligible_for_recommendation,
             origin_type=origin_type,
             verification_status=verification_status,
             weight_tier=weight_tier,
@@ -341,51 +339,71 @@ class ChunkFactory:
             metadata_schema_version=self.settings.metadata_schema_version,
             dictionary_version=self.settings.dictionary_version,
             data_version=data_version,
+            embedding_model_alias=None,
+            embedding_model_version=None,
+            indexed_at=None,
+            is_active=True,
             build_batch_id=build_batch_id,
         )
+        return replace(record, metadata_hash=calculate_metadata_hash(record))
 
 
-def _metadata(
-    *,
-    company_raw: str | None,
-    company_norm: str | None,
-    company_status: str | None,
-    role_raw: str | None,
-    role_code: str | None,
-    role_level: str | None,
-    industry_codes: tuple[str, ...],
-    topic_codes: tuple[str, ...],
-    origin_type: str,
-    verification_status: str,
-    weight_tier: str,
-    start_month: str | None = None,
-    end_month: str | None = None,
-    is_current: bool | None = None,
-    project_name: str | None = None,
-    project_role: str | None = None,
-) -> dict[str, object]:
-    """按契约一次性组装 metadata，显式列随后复用相同值。"""
+def metadata_hash_payload(chunk: ChunkRecord) -> dict[str, object]:
+    """返回参与 ``metadata_hash`` 的稳定字段。
 
-    result: dict[str, object] = {
-        "company_name_raw": company_raw,
-        "company_name_norm": company_norm,
-        "company_normalization_status": company_status,
-        "role_name_raw": role_raw,
-        "role_code": role_code,
-        "role_level": role_level,
-        "start_month": start_month,
-        "end_month": end_month,
-        "is_current": is_current,
-        "industry_codes": list(industry_codes),
-        "topic_codes": list(topic_codes),
-        "origin_type": origin_type,
-        "verification_status": verification_status,
-        "weight_tier": weight_tier,
+    ``content_hash`` 被刻意排除，确保正文变化与 Metadata 变化可以分别判断；
+    ``indexed_at``、Embedding 模型字段和数据库更新时间由下游或数据库产生，也不应
+    导致上游相同业务 Metadata 的哈希漂移。
+    """
+
+    return {
+        "vector_doc_id": chunk.vector_doc_id,
+        "expert_id": chunk.expert_id,
+        "serial_number": chunk.serial_number,
+        "chunk_type": chunk.chunk_type,
+        "chunk_subtype": chunk.chunk_subtype,
+        "chunk_index": chunk.chunk_index,
+        "chunk_total": chunk.chunk_total,
+        "source_table": chunk.source_table,
+        "source_field": chunk.source_field,
+        "source_field_id": chunk.source_field_id,
+        "source_item_key": chunk.source_item_key,
+        "source_version": chunk.source_version,
+        "source_updated_at": chunk.source_updated_at,
+        "source_hash": chunk.source_hash,
+        "company_name_raw": chunk.company_name_raw,
+        "company_name_norm": chunk.company_name_norm,
+        "role_name_raw": chunk.role_name_raw,
+        "role_code": chunk.role_code,
+        "role_level": chunk.role_level,
+        "job_status_norm": chunk.job_status_norm,
+        "abroad_flag_norm": chunk.abroad_flag_norm,
+        "work_years": chunk.work_years,
+        "project_name": chunk.project_name,
+        "start_month": chunk.start_month,
+        "end_month": chunk.end_month,
+        "is_current": chunk.is_current,
+        "industry_codes": list(chunk.industry_codes),
+        "function_codes": list(chunk.function_codes),
+        "topic_codes": list(chunk.topic_codes),
+        "school_names_raw": list(chunk.school_names_raw),
+        "major_names_raw": list(chunk.major_names_raw),
+        "eligible_for_recommendation": chunk.eligible_for_recommendation,
+        "origin_type": chunk.origin_type,
+        "verification_status": chunk.verification_status,
+        "weight_tier": chunk.weight_tier,
+        "chunk_policy_version": chunk.chunk_policy_version,
+        "metadata_schema_version": chunk.metadata_schema_version,
+        "dictionary_version": chunk.dictionary_version,
+        "data_version": chunk.data_version,
+        "is_active": chunk.is_active,
     }
-    if project_name is not None or project_role is not None:
-        result["project_name"] = project_name
-        result["project_role"] = project_role
-    return result
+
+
+def calculate_metadata_hash(chunk: ChunkRecord) -> str:
+    """按稳定 JSON 编码计算 Metadata SHA-256。"""
+
+    return sha256_value(canonical_json(metadata_hash_payload(chunk)))
 
 
 def _append(lines: list[str], label: str, value: str | None) -> None:

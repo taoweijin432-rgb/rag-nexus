@@ -6,8 +6,7 @@
 
 各步骤的具体职责由其他模块承担：
 
-* ``source.py``：从 ``experts``、``experts_work_experience`` 和
-  ``experts_project_experience`` 三张源表读取同一位专家的数据；
+* ``source.py``：从 ``experts`` 及工作、项目、教育三张经历表读取同一位专家；
 * ``normalize.py``：清洗源字段，并将源数据转换为结构稳定的 Stage 中间对象；
 * ``chunk_builder.py``：按照 profile_summary、employment、project 三类规则生成
   Chunk Text、Metadata、来源追溯信息和版本信息；
@@ -50,10 +49,10 @@ class BuildResult:
     batch_id: int  # 批次表自增主键，由 start_batch() 插入批次后返回，用于数据库回查。
     batch_no: str  # 可读的业务批次号；可由调用方传入，也可由 _batch_no() 自动生成。
     expert_id: int  # 本次处理的专家 ID，对应源表 experts.id 和经历表中的 expert_id。
-    extracted_count: int  # 从源库读取的记录总数：1 条专家主档 + 工作经历数 + 项目经历数。
+    extracted_count: int  # 记录总数：1 条主档 + 工作 + 项目 + 教育经历数。
     stage_count: int  # 成功保存的 Stage 中间记录数量，由 persist_expert() 返回。
     chunk_count: int  # 本次生成并准备落库的最终 Chunk 数量；长文本拆分时可大于 Stage 数。
-    partial_chunk_count: int  # 证据不完整的 Chunk 数；已落库，但不进入正式 Embedding 队列。
+    partial_chunk_count: int  # 兼容旧 CLI 结果；V1.3 不再使用 partial，当前恒为 0。
 
 
 class ExpertIndexPipeline:
@@ -79,7 +78,7 @@ class ExpertIndexPipeline:
         self.settings = settings
 
         # ``source or ...`` 的含义：调用方传入 Source 时优先使用传入对象；没有传入时，
-        # 才根据 source_db 创建真实 MySQL 读取器。Source 只负责读取三张业务源表。
+        # 才根据 source_db 创建真实 MySQL 读取器。Source 只负责读取四张业务源表。
         self.source = source or MySQLSourceAdapter(settings.source_db)
 
         # Repository 负责批次表、Stage 表和 expert_chunk 表。source_db 与 index_db
@@ -137,13 +136,17 @@ class ExpertIndexPipeline:
         # 写回批次表，帮助判断失败发生在读取、标准化、生成还是持久化阶段。
         extracted_count = stage_count = chunk_count = 0
         try:
-            # 1. Source：按照 expert_id 查询专家主档、工作经历和项目经历，并聚合为
+            # 1. Source：按照 expert_id 查询专家主档、工作、项目和教育经历，并聚合为
             # ExpertAggregate。若 experts 主档不存在，Source Adapter 会直接抛出异常。
             aggregate = self.source.load_expert(expert_id)
 
-            # 源记录数量包含且只包含：1 条专家主档 + N 条工作经历 + M 条项目经历。
-            # 例如测试专家 999641217 有 1 + 3 + 3 = 7 条源记录。
-            extracted_count = 1 + len(aggregate.employments) + len(aggregate.projects)
+            # 源记录数量包含：1 条专家主档 + 工作 + 项目 + 教育经历。
+            extracted_count = (
+                1
+                + len(aggregate.employments)
+                + len(aggregate.projects)
+                + len(aggregate.educations)
+            )
 
             # 2. Normalize/Stage：清理文本、标准化公司/岗位/日期、生成来源哈希，并将
             # 三类 Source 对象转换为 ProfileStage、EmploymentStage、ProjectStage。
@@ -177,27 +180,20 @@ class ExpertIndexPipeline:
             # Chunk 已通过校验并完成事务保存，因此此时才记录最终 Chunk 数量。
             chunk_count = len(chunks)
 
-            # Python 中 True 可按 1 参与求和。这里统计 verification_status=partial 的
-            # Chunk 数量。partial 表示证据不完整：数据允许落表以便审查，但按当前
-            # 向量化资格规则不会进入正式 Embedding 队列。
-            partial_count = sum(chunk.verification_status == "partial" for chunk in chunks)
+            # V1.3 固定使用 source_summary（画像）和 verified（任职/项目），不再使用
+            # parse_status/partial 推断枚举。为保持 CLI 返回结构兼容，该计数暂时固定为 0。
+            partial_count = 0
 
-            # 更新批次最终状态：不存在 partial 时为 success；只要存在 partial，整个
-            # 批次标记为 partial，提醒下游和审查人员本批次并非全部可向量化。
+            # V1.3 当前不会生成 partial，保留条件分支仅为了兼容旧结果结构。
             self.repository.finish_batch(
                 batch_id,
                 status="partial" if partial_count else "success",
                 extracted_count=extracted_count,
                 stage_count=stage_count,
                 chunk_count=chunk_count,
-                # 当前批次表使用 rejected_count 承接未进入正式 Embedding 队列的数量。
-                # partial Chunk 实际已经落入 expert_chunk，因此这里的“rejected”是指
-                # 向量化资格被拒绝，并不表示数据库写入失败或数据被删除。
                 rejected_count=partial_count,
-                # 只有存在 partial Chunk 时才记录结构化说明；完全成功时保存 NULL，
-                # 减少无意义的批次错误信息。
                 error_summary={
-                    "note": "partial Chunk 已落表，但按契约不会进入正式 Embedding 队列"
+                    "note": "兼容分支：发现旧规则 partial Chunk"
                 } if partial_count else None,
             )
 

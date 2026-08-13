@@ -38,7 +38,7 @@ PII_PATTERNS: dict[str, re.Pattern[str]] = {
 _EMPTY_VALUES = {"", "null", "none", "--", "/"}
 _INVISIBLE = re.compile(r"[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f\u200b-\u200f\u202a-\u202e\u2066-\u2069\ufeff]")
 _HTML_TAG = re.compile(r"<[^>]+>")
-_MONTH = re.compile(r"(?<!\d)((?:19|20)\d{2})\s*[-/.年]\s*(0?[1-9]|1[0-2])")
+_MONTH = re.compile(r"(?<!\d)((?:19|20)\d{2})\s*[-/.年]?\s*(0?[1-9]|1[0-2])")
 
 # 第一版词典保持小而可审计；未命中时绝不做模糊猜测。
 COMPANY_ALIASES = {
@@ -151,13 +151,27 @@ def normalize_role(value: Any) -> tuple[str | None, str | None, str | None]:
 
 
 def month_value(value: datetime | date | str | None) -> str | None:
-    """把结构化日期或文本中的首个年月规范为 YYYY-MM。"""
+    """把结构化日期或文本中的首个年月按 V1.3 规范转换为 ``YYYYMM``。"""
 
     if isinstance(value, (datetime, date)):
-        return f"{value.year:04d}-{value.month:02d}"
+        return f"{value.year:04d}{value.month:02d}"
     cleaned = clean_text(value)
     match = _MONTH.search(cleaned)
-    return f"{int(match.group(1)):04d}-{int(match.group(2)):02d}" if match else None
+    return f"{int(match.group(1)):04d}{int(match.group(2)):02d}" if match else None
+
+
+def binary_flag(value: object) -> bool | None:
+    """只把明确的 0/1 标量转换为布尔值，其他测试库脏值保持未知。
+
+    该函数用于 ``abroad_flag``。它与 ``is_employed`` 的枚举不同，后者使用
+    1=在职、2=不在职，因此必须继续由 :func:`employment_status` 单独处理。
+    """
+
+    if value in (0, False):
+        return False
+    if value in (1, True):
+        return True
+    return None
 
 
 def employment_status(value: object) -> bool | None:
@@ -187,7 +201,7 @@ def parse_project_description(
 ) -> tuple[str | None, str | None, str | None, str | None]:
     """从同一项目原文提取角色、目标、动作、结果四类显式事实。
 
-    无标签正文整体作为项目动作，项目角色保持空，后续安全降级为 partial。
+    无标签正文整体作为项目动作；项目角色不再进入 V1.3 输出契约。
     """
 
     text = str(value).strip() if value is not None else ""
@@ -241,13 +255,29 @@ def normalize_aggregate(
     company_raw, company_norm, company_status = normalize_company(profile.company)
     role_raw, role_code, role_level = normalize_role(profile.job_name)
     background = clean_text(profile.background) or None
+    # 教育经历是独立结构化表，不再解析 experts.edu_experience 自由文本。稳定去重时
+    # 保留源表排序中的首次出现，既避免重复 Metadata，也保证相同输入得到相同哈希。
+    school_names = _clean_unique(item.school_name for item in aggregate.educations)
+    major_names = _clean_unique(item.major for item in aggregate.educations)
+    education_facts = [
+        {
+            "id": item.id,
+            "school_name": clean_text(item.school_name) or None,
+            "major": clean_text(item.major) or None,
+        }
+        for item in aggregate.educations
+    ]
     profile_allowed = {
         "expert_id": profile.id,
         "serial_number": clean_text(profile.serial_number) or None,
         "company": company_raw,
+        "job_status": profile.job_status,
         "role": role_raw,
+        "contact_status": profile.contact_status,
+        "doubtful_flag": profile.doubtful_flag,
+        "abroad_flag": profile.abroad_flag,
         "background": background,
-        "education": clean_text(profile.edu_experience) or None,
+        "educations": education_facts,
         "work_years": profile.work_years,
     }
     profile_stage = ProfileStage(
@@ -259,12 +289,18 @@ def normalize_aggregate(
         role_name_raw=role_raw,
         role_code=role_code,
         role_level=role_level,
+        # job_status/contact_status/doubtful_flag 的枚举表尚未确认。本轮读取并纳入
+        # source_hash，但不把不明数值猜成业务标签或推荐资格。
+        job_status_norm=None,
+        abroad_flag_norm=binary_flag(profile.abroad_flag),
         background_clean=background,
-        # 本期不从自由文本推断学校，保留空结构以满足物理契约。
-        school_names=(),
+        school_names_raw=school_names,
+        major_names_raw=major_names,
         work_years=profile.work_years,
+        eligible_for_recommendation=None,
         source_hash=source_hash(profile_allowed),
-        source_updated_at=profile.updated_at or profile.created_at,
+        # 任一教育记录变化都应推动 profile_summary 的来源版本前进。
+        source_updated_at=_latest_source_time(profile, aggregate.educations),
         data_version=data_version,
         build_batch_id=build_batch_id,
     )
@@ -296,7 +332,6 @@ def _normalize_employment(item: EmploymentSource, *, data_version: str, build_ba
     if is_current is True:
         end_month = None
     achievements = clean_text(parsed_achievements) or None
-    evidence = [part for part in (raw_company, raw_role, responsibilities, achievements) if part]
     allowed = {
         "company": raw_company,
         "role": raw_role,
@@ -326,9 +361,10 @@ def _normalize_employment(item: EmploymentSource, *, data_version: str, build_ba
         is_current=is_current,
         responsibilities_clean=responsibilities,
         achievements_clean=achievements,
-        industry_codes=_codes(evidence, INDUSTRY_RULES),
-        topic_codes=_codes(evidence, TOPIC_RULES),
-        parse_status="complete",
+        # V1.3 只保留行业/主题字段，获取规则尚未确定，不能继续使用旧关键词规则
+        # 产生看似正式的分类结果。待产品确认数据源后再接入受版本控制的映射器。
+        industry_codes=(),
+        topic_codes=(),
         source_hash=source_hash(allowed),
         source_updated_at=item.updated_at or item.created_at,
         data_version=data_version,
@@ -341,20 +377,15 @@ def _normalize_project(item: ProjectSource, *, data_version: str, build_batch_id
 
     raw_company, norm_company, company_status = normalize_company(item.company_name)
     project_name = clean_text(item.project_title) or None
-    parsed_role, parsed_objective, parsed_actions, parsed_results = parse_project_description(
+    _parsed_role, parsed_objective, parsed_actions, parsed_results = parse_project_description(
         item.work_description
     )
-    project_role = clean_text(parsed_role) or None
     objective = clean_text(parsed_objective) or None
     actions = clean_text(parsed_actions) or None
     results = clean_text(parsed_results) or None
-    evidence = [
-        part for part in (project_name, raw_company, project_role, objective, actions, results) if part
-    ]
     allowed = {
         "project_name": project_name,
         "company": raw_company,
-        "project_role": project_role,
         "start_month": month_value(item.start_date),
         "end_month": month_value(item.end_date),
         "description": objective,
@@ -371,17 +402,43 @@ def _normalize_project(item: ProjectSource, *, data_version: str, build_batch_id
         company_or_client_raw=raw_company,
         company_or_client_norm=norm_company,
         company_normalization_status=company_status,
-        project_role=project_role,
         start_month=month_value(item.start_date),
         end_month=month_value(item.end_date),
         objective_clean=objective,
         actions_clean=actions,
         results_clean=results,
-        industry_codes=_codes(evidence, INDUSTRY_RULES),
-        topic_codes=_codes(evidence, TOPIC_RULES),
-        parse_status="complete",
+        # 与任职一致：字段保留，但本期不自行推断行业和主题代码。
+        industry_codes=(),
+        topic_codes=(),
         source_hash=source_hash(allowed),
         source_updated_at=item.updated_at or item.created_at,
         data_version=data_version,
         build_batch_id=build_batch_id,
     )
+
+
+def _clean_unique(values: Iterable[object]) -> tuple[str, ...]:
+    """清洗并按首次出现顺序去重，供学校、专业等列表型 Metadata 使用。"""
+
+    result: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        cleaned = clean_text(value)
+        if cleaned and cleaned not in seen:
+            seen.add(cleaned)
+            result.append(cleaned)
+    return tuple(result)
+
+
+def _latest_source_time(profile: object, educations: Iterable[object]) -> datetime | None:
+    """返回主档与教育经历中最新的业务时间，用作 profile 来源版本时间。"""
+
+    candidates = [
+        getattr(profile, "updated_at", None) or getattr(profile, "created_at", None),
+        *(
+            getattr(item, "updated_at", None) or getattr(item, "created_at", None)
+            for item in educations
+        ),
+    ]
+    known = [item for item in candidates if item is not None]
+    return max(known) if known else None

@@ -8,13 +8,12 @@ from __future__ import annotations
 
 import re
 
-from .chunk_builder import HARD_LIMITS, build_vector_doc_id
+from .chunk_builder import HARD_LIMITS, build_vector_doc_id, calculate_metadata_hash
 from .models import ChunkRecord
 from .normalize import pii_hits, sha256_value
 
-
 _CODE = re.compile(r"^[a-z][a-z0-9_]*$")
-_MONTH = re.compile(r"^\d{4}-(0[1-9]|1[0-2])$")
+_MONTH = re.compile(r"^\d{4}(0[1-9]|1[0-2])$")
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _TYPES = {"profile_summary", "employment", "project"}
 _SUBTYPES = {None, "responsibility", "achievement", "context", "action", "result", "segment"}
@@ -74,44 +73,41 @@ def _validate_one(chunk: ChunkRecord) -> None:
     if not chunk.source_item_key.strip():
         fail("source_item_key 不能为空")
 
-    metadata = chunk.metadata
-    required = {
-        "vector_doc_id",
-        "company_name_raw", "company_name_norm", "company_normalization_status",
-        "role_name_raw", "role_code", "role_level", "start_month", "end_month",
-        "is_current", "industry_codes", "topic_codes", "origin_type",
-        "verification_status", "weight_tier",
-    }
-    if not required.issubset(metadata):
-        fail(f"metadata 缺少字段={sorted(required - set(metadata))}")
     expected_vector_doc_id = build_vector_doc_id(
         expert_id=chunk.expert_id,
         chunk_type=chunk.chunk_type,
         source_field_id=chunk.source_field_id,
         chunk_index=chunk.chunk_index,
     )
-    if metadata["vector_doc_id"] != expected_vector_doc_id:
-        fail("metadata.vector_doc_id 不符合统一生成规则")
-    if metadata["company_name_norm"] != chunk.company_name_norm:
-        fail("metadata 与显式 company_name_norm 不一致")
-    if metadata["role_code"] != chunk.role_code:
-        fail("metadata 与显式 role_code 不一致")
-    for name, values in (("industry_codes", chunk.industry_codes), ("topic_codes", chunk.topic_codes)):
-        if metadata[name] != list(values):
-            fail(f"metadata 与显式 {name} 不一致")
+    if chunk.vector_doc_id != expected_vector_doc_id:
+        fail("vector_doc_id 不符合统一生成规则")
+    if not _SHA256.fullmatch(chunk.metadata_hash):
+        fail("metadata_hash 格式错误")
+    if calculate_metadata_hash(chunk) != chunk.metadata_hash:
+        fail("metadata_hash 与扁平 Metadata 不一致")
+    for name, values in (
+        ("industry_codes", chunk.industry_codes),
+        ("function_codes", chunk.function_codes),
+        ("topic_codes", chunk.topic_codes),
+    ):
         if list(values) != sorted(set(values)) or any(not _CODE.fullmatch(value) for value in values):
             fail(f"{name} 必须去重、排序并使用 snake_case")
     for name, value in (("start_month", chunk.start_month), ("end_month", chunk.end_month)):
         if value is not None and not _MONTH.fullmatch(value):
-            fail(f"{name} 格式应为 YYYY-MM")
+            fail(f"{name} 格式应为 YYYYMM")
 
-    # partial 允许进入 expert_chunk 供质量修复和影子评测，但正式 Embedding 消费规则
-    # 会排除它。source_evidence 的经历必须满足数据契约的条件必填字段。
-    if chunk.chunk_type == "employment" and chunk.verification_status == "source_evidence":
-        if not (metadata["company_name_raw"] or metadata["company_name_norm"]):
-            fail("employment 缺少公司")
-        if not metadata["role_name_raw"] or not chunk.start_month or chunk.is_current is None:
-            fail("employment 缺少岗位、开始月份或任职状态")
-    if chunk.chunk_type == "project" and chunk.verification_status == "source_evidence":
-        if not metadata.get("project_name") or not metadata.get("project_role"):
-            fail("project 缺少项目名或项目角色")
+    if chunk.chunk_type == "profile_summary":
+        if chunk.origin_type != "compressed_from_source" or chunk.verification_status != "source_summary":
+            fail("profile_summary 的来源/核验枚举不合法")
+    else:
+        if chunk.eligible_for_recommendation is not None:
+            fail("eligible_for_recommendation 只能出现在 profile_summary")
+        if chunk.origin_type != "source_parsed" or chunk.verification_status != "verified":
+            fail("employment/project 的来源/核验枚举不合法")
+
+    if chunk.chunk_type == "employment" and not (
+        chunk.company_name_raw or chunk.company_name_norm
+    ):
+        fail("employment 缺少公司")
+    if chunk.chunk_type == "project" and not chunk.project_name:
+        fail("project 缺少项目名")

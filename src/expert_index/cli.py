@@ -45,7 +45,7 @@ def build_parser() -> argparse.ArgumentParser:
     export.add_argument(
         "--eligible-only",
         action="store_true",
-        help="只导出 source_evidence/validated 的 A、B 级 active Chunk",
+        help="只导出 verified/source_summary 的 A、B 级 active Chunk",
     )
 
     inspect = sub.add_parser("inspect", help="查看不含正文的 Chunk 验收统计")
@@ -54,7 +54,7 @@ def build_parser() -> argparse.ArgumentParser:
     # 该命令是显式测试数据写入入口，不会在 init-db/build 中自动运行。
     sub.add_parser(
         "seed-test-expert",
-        help="在测试源库幂等创建主档、任职、项目完整关联的虚构专家",
+        help="在测试源库幂等创建主档及工作、项目、教育经历完整关联的虚构专家",
     )
     return parser
 
