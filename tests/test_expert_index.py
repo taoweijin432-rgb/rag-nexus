@@ -18,6 +18,7 @@ from expert_index.chunk_builder import ChunkFactory
 from expert_index.config import DatabaseConfig, Settings
 from expert_index.exporter import export_jsonl
 from expert_index.models import (
+    ChunkRecord,
     EducationSource,
     EmploymentSource,
     ExpertAggregate,
@@ -300,7 +301,7 @@ class ChunkFactoryTest(unittest.TestCase):
         validate_chunks(chunks)
         self.assertEqual({"profile_summary", "employment", "project"}, {c.chunk_type for c in chunks})
         self.assertTrue(all(c.content_hash == sha256_value(c.chunk_text) for c in chunks))
-        self.assertTrue(all(c.chunk_id.startswith("expert:24:") for c in chunks))
+        self.assertTrue(all(c.vector_doc_id.startswith("expert:24:") for c in chunks))
         self.assertTrue(
             all(
                 c.vector_doc_id
@@ -314,6 +315,19 @@ class ChunkFactoryTest(unittest.TestCase):
         )
         self.assertNotIn("fake@example.com", "\n".join(c.chunk_text for c in chunks))
 
+    def test_final_chunk_model_omits_removed_database_fields(self) -> None:
+        """产品删除的五个字段不得继续出现在最终 ChunkRecord 中。"""
+
+        chunk_fields = {item.name for item in fields(ChunkRecord)}
+        self.assertTrue(
+            {
+                "chunk_id",
+                "source_item_key",
+                "dictionary_version",
+                "data_version",
+            }.isdisjoint(chunk_fields)
+        )
+
     def test_long_employment_splits_but_keeps_source_key(self) -> None:
         settings = _settings()
         profile, employments, projects = normalize_aggregate(
@@ -323,7 +337,7 @@ class ChunkFactoryTest(unittest.TestCase):
         employment = [chunk for chunk in chunks if chunk.chunk_type == "employment"]
         validate_chunks(chunks)
         self.assertGreater(len(employment), 1)
-        self.assertEqual({"1001"}, {chunk.source_item_key for chunk in employment})
+        self.assertEqual({"1001"}, {chunk.source_field_id for chunk in employment})
         self.assertTrue(all(chunk.char_count <= 900 for chunk in employment))
         self.assertEqual(list(range(len(employment))), [chunk.chunk_index for chunk in employment])
         self.assertEqual(
@@ -387,8 +401,33 @@ class RepositoryMappingTest(unittest.TestCase):
         MySQLIndexRepository._insert_project(cursor, projects[0])
         MySQLIndexRepository._upsert_chunk(cursor, chunk)
 
+    def test_final_chunk_insert_omits_removed_columns(self) -> None:
+        """最终表 INSERT 不得重新携带已删除的五个物理列。"""
+
+        captured: list[str] = []
+
+        class CapturingCursor:
+            @staticmethod
+            def execute(sql: str, params: tuple[object, ...]) -> None:
+                captured.append(sql.split("ON DUPLICATE KEY UPDATE", 1)[0])
+
+        profile, employments, projects = normalize_aggregate(
+            _aggregate(), data_version="20260813_03", build_batch_id=1
+        )
+        chunk = ChunkFactory(_settings()).build_all(profile, employments, projects)[0]
+        MySQLIndexRepository._upsert_chunk(CapturingCursor(), chunk)
+        insert_sql = captured[0]
+        for removed in (
+            "chunk_id",
+            "token_count_estimate",
+            "source_item_key",
+            "dictionary_version",
+            "data_version",
+        ):
+            self.assertNotIn(removed, insert_sql)
+
     def test_stale_chunks_are_deactivated_after_snapshot_rebuild(self) -> None:
-        """经历被逻辑删除后，其旧 chunk_id 不在新快照中，Repository 应停用旧行。"""
+        """经历被逻辑删除后，其旧 vector_doc_id 不在新快照中，Repository 应停用。"""
 
         calls: list[tuple[str, tuple[object, ...]]] = []
 
@@ -402,7 +441,7 @@ class RepositoryMappingTest(unittest.TestCase):
         )
         self.assertEqual(1, len(calls))
         self.assertIn("SET is_active=0", calls[0][0])
-        self.assertIn("chunk_id NOT IN", calls[0][0])
+        self.assertIn("vector_doc_id NOT IN", calls[0][0])
         self.assertEqual((24, "expert:24:employment:1001:0"), calls[0][1])
 
 
@@ -413,7 +452,6 @@ class ExporterTest(unittest.TestCase):
         now = datetime(2026, 8, 11, 10, 0, 0, tzinfo=ZoneInfo("Asia/Shanghai"))
         text = "[专家能力概述]\n核心背景：虚构测试资料"
         row = {
-            "chunk_id": "expert:24:profile_summary:24:0",
             "expert_id": 24,
             "serial_number": "EXP000024",
             "chunk_type": "profile_summary",
@@ -428,7 +466,6 @@ class ExporterTest(unittest.TestCase):
             "source_table": "experts+experts_education_experience",
             "source_field": "company+job_name+background+school_name+major",
             "source_field_id": "24",
-            "source_item_key": "24",
             "source_version": "2026-08-11T10:00:00+08:00",
             "source_updated_at": now,
             "source_hash": "a" * 64,
@@ -455,8 +492,6 @@ class ExporterTest(unittest.TestCase):
             "weight_tier": "B",
             "chunk_policy_version": "1.3",
             "metadata_schema_version": "3.0",
-            "dictionary_version": "2026.08",
-            "data_version": "20260811_01",
             "is_active": 1,
             "updated_at": now,
         }
@@ -464,7 +499,7 @@ class ExporterTest(unittest.TestCase):
             path = Path(directory) / "chunks.jsonl"
             self.assertEqual(1, export_jsonl([row], path, "Asia/Shanghai"))
             contract = json.loads(path.read_text(encoding="utf-8"))
-        self.assertEqual("3.0.0", contract["contract_version"])
+        self.assertEqual("4.0.0", contract["contract_version"])
         self.assertEqual(text, contract["chunk_text"])
         self.assertNotIn("source_record_id", contract["source"])
         self.assertEqual("company+job_name+background+school_name+major", contract["source"]["source_field"])
@@ -473,7 +508,8 @@ class ExporterTest(unittest.TestCase):
             "expert:24:profile_summary:24:0",
             contract["metadata"]["vector_doc_id"],
         )
-        self.assertEqual("20260811_01", contract["versions"]["data_version"])
+        self.assertNotIn("data_version", contract["versions"])
+        self.assertNotIn("dictionary_version", contract["versions"])
 
 
 if __name__ == "__main__":

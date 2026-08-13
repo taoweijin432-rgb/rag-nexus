@@ -119,7 +119,6 @@ CREATE TABLE IF NOT EXISTS expert_index_project_stage (
 
 CREATE TABLE IF NOT EXISTS expert_chunk (
     id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
-    chunk_id VARCHAR(256) NOT NULL COMMENT '稳定业务 Chunk ID',
     vector_doc_id VARCHAR(256) NOT NULL COMMENT 'Milvus 唯一标识，不追加版本后缀',
     expert_id BIGINT UNSIGNED NOT NULL,
     serial_number VARCHAR(64) NULL,
@@ -129,12 +128,10 @@ CREATE TABLE IF NOT EXISTS expert_chunk (
     chunk_total SMALLINT UNSIGNED NOT NULL DEFAULT 1,
     chunk_text MEDIUMTEXT NOT NULL,
     char_count INT UNSIGNED NOT NULL,
-    token_count_estimate INT UNSIGNED NULL,
     -- 以下为三种 Chunk Metadata 的全字段并集；不适用当前类型的字段保存 NULL/[]。
     source_table VARCHAR(256) NOT NULL COMMENT '来源表；聚合多个来源时使用 + 拼接',
     source_field VARCHAR(512) NOT NULL COMMENT '参与生成 Chunk 的源列名，+拼接',
     source_field_id VARCHAR(128) NOT NULL COMMENT '来源行主键 ID',
-    source_item_key VARCHAR(128) NOT NULL COMMENT '稳定业务项键',
     source_version VARCHAR(64) NOT NULL,
     source_updated_at DATETIME(6) NULL,
     source_hash CHAR(64) NOT NULL,
@@ -163,8 +160,6 @@ CREATE TABLE IF NOT EXISTS expert_chunk (
     weight_tier CHAR(1) NOT NULL,
     chunk_policy_version VARCHAR(32) NOT NULL,
     metadata_schema_version VARCHAR(32) NOT NULL,
-    dictionary_version VARCHAR(32) NOT NULL,
-    data_version VARCHAR(64) NOT NULL,
     embedding_model_alias VARCHAR(128) NULL COMMENT '下游完成 Embedding 后回填',
     embedding_model_version VARCHAR(128) NULL COMMENT '下游完成 Embedding 后回填',
     indexed_at DATETIME(6) NULL COMMENT '下游写入 Milvus 成功后回填',
@@ -174,11 +169,10 @@ CREATE TABLE IF NOT EXISTS expert_chunk (
     updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6)
         ON UPDATE CURRENT_TIMESTAMP(6),
     PRIMARY KEY (id),
-    UNIQUE KEY uk_expert_chunk_id (chunk_id),
     UNIQUE KEY uk_expert_chunk_vector_doc_id (vector_doc_id),
     KEY idx_expert_chunk_expert_active (expert_id, is_active),
     KEY idx_expert_chunk_type_active (chunk_type, is_active),
-    KEY idx_expert_chunk_source (source_table, source_field_id, source_item_key),
+    KEY idx_expert_chunk_source (source_table, source_field_id),
     KEY idx_expert_chunk_content_hash (content_hash),
     KEY idx_expert_chunk_metadata_hash (metadata_hash),
     CONSTRAINT chk_expert_chunk_position CHECK (chunk_index < chunk_total),

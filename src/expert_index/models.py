@@ -184,20 +184,18 @@ class ChunkRecord:
     显式声明；不适用于当前 ``chunk_type`` 的字段保存为 ``None`` 或空元组。
     """
 
-    chunk_id: str  # 稳定业务 ID：expert:{expert_id}:{chunk_type}:{source_item_key}:{chunk_index}。
     expert_id: int  # Chunk 所属专家 ID，对应 experts.id。
     serial_number: str | None  # 专家业务编号，来自 experts.serial_number。
     chunk_type: str  # Chunk 主类型：profile_summary/employment/project。
     chunk_subtype: str | None  # 超长记录切分后的语义子类型，未切分时可为空。
     chunk_index: int  # 当前子块序号，从 0 开始。
-    chunk_total: int  # 同一 source_item_key 切分出的子块总数。
+    chunk_total: int  # 同一 source_field_id 切分出的子块总数。
     chunk_text: str  # 最终供 Embedding 使用的标准文本。
     char_count: int  # chunk_text 的 Unicode 字符数。
     vector_doc_id: str  # Milvus 唯一标识，按统一基础公式生成且不追加版本后缀。
     source_table: str  # 物理来源表名。
     source_field: str  # 参与生成该 Chunk 的源列名组合，例如 company+job_name+background。
     source_field_id: str  # 来源行主键 ID，用于回查 source_table 中的具体记录。
-    source_item_key: str  # 同源业务项稳定键，用于 Same Segment 约束和 chunk_id。
     source_version: str  # 由 source_updated_at 生成的带时区 ISO 8601 版本串。
     source_updated_at: datetime | None  # 源行更新时间，用于增量判断与审计。
     source_hash: str  # 允许的标准化来源事实 SHA-256。
@@ -226,8 +224,6 @@ class ChunkRecord:
     weight_tier: str  # 检索权重等级，如 A/B。
     chunk_policy_version: str  # Chunk 模板与切分规则版本。
     metadata_schema_version: str  # Metadata 数据契约版本。
-    dictionary_version: str  # 公司/岗位/行业/主题词典版本。
-    data_version: str  # 本轮构建的业务数据版本。
     embedding_model_alias: str | None  # 下游实际向量化时回填的模型别名。
     embedding_model_version: str | None  # 下游实际向量化时回填的模型版本。
     indexed_at: datetime | None  # 下游写入 Milvus 成功后的索引时间；上游初始为空。

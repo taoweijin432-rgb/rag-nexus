@@ -114,7 +114,7 @@ class ExpertIndexPipeline:
 
         Notes
         -----
-        同一来源会产生稳定的 ``chunk_id``。重复运行同一专家时，Repository 使用
+        同一来源会产生稳定的 ``vector_doc_id``。重复运行同一专家时，Repository 使用
         Upsert 更新对应记录，而不是无条件插入重复 Chunk。
         """
 

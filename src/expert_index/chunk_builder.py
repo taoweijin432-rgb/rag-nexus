@@ -80,7 +80,6 @@ class ChunkFactory:
                 expert_id=item.expert_id,
                 serial_number=item.serial_number,
                 chunk_type="profile_summary",
-                source_item_key=str(item.expert_id),
                 text=text,
                 # profile 同时压缩主档与教育表信息。source_field_id 仍使用专家 ID，
                 # 因为教育表是通过 expert_id 聚合，vector_doc_id 因而保持稳定。
@@ -115,13 +114,12 @@ class ChunkFactory:
                 # 1=普通→source_summary，2/未知=存疑→rejected。
                 verification_status=item.verification_status,
                 weight_tier="B",
-                data_version=item.data_version,
                 build_batch_id=item.build_batch_id,
             )
         ]
 
     def build_employment(self, serial_number: str | None, item: EmploymentStage) -> list[ChunkRecord]:
-        """生成同一任职段的一个或多个 Chunk，不跨 source_item_key。"""
+        """生成同一任职段的一个或多个 Chunk，不跨 source_field_id。"""
 
         # 公司和岗位至少要有一个，且职责/成果可以为空；绝不补造不存在的职责。
         if not any((item.company_name_raw, item.company_name_norm, item.role_name_raw)):
@@ -144,7 +142,6 @@ class ChunkFactory:
                 expert_id=item.expert_id,
                 serial_number=serial_number,
                 chunk_type="employment",
-                source_item_key=item.source_item_key,
                 text=text,
                 source_table=item.source_table,
                 source_field=item.source_field,
@@ -172,7 +169,6 @@ class ChunkFactory:
                 origin_type="source_parsed",
                 verification_status="verified",
                 weight_tier="A",
-                data_version=item.data_version,
                 build_batch_id=item.build_batch_id,
                 chunk_subtype=subtype,
                 chunk_index=index,
@@ -204,7 +200,6 @@ class ChunkFactory:
                 expert_id=item.expert_id,
                 serial_number=serial_number,
                 chunk_type="project",
-                source_item_key=item.source_item_key,
                 text=text,
                 source_table=item.source_table,
                 source_field=item.source_field,
@@ -232,7 +227,6 @@ class ChunkFactory:
                 origin_type="source_parsed",
                 verification_status="verified",
                 weight_tier="A",
-                data_version=item.data_version,
                 build_batch_id=item.build_batch_id,
                 chunk_subtype=subtype,
                 chunk_index=index,
@@ -247,7 +241,6 @@ class ChunkFactory:
         expert_id: int,
         serial_number: str | None,
         chunk_type: str,
-        source_item_key: str,
         text: str,
         source_table: str,
         source_field: str,
@@ -275,7 +268,6 @@ class ChunkFactory:
         origin_type: str,
         verification_status: str,
         weight_tier: str,
-        data_version: str,
         build_batch_id: int,
         chunk_subtype: str | None = None,
         chunk_index: int = 0,
@@ -295,7 +287,6 @@ class ChunkFactory:
         # chunk_text/content_hash，因此可以独立识别“正文不变、Metadata 变化”。
         # indexed_at 与 embedding 模型信息由下游回填，也不参与上游计算。
         record = ChunkRecord(
-            chunk_id=f"expert:{expert_id}:{chunk_type}:{source_item_key}:{chunk_index}",
             expert_id=expert_id,
             serial_number=serial_number,
             chunk_type=chunk_type,
@@ -308,7 +299,6 @@ class ChunkFactory:
             source_table=source_table,
             source_field=source_field,
             source_field_id=source_field_id,
-            source_item_key=source_item_key,
             source_version=source_version,
             source_updated_at=source_updated_at,
             source_hash=source_hash,
@@ -339,8 +329,6 @@ class ChunkFactory:
             weight_tier=weight_tier,
             chunk_policy_version=self.settings.chunk_policy_version,
             metadata_schema_version=self.settings.metadata_schema_version,
-            dictionary_version=self.settings.dictionary_version,
-            data_version=data_version,
             embedding_model_alias=None,
             embedding_model_version=None,
             indexed_at=None,
@@ -369,7 +357,6 @@ def metadata_hash_payload(chunk: ChunkRecord) -> dict[str, object]:
         "source_table": chunk.source_table,
         "source_field": chunk.source_field,
         "source_field_id": chunk.source_field_id,
-        "source_item_key": chunk.source_item_key,
         "source_version": chunk.source_version,
         "source_updated_at": chunk.source_updated_at,
         "source_hash": chunk.source_hash,
@@ -396,8 +383,6 @@ def metadata_hash_payload(chunk: ChunkRecord) -> dict[str, object]:
         "weight_tier": chunk.weight_tier,
         "chunk_policy_version": chunk.chunk_policy_version,
         "metadata_schema_version": chunk.metadata_schema_version,
-        "dictionary_version": chunk.dictionary_version,
-        "data_version": chunk.data_version,
         "is_active": chunk.is_active,
     }
 

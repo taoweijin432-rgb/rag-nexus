@@ -17,8 +17,8 @@ CHUNK_POLICY_VERSION = "1.3"
 # V1.3 取消 metadata_json，并按三种 Chunk 类型使用扁平字段规范，属于主版本变化。
 METADATA_SCHEMA_VERSION = "3.0"
 DICTIONARY_VERSION = "2026.08"
-# v3 与扁平化表结构同步；JSONL 仅是从显式列重建出的兼容交换视图。
-CONTRACT_VERSION = "3.0.0"
+# v4 删除最终表/导出中的 chunk_id、source_item_key、dictionary_version、data_version。
+CONTRACT_VERSION = "4.0.0"
 
 _ENV_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 

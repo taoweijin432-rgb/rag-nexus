@@ -20,15 +20,15 @@ _SUBTYPES = {None, "responsibility", "achievement", "context", "action", "result
 
 
 class ChunkValidationError(ValueError):
-    """包含 chunk_id 的可定位校验错误，但不包含原始正文。"""
+    """包含 vector_doc_id 的可定位校验错误，但不包含原始正文。"""
 
 
 def validate_chunks(chunks: list[ChunkRecord]) -> None:
-    """校验完整集合，同时检查 chunk_id 唯一性。"""
+    """校验完整集合，同时检查 vector_doc_id 唯一性。"""
 
-    ids = [chunk.chunk_id for chunk in chunks]
+    ids = [chunk.vector_doc_id for chunk in chunks]
     if len(ids) != len(set(ids)):
-        raise ChunkValidationError("同一专家生成了重复 chunk_id")
+        raise ChunkValidationError("同一专家生成了重复 vector_doc_id")
     for chunk in chunks:
         _validate_one(chunk)
 
@@ -37,7 +37,7 @@ def _validate_one(chunk: ChunkRecord) -> None:
     """执行长度、PII、哈希、结构、Metadata 一致性检查。"""
 
     def fail(message: str) -> None:
-        raise ChunkValidationError(f"{chunk.chunk_id}: {message}")
+        raise ChunkValidationError(f"{chunk.vector_doc_id}: {message}")
 
     if chunk.chunk_type not in _TYPES:
         fail("chunk_type 不合法")
@@ -70,9 +70,6 @@ def _validate_one(chunk: ChunkRecord) -> None:
         fail("source_field 必须是非空源列名组合")
     if not chunk.source_field_id.strip():
         fail("source_field_id 不能为空")
-    if not chunk.source_item_key.strip():
-        fail("source_item_key 不能为空")
-
     expected_vector_doc_id = build_vector_doc_id(
         expert_id=chunk.expert_id,
         chunk_type=chunk.chunk_type,

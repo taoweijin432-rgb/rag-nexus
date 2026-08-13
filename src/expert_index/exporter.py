@@ -38,9 +38,9 @@ def row_to_contract(row: dict[str, object], timezone_name: str) -> dict[str, obj
 
     text = str(row["chunk_text"])
     if len(text) != int(row["char_count"]):
-        raise ValueError(f"{row['chunk_id']} char_count 不一致")
+        raise ValueError(f"{row['vector_doc_id']} char_count 不一致")
     if sha256_value(text) != row["content_hash"]:
-        raise ValueError(f"{row['chunk_id']} content_hash 不一致")
+        raise ValueError(f"{row['vector_doc_id']} content_hash 不一致")
     expected_vector_doc_id = build_vector_doc_id(
         expert_id=int(row["expert_id"]),
         chunk_type=str(row["chunk_type"]),
@@ -48,11 +48,10 @@ def row_to_contract(row: dict[str, object], timezone_name: str) -> dict[str, obj
         chunk_index=int(row["chunk_index"]),
     )
     if row["vector_doc_id"] != expected_vector_doc_id:
-        raise ValueError(f"{row['chunk_id']} vector_doc_id 不一致")
+        raise ValueError(f"{row['vector_doc_id']} vector_doc_id 不一致")
     metadata = _metadata_from_columns(row)
     return {
         "contract_version": CONTRACT_VERSION,
-        "chunk_id": row["chunk_id"],
         "expert_id": int(row["expert_id"]),
         "serial_number": row["serial_number"],
         "chunk_type": row["chunk_type"],
@@ -68,16 +67,13 @@ def row_to_contract(row: dict[str, object], timezone_name: str) -> dict[str, obj
             "source_table": row["source_table"],
             "source_field": row["source_field"],
             "source_field_id": row["source_field_id"],
-            "source_item_key": row["source_item_key"],
             "source_version": row["source_version"],
             "source_updated_at": _iso(row["source_updated_at"], timezone_name),
             "source_hash": row["source_hash"],
         },
         "versions": {
-            "data_version": row["data_version"],
             "chunk_policy_version": row["chunk_policy_version"],
             "metadata_schema_version": row["metadata_schema_version"],
-            "dictionary_version": row["dictionary_version"],
         },
         "is_active": bool(row["is_active"]),
         "updated_at": _iso(row["updated_at"], timezone_name),
@@ -149,7 +145,7 @@ def _metadata_from_columns(row: dict[str, object]) -> dict[str, object]:
             "topic_codes": _json_list(row["topic_codes"]),
         })
     else:
-        raise ValueError(f"{row['chunk_id']} chunk_type 不支持：{chunk_type}")
+        raise ValueError(f"{row['vector_doc_id']} chunk_type 不支持：{chunk_type}")
     return common
 
 
