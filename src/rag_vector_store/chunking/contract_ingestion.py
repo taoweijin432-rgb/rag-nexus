@@ -1,8 +1,8 @@
-"""正式 Contract 的单条向量化与入库编排。"""
+"""正式 Contract 的单条与批量向量化、入库编排。"""
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from typing import Literal, Protocol
 
@@ -19,6 +19,8 @@ from .contract_pipeline import (
 )
 
 __all__ = [
+    "ContractBatchIngestionResult",
+    "ContractBatchIngestionService",
     "ContractIngestionError",
     "ContractIngestionResult",
     "ContractIngestionService",
@@ -39,7 +41,7 @@ class ContractRepository(Protocol):
 
 
 class ContractIngestionError(RuntimeError):
-    """单条 Contract 编排结果不符合内部一致性约束。"""
+    """Contract 编排结果不符合内部一致性约束。"""
 
 
 @dataclass(frozen=True)
@@ -81,6 +83,52 @@ class ContractIngestionResult:
             raise ValueError("skipped 结果的 affected_count 必须是 0")
         if not isinstance(self.skip_reason, str) or not self.skip_reason.strip():
             raise ValueError("skipped 结果必须包含 skip_reason")
+
+
+@dataclass(frozen=True)
+class ContractBatchIngestionResult:
+    """多条 Contract ingestion 的汇总结果。"""
+
+    results: list[ContractIngestionResult]
+    embedded_count: int
+    skipped_count: int
+    affected_count: int
+
+    def __post_init__(self) -> None:
+        """确保批量汇总与逐条状态及 Repository 结果一致。"""
+
+        if any(not isinstance(item, ContractIngestionResult) for item in self.results):
+            raise ValueError("results 必须只包含 ContractIngestionResult")
+        for name, value in (
+            ("embedded_count", self.embedded_count),
+            ("skipped_count", self.skipped_count),
+            ("affected_count", self.affected_count),
+        ):
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise ValueError(f"{name} 必须是非负整数")
+
+        embedded_count = sum(item.status == "embedded" for item in self.results)
+        skipped_count = sum(item.status == "skipped" for item in self.results)
+        if self.embedded_count != embedded_count:
+            raise ValueError("embedded_count 与 results 不一致")
+        if self.skipped_count != skipped_count:
+            raise ValueError("skipped_count 与 results 不一致")
+        if self.embedded_count + self.skipped_count != len(self.results):
+            raise ValueError("批量汇总数量与 results 不一致")
+        if self.affected_count != self.embedded_count:
+            raise ValueError("affected_count 必须等于 embedded_count")
+
+    @property
+    def total_count(self) -> int:
+        """返回本批输入总数。"""
+
+        return len(self.results)
+
+    @property
+    def item_results(self) -> list[ContractIngestionResult]:
+        """返回按输入顺序排列的逐条结果。"""
+
+        return self.results
 
 
 class ContractIngestionService:
@@ -171,3 +219,141 @@ class ContractIngestionService:
             raise ContractIngestionError("单条 Contract upsert 的 affected_count 必须是 1")
         if mutation.primary_keys != [embedded.vector_doc_id]:
             raise ContractIngestionError("Repository 返回的 primary_keys 与 vector_doc_id 不一致")
+
+
+class ContractBatchIngestionService:
+    """编排多条正式 Contract 的校验、向量化和单次批量 Upsert。"""
+
+    def __init__(
+        self,
+        embedding_worker: ContractEmbeddingWorker,
+        repository: ContractRepository,
+    ) -> None:
+        self.embedding_worker = embedding_worker
+        self.repository = repository
+
+    def ingest_batch(
+        self,
+        records: Iterable[ExpertChunkEmbeddingInput],
+    ) -> ContractBatchIngestionResult:
+        """处理一批输入；任何校验、Embedding 或写入错误都使整批失败。"""
+
+        items = list(records)
+        self._validate_input_records(items)
+        embedding_result = self.embedding_worker.embed(items)
+        embedded, skipped = self._validate_worker_result(items, embedding_result)
+
+        affected_count = 0
+        if embedded:
+            mutation = self.repository.upsert_batch(embedded)
+            self._validate_repository_result(embedded, mutation)
+            affected_count = mutation.affected_count
+
+        embedded_by_chunk_id = {item.chunk_id: item for item in embedded}
+        skipped_by_chunk_id = {item.chunk_id: item for item in skipped}
+        results: list[ContractIngestionResult] = []
+        for item in items:
+            embedded_item = embedded_by_chunk_id.get(item.chunk_id)
+            if embedded_item is not None:
+                results.append(
+                    ContractIngestionResult(
+                        chunk_id=item.chunk_id,
+                        status="embedded",
+                        vector_doc_id=embedded_item.vector_doc_id,
+                        affected_count=1,
+                    )
+                )
+                continue
+
+            skipped_item = skipped_by_chunk_id[item.chunk_id]
+            results.append(
+                ContractIngestionResult(
+                    chunk_id=item.chunk_id,
+                    status="skipped",
+                    skip_reason=skipped_item.reason,
+                )
+            )
+
+        return ContractBatchIngestionResult(
+            results=results,
+            embedded_count=len(embedded),
+            skipped_count=len(skipped),
+            affected_count=affected_count,
+        )
+
+    @staticmethod
+    def _validate_input_records(
+        records: Sequence[ExpertChunkEmbeddingInput],
+    ) -> None:
+        """在调用 Worker 前拒绝非 Contract 和重复批次主键。"""
+
+        if not all(isinstance(item, ExpertChunkEmbeddingInput) for item in records):
+            raise TypeError("ingest_batch 只接受 ExpertChunkEmbeddingInput")
+
+        chunk_ids = [item.chunk_id for item in records]
+        if len(chunk_ids) != len(set(chunk_ids)):
+            raise ContractIngestionError("一个批次不能包含重复 chunk_id")
+
+        vector_doc_ids = [item.vector_doc_id for item in records]
+        if len(vector_doc_ids) != len(set(vector_doc_ids)):
+            raise ContractIngestionError("一个批次不能包含重复 vector_doc_id")
+
+    @staticmethod
+    def _validate_worker_result(
+        records: Sequence[ExpertChunkEmbeddingInput],
+        result: ContractEmbeddingResult,
+    ) -> tuple[
+        list[EmbeddedContractPreparedChunk],
+        list[SkippedContractChunk],
+    ]:
+        """确保 Worker 返回的结果完整覆盖输入且不发生身份错配。"""
+
+        if not isinstance(result, ContractEmbeddingResult):
+            raise ContractIngestionError("Worker 返回了非法 ContractEmbeddingResult")
+
+        embedded = result.embedded_chunks
+        skipped = result.skipped_chunks
+        if len(embedded) + len(skipped) != len(records):
+            raise ContractIngestionError("批量 ingestion 返回结果数量与输入不一致")
+        if any(
+            not isinstance(item, EmbeddedContractPreparedChunk) for item in embedded
+        ):
+            raise ContractIngestionError("Worker 返回了非法 embedded Contract")
+        if any(not isinstance(item, SkippedContractChunk) for item in skipped):
+            raise ContractIngestionError("Worker 返回了非法 skipped Contract")
+
+        input_chunk_ids = {item.chunk_id for item in records}
+        result_chunk_ids = [item.chunk_id for item in embedded] + [
+            item.chunk_id for item in skipped
+        ]
+        if len(result_chunk_ids) != len(set(result_chunk_ids)):
+            raise ContractIngestionError("Worker 返回了重复 chunk_id")
+        if set(result_chunk_ids) != input_chunk_ids:
+            raise ContractIngestionError("Worker 返回的 chunk_id 与输入不一致")
+
+        input_by_chunk_id = {item.chunk_id: item for item in records}
+        for item in embedded:
+            if item.vector_doc_id != input_by_chunk_id[item.chunk_id].vector_doc_id:
+                raise ContractIngestionError(
+                    "Worker 返回的 vector_doc_id 与输入不一致"
+                )
+        return embedded, skipped
+
+    @staticmethod
+    def _validate_repository_result(
+        embedded: Sequence[EmbeddedContractPreparedChunk],
+        mutation: MutationResult,
+    ) -> None:
+        """确保一次批量 mutation 完整覆盖所有已向量化记录。"""
+
+        if not isinstance(mutation, MutationResult):
+            raise ContractIngestionError("Repository 返回了非法 MutationResult")
+        if mutation.affected_count != len(embedded):
+            raise ContractIngestionError(
+                "批量 Contract upsert 的 affected_count 与 embedded 数量不一致"
+            )
+        expected_ids = [item.vector_doc_id for item in embedded]
+        if mutation.primary_keys != expected_ids:
+            raise ContractIngestionError(
+                "Repository 返回的 primary_keys 与 embedded 记录不一致"
+            )

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import Callable
-from urllib.error import HTTPError
+from urllib.error import HTTPError, URLError
 
 import pytest
 
@@ -105,6 +105,72 @@ def test_company_cloud_embedding_supports_batch_and_discovers_dimension() -> Non
     assert embeddings == [[0.1, 0.2, 0.3], [0.4, 0.5, 0.6]]
     assert model.dimension == 3
     assert model.model_alias == FORMAL_EMBEDDING_MODEL_ALIAS
+
+
+def test_company_cloud_embedding_splits_large_input_and_preserves_order() -> None:
+    requests: list[object] = []
+
+    def opener(request: object, **kwargs: object) -> FakeResponse:
+        requests.append(request)
+        payload = json.loads(request.data.decode("utf-8"))
+        data = [
+            {
+                "index": index,
+                "embedding": [float(text.rsplit("-", 1)[1])],
+            }
+            for index, text in reversed(list(enumerate(payload["input"])))
+        ]
+        return FakeResponse({"data": data})
+
+    model = CompanyCloudEmbeddingModel(
+        CompanyCloudEmbeddingSettings(
+            api_url="https://embedding.example.test/v1/embeddings",
+            api_key="unit-test-key",
+            expected_dimension=1,
+        ),
+        opener=opener,
+    )
+
+    embeddings = model.embed([f"chunk-{index}" for index in range(25)])
+
+    assert [len(json.loads(request.data.decode("utf-8"))["input"]) for request in requests] == [
+        10,
+        10,
+        5,
+    ]
+    assert embeddings == [[float(index)] for index in range(25)]
+
+
+def test_company_cloud_embedding_fails_whole_call_when_a_slice_fails() -> None:
+    requests: list[object] = []
+
+    def opener(request: object, **kwargs: object) -> FakeResponse:
+        requests.append(request)
+        if len(requests) == 2:
+            raise URLError("temporary network failure")
+        payload = json.loads(request.data.decode("utf-8"))
+        return FakeResponse(
+            {
+                "data": [
+                    {"index": index, "embedding": [0.1]}
+                    for index in range(len(payload["input"]))
+                ]
+            }
+        )
+
+    model = CompanyCloudEmbeddingModel(
+        CompanyCloudEmbeddingSettings(
+            api_url="https://embedding.example.test/v1/embeddings",
+            api_key="unit-test-key",
+            expected_dimension=1,
+        ),
+        opener=opener,
+    )
+
+    with pytest.raises(CompanyCloudEmbeddingError, match="连接或请求超时"):
+        model.embed([f"chunk-{index}" for index in range(25)])
+
+    assert len(requests) == 2
 
 
 def test_company_cloud_embedding_builds_the_agreed_http_request() -> None:

@@ -8,6 +8,8 @@ from typing import cast
 import pytest
 
 from rag_vector_store import (
+    ContractBatchIngestionResult,
+    ContractBatchIngestionService,
     ContractEmbeddingResult,
     ContractEmbeddingWorker,
     ContractIngestionError,
@@ -139,6 +141,44 @@ def make_record() -> ExpertChunkEmbeddingInput:
     )
 
 
+def make_records(count: int) -> list[ExpertChunkEmbeddingInput]:
+    """构造不依赖数据源的多条正式 Contract 测试数据。"""
+
+    base = make_record()
+    records: list[ExpertChunkEmbeddingInput] = []
+    for index in range(count):
+        text = f"[专家能力概述]\n虚构测试专家第{index}条具备知识检索系统建设经验。"
+        vector_doc_id = f"expert:900001:profile_summary:900001:{index}"
+        records.append(
+            base.model_copy(
+                update={
+                    "chunk_id": (
+                        f"expert:900001:profile_summary:test-profile-{index}:0"
+                    ),
+                    "vector_doc_id": vector_doc_id,
+                    "chunk_text": text,
+                    "char_count": len(text),
+                    "content_hash": hashlib.sha256(text.encode("utf-8")).hexdigest(),
+                    "metadata": base.metadata.model_copy(
+                        update={"vector_doc_id": vector_doc_id}
+                    ),
+                    "source": base.source.model_copy(
+                        update={
+                            "source_item_key": f"test-profile-{index}",
+                            "source_field_id": (
+                                f"dev_experts:900001:background:{index}"
+                            ),
+                            "source_hash": hashlib.sha256(
+                                f"source-{index}".encode()
+                            ).hexdigest(),
+                        }
+                    ),
+                }
+            )
+        )
+    return records
+
+
 def make_service(
     model: FakeEmbeddingModel | None = None,
     repository: FakeContractRepository | None = None,
@@ -154,6 +194,30 @@ def make_service(
     )
     return (
         ContractIngestionService(worker, actual_repository),
+        actual_model,
+        actual_repository,
+    )
+
+
+def make_batch_service(
+    model: FakeEmbeddingModel | None = None,
+    repository: FakeContractRepository | None = None,
+) -> tuple[
+    ContractBatchIngestionService,
+    FakeEmbeddingModel,
+    FakeContractRepository,
+]:
+    """组装不连接外部系统的批量 Contract ingestion 服务。"""
+
+    actual_model = model or FakeEmbeddingModel()
+    actual_repository = repository or FakeContractRepository()
+    worker = ContractEmbeddingWorker(
+        actual_model,
+        expected_dimension=3,
+        clock=fixed_clock,
+    )
+    return (
+        ContractBatchIngestionService(worker, actual_repository),
         actual_model,
         actual_repository,
     )
@@ -270,3 +334,63 @@ def test_ingest_one_rejects_repository_primary_key_mismatch() -> None:
         service.ingest_one(make_record())
 
     assert model.calls == [[make_record().chunk_text]]
+
+
+def test_batch_ingestion_handles_hundreds_of_contracts_with_one_upsert() -> None:
+    service, model, repository = make_batch_service()
+    records = make_records(205)
+    skipped_indexes = {10, 100, 204}
+    records = [
+        record.model_copy(update={"is_active": False})
+        if index in skipped_indexes
+        else record
+        for index, record in enumerate(records)
+    ]
+
+    result = service.ingest_batch(records)
+
+    assert isinstance(result, ContractBatchIngestionResult)
+    assert result.total_count == 205
+    assert result.embedded_count == 202
+    assert result.skipped_count == 3
+    assert result.affected_count == 202
+    assert [item.chunk_id for item in result.results] == [
+        item.chunk_id for item in records
+    ]
+    assert [item.status for item in result.results] == [
+        "skipped" if index in skipped_indexes else "embedded"
+        for index in range(205)
+    ]
+    assert model.calls == [
+        [record.chunk_text for index, record in enumerate(records) if index not in skipped_indexes]
+    ]
+    assert len(repository.calls) == 1
+    assert len(repository.calls[0]) == 202
+    assert [item.vector_doc_id for item in repository.calls[0]] == [
+        record.vector_doc_id
+        for index, record in enumerate(records)
+        if index not in skipped_indexes
+    ]
+
+
+def test_batch_ingestion_invalid_input_fails_closed_before_embedding_and_upsert() -> None:
+    service, model, repository = make_batch_service()
+    records = make_records(201)
+    records[100] = records[100].model_copy(update={"content_hash": "0" * 64})
+
+    with pytest.raises(ValueError, match="content_hash"):
+        service.ingest_batch(records)
+
+    assert model.calls == []
+    assert repository.calls == []
+
+
+def test_batch_ingestion_does_not_upsert_when_embedding_fails() -> None:
+    model = FakeEmbeddingModel("error")
+    service, _, repository = make_batch_service(model=model)
+
+    with pytest.raises(RuntimeError, match="fake embedding failure"):
+        service.ingest_batch(make_records(120))
+
+    assert len(model.calls) == 1
+    assert repository.calls == []

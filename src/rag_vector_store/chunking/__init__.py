@@ -1,6 +1,8 @@
-"""正式 Contract 校验、Embedding 与单条 ingestion 边界。"""
+"""正式 Contract 校验、Embedding 与 ingestion 边界。"""
 
 from .contract_ingestion import (
+    ContractBatchIngestionResult,
+    ContractBatchIngestionService,
     ContractIngestionError,
     ContractIngestionResult,
     ContractIngestionService,
@@ -21,6 +23,8 @@ from .contract_pipeline import (
 
 __all__ = [
     "EXPECTED_EMBEDDING_DIMENSION",
+    "ContractBatchIngestionResult",
+    "ContractBatchIngestionService",
     "ContractEmbeddingResult",
     "ContractEmbeddingWorker",
     "ContractIngestionError",

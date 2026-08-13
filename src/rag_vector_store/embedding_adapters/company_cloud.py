@@ -46,6 +46,9 @@ class CompanyCloudEmbeddingError(RuntimeError):
     """阿里云百炼 Embedding 调用或响应校验失败。"""
 
 
+DEFAULT_EMBEDDING_BATCH_SIZE = 10
+
+
 @dataclass(frozen=True)
 class CompanyCloudEmbeddingSettings:
     """阿里云百炼 Embedding API 的非敏感配置和密钥配置。"""
@@ -181,14 +184,23 @@ class CompanyCloudEmbeddingModel(EmbeddingModel):
     def embed(self, texts: Sequence[str]) -> list[list[float]]:
         """调用云端 API，并返回与输入顺序一致的向量列表。
 
-        API 若返回 ``index``，解析器会按 index 复原顺序；若返回维度与此前已
-        观测值不一致，则拒绝本次结果，避免同一模型实例混入不同向量空间。
+        每次百炼请求最多携带十条文本。API 若返回 ``index``，解析器会在片内
+        复原顺序；所有片都成功后才返回合并结果，避免调用方拿到部分向量。
         """
 
         input_texts = list(texts)
         _validate_input_texts(input_texts)
         if not input_texts:
             return []
+
+        embeddings: list[list[float]] = []
+        for start in range(0, len(input_texts), DEFAULT_EMBEDDING_BATCH_SIZE):
+            batch = input_texts[start : start + DEFAULT_EMBEDDING_BATCH_SIZE]
+            embeddings.extend(self._embed_batch(batch))
+        return embeddings
+
+    def _embed_batch(self, input_texts: Sequence[str]) -> list[list[float]]:
+        """请求并校验一个不超过厂商限制的文本片。"""
 
         request = Request(
             self.settings.api_url,
@@ -303,7 +315,15 @@ def _parse_embeddings(response_body: bytes) -> list[list[float]]:
             raise CompanyCloudEmbeddingError(
                 "Embedding API 响应中的 index 存在重复值"
             )
-        embeddings = [vector for _, vector in sorted(indexed_embeddings)]
+        expected_indexes = set(range(len(data)))
+        if set(indexes) != expected_indexes:
+            raise CompanyCloudEmbeddingError(
+                "Embedding API 响应中的 index 必须覆盖当前片的连续范围"
+            )
+        embeddings_by_index = {
+            index: vector for index, vector in indexed_embeddings
+        }
+        embeddings = [embeddings_by_index[index] for index in range(len(data))]
 
     return embeddings
 

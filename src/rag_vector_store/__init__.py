@@ -12,6 +12,8 @@ from expert_contracts import (
 
 from .chunking import (
     EXPECTED_EMBEDDING_DIMENSION,
+    ContractBatchIngestionResult,
+    ContractBatchIngestionService,
     ContractEmbeddingResult,
     ContractEmbeddingWorker,
     ContractIngestionError,
@@ -69,6 +71,8 @@ __all__ = [
     "CompanyCloudEmbeddingError",
     "CompanyCloudEmbeddingModel",
     "CompanyCloudEmbeddingSettings",
+    "ContractBatchIngestionResult",
+    "ContractBatchIngestionService",
     "ContractEmbeddingResult",
     "ContractEmbeddingWorker",
     "ContractIngestionError",
