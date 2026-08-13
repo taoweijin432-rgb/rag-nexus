@@ -25,6 +25,7 @@ FIXTURE_PATH = (
     / "fixtures"
     / "expert_chunk_embedding_input_v2.jsonl"
 )
+_DEFAULT_UPSERT_RESPONSE = object()
 
 
 class FakeEmbeddingModel:
@@ -55,6 +56,7 @@ class FakeContractMilvusClient:
         self.search_calls: list[dict[str, Any]] = []
         self.rows: dict[str, dict[str, Any]] = {}
         self.drop_calls: list[str] = []
+        self.upsert_response: object = _DEFAULT_UPSERT_RESPONSE
 
     def has_collection(self, collection_name: str) -> bool:
         return self.exists
@@ -95,14 +97,19 @@ class FakeContractMilvusClient:
             "index_type": "INVERTED",
         }
 
-    def upsert(self, **kwargs: Any) -> dict[str, Any]:
+    def upsert(self, **kwargs: Any) -> Any:
         self.upsert_calls.append(kwargs)
         for row in kwargs["data"]:
             self.rows[str(row["vector_doc_id"])] = dict(row)
-        return {
+        response = {
             "upsert_count": len(kwargs["data"]),
             "ids": [row["vector_doc_id"] for row in kwargs["data"]],
         }
+        return (
+            response
+            if self.upsert_response is _DEFAULT_UPSERT_RESPONSE
+            else self.upsert_response
+        )
 
     def query(self, **kwargs: Any) -> list[dict[str, Any]]:
         self.query_calls.append(kwargs)
@@ -297,6 +304,33 @@ def test_contract_repository_upsert_uses_row_mapper() -> None:
         call for call in client.query_calls if "embedding_model_alias" in call["output_fields"]
     ]
     assert model_space_queries[0]["filter"] == "embedding_dim >= 0"
+
+
+@pytest.mark.parametrize(
+    ("response", "message"),
+    [
+        (None, "必须是 Mapping"),
+        ({"ids": []}, "upsert_count"),
+        ({"upsert_count": 3}, "缺少 ids 或 primary_keys"),
+        ({"upsert_count": 2, "ids": []}, "请求数量不一致"),
+        ({"upsert_count": 3, "ids": ["wrong-id"]}, "主键与请求主键不一致"),
+    ],
+)
+def test_contract_repository_rejects_unconfirmed_mutation_response(
+    response: object,
+    message: str,
+) -> None:
+    client = FakeContractMilvusClient(exists=True)
+    repository = ContractMilvusVectorRepository(
+        contract_settings(),
+        vector_dimension=1024,
+        client=client,
+    )
+    client.description = repository._build_schema(1024).to_dict()
+    client.upsert_response = response
+
+    with pytest.raises((TypeError, ValueError), match=message):
+        repository.upsert_batch(embedded_contract_chunks())
 
 
 def test_contract_repository_rejects_mixed_batch_model_space_before_upsert() -> None:

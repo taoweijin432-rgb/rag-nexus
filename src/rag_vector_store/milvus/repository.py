@@ -216,8 +216,8 @@ class ContractMilvusVectorRepository:
         return _mutation_result(
             response,
             "upsert_count",
-            len(items),
-            self._primary_keys(items),
+            expected_count=len(items),
+            expected_ids=self._primary_keys(items),
         )
 
     def get_by_vector_doc_id(
@@ -514,21 +514,40 @@ class ContractMilvusVectorRepository:
 
 def _mutation_result(
     response: Any,
-    primary_key: str,
-    fallback_count: int,
-    fallback_ids: Sequence[str],
+    count_key: str,
+    *,
+    expected_count: int,
+    expected_ids: Sequence[str],
 ) -> MutationResult:
-    if isinstance(response, Mapping):
-        count = response.get(primary_key)
-        if count is None:
-            count = fallback_count
-        ids = response.get("ids") or response.get("primary_keys") or fallback_ids
+    """严格解析 SDK mutation 响应，不根据输入推定写入成功。"""
+
+    if not isinstance(response, Mapping):
+        raise TypeError("Milvus mutation 响应必须是 Mapping")
+
+    count = response.get(count_key)
+    if isinstance(count, bool) or not isinstance(count, int):
+        raise TypeError(f"Milvus mutation 响应缺少合法的 {count_key}")
+    if count != expected_count:
+        raise ValueError(
+            f"Milvus mutation 的 {count_key} 与请求数量不一致: "
+            f"expected {expected_count}, got {count}"
+        )
+
+    if "ids" in response:
+        ids = response["ids"]
+    elif "primary_keys" in response:
+        ids = response["primary_keys"]
     else:
-        count = fallback_count
-        ids = fallback_ids
+        raise ValueError("Milvus mutation 响应缺少 ids 或 primary_keys")
+    if isinstance(ids, (str, bytes)) or not isinstance(ids, Sequence):
+        raise TypeError("Milvus mutation 响应中的主键必须是序列")
+    primary_keys = [str(item) for item in ids]
+    if primary_keys != list(expected_ids):
+        raise ValueError("Milvus mutation 响应的主键与请求主键不一致")
+
     return MutationResult(
-        affected_count=int(count),
-        primary_keys=[str(item) for item in ids],
+        affected_count=count,
+        primary_keys=primary_keys,
     )
 
 
