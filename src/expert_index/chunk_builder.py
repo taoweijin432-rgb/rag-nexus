@@ -111,7 +111,9 @@ class ChunkFactory:
                 major_names_raw=item.major_names_raw,
                 eligible_for_recommendation=item.eligible_for_recommendation,
                 origin_type="compressed_from_source",
-                verification_status="source_summary",
+                # profile 的 verification_status 由 experts.doubtful_flag 决定：
+                # 1=普通→source_summary，2/未知=存疑→rejected。
+                verification_status=item.verification_status,
                 weight_tier="B",
                 data_version=item.data_version,
                 build_batch_id=item.build_batch_id,

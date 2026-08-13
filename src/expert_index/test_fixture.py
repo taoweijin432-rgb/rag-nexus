@@ -66,6 +66,8 @@ class EducationFixture:
 
     school_name: str
     major: str
+    education_level: str
+    is_regular_enrollment: str
     start_date: str
     end_date: str
 
@@ -147,12 +149,16 @@ EDUCATION_FIXTURES = (
     EducationFixture(
         school_name="华东流程测试大学",
         major="信息管理与信息系统",
+        education_level="本科",
+        is_regular_enrollment="是",
         start_date="2010-09-01 00:00:00",
         end_date="2014-06-01 00:00:00",
     ),
     EducationFixture(
         school_name="国际流程测试商学院",
         major="数字化管理",
+        education_level="硕士",
+        is_regular_enrollment="是",
         start_date="2019-09-01 00:00:00",
         end_date="2021-06-01 00:00:00",
     ),
@@ -214,7 +220,7 @@ def _upsert_expert(cursor: object) -> int:
             UPDATE experts
             SET name='流程测试专家A001', interview_nickname='流程测试专家',
                 company=%s, job_status=1, job_name=%s, background=%s,
-                contact_status=1, doubtful_flag=0, abroad_flag=1,
+                contact_status=4, doubtful_flag=1, abroad_flag=2,
                 source_type=99, work_years=12, education='本科', gender=0,
                 email='', phone='', other_contacts='', deleted_at=NULL,
                 updated_at=CURRENT_TIMESTAMP(3)
@@ -233,7 +239,7 @@ def _upsert_expert(cursor: object) -> int:
             email, phone, other_contacts, created_at, updated_at
         ) VALUES (
             %s, '流程测试专家A001', '流程测试专家', %s, 1,
-            %s, 1, 0, 1, %s, 99, 12, '本科', 0,
+            %s, 4, 1, 2, %s, 99, 12, '本科', 0,
             '', '', '', CURRENT_TIMESTAMP(3), CURRENT_TIMESTAMP(3)
         )
         """,
@@ -340,23 +346,32 @@ def _upsert_education(cursor: object, expert_id: int, item: EducationFixture) ->
         cursor.execute(
             """
             UPDATE experts_education_experience
-            SET start_date=%s, end_date=%s, deleted_at=NULL,
+            SET education_level=%s, is_regular_enrollment=%s,
+                start_date=%s, end_date=%s, deleted_at=NULL,
                 updated_at=CURRENT_TIMESTAMP
             WHERE id=%s
             """,
-            (item.start_date, item.end_date, record_id),
+            (
+                item.education_level, item.is_regular_enrollment,
+                item.start_date, item.end_date, record_id,
+            ),
         )
         return record_id
     cursor.execute(
         """
         INSERT INTO experts_education_experience(
             expert_id, school_name, major, start_date, end_date,
+            education_level, is_regular_enrollment, create_by,
             created_at, updated_at
-        ) VALUES (%s, %s, %s, %s, %s, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+        ) VALUES (
+            %s, %s, %s, %s, %s, %s, %s, 0,
+            CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
+        )
         """,
         (
             expert_id, item.school_name, item.major,
-            item.start_date, item.end_date,
+            item.start_date, item.end_date, item.education_level,
+            item.is_regular_enrollment,
         ),
     )
     return int(cursor.lastrowid)

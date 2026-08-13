@@ -38,6 +38,7 @@ CREATE TABLE IF NOT EXISTS expert_index_stage (
     major_names_json JSON NOT NULL,
     work_years DECIMAL(5,2) NULL,
     eligible_for_recommendation TINYINT(1) NULL,
+    verification_status VARCHAR(32) NOT NULL COMMENT 'doubtful_flag 映射结果',
     source_hash CHAR(64) NOT NULL,
     source_updated_at DATETIME(6) NULL,
     data_version VARCHAR(64) NOT NULL,

@@ -97,7 +97,10 @@ def _validate_one(chunk: ChunkRecord) -> None:
             fail(f"{name} 格式应为 YYYYMM")
 
     if chunk.chunk_type == "profile_summary":
-        if chunk.origin_type != "compressed_from_source" or chunk.verification_status != "source_summary":
+        if chunk.origin_type != "compressed_from_source" or chunk.verification_status not in {
+            "source_summary",
+            "rejected",
+        }:
             fail("profile_summary 的来源/核验枚举不合法")
     else:
         if chunk.eligible_for_recommendation is not None:

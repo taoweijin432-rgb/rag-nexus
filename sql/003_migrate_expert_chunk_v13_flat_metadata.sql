@@ -11,7 +11,9 @@ ALTER TABLE expert_index_stage
     ADD COLUMN job_status_norm VARCHAR(32) NULL AFTER role_level,
     ADD COLUMN abroad_flag_norm TINYINT(1) NULL AFTER job_status_norm,
     ADD COLUMN major_names_json JSON NULL AFTER school_names_json,
-    ADD COLUMN eligible_for_recommendation TINYINT(1) NULL AFTER work_years;
+    ADD COLUMN eligible_for_recommendation TINYINT(1) NULL AFTER work_years,
+    ADD COLUMN verification_status VARCHAR(32) NOT NULL DEFAULT 'source_summary'
+        AFTER eligible_for_recommendation;
 
 UPDATE expert_index_stage
 SET school_names_json = COALESCE(school_names_json, JSON_ARRAY()),

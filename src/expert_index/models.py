@@ -108,13 +108,14 @@ class ProfileStage:
     role_name_raw: str | None  # 清洗后但未编码的 experts.job_name。
     role_code: str | None  # 按岗位词典映射的标准岗位代码。
     role_level: str | None  # 按岗位词典映射的职级/责任等级。
-    job_status_norm: str | None  # 岗位状态规范码；枚举未确认前保持 None。
+    job_status_norm: str | None  # 岗位状态规范码：active/former，未知值为 None。
     abroad_flag_norm: bool | None  # 海外背景规范值；源值 0/1 分别映射 False/True。
     background_clean: str | None  # 删除噪声与 PII 后的 experts.background。
     school_names_raw: tuple[str, ...]  # 有效教育经历的学校原始名，清洗、去空并稳定去重。
     major_names_raw: tuple[str, ...]  # 有效教育经历的专业原始名，清洗、去空并稳定去重。
     work_years: float | None  # 标准化后的工作年限，来自 experts.work_years。
-    eligible_for_recommendation: bool | None  # 推荐资格；源枚举定义未确认前保持 None。
+    eligible_for_recommendation: bool | None  # contact_status 映射的推荐资格，未知值为 None。
+    verification_status: str  # doubtful_flag 映射：普通=source_summary，存疑/未知=rejected。
     source_hash: str  # 允许进入链路的主档字段规范 JSON 的 SHA-256。
     source_updated_at: datetime | None  # 优先取 experts.updated_at，为空时取 created_at。
     data_version: str  # 运行时指定的业务数据版本。

@@ -135,9 +135,9 @@ class MySQLIndexRepository:
                 company_normalization_status, role_name_raw, role_code, role_level,
                 job_status_norm, abroad_flag_norm, background_clean,
                 school_names_json, major_names_json, work_years,
-                eligible_for_recommendation, source_hash,
+                eligible_for_recommendation, verification_status, source_hash,
                 source_updated_at, data_version, stage_status, build_batch_id
-            ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,'ready',%s)
+            ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,'ready',%s)
             ON DUPLICATE KEY UPDATE
                 serial_number=VALUES(serial_number), company_name_raw=VALUES(company_name_raw),
                 company_name_norm=VALUES(company_name_norm),
@@ -149,6 +149,7 @@ class MySQLIndexRepository:
                 school_names_json=VALUES(school_names_json),
                 major_names_json=VALUES(major_names_json), work_years=VALUES(work_years),
                 eligible_for_recommendation=VALUES(eligible_for_recommendation),
+                verification_status=VALUES(verification_status),
                 source_hash=VALUES(source_hash), source_updated_at=VALUES(source_updated_at),
                 data_version=VALUES(data_version), stage_status='ready', reject_reason=NULL,
                 build_batch_id=VALUES(build_batch_id)
@@ -159,7 +160,7 @@ class MySQLIndexRepository:
                 item.role_level, item.job_status_norm, item.abroad_flag_norm,
                 item.background_clean, _json(list(item.school_names_raw)),
                 _json(list(item.major_names_raw)), item.work_years,
-                item.eligible_for_recommendation, item.source_hash,
+                item.eligible_for_recommendation, item.verification_status, item.source_hash,
                 item.source_updated_at, item.data_version,
                 item.build_batch_id,
             ),

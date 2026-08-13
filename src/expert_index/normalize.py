@@ -160,17 +160,48 @@ def month_value(value: datetime | date | str | None) -> str | None:
     return f"{int(match.group(1)):04d}{int(match.group(2)):02d}" if match else None
 
 
-def binary_flag(value: object) -> bool | None:
-    """只把明确的 0/1 标量转换为布尔值，其他测试库脏值保持未知。
+def normalize_job_status(value: object) -> str | None:
+    """标准化 ``experts.job_status``：1=现任，2=曾任。"""
 
-    该函数用于 ``abroad_flag``。它与 ``is_employed`` 的枚举不同，后者使用
-    1=在职、2=不在职，因此必须继续由 :func:`employment_status` 单独处理。
+    if value == 1:
+        return "active"
+    if value == 2:
+        return "former"
+    return None
+
+
+def recommendation_eligibility(value: object) -> bool | None:
+    """由 ``contact_status`` 计算推荐资格。
+
+    1=未接触、2=接触中，尚未形成可推荐合作状态；3=接受访谈、4=访谈合作，
+    已达到推荐准入条件。未知脏值保持 ``None``，不默认为可推荐。
     """
 
-    if value in (0, False):
+    if value in (1, 2):
         return False
-    if value in (1, True):
+    if value in (3, 4):
         return True
+    return None
+
+
+def profile_verification_status(value: object) -> str:
+    """由 ``doubtful_flag`` 生成画像核验状态：1=普通，2=存疑。"""
+
+    if value == 1:
+        return "source_summary"
+    if value == 2:
+        return "rejected"
+    # 未知值不能按正常专家处理，使用 rejected 阻止进入推荐/向量消费。
+    return "rejected"
+
+
+def normalize_abroad_flag(value: object) -> bool | None:
+    """标准化 ``abroad_flag``：1=海外专家，2=非海外专家。"""
+
+    if value == 1:
+        return True
+    if value == 2:
+        return False
     return None
 
 
@@ -289,15 +320,14 @@ def normalize_aggregate(
         role_name_raw=role_raw,
         role_code=role_code,
         role_level=role_level,
-        # job_status/contact_status/doubtful_flag 的枚举表尚未确认。本轮读取并纳入
-        # source_hash，但不把不明数值猜成业务标签或推荐资格。
-        job_status_norm=None,
-        abroad_flag_norm=binary_flag(profile.abroad_flag),
+        job_status_norm=normalize_job_status(profile.job_status),
+        abroad_flag_norm=normalize_abroad_flag(profile.abroad_flag),
         background_clean=background,
         school_names_raw=school_names,
         major_names_raw=major_names,
         work_years=profile.work_years,
-        eligible_for_recommendation=None,
+        eligible_for_recommendation=recommendation_eligibility(profile.contact_status),
+        verification_status=profile_verification_status(profile.doubtful_flag),
         source_hash=source_hash(profile_allowed),
         # 任一教育记录变化都应推动 profile_summary 的来源版本前进。
         source_updated_at=_latest_source_time(profile, aggregate.educations),

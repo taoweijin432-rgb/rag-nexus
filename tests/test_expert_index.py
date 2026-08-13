@@ -27,10 +27,14 @@ from expert_index.models import (
 from expert_index.normalize import (
     clean_text,
     employment_status,
+    normalize_abroad_flag,
     normalize_aggregate,
+    normalize_job_status,
     parse_employment_description,
     parse_project_description,
     pii_hits,
+    profile_verification_status,
+    recommendation_eligibility,
     sha256_value,
 )
 from expert_index.repository import MySQLIndexRepository
@@ -61,9 +65,9 @@ def _aggregate(long_employment: bool = False) -> ExpertAggregate:
         company="京东零售集团有限公司",
         job_status=1,
         job_name="运营负责人",
-        contact_status=1,
-        doubtful_flag=0,
-        abroad_flag=1,
+        contact_status=4,
+        doubtful_flag=1,
+        abroad_flag=2,
         background="8年电商运营经验，邮箱 fake@example.com，手机号 13800138000。",
         work_years=8,
         updated_at=when,
@@ -138,6 +142,24 @@ class SourceMappingTest(unittest.TestCase):
         self.assertIsNone(employment_status(0))
         self.assertIsNone(employment_status(None))
 
+    def test_profile_status_enums(self) -> None:
+        """锁定四个 experts 标量字段的数据库枚举映射。"""
+
+        self.assertEqual("active", normalize_job_status(1))
+        self.assertEqual("former", normalize_job_status(2))
+        self.assertIsNone(normalize_job_status(0))
+        self.assertIs(recommendation_eligibility(1), False)
+        self.assertIs(recommendation_eligibility(2), False)
+        self.assertIs(recommendation_eligibility(3), True)
+        self.assertIs(recommendation_eligibility(4), True)
+        self.assertIsNone(recommendation_eligibility(0))
+        self.assertEqual("source_summary", profile_verification_status(1))
+        self.assertEqual("rejected", profile_verification_status(2))
+        self.assertEqual("rejected", profile_verification_status(0))
+        self.assertIs(normalize_abroad_flag(1), True)
+        self.assertIs(normalize_abroad_flag(2), False)
+        self.assertIsNone(normalize_abroad_flag(0))
+
     def test_source_model_names_match_mysql_columns(self) -> None:
         """Source 层不得再用 role/description 等派生别名隐藏源列。"""
 
@@ -205,7 +227,10 @@ class SourceMappingTest(unittest.TestCase):
         self.assertEqual("2001", projects[0].source_field_id)
         self.assertEqual(("华东流程测试大学",), profile.school_names_raw)
         self.assertEqual(("信息管理与信息系统",), profile.major_names_raw)
-        self.assertIs(profile.abroad_flag_norm, True)
+        self.assertEqual("active", profile.job_status_norm)
+        self.assertIs(profile.abroad_flag_norm, False)
+        self.assertIs(profile.eligible_for_recommendation, True)
+        self.assertEqual("source_summary", profile.verification_status)
 
     def test_new_month_format_is_yyyymm(self) -> None:
         """新标准不再保留年月之间的连字符。"""
