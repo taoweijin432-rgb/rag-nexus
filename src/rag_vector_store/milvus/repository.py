@@ -403,13 +403,12 @@ class ContractMilvusVectorRepository:
         self,
         record: EmbeddedContractPreparedChunk,
     ) -> None:
-        """在 upsert 前确认已有 Entity 与本批次属于同一模型空间。"""
+        """在 upsert 前分批遍历已有 Entity，确认 Collection 模型空间一致。"""
 
-        rows = self._get_client().query(
+        iterator = self._get_client().query_iterator(
             collection_name=self.settings.collection_name,
-            # Milvus 不允许在没有 limit 时使用空表达式；embedding_dim 是正式
-            # Contract 的非空正整数投影，用它做全量筛选可同时覆盖空 Collection，
-            # 并保留对已有所有 Entity 的 model-space 检查。
+            batch_size=1000,
+            limit=-1,
             filter="embedding_dim >= 0",
             output_fields=[
                 "embedding_model_alias",
@@ -419,19 +418,28 @@ class ContractMilvusVectorRepository:
             consistency_level="Strong",
             **self._timeout_kwargs(),
         )
-        if not isinstance(rows, list) or not all(isinstance(row, Mapping) for row in rows):
-            raise TypeError("Milvus model-space query 返回了非法 Entity 列表")
-        difference = compare_model_space(
-            rows,
-            embedding_model_alias=record.embedding_model_alias,
-            embedding_model_version=record.embedding_model_version,
-            embedding_dimension=record.embedding_dim,
-        )
-        if not difference.compatible:
-            raise ValueError(
-                "Milvus Collection 已有 Entity 与当前 Embedding model-space 不一致: "
-                f"{json.dumps(difference.as_dict(), ensure_ascii=False, sort_keys=True)}"
-            )
+        try:
+            while True:
+                rows = iterator.next()
+                if not isinstance(rows, list) or not all(
+                    isinstance(row, Mapping) for row in rows
+                ):
+                    raise TypeError("Milvus model-space iterator 返回了非法 Entity 批次")
+                if not rows:
+                    break
+                difference = compare_model_space(
+                    rows,
+                    embedding_model_alias=record.embedding_model_alias,
+                    embedding_model_version=record.embedding_model_version,
+                    embedding_dimension=record.embedding_dim,
+                )
+                if not difference.compatible:
+                    raise ValueError(
+                        "Milvus Collection 已有 Entity 与当前 Embedding model-space 不一致: "
+                        f"{json.dumps(difference.as_dict(), ensure_ascii=False, sort_keys=True)}"
+                    )
+        finally:
+            iterator.close()
 
     def _build_schema(self, vector_dimension: int | None) -> Any:
         """构造正式 Contract Schema，不修改任何已有 Collection。"""

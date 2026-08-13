@@ -45,6 +45,28 @@ class FakeIndexParams:
         self.calls.append(kwargs)
 
 
+class FakeQueryIterator:
+    def __init__(
+        self,
+        batches: list[object],
+        *,
+        error_on_call: int | None = None,
+    ) -> None:
+        self.batches = list(batches)
+        self.error_on_call = error_on_call
+        self.next_calls = 0
+        self.closed = False
+
+    def next(self) -> object:
+        self.next_calls += 1
+        if self.error_on_call == self.next_calls:
+            raise RuntimeError("iterator query failed")
+        return self.batches.pop(0) if self.batches else []
+
+    def close(self) -> None:
+        self.closed = True
+
+
 class FakeContractMilvusClient:
     def __init__(self, *, exists: bool) -> None:
         self.exists = exists
@@ -53,10 +75,14 @@ class FakeContractMilvusClient:
         self.create_calls: list[dict[str, Any]] = []
         self.upsert_calls: list[dict[str, Any]] = []
         self.query_calls: list[dict[str, Any]] = []
+        self.query_iterator_calls: list[dict[str, Any]] = []
         self.search_calls: list[dict[str, Any]] = []
         self.rows: dict[str, dict[str, Any]] = {}
         self.drop_calls: list[str] = []
         self.upsert_response: object = _DEFAULT_UPSERT_RESPONSE
+        self.model_space_batches: list[object] | None = None
+        self.iterator_error_on_call: int | None = None
+        self.last_query_iterator: FakeQueryIterator | None = None
 
     def has_collection(self, collection_name: str) -> bool:
         return self.exists
@@ -117,6 +143,20 @@ class FakeContractMilvusClient:
         if ids is None:
             return list(self.rows.values())
         return [self.rows[vector_doc_id] for vector_doc_id in ids if vector_doc_id in self.rows]
+
+    def query_iterator(self, **kwargs: Any) -> FakeQueryIterator:
+        self.query_iterator_calls.append(kwargs)
+        batches = (
+            [list(self.rows.values())]
+            if self.model_space_batches is None
+            else self.model_space_batches
+        )
+        iterator = FakeQueryIterator(
+            batches,
+            error_on_call=self.iterator_error_on_call,
+        )
+        self.last_query_iterator = iterator
+        return iterator
 
     def search(self, **kwargs: Any) -> list[list[dict[str, Any]]]:
         self.search_calls.append(kwargs)
@@ -300,10 +340,11 @@ def test_contract_repository_upsert_uses_row_mapper() -> None:
     assert rows[1]["source_ext"] == chunks[1].source.model_dump(mode="json")
     assert rows[2]["versions_ext"] == chunks[2].versions.model_dump(mode="json")
     assert client.drop_calls == []
-    model_space_queries = [
-        call for call in client.query_calls if "embedding_model_alias" in call["output_fields"]
-    ]
-    assert model_space_queries[0]["filter"] == "embedding_dim >= 0"
+    assert client.query_iterator_calls[0]["filter"] == "embedding_dim >= 0"
+    assert client.query_iterator_calls[0]["batch_size"] == 1000
+    assert client.query_iterator_calls[0]["limit"] == -1
+    assert client.last_query_iterator is not None
+    assert client.last_query_iterator.closed is True
 
 
 @pytest.mark.parametrize(
@@ -367,6 +408,75 @@ def test_contract_repository_rejects_existing_mismatched_model_space() -> None:
     with pytest.raises(ValueError, match="已有 Entity 与当前 Embedding model-space"):
         repository.upsert_batch(embedded_contract_chunks())
 
+    assert client.upsert_calls == []
+
+
+def test_contract_repository_checks_all_model_space_iterator_batches() -> None:
+    client = FakeContractMilvusClient(exists=True)
+    repository = ContractMilvusVectorRepository(
+        contract_settings(),
+        vector_dimension=1024,
+        client=client,
+    )
+    client.description = repository._build_schema(1024).to_dict()
+    matching = {
+        "embedding_model_alias": "alibaba-bailian:text-embedding-v4",
+        "embedding_model_version": "v1",
+        "embedding_dim": 1024,
+    }
+    client.model_space_batches = [
+        [matching],
+        [{**matching, "embedding_model_version": "v0"}],
+    ]
+
+    with pytest.raises(ValueError, match="已有 Entity 与当前 Embedding model-space"):
+        repository.upsert_batch(embedded_contract_chunks())
+
+    assert client.last_query_iterator is not None
+    assert client.last_query_iterator.next_calls == 2
+    assert client.last_query_iterator.closed is True
+    assert client.upsert_calls == []
+
+
+def test_contract_repository_rejects_missing_model_space_field_and_closes_iterator() -> None:
+    client = FakeContractMilvusClient(exists=True)
+    repository = ContractMilvusVectorRepository(
+        contract_settings(),
+        vector_dimension=1024,
+        client=client,
+    )
+    client.description = repository._build_schema(1024).to_dict()
+    client.model_space_batches = [[{"embedding_model_dim": 1024}]]
+
+    with pytest.raises(ValueError, match="已有 Entity 与当前 Embedding model-space"):
+        repository.upsert_batch(embedded_contract_chunks())
+
+    assert client.last_query_iterator is not None
+    assert client.last_query_iterator.closed is True
+    assert client.upsert_calls == []
+
+
+def test_contract_repository_closes_model_space_iterator_when_query_fails() -> None:
+    client = FakeContractMilvusClient(exists=True)
+    repository = ContractMilvusVectorRepository(
+        contract_settings(),
+        vector_dimension=1024,
+        client=client,
+    )
+    client.description = repository._build_schema(1024).to_dict()
+    client.iterator_error_on_call = 2
+    client.model_space_batches = [[{
+        "embedding_model_alias": "alibaba-bailian:text-embedding-v4",
+        "embedding_model_version": "v1",
+        "embedding_dim": 1024,
+    }]]
+
+    with pytest.raises(RuntimeError, match="iterator query failed"):
+        repository.upsert_batch(embedded_contract_chunks())
+
+    assert client.last_query_iterator is not None
+    assert client.last_query_iterator.next_calls == 2
+    assert client.last_query_iterator.closed is True
     assert client.upsert_calls == []
 
 
