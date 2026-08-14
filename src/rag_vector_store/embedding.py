@@ -15,12 +15,27 @@ from typing import Protocol
 class EmbeddingModel(Protocol):
     """适配任意文本 Embedding 服务所需的最小接口。
 
-    实现可以包装本地模型、托管 API 或团队内部服务。调用方只传入已通过
-    Contract/Eligibility 的 ``chunk_text``，不会把 Metadata、Source 或 Versions
-    拼接进模型输入。
+    设计意图：
+        ``ContractEmbeddingWorker`` 依赖的是这个抽象 ``EmbeddingModel``，而不是
+        具体厂商 SDK；这样阿里云百炼、本地模型或团队内部服务可以在不修改
+        Validator / Worker / Ingestion / Repository 的前提下替换。
 
-    ``embed`` 返回值必须与输入文本一一对应；具体适配器负责把网络或厂商错误
-    转成安全异常，Contract Worker 再统一校验向量的有限性和维度。
+    实现：
+        - 正式实现为 ``embedding_adapters/company_cloud.py`` 的
+          ``CompanyCloudEmbeddingModel``（阿里云百炼适配器）。
+
+    调用方：
+        ``ContractEmbeddingWorker.embed`` —— 只传入已通过 Contract/Eligibility
+        的 ``chunk_text``，不会把 Metadata、Source 或 Versions 拼接进模型输入。
+
+    接口：
+        - ``embed(texts)``：接收 ``Sequence[str]``，返回与输入**顺序一一对应**
+          的向量序列。
+        - ``dimension``：每条输入文本对应的浮点数个数。
+
+    失败契约：
+        具体适配器负责把网络或厂商错误转成安全异常；Contract Worker 再统一
+        校验向量的有限性和维度（fail-closed）。
     """
 
     @property

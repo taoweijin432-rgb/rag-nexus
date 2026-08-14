@@ -166,7 +166,22 @@ class ExpertChunkVersions(_ContractModel):
 
 
 class ExpertChunkEmbeddingInput(_ContractModel):
-    """一条待向量化的正式 ``expert_chunk`` 输入记录（导出契约 4.0.0）。"""
+    """一条待向量化的正式 ``expert_chunk`` 输入记录（导出契约 4.0.0）。
+
+    在主链路中的位置：
+        - 产生：由上游 Builder（expert_index 侧）生成，或由
+          ``MySqlExpertChunkReader.map_row`` 从 MySQL ``expert_chunk`` 扁平行组装。
+        - 消费：``ContractValidator.validate``（校验）→ ``ContractEmbeddingWorker``
+          （Eligibility + Embedding）→ ``ContractIngestionService`` /
+          ``ContractBatchIngestionService``（入库编排）。
+        - 下一站：通过 Validator 后转换为 ``ContractPreparedChunk``。
+
+    设计要点：
+        - 顶层 ``vector_doc_id`` 是唯一身份键（主线公式见 ``validate_contract_consistency``），
+          ``metadata`` 不保留副本；不存在 ``chunk_id`` 旧语义。
+        - 叠加 strict + extra=forbid：未声明字段或类型不符都会直接失败（fail-closed）。
+        - 本类型只表达结构，不负责校验“是否应 Embedding”，也不负责向量化。
+    """
 
     model_config = ConfigDict(
         extra="forbid",
@@ -237,14 +252,33 @@ class ExpertChunkEmbeddingInput(_ContractModel):
 
 
 class ContractPreparedChunk(ExpertChunkEmbeddingInput):
-    """通过契约校验、尚未生成向量的 Chunk。"""
+    """通过契约校验、尚未生成向量的 Chunk。
+
+    在主链路中的位置：
+        - 产生：``ContractValidator.validate`` / ``validate_mapping`` 成功时，
+          由 ``ExpertChunkEmbeddingInput`` 转换而来。
+        - 消费：``EmbeddingEligibilityValidator.get_skip_reason`` 判断是否允许
+          Embedding。
+        - 下一站：eligible 记录经 ``ContractEmbeddingWorker.embed`` 附加向量后
+          变为 ``EmbeddedContractPreparedChunk``。
+
+    含义：它的存在代表“该记录已通过消费端 Validator”，但尚未具备向量。
+    """
 
 
 class EmbeddedContractPreparedChunk(ContractPreparedChunk):
     """保留完整输入契约并附加向量化输出字段的记录。
 
+    在主链路中的位置：
+        - 产生：``ContractEmbeddingWorker.embed`` 对每条 eligible 记录调用
+          ``EmbeddingModel.embed`` 后构造。
+        - 消费：``ContractIngestionService`` / ``ContractBatchIngestionService``
+          把 embedded 记录交给 ``ContractMilvusVectorRepository.upsert_batch``。
+        - 下一站：``MilvusRowMapper.to_entity`` 映射为 Milvus 物理行。
+
     ``embedded_at`` 是内部 Embedding 完成时间，与下游回填的 ``indexed_at``
-    （Milvus upsert 成功时间）保持独立。
+    （Milvus upsert 成功时间）保持独立。向量字段带模型空间信息，保证写入前
+    可跨批次核对模型空间一致。
     """
 
     embedding: list[float] = Field(..., min_length=1)

@@ -104,14 +104,32 @@ class ContractEmbeddingResult:
 class ContractValidator:
     """执行结构约束和无法由 Schema 表达的跨字段业务校验。
 
-    输入可以是原始 Mapping 或严格的 ``ExpertChunkEmbeddingInput``；成功时返回
-    ``ContractPreparedChunk``，失败则抛出不携带正文的 ``ContractValidationError``。
-    ``content_hash`` 会在消费端重新按 ``chunk_text`` 校验，但 ``source_hash``
-    不在这里重算，因为它属于上游来源事实的责任边界。
+    调用时机：
+        ``ContractEmbeddingWorker.embed`` 在每条记录进入 Embedding 前调用；
+        验收脚本 ``scripts/task2_acceptance.py`` 的预检统计也复用本类。
+
+    输入：
+        可以是原始 Mapping 或严格的 ``ExpertChunkEmbeddingInput``。
+
+    输出：
+        校验通过时返回 ``ContractPreparedChunk``（由输入转换而来，携带全部
+        Contract 字段，是 Eligibility 与 Milvus 投影的下一站）。
+
+    失败：
+        抛出不携带正文的 ``ContractValidationError``（invalid）。
+
+    职责：
+        判断“数据是否合法/可信”，不是判断“是否应该 Embedding”——后者属于
+        ``EmbeddingEligibilityValidator``。``content_hash`` 会在消费端重新按
+        ``chunk_text`` 校验，但 ``source_hash`` 不在这里重算，因为它属于上游
+        来源事实的责任边界。
     """
 
     def validate_mapping(self, value: Mapping[str, Any]) -> ContractPreparedChunk:
-        """先执行 Pydantic 生成的 JSON Schema 等价校验，再执行跨字段校验。"""
+        """先执行 Pydantic 生成的 JSON Schema 等价校验，再执行跨字段校验。
+
+        调用方：需要从原始 dict/Mapping 构造正式记录的外部适配层（如测试 Fixture）。
+        """
 
         try:
             record = ExpertChunkEmbeddingInput.model_validate(value)
@@ -123,7 +141,30 @@ class ContractValidator:
         self,
         value: ExpertChunkEmbeddingInput,
     ) -> ContractPreparedChunk:
-        """校验一条已完成结构解析的契约记录。"""
+        """校验一条已完成结构解析的契约记录。
+
+        “合法”的范围（当前正式校验类别，具体规则见函数体）：
+
+        - chunk 组织关系：chunk_index < chunk_total、chunk_subtype × chunk_type 兼容；
+        - chunk_text：非空、无回车/控制字符、按 chunk_type 上限、char_count 一致、
+          UTF-8 字节量；
+        - content_hash：按实际 chunk_text 重算 SHA-256 并比对；
+        - PII / 控制字符：PII 模式与禁止字符检测（Embedding 前执行，避免敏感
+          信息进入外部模型）；
+        - 时间跨字段约束：is_current=true 时 end_month 必须为 null；
+        - origin_type × chunk_type、verification_status × chunk_type 填充规则；
+        - recommendation 字段适用性：eligible_for_recommendation 只能出现在
+          profile_summary。
+
+        输出类型：
+            ``ContractPreparedChunk`` —— “已通过消费端 Validator”的阶段类型，
+            下一站是 ``EmbeddingEligibilityValidator``。
+
+        分支：
+            - invalid：任一规则不满足则抛 ``ContractValidationError``，
+              不会进入 Embedding；
+            - valid：返回 ContractPreparedChunk。
+        """
 
         if not isinstance(value, ExpertChunkEmbeddingInput):
             raise TypeError("ContractValidator 只接受 ExpertChunkEmbeddingInput")
@@ -203,10 +244,27 @@ class ContractValidator:
 class EmbeddingEligibilityValidator:
     """决定一条合法 Contract 是否进入正常向量消费。
 
-    Eligibility skip 与 Contract invalid 是两类不同结果：前者是记录结构合法但
-    当前不应进入正式向量索引（``is_active=false`` 或
-    ``verification_status=rejected``），后者表示输入契约本身不可信。这里不执行
-    删除或 tombstone，生命周期动作由上层后续流程处理。
+    调用时机：
+        ``ContractEmbeddingWorker.embed`` 对每条已通过 ``ContractValidator`` 的
+        ``ContractPreparedChunk`` 调用 ``get_skip_reason``。
+
+    输入：
+        ``ContractPreparedChunk``（合法但尚未向量化）。
+
+    输出：
+        ``None``（允许 Embedding）或 skip reason 字符串（跳过）。
+
+    当前正式 Eligibility 规则：
+        - ``is_active=false`` → skip；
+        - ``verification_status=rejected`` → skip。
+
+    边界：
+        - rejected 是 profile_summary 的合法 Contract 状态，不是
+          ContractValidationError；它只是不进入正式向量索引。
+        - ``weight_tier``（检索权重）与 ``eligible_for_recommendation``（推荐资格）
+          不参与 Embedding Eligibility。
+        - Eligibility skip 与 Contract invalid 是两类不同结果；这里不执行删除或
+          tombstone，生命周期动作由上层后续流程处理。
     """
 
     def get_skip_reason(self, record: ContractPreparedChunk) -> str | None:
@@ -224,12 +282,12 @@ class EmbeddingEligibilityValidator:
         return None
 
     def is_eligible(self, record: ContractPreparedChunk) -> bool:
-        """判断记录是否允许进入 Embedding。"""
+        """判断记录是否允许进入 Embedding（get_skip_reason 的布尔视图）。"""
 
         return self.get_skip_reason(record) is None
 
     def validate(self, record: ContractPreparedChunk) -> None:
-        """不满足资格时抛出明确异常。"""
+        """不满足资格时抛出明确异常（供需要 fail-fast 的场景）。"""
 
         reason = self.get_skip_reason(record)
         if reason is not None:
@@ -239,9 +297,28 @@ class EmbeddingEligibilityValidator:
 class ContractEmbeddingWorker:
     """只把通过校验且符合资格的 ``chunk_text`` 交给 EmbeddingModel。
 
-    Worker 负责批量调用和响应防御性校验，输出带模型空间并保留上游
-    ``vector_doc_id`` 的 Embedded Contract。它不负责任务级幂等；是否跳过调用由
-    ``ContractIngestionService`` 在调用 Worker 之前决定。
+    调用时机：
+        - ``ContractIngestionService.ingest_one``（单条路径）；
+        - ``ContractBatchIngestionService.ingest_batch``（批量路径）；
+        - 验收脚本 ``scripts/task2_acceptance.py`` 的预检复用其内部 Validator。
+
+    输入：
+        ``Iterable[ExpertChunkEmbeddingInput]`` —— 尚未经过消费端校验/资格判断的记录。
+
+    主要调用：
+        1. ``ContractValidator.validate``（每条记录）
+        2. ``EmbeddingEligibilityValidator.get_skip_reason``（每条 valid 记录）
+        3. ``EmbeddingModel.embed(texts)``（只传 eligible 的 chunk_text）
+
+    输出：
+        ``ContractEmbeddingResult`` —— embedded_chunks（``EmbeddedContractPreparedChunk``
+        列表，携带 embedding 与模型空间）+ skipped_chunks（``SkippedContractChunk``
+        列表，携带 vector_doc_id 与原因）。
+
+    职责边界：
+        Worker 只负责批量调用与响应防御性校验，输出带模型空间并保留上游
+        ``vector_doc_id`` 的 Embedded Contract；它不负责任务级幂等，也不负责
+        Milvus 写入（写入由 Ingestion 层交给 Repository）。
     """
 
     def __init__(
@@ -277,7 +354,29 @@ class ContractEmbeddingWorker:
         self,
         records: Iterable[ExpertChunkEmbeddingInput],
     ) -> ContractEmbeddingResult:
-        """校验、筛选并批量向量化；不会改写或拼接 chunk_text。"""
+        """校验、筛选并批量向量化；不会改写或拼接 chunk_text。
+
+        调用链：
+            ExpertChunkEmbeddingInput
+            -> ContractValidator.validate()            # invalid 在此抛错
+            -> ContractPreparedChunk
+            -> EmbeddingEligibilityValidator.get_skip_reason()
+            -> eligible / skipped
+            -> 提取 eligible.chunk_text               # Embedding 唯一输入
+            -> embedding_model.embed(texts)           # 外部模型调用
+            -> EmbeddedContractPreparedChunk          # 逐个构造
+            -> ContractEmbeddingResult
+
+        关键约束：
+            - Embedding 的语义输入严格只有 ``chunk_text``；Metadata、Source、
+              Versions、vector_doc_id 一律不拼入 Embedding 文本（它们在 Milvus
+              行映射中保存，避免向量语义与过滤字段耦合）。
+            - invalid（Contract 不合法）与 skipped（合法但不符合资格）是两种
+              不同结果：invalid 在这里直接抛 ``ContractValidationError``，
+              skipped 进入结果列表。
+            - 没有 eligible 记录时不触碰外部 Embedding 服务。
+            - 模型返回数量/维度/有限性在构造输出对象前 fail-closed 校验。
+        """
 
         eligible: list[ContractPreparedChunk] = []
         skipped: list[SkippedContractChunk] = []

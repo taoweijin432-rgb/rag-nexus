@@ -38,6 +38,10 @@ def compare_schema_specs(
 ) -> CollectionCompatibilityResult:
     """比较服务端字段描述与一组 Schema 定义。
 
+    谁使用：
+        ``ContractMilvusVectorRepository.compare_contract_schema``（zero-write gate）；
+        验收/验证脚本的 Collection 结构预检。
+
     字段集合、类型、nullable、VARCHAR 容量、向量维度和 Collection 选项任一不
     一致都会返回 incompatible；该函数不尝试修复或迁移现有 Collection。
     """
@@ -80,6 +84,10 @@ def compare_contract_indexes(
     expected_specs: Sequence[IndexSpec],
 ) -> CollectionCompatibilityResult:
     """比较 Contract 向量索引和完整 scalar index set。
+
+    谁使用：
+        ``ContractMilvusVectorRepository.compare_contract_indexes`` 在写入前/初始化
+        时对比服务端索引；只调用 describe/list 类只读接口。
 
     向量索引比较 metric/params，scalar 索引比较字段与类型；缺少或多出索引都
     被报告，避免 Repository 在未知索引集合上继续写入。
@@ -143,6 +151,10 @@ def compare_model_space(
     embedding_dimension: int,
 ) -> CollectionCompatibilityResult:
     """判断已读取 Entity 是否属于同一个 alias/version/dimension 空间。
+
+    谁使用：
+        ``ContractMilvusVectorRepository._validate_batch_model_space``（批内混用检查）
+        与 ``_validate_existing_model_space``（Collection 既有数据检查）。
 
     维度相同不等于向量空间相同，因此 alias、version、dimension 必须同时匹配；
     这是防止两个同维模型混写同一 Collection 的只读保护。

@@ -29,7 +29,16 @@ def build_model_space_id(
     dimension: int,
     model_version: str,
 ) -> str:
-    """由模型别名、向量维度和项目/供应商版本构造稳定空间标识。"""
+    """由模型别名、向量维度和项目/供应商版本构造稳定空间标识。
+
+    谁使用：
+        - ``CompanyCloudEmbeddingModel.model_space_id``：报告的正式空间标识；
+        - 验收/验证脚本核对 ``FORMAL_EMBEDDING_MODEL_SPACE_ID``。
+
+    格式：
+        ``{model_alias}:{dimension}:{model_version}``，例如
+        ``alibaba-bailian:text-embedding-v4:1024:v1``。
+    """
 
     if not isinstance(model_alias, str) or not model_alias.strip():
         raise ValueError("embedding model alias 必须是非空字符串")

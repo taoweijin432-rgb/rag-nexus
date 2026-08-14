@@ -32,6 +32,19 @@ def contract_milvus_field_specs(
 ) -> tuple[MilvusFieldSpec, ...]:
     """返回无损承载正式 Chunk 契约输出所需的字段定义。
 
+    谁使用：
+        - ``schemas/builder.py``：构造 SDK Schema（Repository 创建 Collection）；
+        - ``MilvusRowMapper``：存储容量校验的字段基线；
+        - ``Repository`` / 验证脚本：只读 Schema 对比。
+
+    当前 v14 设计：
+        - ``vector_doc_id`` 是唯一 PK（auto_id=False，VARCHAR 2048 bytes）；
+        - ``embedding`` 为 FLOAT_VECTOR（默认 1024 维）；
+        - ``metadata_ext`` / ``source_ext`` / ``versions_ext`` 为三组 JSON 完整快照；
+        - Scalar Index 字段：``expert_id`` / ``chunk_type`` /
+          ``eligible_for_recommendation``（见 ``CONTRACT_SCALAR_INDEX_FIELDS``）；
+        - 已废弃字段（chunk_id 等）在新 Schema 中一律不存在。
+
     维度由调用方传入并写入向量字段；其余字段必须保持稳定，Repository 的
     Compatibility Gate 会在任何写入前逐项核对。
 

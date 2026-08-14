@@ -43,11 +43,17 @@ __all__ = [
 class MilvusExpertChunkEntity(BaseModel):
     """正式 Contract 在 Milvus 中的完整 Entity 数据模型。
 
-    该模型同时表达向量、标量投影和三组 JSON extension，确保过滤字段可直接使用
-    且原始嵌套结构可完整回查。构造时会拒绝非有限向量或错误维度。
+    谁使用：
+        ``MilvusRowMapper`` 的输出模型；``ContractMilvusVectorRepository`` 通过
+        Mapper 把 ``EmbeddedContractPreparedChunk`` 映射为行后再交给 PyMilvus。
 
-    身份字段只有 ``vector_doc_id``（唯一 PK），不存在 ``chunk_id`` 或其他业务
-    主键；已废弃字段不得出现在本模型中。
+    内容：
+        同一实体同时表达向量、标量投影和三组 JSON extension，确保过滤字段可
+        直接使用且原始嵌套结构可完整回查。构造时会拒绝非有限向量或错误维度。
+
+    身份：
+        只有 ``vector_doc_id``（唯一 PK），不存在 ``chunk_id`` 或其他业务主键；
+        已废弃字段不得出现在本模型中。
     """
 
     model_config = ConfigDict(extra="forbid", strict=True)
@@ -103,8 +109,30 @@ class MilvusExpertChunkEntity(BaseModel):
 class MilvusRowMapper:
     """将 ``EmbeddedContractPreparedChunk`` 无损映射为 Milvus 行。
 
-    Mapper 负责上游主键透传、字段投影、JSON 快照和存储容量检查；不负责调用
-    Embedding、生成或重算主键、修改输入对象或执行 Milvus CRUD。
+    这是主链路中唯一的“业务 Contract → Milvus 物理存储模型”映射边界：
+
+        EmbeddedContractPreparedChunk
+        -> to_entity / to_rows
+        -> MilvusExpertChunkEntity（再经 ``model_dump(mode="python")`` 成行）
+
+    调用方：
+        ``ContractMilvusVectorRepository``（写入前、落 SDK 前调用）。
+
+    映射规则：
+        - Scalar 投影：expert_id / chunk_type / content_hash / verification_status /
+          eligible_for_recommendation 等高频过滤或增量字段投影为独立列；
+        - ``metadata_ext`` / ``source_ext`` / ``versions_ext``：完整 JSON 快照，
+          保证嵌套结构可无损回查；
+        - ``embedding`` + 模型空间字段（embedding_dim / alias / version）随行保存；
+        - Decimal ``work_years`` 经 ``model_dump(mode="json")`` 稳定序列化为字符串
+          （保留两位小数精度），不转 float；
+        - nullable 语义原样保留（None 保持为 None）；
+        - 字节/JSON 大小 fail-closed：VARCHAR 按 UTF-8 bytes、JSON extension 按
+          Milvus 服务端限制校验，超限拒绝写入。
+
+    职责边界：
+        Mapper 只负责字段投影、JSON 快照和存储容量检查；不负责调用 Embedding、
+        生成或重算主键、修改输入对象或执行 Milvus CRUD。
     """
 
     def to_entity(
@@ -163,7 +191,12 @@ class MilvusRowMapper:
         self,
         chunks: Sequence[EmbeddedContractPreparedChunk],
     ) -> list[dict[str, object]]:
-        """批量映射并拒绝同批重复主键。"""
+        """批量映射并拒绝同批重复主键。
+
+        调用方：
+            ``ContractMilvusVectorRepository._to_rows`` 在落 SDK 前调用；
+            这是正式写入路径的主入口。
+        """
 
         entities = [self.to_entity(chunk) for chunk in chunks]
         primary_keys = [entity.vector_doc_id for entity in entities]
@@ -172,12 +205,16 @@ class MilvusRowMapper:
         return [entity.model_dump(mode="python") for entity in entities]
 
     def from_row(self, row: Mapping[str, object]) -> EmbeddedContractPreparedChunk:
-        """将已有 Milvus 行还原为 Contract 输出对象。
+        """将已有 Milvus 行还原为 Contract 输出对象（反向映射，非主写入路径）。
 
-        Metadata-only 更新必须保留原向量，因此需要先从 Milvus 读取当前 Entity，
-        再用新输入的 Metadata/source/versions 生成完整 Upsert 行。该方法只做字段
-        还原，不会调用 Embedding，也不会修改 Milvus。``metadata_ext`` 中 Decimal
-        化的 ``work_years`` 字符串会由 Contract 模型重新构造为 ``Decimal``。
+        用途：
+            Metadata-only 更新必须保留原向量，因此需要先从 Milvus 读取当前
+            Entity，再用新输入的 Metadata/source/versions 生成完整 Upsert 行。
+
+        边界：
+            该方法只做字段还原，不会调用 Embedding，也不会修改 Milvus；
+            ``metadata_ext`` 中 Decimal 化的 ``work_years`` 字符串会由 Contract
+            模型重新构造为 ``Decimal``。不要把它描述成主写入路径。
         """
 
         metadata = row.get("metadata_ext")

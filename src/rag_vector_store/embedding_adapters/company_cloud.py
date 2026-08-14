@@ -51,7 +51,17 @@ DEFAULT_EMBEDDING_BATCH_SIZE = 10
 
 @dataclass(frozen=True)
 class CompanyCloudEmbeddingSettings:
-    """阿里云百炼 Embedding API 的非敏感配置和密钥配置。"""
+    """阿里云百炼 Embedding API 的非敏感配置和密钥配置。
+
+    谁使用：
+        ``CompanyCloudEmbeddingModel.from_env`` 构造模型时读取；
+        测试可显式构造本对象注入。
+
+    来源：
+        全部来自环境变量（``EMBEDDING_API_URL`` / ``EMBEDDING_API_KEY`` 必填，
+        其余可选并默认正式常量）。密钥字段 ``api_key`` 设置 ``repr=False``，
+        避免日志/异常中泄露。
+    """
 
     api_url: str
     api_key: str = field(repr=False)
@@ -121,8 +131,26 @@ class CompanyCloudEmbeddingSettings:
 class CompanyCloudEmbeddingModel(EmbeddingModel):
     """通过阿里云百炼兼容 HTTP API 批量生成 Embedding。
 
-    适配器保持输入文本顺序，并在接受响应前检查数量、索引、有限数值和批内
-    dimension；它不做重试或文本清洗，调用方可以据异常决定是否重试任务。
+    调用方：
+        ``ContractEmbeddingWorker``（通过 ``EmbeddingModel`` Protocol 抽象）。
+
+    输入：
+        一批 ``chunk_text``（经 Contract/Eligibility 过滤后的正式文本）。
+
+    内部流程：
+        - 按 Provider 限制微批（每次最多 ``DEFAULT_EMBEDDING_BATCH_SIZE`` = 10 条）；
+        - 每批调用 ``_embed_batch()``（一次真正的 Provider 请求边界）；
+        - 调用阿里云百炼 ``text-embedding-v4``；
+        - 保持输入输出顺序；
+        - 校验响应结构 / index / 数值有限性 / 维度。
+
+    输出：
+        与 ``texts`` 一一对应的 embedding 列表。
+
+    设计边界：
+        - 10 条微批限制只属于本 Adapter；Worker / Ingestion 不应感知。
+        - 本适配器不做重试或文本清洗，调用方可以据异常决定是否重试任务；
+        - Contract 校验、幂等、Task State 和 Milvus 写入不在这里处理。
     """
 
     def __init__(
@@ -191,6 +219,7 @@ class CompanyCloudEmbeddingModel(EmbeddingModel):
         input_texts = list(texts)
         _validate_input_texts(input_texts)
         if not input_texts:
+            # 空输入直接返回空列表：正式 Worker 不会在无 eligible 时调用本方法。
             return []
 
         embeddings: list[list[float]] = []
@@ -200,7 +229,12 @@ class CompanyCloudEmbeddingModel(EmbeddingModel):
         return embeddings
 
     def _embed_batch(self, input_texts: Sequence[str]) -> list[list[float]]:
-        """请求并校验一个不超过厂商限制的文本片。"""
+        """请求并校验一个不超过厂商限制的文本片。
+
+        这是一次真正 Provider 请求边界：构造 HTTP 请求 → 发送 → 解析 
+        ``data[].embedding`` → 校验数量/顺序/有限性/维度 → 锁定运行时维度。
+        任一环节失败都会让本片失败（fail-closed），不会返回部分结果。
+        """
 
         request = Request(
             self.settings.api_url,

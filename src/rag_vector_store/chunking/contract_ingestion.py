@@ -34,7 +34,22 @@ __all__ = [
 
 
 class ContractRepository(Protocol):
-    """正式 Contract 入库所需的最小 Repository 协议。"""
+    """正式 Contract 入库所需的最小 Repository 协议。
+
+    调用时机：
+        ``ContractIngestionService.ingest_one`` / ``ContractBatchIngestionService.ingest_batch``
+        在 Worker 完成 Eligibility 与向量化后，用这里写入 Milvus。
+
+    当前正式实现：
+        ``ContractMilvusVectorRepository``（见 ``milvus/repository.py``）。
+
+    输入：
+        Sequence[EmbeddedContractPreparedChunk] —— 已通过 Contract 校验、Eligibility
+        并携带完整 embedding 的正式记录。
+
+    输出：
+        MutationResult —— affected_count 与 primary_keys；调用方要求两者与输入完全一致。
+    """
 
     def upsert_batch(
         self,
@@ -136,7 +151,27 @@ class ContractBatchIngestionResult:
 
 
 class ContractIngestionService:
-    """编排一条正式 Contract 的校验、资格判断、向量化和 Upsert。"""
+    """编排一条正式 Contract 的校验、资格判断、向量化和 Upsert。
+
+    调用时机：
+        需要单条处理一条 ``ExpertChunkEmbeddingInput``（如单条重试、单条回放）时使用；
+        批量场景请使用 ``ContractBatchIngestionService``（批量不通过循环本类实现）。
+
+    输入：
+        ``ExpertChunkEmbeddingInput`` —— 已完成结构解析但尚未经过消费端校验/向量化的记录。
+
+    主要调用：
+        1. ``ContractEmbeddingWorker.embed([record])``（校验 + Eligibility + Embedding）
+        2. ``ContractRepository.upsert_batch([embedded])``（写入 Milvus）
+
+    输出：
+        ``ContractIngestionResult`` —— status=embedded（affected_count=1）或
+        status=skipped（携带 skip_reason）；skip 是正常结果，其余错误直接向上抛出。
+
+    职责边界：
+        本类只做单条结果对齐与身份一致性校验，不实现 Validator / Eligibility /
+        Embedding 本身；是否跳过由 Worker 的 Eligibility 决定。
+    """
 
     def __init__(
         self,
@@ -150,7 +185,22 @@ class ContractIngestionService:
         self,
         record: ExpertChunkEmbeddingInput,
     ) -> ContractIngestionResult:
-        """处理一条输入；skip 是正常结果，其它错误直接向上抛出。"""
+        """处理一条输入；skip 是正常结果，其它错误直接向上抛出。
+
+        调用链：
+            ingest_one(record)
+            -> embedding_worker.embed([record])            # 校验 + Eligibility + 向量化
+            -> _single_worker_result(record, result)       # 拒绝空/多结果与身份错配
+            -> repository.upsert_batch([embedded])         # 单条写入 Milvus
+            -> _validate_repository_result(embedded, ...)  # affected_count/PK 一致
+            -> ContractIngestionResult
+
+        分支：
+            - skipped：Eligibility 未通过（is_active=false 或 rejected），直接返回
+              skipped 结果，不调用 Repository。
+            - embedded：Eligibility 通过且向量化成功，进入 Repository upsert。
+            - fail-closed：Worker/Repository 结果身份或数量不一致时抛异常。
+        """
 
         if not isinstance(record, ExpertChunkEmbeddingInput):
             raise TypeError("ingest_one 只接受 ExpertChunkEmbeddingInput")
@@ -159,6 +209,7 @@ class ContractIngestionService:
         embedding_result = self.embedding_worker.embed([record])
         embedded, skipped = self._single_worker_result(record, embedding_result)
         if skipped is not None:
+            # skipped 是合法结果：记录结构没问题，只是当前不进入正式向量索引。
             return ContractIngestionResult(
                 status="skipped",
                 vector_doc_id=record.vector_doc_id,
@@ -182,7 +233,11 @@ class ContractIngestionService:
         record: ExpertChunkEmbeddingInput,
         result: ContractEmbeddingResult,
     ) -> tuple[EmbeddedContractPreparedChunk | None, SkippedContractChunk | None]:
-        """拒绝 Worker 的空结果、多结果或记录身份错配。"""
+        """拒绝 Worker 的空结果、多结果或记录身份错配。
+
+        单条入口必须以 ``vector_doc_id`` 对齐 Worker 输出：无论 embedded 还是
+        skipped，输出主键必须与输入一致，否则不能继续（fail-closed）。
+        """
 
         if not isinstance(result, ContractEmbeddingResult):
             raise ContractIngestionError("Worker 返回了非法 ContractEmbeddingResult")
@@ -227,7 +282,40 @@ class ContractIngestionService:
 
 
 class ContractBatchIngestionService:
-    """编排多条正式 Contract 的校验、向量化和单次批量 Upsert。"""
+    """编排多条正式 Contract 的校验、向量化和单次批量 Upsert。
+
+    调用时机：
+        - 正式批处理入口（例如 ``scripts/task2_acceptance.py`` 的真实 7 条 E2E）；
+        - 任何需要一次性消费多条 ``ExpertChunkEmbeddingInput`` 的场景。
+
+    输入：
+        Iterable[ExpertChunkEmbeddingInput] —— 每条已符合 Contract 4.0.0 结构，
+        但尚未经过消费端 Validator / Eligibility / Embedding。
+
+    主要调用：
+        1. ``authenticate_validate_input_records``（批量输入检查）
+        2. ``ContractEmbeddingWorker.embed(items)``（一次向量化全部 eligible）
+        3. ``validate_worker_result``（结果全覆盖与身份对齐）
+        4. ``ContractRepository.upsert_batch(embedded)``（单次批量写入 Milvus）
+        5. ``validate_repository_result``（affected_count/primary_keys 一致）
+
+    输出：
+        ``ContractBatchIngestionResult`` —— results（逐条 embedded/skipped）+
+        embedded_count/skipped_count/affected_count 汇总。
+
+    职责与设计：
+        - 保持真正批量：Worker 一次向量化、Repository 单次 ``upsert_batch``，
+          不循环调用 ``ingest_one``。
+        - ``vector_doc_id`` 是整条链路的身份键：批内不允许重复主键，Worker 输出
+          必须完整覆盖输入且身份一致。
+        - skipped 记录不进 Repository；只有 embedded 记录才写入 Milvus。
+        - fail-closed：任何校验、Embedding 或写入错误都会使整批失败，
+          不会返回部分成功。
+
+    职责边界：
+        本类只负责编排与结果对齐，不实现 Validator / Eligibility / Embedding /
+        Milvus Row Mapping；这些分别由 Worker 与 Repository 承担。
+    """
 
     def __init__(
         self,
@@ -243,8 +331,20 @@ class ContractBatchIngestionService:
     ) -> ContractBatchIngestionResult:
         """处理一批输入；任何校验、Embedding 或写入错误都使整批失败。
 
-        保持真正批量：Worker 一次向量化全部 eligible 记录，再对全部 embedded
-        做单次 ``Repository.upsert_batch``，不循环调用单条入口。
+        调用链：
+            ingest_batch(records)
+            -> _validate_input_records(items)              # 类型 + 批内去重
+            -> embedding_worker.embed(items)               # 校验/Eligibility/向量化
+            -> _validate_worker_result(items, result)      # 全覆盖 + 身份对齐
+            -> repository.upsert_batch(embedded)           # 单次批量写入
+            -> _validate_repository_result(embedded, ...)  # 数量/PK 一致
+            -> ContractBatchIngestionResult
+
+        分支：
+            - 全部 skipped：不调用 Repository，affected_count=0。
+            - 部分/全部 embedded：只把 embedded 记录送入 Milvus。
+            - fail-closed：输入重复 / Worker 结果错配 / Repository 数量不一致
+              时整批抛出异常。
         """
 
         items = list(records)

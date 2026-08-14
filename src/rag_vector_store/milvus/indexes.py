@@ -60,7 +60,17 @@ def vector_index_spec(settings: MilvusSettings) -> IndexSpec:
 
 
 def index_specs(settings: MilvusSettings) -> tuple[IndexSpec, ...]:
-    """返回正式 Contract Collection 应具备的完整索引集合。"""
+    """返回正式 Contract Collection 应具备的完整索引集合。
+
+    谁使用：
+        - ``Repository.initialize``：创建 Collection 时的索引声明；
+        - ``Repository.compare_contract_indexes``：只读索引对比基准。
+
+    构成：
+        1 个向量索引（``embedding_vector``，HNSW/COSINE，参数来自环境配置）+ 3 个
+        INVERTED 标量索引（``expert_id`` / ``chunk_type`` /
+        ``eligible_for_recommendation``，见 ``contract.CONTRACT_SCALAR_INDEX_FIELDS``）。
+    """
 
     vector = vector_index_spec(settings)
     return (

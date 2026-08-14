@@ -122,7 +122,23 @@ class AcceptanceFailure(RuntimeError):
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    """执行验收并输出终端摘要及 JSON 报告。"""
+    """执行真实 7 条 E2E 验收并输出终端摘要及 JSON 报告。
+
+    主链路编排（按顺序调用正式组件，不复制业务逻辑）：
+        1. _read_mysql_records   # MySqlExpertChunkReader（真实 MySQL → Contract 4.0.0）
+        2. _load_settings        # Milvus 配置 + 受保护 Collection 拒绝
+        3. _verify_collection    # ContractMilvusVectorRepository 只读 preflight
+        4. _snapshot_v13         # 旧 v13 只读行数快照（get_collection_stats）
+        5. _build_embedding_worker  # CompanyCloudEmbeddingModel + ContractEmbeddingWorker
+        6. _count_valid_and_eligible # ContractValidator + Eligibility 预检
+        7. _ingest_records       # ContractBatchIngestionService.ingest_batch
+        8. _verify_queries       # vector_doc_id / expert_id / missing PK 回查
+        9. _check_no_deprecated_fields
+        10. _check_v13_unchanged  # v13 before/after 对比
+
+    失败模式：任何阶段失败都记入 report.failures 并将 overall 置为 FAIL，
+    但脚本仍会写出 JSON 报告供人工检查。
+    """
 
     args = _parse_args(argv)
     report = _new_report(args)
@@ -270,7 +286,17 @@ def _read_mysql_records(
     args: argparse.Namespace,
     report: dict[str, Any],
 ) -> list[ExpertChunkEmbeddingInput]:
-    """通过正式 Reader 只读读取真实 ``expert_chunk`` 并映射为 Contract 4.0.0。"""
+    """通过正式 Reader 只读读取真实 ``expert_chunk`` 并映射为 Contract 4.0.0。
+
+    数据流：
+        MySQL expert_chunk（真实 DEV 数据）
+        -> MySqlExpertChunkReader.read()（固定 SELECT，Asia/Shanghai 解释无时区时间）
+        -> ExpertChunkEmbeddingInput 4.0.0
+        -> 返回 records 列表给后续 Validator / Eligibility / Ingestion
+
+    本函数是整条 E2E 的真实数据入口；Reader 只做读取和映射，不做 Embedding。
+    任何读取错误（含单行映射失败与记录数 != expected_count）都 fail-closed。
+    """
 
     _begin(report, "mysql_read")
     settings = MySQLSettings.from_env()
@@ -377,7 +403,17 @@ def _verify_collection(
     settings: MilvusSettings,
     report: dict[str, Any],
 ) -> ContractMilvusVectorRepository:
-    """只读确认 v14 Collection；Repository 禁止自动创建。"""
+    """只读确认 v14 Collection；Repository 禁止自动创建。
+
+    调用方：
+        ``main`` 在 ``_load_settings`` 之后调用（任何写入前）。
+
+    作用：
+        用正式 ``ContractMilvusVectorRepository`` 的只读 gate（has_collection /
+        describe_collection / compare_contract_schema / compare_contract_indexes）
+        确认 Schema、Index、auto_id、PK、dim 与冻结方案一致；不一致立即 FAIL，
+        绝不会自动创建、drop、alter 或迁移 Collection。
+    """
 
     _begin(report, "collection_precondition")
     repository = ContractMilvusVectorRepository(
@@ -463,7 +499,19 @@ def _verify_collection(
 def _build_embedding_worker(
     report: dict[str, Any],
 ) -> tuple[CompanyCloudEmbeddingModel, ContractEmbeddingWorker]:
-    """构造正式云端 Embedding Adapter 和已有 Contract Worker，并核对模型空间。"""
+    """构造正式云端 Embedding Adapter 和已有 Contract Worker，并核对模型空间。
+
+    调用方：
+        ``main`` 在 Collection preflight 之后调用。
+
+    数据流：
+        环境变量（EMBEDDING_API_*）
+        -> CompanyCloudEmbeddingModel.from_env()（阿里云百炼适配器）
+        -> ContractEmbeddingWorker（Validator + Eligibility + Embedding 编排）
+
+    本函数同时做 fail-closed 门禁：model_space_id 必须是正式空间
+    ``alibaba-bailian:text-embedding-v4:1024:v1``，配置维度必须与 Collection 一致。
+    """
 
     _begin(report, "embedding")
     model = CompanyCloudEmbeddingModel.from_env()
@@ -573,7 +621,18 @@ def _ingest_records(
     report: dict[str, Any],
     stats: Mapping[str, int],
 ) -> None:
-    """通过正式批量 ingestion 一次完成校验、向量化和 v14 upsert。"""
+    """通过正式批量 ingestion 一次完成校验、向量化和 v14 upsert。
+
+    调用链：
+        _ingest_records(records, ...)
+        -> ContractBatchIngestionService.ingest_batch(records)
+             -> Worker.embed（Validator/Eligibility/Embedding）
+             -> Repository.upsert_batch（正式 Milvus v14）
+        -> _batch_count_mismatch（与预检数量交叉核对）
+
+    本函数是主链路中唯一真正调用 Embedding 与写入 Milvus 的步骤；
+    embedded_count 必须 >= 1（验收必须产生真实写入）。
+    """
 
     _begin(report, "embedding")
     service = ContractBatchIngestionService(worker, repository)
@@ -757,7 +816,12 @@ def _snapshot_v13(
     collection_name: str,
     report: dict[str, Any],
 ) -> None:
-    """ingestion 前对旧 v13 Collection 做只读行数快照。"""
+    """ingestion 前对旧 v13 Collection 做只读行数快照。
+
+    保护语义：v13 在受保护名单中，本脚本绝不对它写入/alter/drop；
+    唯一交互是只读快照（has_collection / describe_collection /
+    get_collection_stats），供验收后与 after 对比。
+    """
 
     snapshot = _v13_snapshot(client, collection_name)
     report["v13"]["exists"] = snapshot["exists"]
@@ -766,7 +830,16 @@ def _snapshot_v13(
 
 
 def _check_v13_unchanged(client: Any, report: dict[str, Any]) -> None:
-    """ingestion 后再次快照旧 Collection，确认行数前后一致。"""
+    """ingestion 后再次快照旧 Collection，确认行数前后一致。
+
+    调用方：
+        ``main`` 在全部查询验证之后调用（验收最后阶段）。
+
+    分支：
+        - v13 不存在：unchanged=None，直接 PASS（不阻止新链路验收）；
+        - before/after 行数变化：FAIL（fail-closed，绝不允许旧 Collection 被
+          本次验收意外修改）。
+    """
 
     _begin(report, "v13_integrity")
     if not report["v13"].get("exists"):

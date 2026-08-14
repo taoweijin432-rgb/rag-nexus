@@ -143,8 +143,27 @@ class MySQLReadResult:
 class MySqlExpertChunkReader:
     """使用同步 MySQL 连接只读读取 ``expert_chunk`` 扁平表。
 
-    ``id`` 只作为数据库 Row identity 用于排序和错误定位，不会写入 Contract；
-    ``vector_doc_id`` 直接读取独立列，用于错误定位，不生成、不重算。
+    调用时机：
+        - 正式批处理/E2E 入口（如 ``scripts/task2_acceptance.py``）在调用
+          ``ContractValidator`` / Ingestion 之前读取真实数据；
+        - 任何需要从 MySQL 重建 ``ExpertChunkEmbeddingInput 4.0.0`` 的读取端。
+
+    输入：
+        ``MySQLSettings``（只读连接配置，见 ``config.py``）。
+
+    数据流：
+        MySQL ``expert_chunk`` 行
+        -> ``read()``（固定 SELECT，按 id 排序）
+        -> ``map_row()``（Python 类型转换：JSON 数组 / DECIMAL / bool / datetime）
+        -> ``ExpertChunkEmbeddingInput 4.0.0``（Pydantic 严格校验）
+        -> ``MySQLReadResult``（records + errors 分离）
+
+    职责边界：
+        - Reader 只做读取和映射，**不做 Embedding**，也不做 Eligibility、Task
+          State 或 Milvus 写入；
+        - 不清洗、摘要、截断、重算 ``source_hash``；
+        - ``id`` 只作为数据库 Row identity 用于排序和错误定位，不会写入 Contract；
+        - ``vector_doc_id`` 直接读取独立列，用于错误定位，不生成、不重算。
     """
 
     def __init__(
@@ -162,7 +181,12 @@ class MySqlExpertChunkReader:
         """按 ``id`` 顺序读取全部或前 ``limit`` 条记录。
 
         使用固定 SELECT 而不是 ``SELECT *``，避免上游新增列时改变 tuple 位置或
-        把不属于输入契约的数据意外带入映射层。单条映射失败只进入 errors。
+        把不属于输入契约的数据意外带入映射层。单条映射失败只进入 errors，
+        由调用方（如验收脚本）决定是否 fatal。
+
+        输出：
+            ``MySQLReadResult`` —— input_count（数据库行数）/ records（成功映射
+            Contract 列表）/ errors（安全定位错误）。
         """
 
         if limit is not None and (isinstance(limit, bool) or limit < 1):
@@ -215,6 +239,8 @@ class MySqlExpertChunkReader:
         row_id = _optional_row_id(values.get("id"))
         vector_doc_id = _optional_text(values.get("vector_doc_id"))
 
+        # 扁平列 → Contract 组装点：顶层身份、业务 metadata、来源/版本、生命周期。
+        # 数据库 id 只用于错误定位，不进入 payload；vector_doc_id 直接透传。
         try:
             payload: dict[str, Any] = {
                 "contract_version": EXPERT_CHUNK_CONTRACT_VERSION,

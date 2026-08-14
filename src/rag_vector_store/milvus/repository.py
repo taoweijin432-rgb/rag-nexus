@@ -38,10 +38,32 @@ from .schemas import (
 class ContractMilvusVectorRepository:
     """封装 Milvus 连接、Schema 管理和 CRUD 写操作。
 
-    SDK client 会在第一次操作时延迟创建。传入 ``client`` 适合测试，或适合由
-    应用自行管理 PyMilvus client 生命周期的场景。所有正式写入都先确定向量维度，
-    再通过 Schema/Index Compatibility Gate；已存在但不兼容的 Collection 会阻断，
-    不自动 drop、alter 或 recreate。
+    调用方：
+        - ``ContractIngestionService.ingest_one`` / ``ContractBatchIngestionService.ingest_batch``
+          （通过 ``ContractRepository`` Protocol）；
+        - 验收/验证脚本（只读 gate、结构对比、PK 回查）。
+
+    输入：
+        ``EmbeddedContractPreparedChunk``（已经过 Contract 校验、Eligibility 与
+        Embedding 的结果记录）。
+
+    内部主要步骤（见 ``upsert_batch``）：
+        1. Collection / Schema / Index compatibility gate；
+        2. model-space / embedding dimension 检查；
+        3. ``MilvusRowMapper`` 行转换；
+        4. vector_doc_id / PK 一致性检查；
+        5. SDK upsert；
+        6. ``MutationResult``（affected_count / primary_keys）fail-closed 校验。
+
+    职责边界：
+        Repository **不负责** Contract Validation、Eligibility、调用 Embedding、
+        Task State；它只消费已经向量化的正式记录。
+
+    连接生命周期：
+        SDK client 在第一次操作时延迟创建。传入 ``client`` 适合测试，或适合由
+        应用自行管理 PyMilvus client 生命周期的场景。所有正式写入都先确定向量
+        维度，再通过 Schema/Index Compatibility Gate；已存在但不兼容的 Collection
+        会阻断，不自动 drop、alter 或 recreate。
     """
 
     def __init__(
@@ -187,9 +209,33 @@ class ContractMilvusVectorRepository:
     ) -> MutationResult:
         """按 Contract 主键 upsert 一批已经完成向量化的记录。
 
-        调用顺序是输入类型/批次主键检查 → 维度锁定 → Collection gate → 行映射
-        → SDK upsert。Repository 不自行生成向量或修复字段，Mapper 拒绝容量/主键
-        不合法的数据。
+        调用链：
+            upsert_batch(records)
+            -> 类型检查 + 空批处理
+            -> _ensure_dimension_from_records      # 从记录锁定向量维度
+            -> _validate_batch_model_space         # 批内模型空间一致 + 非占位版本
+            -> initialize(dimension)               # Collection/Index gate（已存在只读校验）
+            -> _validate_existing_model_space      # 遍历已有 Entity 对比模型空间
+            -> _to_rows(records)                   # MilvusRowMapper 行映射 + PK 去重
+            -> SDK upsert
+            -> _mutation_result                    # upsert_count/PK 严格解析
+            -> MutationResult
+
+        输入：
+            ``EmbeddedContractPreparedChunk[]`` —— 已经过 Contract 校验、Eligibility
+            与 Embedding 的正式记录。
+
+        输出：
+            ``MutationResult`` —— affected_count 与 primary_keys；两者必须与请求
+            完全一致（fail-closed），否则抛异常，不推定写入成功。
+
+        分支：
+            - 空批：直接返回 ``MutationResult(affected_count=0)``；
+            - 任一校验失败：抛异常，不执行部分写入。
+
+        职责边界：
+            Repository 不自行生成向量或修复字段；Mapper 拒绝容量/主键不合法的
+            数据；Repository 不负责 Contract Validation / Eligibility / Embedding。
         """
 
         items = list(records)
