@@ -21,14 +21,12 @@ class SearchHit(BaseModel):
 
     vector_doc_id: str = Field(min_length=1)
     expert_id: int = Field(ge=1)
-    chunk_id: str = Field(min_length=1)
     chunk_type: str = Field(min_length=1)
     chunk_text: str = Field(min_length=1)
     score: float
 
     @field_validator(
         "vector_doc_id",
-        "chunk_id",
         "chunk_type",
         "chunk_text",
     )

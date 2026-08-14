@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from collections.abc import Sequence
 from datetime import datetime, timezone
+from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
@@ -23,7 +24,7 @@ from rag_vector_store import (
 FIXTURE_PATH = (
     Path(__file__).resolve().parents[1]
     / "fixtures"
-    / "expert_chunk_embedding_input_v2.jsonl"
+    / "expert_chunk_embedding_input_v4.jsonl"
 )
 _DEFAULT_UPSERT_RESPONSE = object()
 
@@ -195,7 +196,7 @@ def embedded_contract_chunks() -> list[EmbeddedContractPreparedChunk]:
 
 def contract_settings() -> MilvusSettings:
     return MilvusSettings(
-        collection_name="expert_candidates_v13_contract_dev",
+        collection_name="expert_candidates_v14_contract_dev",
         index_type="HNSW",
         metric_type="COSINE",
         index_params={"M": 16, "efConstruction": 200},
@@ -210,12 +211,37 @@ def test_milvus_row_mapper_preserves_scalars_and_nested_contracts() -> None:
     assert entity.vector_doc_id == chunk.vector_doc_id
     assert entity.chunk_text == chunk.chunk_text
     assert entity.content_hash == chunk.content_hash
-    assert entity.company_name_norm == chunk.metadata.company_name_norm
-    assert entity.role_code == chunk.metadata.role_code
-    assert entity.source_table == chunk.source.source_table
-    assert entity.source_field_id == chunk.source.source_field_id
-    assert "source_record_id" not in entity.model_dump()
-    assert entity.chunk_policy_version == chunk.versions.chunk_policy_version
+    assert entity.metadata_hash == chunk.metadata_hash
+    assert entity.verification_status == chunk.metadata.verification_status
+    assert entity.weight_tier == chunk.metadata.weight_tier
+    assert entity.eligible_for_recommendation == (
+        chunk.metadata.eligible_for_recommendation
+    )
+    # source_field 只进入 source_ext，不保留独立 Scalar
+    assert entity.source_ext["source_field"] == chunk.source.source_field
+    # 不存在旧 v13 标量投影，也不存在已废弃字段
+    dumped = entity.model_dump()
+    for removed in (
+        "chunk_id",
+        "source_item_key",
+        "data_version",
+        "dictionary_version",
+        "project_role",
+        "company_normalization_status",
+        "company_name_norm",
+        "role_code",
+        "role_level",
+        "start_month",
+        "end_month",
+        "is_current",
+        "origin_type",
+        "source_table",
+        "source_field",
+        "source_field_id",
+        "chunk_policy_version",
+        "metadata_schema_version",
+    ):
+        assert removed not in dumped
     assert entity.metadata_ext == chunk.metadata.model_dump(mode="json")
     assert entity.source_ext == chunk.source.model_dump(mode="json")
     assert entity.versions_ext == chunk.versions.model_dump(mode="json")
@@ -229,10 +255,32 @@ def test_milvus_row_mapper_round_trip_preserves_upstream_vector_doc_id() -> None
     restored = MilvusRowMapper().from_row(entity.model_dump(mode="python"))
 
     assert restored.vector_doc_id == chunk.vector_doc_id
-    assert restored.metadata.vector_doc_id == chunk.vector_doc_id
+    # metadata 不保留 vector_doc_id 副本，因此恢复后顶层主键仍然成立即可；
+    # 不再要求 metadata.vector_doc_id 存在。
+    assert "vector_doc_id" not in restored.metadata.model_dump()
+    assert restored.metadata_hash == chunk.metadata_hash
+    assert restored.metadata.verification_status == chunk.metadata.verification_status
+    # source_field 从 source_ext 还原
+    assert restored.source.source_field == chunk.source.source_field
+    assert restored.source.source_table == chunk.source.source_table
 
 
-def test_contract_schema_uses_json_nullable_and_1024_dimension() -> None:
+def test_milvus_row_mapper_source_ext_is_complete_source_snapshot() -> None:
+    chunk = embedded_contract_chunks()[1]
+    entity = MilvusRowMapper().to_entity(chunk)
+
+    source = entity.source_ext
+    assert set(source) == {
+        "source_table",
+        "source_field",
+        "source_field_id",
+        "source_version",
+        "source_updated_at",
+        "source_hash",
+    }
+    assert source == chunk.source.model_dump(mode="json")
+    restored = MilvusRowMapper().from_row(entity.model_dump(mode="python"))
+    assert restored.source == chunk.source
     repository = ContractMilvusVectorRepository(
         contract_settings(),
         vector_dimension=1024,
@@ -250,10 +298,64 @@ def test_contract_schema_uses_json_nullable_and_1024_dimension() -> None:
     assert fields["source_ext"].dtype == DataType.JSON
     assert fields["versions_ext"].dtype == DataType.JSON
     assert fields["serial_number"].nullable is True
-    assert fields["company_name_norm"].nullable is True
-    assert fields["is_current"].nullable is True
-    assert fields["start_month"].dtype == DataType.VARCHAR
+    assert fields["eligible_for_recommendation"].nullable is True
+    assert fields["metadata_hash"].dtype == DataType.VARCHAR
+    assert fields["verification_status"].dtype == DataType.VARCHAR
+    assert fields["is_active"].dtype == DataType.BOOL
+    # source_field 只进入 source_ext JSON，不保留独立 Scalar 列
+    assert "source_field" not in fields
+    assert fields["source_ext"].dtype == DataType.JSON
+    # 已废弃/非检索字段不进入正式 Schema
+    for removed in (
+        "chunk_id",
+        "source_item_key",
+        "data_version",
+        "company_normalization_status",
+        "project_role",
+        "company_name_norm",
+        "start_month",
+    ):
+        assert removed not in fields
 
+
+def test_milvus_work_years_decimal_is_serialized_as_string_not_float() -> None:
+    chunk = embedded_contract_chunks()[0]  # profile：work_years=Decimal('12.00')
+    entity = MilvusRowMapper().to_entity(chunk)
+
+    work_years = entity.metadata_ext["work_years"]
+    assert isinstance(work_years, str)
+    assert work_years == "12.00"
+    assert isinstance(chunk.metadata.work_years, Decimal)
+    # JSON 快照可稳定序列化（不含 Decimal / float）
+    json.dumps(entity.metadata_ext)
+    # 从 backend 字典还原后 work_years 仍是 Decimal
+    restored = MilvusRowMapper().from_row(entity.model_dump(mode="python"))
+    assert restored.metadata.work_years == Decimal("12.00")
+
+
+def test_milvus_json_snapshots_match_contract_and_enum_values() -> None:
+    chunks = embedded_contract_chunks()
+    for chunk in chunks:
+        entity = MilvusRowMapper().to_entity(chunk)
+        assert entity.metadata_ext == chunk.metadata.model_dump(mode="json")
+        assert entity.source_ext == chunk.source.model_dump(mode="json")
+        assert entity.versions_ext == chunk.versions.model_dump(mode="json")
+        # 顶层 vector_doc_id 不进入 metadata JSON
+        assert "vector_doc_id" not in entity.metadata_ext
+    # verification_status 正式三值
+    statuses = {c.metadata.verification_status for c in chunks}
+    assert "verified" in statuses
+    assert "source_summary" in statuses
+    # origin_type 正式两值
+    origins = {c.metadata.origin_type for c in chunks}
+    assert {"source_parsed", "compressed_from_source"} == origins
+    # YYYYMM start_month / end_month 出现在 metadata JSON 快照中，
+    # 且不作为独立标量字段（不属于有明确检索需求的投影）
+    employment = chunks[1]
+    employment_entity = MilvusRowMapper().to_entity(employment)
+    assert employment_entity.metadata_ext["start_month"] == "202301"
+    assert employment_entity.metadata_ext["end_month"] is None
+    assert "start_month" not in employment_entity.model_dump()
 
 def test_contract_repository_requires_contract_schema_mode() -> None:
     settings = contract_settings().model_copy(update={"schema_mode": "legacy"})
@@ -345,6 +447,75 @@ def test_contract_repository_upsert_uses_row_mapper() -> None:
     assert client.query_iterator_calls[0]["limit"] == -1
     assert client.last_query_iterator is not None
     assert client.last_query_iterator.closed is True
+
+
+def test_contract_repository_upsert_rows_have_no_deprecated_fields() -> None:
+    client = FakeContractMilvusClient(exists=True)
+    repository = ContractMilvusVectorRepository(
+        contract_settings(),
+        vector_dimension=1024,
+        client=client,
+    )
+    client.description = repository._build_schema(1024).to_dict()
+
+    repository.upsert_batch(embedded_contract_chunks())
+
+    row = client.upsert_calls[0]["data"][0]
+    for removed in (
+        "chunk_id",
+        "source_item_key",
+        "data_version",
+        "dictionary_version",
+        "project_role",
+        "company_normalization_status",
+        "company_name_norm",
+        "role_code",
+        "start_month",
+        "end_month",
+        "is_current",
+        "origin_type",
+        "metadata.vector_doc_id",
+    ):
+        assert removed not in row
+    assert row["metadata_hash"] not in (None, "")
+    assert row["vector_doc_id"] == client.upsert_calls[0]["data"][0]["vector_doc_id"]
+    assert row["embedding_dim"] == 1024
+
+
+def test_contract_repository_rejects_duplicate_vector_doc_id_batch() -> None:
+    client = FakeContractMilvusClient(exists=True)
+    repository = ContractMilvusVectorRepository(
+        contract_settings(),
+        vector_dimension=1024,
+        client=client,
+    )
+    client.description = repository._build_schema(1024).to_dict()
+    chunks = embedded_contract_chunks()
+    chunks[1] = chunks[1].model_copy(
+        update={"vector_doc_id": chunks[0].vector_doc_id}
+    )
+
+    with pytest.raises(ValueError, match="重复"):
+        repository.upsert_batch(chunks)
+
+    assert client.upsert_calls == []
+
+
+def test_contract_repository_dimension_error_uses_vector_doc_id() -> None:
+    client = FakeContractMilvusClient(exists=True)
+    repository = ContractMilvusVectorRepository(
+        contract_settings(),
+        # 不预先锁定维度，让批次维度检查走 vector_doc_id 定位的错误分支
+        client=client,
+    )
+    client.description = repository._build_schema(1024).to_dict()
+    chunks = embedded_contract_chunks()
+    chunks[0] = chunks[0].model_copy(update={"embedding": [0.1] * 512})
+
+    with pytest.raises(ValueError, match=r"vector_doc_id.*employment:21307:0|employment:21307:0"):
+        repository.upsert_batch(chunks)
+
+    assert client.upsert_calls == []
 
 
 @pytest.mark.parametrize(

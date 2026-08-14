@@ -297,7 +297,6 @@ class ContractMilvusVectorRepository:
             output_fields=[
                 "vector_doc_id",
                 "expert_id",
-                "chunk_id",
                 "chunk_type",
                 "chunk_text",
             ],
@@ -367,7 +366,7 @@ class ContractMilvusVectorRepository:
         for record in records:
             if len(record.embedding) != self._vector_dimension:
                 raise ValueError(
-                    f"embedding dimension mismatch for chunk {record.chunk_id!r}: "
+                    f"embedding dimension mismatch for chunk {record.vector_doc_id!r}: "
                     f"expected {self._vector_dimension}, got {len(record.embedding)}"
                 )
 
@@ -595,7 +594,6 @@ def _to_search_hit(raw_hit: object) -> SearchHit:
     payload = {
         "vector_doc_id": entity.get("vector_doc_id", raw_hit.get("id")),
         "expert_id": entity.get("expert_id"),
-        "chunk_id": entity.get("chunk_id"),
         "chunk_type": entity.get("chunk_type"),
         "chunk_text": entity.get("chunk_text"),
         "score": raw_hit.get("distance", raw_hit.get("score")),

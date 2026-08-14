@@ -1,9 +1,14 @@
 """正式 Chunk Contract 对应的 Milvus Entity 与行映射。
 
-本模块是 Contract 输出到物理存储之间唯一的字段映射边界：高频 Metadata 被投影
-为 scalar，``metadata/source/versions`` 作为完整 JSON 快照保留。它不创建
+本模块是 Contract 输出到物理存储之间唯一的字段映射边界：高频标量被投影为
+独立列，``metadata/source/versions`` 作为完整 JSON 快照保留，且不包含任何
+已废弃字段（chunk_id / source_item_key / data_version / dictionary_version /
+company_normalization_status / project_role / metadata.vector_doc_id）。它不创建
 Collection、不调用 Milvus Client，也不决定 Task State；Repository 只消费这里的
 Entity/row 结果。
+
+``work_years`` 在 Contract 中保持 ``Decimal``；写入 JSON extension 时依赖
+Pydantic ``mode="json"`` 稳定序列化为字符串（保留两位小数精度），不转 float。
 """
 
 from __future__ import annotations
@@ -38,14 +43,16 @@ __all__ = [
 class MilvusExpertChunkEntity(BaseModel):
     """正式 Contract 在 Milvus 中的完整 Entity 数据模型。
 
-    该模型同时表达向量、scalar projection 和三组 JSON extension，确保过滤字段
-    可直接使用且原始嵌套结构可完整回查。构造时会拒绝非有限向量或错误维度。
+    该模型同时表达向量、标量投影和三组 JSON extension，确保过滤字段可直接使用
+    且原始嵌套结构可完整回查。构造时会拒绝非有限向量或错误维度。
+
+    身份字段只有 ``vector_doc_id``（唯一 PK），不存在 ``chunk_id`` 或其他业务
+    主键；已废弃字段不得出现在本模型中。
     """
 
     model_config = ConfigDict(extra="forbid", strict=True)
 
     vector_doc_id: str
-    chunk_id: str
     expert_id: int
     serial_number: str | None
     chunk_type: str
@@ -56,34 +63,20 @@ class MilvusExpertChunkEntity(BaseModel):
     chunk_text: str
     char_count: int
     content_hash: str
+    metadata_hash: str
+    contract_version: str
+
+    verification_status: str
+    eligible_for_recommendation: bool | None
+    weight_tier: str
+    is_active: bool
+
+    updated_at: str
+    embedded_at: str
     embedding: list[float] = Field(min_length=1)
     embedding_dim: int = Field(ge=1)
     embedding_model_alias: str
     embedding_model_version: str
-
-    company_name_norm: str | None
-    company_normalization_status: str | None
-    role_code: str | None
-    role_level: str | None
-    start_month: str | None
-    end_month: str | None
-    is_current: bool | None
-    origin_type: str
-    verification_status: str
-    weight_tier: str
-    is_active: bool
-
-    source_table: str
-    source_field_id: str
-    source_item_key: str
-    source_field: str
-    source_hash: str
-    contract_version: str
-    chunk_policy_version: str
-    metadata_schema_version: str
-    data_version: str
-    updated_at: str
-    embedded_at: str
 
     metadata_ext: dict[str, object]
     source_ext: dict[str, object]
@@ -124,13 +117,13 @@ class MilvusRowMapper:
             raise TypeError("MilvusRowMapper 只接受 EmbeddedContractPreparedChunk")
 
         # scalar projection 服务于高频过滤；完整对象另存为 JSON，不能因为只投影
-        # 过滤字段就丢失 source/versions 中的追溯信息。
+        # 过滤字段就丢失 source/versions 中的追溯信息。model_dump(mode="json")
+        # 会把 Decimal work_years 稳定序列化为字符串，不转 float。
         metadata = chunk.metadata.model_dump(mode="json")
         source = chunk.source.model_dump(mode="json")
         versions = chunk.versions.model_dump(mode="json")
         entity = MilvusExpertChunkEntity(
             vector_doc_id=chunk.vector_doc_id,
-            chunk_id=chunk.chunk_id,
             expert_id=chunk.expert_id,
             serial_number=chunk.serial_number,
             chunk_type=chunk.chunk_type,
@@ -140,34 +133,20 @@ class MilvusRowMapper:
             chunk_text=chunk.chunk_text,
             char_count=chunk.char_count,
             content_hash=chunk.content_hash,
+            metadata_hash=chunk.metadata_hash,
+            contract_version=chunk.contract_version,
+            verification_status=chunk.metadata.verification_status,
+            eligible_for_recommendation=(
+                chunk.metadata.eligible_for_recommendation
+            ),
+            weight_tier=chunk.metadata.weight_tier,
+            is_active=chunk.is_active,
+            updated_at=chunk.updated_at,
+            embedded_at=chunk.embedded_at,
             embedding=list(chunk.embedding),
             embedding_dim=chunk.embedding_dim,
             embedding_model_alias=chunk.embedding_model_alias,
             embedding_model_version=chunk.embedding_model_version,
-            company_name_norm=chunk.metadata.company_name_norm,
-            company_normalization_status=(
-                chunk.metadata.company_normalization_status
-            ),
-            role_code=chunk.metadata.role_code,
-            role_level=chunk.metadata.role_level,
-            start_month=chunk.metadata.start_month,
-            end_month=chunk.metadata.end_month,
-            is_current=chunk.metadata.is_current,
-            origin_type=chunk.metadata.origin_type,
-            verification_status=chunk.metadata.verification_status,
-            weight_tier=chunk.metadata.weight_tier,
-            is_active=chunk.is_active,
-            source_table=chunk.source.source_table,
-            source_field_id=chunk.source.source_field_id,
-            source_item_key=chunk.source.source_item_key,
-            source_field=chunk.source.source_field,
-            source_hash=chunk.source.source_hash,
-            contract_version=chunk.contract_version,
-            chunk_policy_version=chunk.versions.chunk_policy_version,
-            metadata_schema_version=chunk.versions.metadata_schema_version,
-            data_version=chunk.versions.data_version,
-            updated_at=chunk.updated_at,
-            embedded_at=chunk.embedded_at,
             metadata_ext=metadata,
             source_ext=source,
             versions_ext=versions,
@@ -197,7 +176,8 @@ class MilvusRowMapper:
 
         Metadata-only 更新必须保留原向量，因此需要先从 Milvus 读取当前 Entity，
         再用新输入的 Metadata/source/versions 生成完整 Upsert 行。该方法只做字段
-        还原，不会调用 Embedding，也不会修改 Milvus。
+        还原，不会调用 Embedding，也不会修改 Milvus。``metadata_ext`` 中 Decimal
+        化的 ``work_years`` 字符串会由 Contract 模型重新构造为 ``Decimal``。
         """
 
         metadata = row.get("metadata_ext")
@@ -214,7 +194,6 @@ class MilvusRowMapper:
         # 依赖旧向量和新 Contract 字段重新构造完整 Upsert 行。
         payload = {
             "contract_version": row.get("contract_version"),
-            "chunk_id": row.get("chunk_id"),
             "vector_doc_id": row.get("vector_doc_id"),
             "expert_id": row.get("expert_id"),
             "serial_number": row.get("serial_number"),
@@ -225,6 +204,7 @@ class MilvusRowMapper:
             "chunk_text": row.get("chunk_text"),
             "char_count": row.get("char_count"),
             "content_hash": row.get("content_hash"),
+            "metadata_hash": row.get("metadata_hash"),
             "metadata": dict(metadata),
             "source": dict(source),
             "versions": dict(versions),

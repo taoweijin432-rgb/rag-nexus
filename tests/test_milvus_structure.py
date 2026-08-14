@@ -18,7 +18,6 @@ from rag_vector_store.milvus.schemas import (
 
 CONTRACT_FIELD_NAMES = (
     "vector_doc_id",
-    "chunk_id",
     "expert_id",
     "serial_number",
     "chunk_type",
@@ -28,32 +27,18 @@ CONTRACT_FIELD_NAMES = (
     "chunk_text",
     "char_count",
     "content_hash",
+    "metadata_hash",
+    "contract_version",
+    "verification_status",
+    "eligible_for_recommendation",
+    "weight_tier",
+    "is_active",
+    "updated_at",
+    "embedded_at",
     "embedding",
     "embedding_dim",
     "embedding_model_alias",
     "embedding_model_version",
-    "company_name_norm",
-    "company_normalization_status",
-    "role_code",
-    "role_level",
-    "start_month",
-    "end_month",
-    "is_current",
-    "origin_type",
-    "verification_status",
-    "weight_tier",
-    "is_active",
-    "source_table",
-    "source_field_id",
-    "source_item_key",
-    "source_field",
-    "source_hash",
-    "contract_version",
-    "chunk_policy_version",
-    "metadata_schema_version",
-    "data_version",
-    "updated_at",
-    "embedded_at",
     "metadata_ext",
     "source_ext",
     "versions_ext",
@@ -62,7 +47,7 @@ CONTRACT_FIELD_NAMES = (
 
 def _contract_settings() -> MilvusSettings:
     return MilvusSettings(
-        collection_name="expert_candidates_v13_contract_dev",
+        collection_name="expert_candidates_v14_contract_dev",
         index_type="HNSW",
         metric_type="COSINE",
         index_params={"M": 16, "efConstruction": 200},
@@ -136,17 +121,31 @@ def _description_from_specs(specs: tuple[Any, ...]) -> dict[str, Any]:
     }
 
 
-def test_contract_schema_provider_preserves_the_40_field_contract() -> None:
+def test_contract_schema_provider_preserves_the_formal_field_contract() -> None:
     specs = contract_milvus_field_specs(1024)
 
-    assert len(specs) == 40
+    assert len(specs) == 25
     assert tuple(spec.name for spec in specs) == CONTRACT_FIELD_NAMES
-    assert specs[11].name == "embedding"
-    assert specs[11].dim == 1024
-    source_field_id = next(spec for spec in specs if spec.name == "source_field_id")
-    assert source_field_id.datatype == "VARCHAR"
-    assert source_field_id.nullable is False
-    assert source_field_id.max_length == 256
+    assert next(spec for spec in specs if spec.name == "embedding").dim == 1024
+    assert next(spec for spec in specs if spec.name == "vector_doc_id").primary_key is True
+    # 已废弃字段不得出现在正式 Schema
+    for old_field in (
+        "chunk_id",
+        "source_item_key",
+        "data_version",
+        "company_normalization_status",
+        "project_role",
+        "dictionary_version",
+    ):
+        assert old_field not in {spec.name for spec in specs}
+    # source_field 只进入 source_ext JSON，不保留独立 Scalar 列
+    assert "source_field" not in {spec.name for spec in specs}
+    source_ext = next(spec for spec in specs if spec.name == "source_ext")
+    assert source_ext.datatype == "JSON"
+    metadata_hash = next(spec for spec in specs if spec.name == "metadata_hash")
+    assert metadata_hash.datatype == "VARCHAR"
+    assert metadata_hash.max_length == 64
+
 
 
 def test_index_provider_preserves_contract_vector_and_scalar_indexes() -> None:
@@ -161,7 +160,7 @@ def test_index_provider_preserves_contract_vector_and_scalar_indexes() -> None:
         "metric_type": "COSINE",
         "params": {"M": 16, "efConstruction": 200},
     }
-    assert len(scalar) == 11
+    assert len(scalar) == 3
     assert tuple(spec.field_name for spec in scalar) == CONTRACT_SCALAR_INDEX_FIELDS
     assert all(spec.index_type == "INVERTED" for spec in scalar)
 
