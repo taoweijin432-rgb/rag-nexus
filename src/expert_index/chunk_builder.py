@@ -313,7 +313,9 @@ class ChunkFactory:
             role_level=role_level,
             job_status_norm=job_status_norm,
             abroad_flag_norm=abroad_flag_norm,
-            work_years=work_years,
+            # expert_chunk 使用 DECIMAL 保存工作年限，PyMySQL 读回后会表现为小数。
+            # 生成时也统一为 float，避免 8 与 8.0 的 JSON 表示差异导致停用重算哈希漂移。
+            work_years=float(work_years) if work_years is not None else None,
             project_name=project_name,
             start_month=start_month,
             end_month=end_month,

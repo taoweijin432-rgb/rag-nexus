@@ -4,7 +4,7 @@
 -- 1. 已经执行过旧版 001、数据库中已存在 expert_index_batch 的环境执行本迁移；
 -- 2. 新建环境直接执行最新 001，不需要再执行本文件；
 -- 3. 本迁移只增加兼容列和新表，不删除或改写现有批次、Stage、Chunk 数据；
--- 4. 本阶段只准备数据结构，Source/Pipeline/Repository 尚不会读写这些新字段。
+-- 4. 执行本迁移后，Repository/Pipeline 才能运行 build-batch 并写入这些字段。
 
 ALTER TABLE expert_index_batch
     -- data_version 继续属于批次和 Stage，不重新加入最终 expert_chunk。
@@ -22,7 +22,7 @@ ALTER TABLE expert_index_batch
     ADD COLUMN failed_count INT UNSIGNED NOT NULL DEFAULT 0 AFTER success_count,
     ADD COLUMN deactivated_count INT UNSIGNED NOT NULL DEFAULT 0 AFTER failed_count;
 
--- 每个候选专家在一个批次中最多一行。后续批量编排会通过该唯一键幂等创建明细，
+-- 每个候选专家在一个批次中最多一行。批量编排通过该唯一键幂等创建明细，
 -- 分别记录正常成功、无内容拒绝、逻辑删除停用和处理失败，并据此汇总 partial 批次。
 CREATE TABLE IF NOT EXISTS expert_index_batch_item (
     id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,

@@ -14,7 +14,7 @@ from datetime import datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-from expert_index.chunk_builder import ChunkFactory
+from expert_index.chunk_builder import ChunkFactory, calculate_metadata_hash
 from expert_index.config import DatabaseConfig, Settings
 from expert_index.exporter import export_jsonl
 from expert_index.models import (
@@ -427,22 +427,49 @@ class RepositoryMappingTest(unittest.TestCase):
             self.assertNotIn(removed, insert_sql)
 
     def test_stale_chunks_are_deactivated_after_snapshot_rebuild(self) -> None:
-        """经历被逻辑删除后，其旧 vector_doc_id 不在新快照中，Repository 应停用。"""
+        """旧 Chunk 停用时必须同步重算包含 is_active 的 metadata_hash。"""
 
         calls: list[tuple[str, tuple[object, ...]]] = []
 
+        profile, employments, projects = normalize_aggregate(
+            _aggregate(), data_version="20260814_01", build_batch_id=1
+        )
+        active = ChunkFactory(_settings()).build_all(profile, employments, projects)[0]
+        row = dict(active.__dict__)
+        for field_name in (
+            "industry_codes",
+            "function_codes",
+            "topic_codes",
+            "school_names_raw",
+            "major_names_raw",
+        ):
+            row[field_name] = json.dumps(list(row[field_name]), ensure_ascii=False)
+
         class RecordingCursor:
-            @staticmethod
-            def execute(sql: str, params: tuple[object, ...]) -> None:
+            def execute(self, sql: str, params: tuple[object, ...]) -> None:
                 calls.append((" ".join(sql.split()), params))
 
-        MySQLIndexRepository._deactivate_stale_chunks(
-            RecordingCursor(), 24, ["expert:24:employment:1001:0"]
+            @staticmethod
+            def fetchall() -> list[dict[str, object]]:
+                return [row]
+
+        count = MySQLIndexRepository._deactivate_stale_chunks(
+            RecordingCursor(),
+            active.expert_id,
+            [],
+            build_batch_id=9,
         )
-        self.assertEqual(1, len(calls))
-        self.assertIn("SET is_active=0", calls[0][0])
-        self.assertIn("vector_doc_id NOT IN", calls[0][0])
-        self.assertEqual((24, "expert:24:employment:1001:0"), calls[0][1])
+        self.assertEqual(1, count)
+        self.assertIn("FOR UPDATE", calls[0][0])
+        self.assertIn("SET is_active=0, metadata_hash=%s", calls[1][0])
+        expected_hash = calculate_metadata_hash(
+            replace(active, is_active=False, build_batch_id=9)
+        )
+        self.assertEqual(
+            (expected_hash, 9, active.vector_doc_id),
+            calls[1][1],
+        )
+        self.assertNotEqual(active.metadata_hash, expected_hash)
 
 
 class ExporterTest(unittest.TestCase):

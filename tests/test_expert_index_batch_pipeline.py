@@ -1,18 +1,21 @@
-"""第三、第四阶段 Pipeline 复用和全量失败隔离测试。
+"""全量 Pipeline 编排、批次记录和生命周期测试。
 
 测试全部使用虚构 Source 与内存 Repository，不连接 MySQL。它验证 Pipeline 的调用
-顺序、分页循环、数量汇总和批次状态，不测试下一阶段才会实现的批次明细、生命周期
-停用、Metadata Hash 重算或并发锁。
+顺序、分页循环、数量汇总、专家终态和批次状态。Metadata Hash 的数据库行重算由
+Repository 定向测试覆盖。
 """
 
 from __future__ import annotations
 
+from collections.abc import Iterator
+from contextlib import contextmanager
 from datetime import datetime
 from typing import Any
 from zoneinfo import ZoneInfo
 
 import pytest
 
+from expert_index.cli import build_parser
 from expert_index.config import DatabaseConfig, Settings
 from expert_index.models import ExpertAggregate, ExpertCandidate, ExpertSource
 from expert_index.pipeline import ExpertIndexPipeline
@@ -93,12 +96,24 @@ class FakeRepository:
     """记录 Pipeline 的批次和专家事务调用，不执行任何 SQL。"""
 
     def __init__(self) -> None:
-        self.start_calls: list[tuple[str, str]] = []
+        self.lock_modes: list[str] = []
+        self.start_calls: list[tuple[str, str, dict[str, Any]]] = []
         self.finish_calls: list[tuple[int, dict[str, Any]]] = []
         self.persisted_expert_ids: list[int] = []
+        self.rejected_expert_ids: list[int] = []
+        self.deactivated_expert_ids: list[int] = []
+        self.events: list[tuple[str, Any]] = []
+        self.progress_calls: list[dict[str, Any]] = []
 
-    def start_batch(self, batch_no: str, run_mode: str) -> int:
-        self.start_calls.append((batch_no, run_mode))
+    @contextmanager
+    def build_lock(self, run_mode: str) -> Iterator[None]:
+        """模拟 Repository 全局锁，并记录 Pipeline 是否覆盖整个入口。"""
+
+        self.lock_modes.append(run_mode)
+        yield
+
+    def start_batch(self, batch_no: str, run_mode: str, **kwargs: Any) -> int:
+        self.start_calls.append((batch_no, run_mode, kwargs))
         return 701
 
     def finish_batch(self, batch_id: int, **kwargs: Any) -> None:
@@ -116,6 +131,40 @@ class FakeRepository:
         self.persisted_expert_ids.append(profile.expert_id)
         assert chunks
         return 1 + len(employments) + len(projects)
+
+    def persist_rejected_expert(
+        self,
+        profile: Any,
+        employments: list[Any],
+        projects: list[Any],
+        *,
+        reason: str,
+    ) -> int:
+        """模拟保存 rejected Stage 并停用旧 Chunk 的专家事务。"""
+
+        assert reason == "no_chunkable_content"
+        self.rejected_expert_ids.append(profile.expert_id)
+        return 1 + len(employments) + len(projects)
+
+    def deactivate_deleted_expert(self, expert_id: int, *, build_batch_id: int) -> int:
+        """模拟逻辑删除专家的历史 Chunk 停用事务。"""
+
+        assert build_batch_id == 701
+        self.deactivated_expert_ids.append(expert_id)
+        return 1
+
+    def prepare_batch_items(self, batch_id: int, expert_ids: list[int]) -> None:
+        self.events.append(("prepare", (batch_id, expert_ids)))
+
+    def mark_batch_item_running(self, batch_id: int, expert_id: int) -> None:
+        self.events.append(("running", (batch_id, expert_id)))
+
+    def finish_batch_item(self, batch_id: int, expert_id: int, **kwargs: Any) -> None:
+        self.events.append(("finished", (batch_id, expert_id, kwargs)))
+
+    def update_batch_progress(self, batch_id: int, **kwargs: Any) -> None:
+        self.events.append(("progress", (batch_id, kwargs["cursor_id"])))
+        self.progress_calls.append(kwargs)
 
 
 def _pipeline(
@@ -149,7 +198,10 @@ def test_build_one_reuses_expert_core_and_keeps_existing_result() -> None:
     assert result.stage_count == 1
     assert result.chunk_count == 1
     assert result.partial_chunk_count == 0
-    assert repository.start_calls == [("single_pipeline_refactor_test", "single")]
+    assert repository.lock_modes == ["single"]
+    assert repository.start_calls == [
+        ("single_pipeline_refactor_test", "single", {})
+    ]
     assert repository.persisted_expert_ids == [24]
     assert repository.finish_calls[-1][1]["status"] == "success"
 
@@ -185,6 +237,11 @@ def test_build_many_paginates_and_continues_after_one_expert_fails() -> None:
     assert source.page_calls == [(0, 30, 2), (20, 30, 2)]
     assert source.loaded_ids == [10, 20, 30]
     assert repository.persisted_expert_ids == [10, 30]
+    assert repository.start_calls[0][2] == {
+        "data_version": "20260814_02",
+        "upper_bound_id": 30,
+    }
+    assert [call["cursor_id"] for call in repository.progress_calls] == [20, 30]
     finish = repository.finish_calls[-1][1]
     assert finish["status"] == "partial"
     assert finish["error_summary"]["failed_expert_count"] == 1
@@ -193,8 +250,8 @@ def test_build_many_paginates_and_continues_after_one_expert_fails() -> None:
     ]
 
 
-def test_build_many_currently_isolates_deleted_candidate_for_next_stage() -> None:
-    """本阶段不误读 deleted 专家；实际停用与 deactivated 计数留给下一阶段。"""
+def test_build_many_deactivates_deleted_candidate_without_loading_source() -> None:
+    """deleted 专家不读取正文，完成历史停用后记为 deactivated。"""
 
     deleted_at = datetime(2026, 8, 14, 12, 30, tzinfo=ZoneInfo("Asia/Shanghai"))
     source = FakeSource([ExpertCandidate(id=40, deleted_at=deleted_at)])
@@ -205,17 +262,19 @@ def test_build_many_currently_isolates_deleted_candidate_for_next_stage() -> Non
         batch_no="full_deleted_pending_test",
     )
 
-    assert result.status == "partial"
-    assert result.failed_count == 1
-    assert result.deactivated_count == 0
+    assert result.status == "success"
+    assert result.failed_count == 0
+    assert result.deactivated_count == 1
     assert source.loaded_ids == []
     assert repository.persisted_expert_ids == []
-    error = repository.finish_calls[-1][1]["error_summary"]["sample_errors"][0]
-    assert error["error_type"] == "DeletedExpertLifecyclePendingError"
+    assert repository.deactivated_expert_ids == [40]
+    finished = [event for event in repository.events if event[0] == "finished"]
+    assert finished[0][1][2]["status"] == "deactivated"
+    assert finished[0][1][2]["result_code"] == "expert_deleted"
 
 
-def test_build_many_currently_isolates_no_content_for_next_stage() -> None:
-    """无内容专家不会写空 Chunk；rejected 与历史停用计数留给下一阶段。"""
+def test_build_many_rejects_no_content_and_continues_next_expert() -> None:
+    """无内容专家刷新 Stage、停用旧 Chunk 并记为 rejected，不算程序失败。"""
 
     source = FakeSource(
         [
@@ -232,14 +291,19 @@ def test_build_many_currently_isolates_no_content_for_next_stage() -> None:
         batch_no="full_empty_pending_test",
     )
 
-    assert result.status == "partial"
+    assert result.status == "success"
     assert result.success_count == 1
-    assert result.failed_count == 1
-    assert result.rejected_count == 0
+    assert result.failed_count == 0
+    assert result.rejected_count == 1
     assert result.extracted_count == 2
     assert repository.persisted_expert_ids == [60]
-    errors = repository.finish_calls[-1][1]["error_summary"]["sample_errors"]
-    assert errors == [{"expert_id": 50, "error_type": "NoChunkableContentError"}]
+    assert repository.rejected_expert_ids == [50]
+    statuses = [
+        event[1][2]["status"]
+        for event in repository.events
+        if event[0] == "finished"
+    ]
+    assert statuses == ["rejected", "success"]
 
 
 def test_build_many_marks_batch_failed_when_candidate_page_is_invalid() -> None:
@@ -278,3 +342,24 @@ def test_build_many_rejects_invalid_page_size_before_source_access(page_size: in
 
     assert source.upper_bound_calls == 0
     assert repository.start_calls == []
+
+
+def test_cli_exposes_full_batch_entry_with_explicit_page_size() -> None:
+    """build-batch 命令应把全量版本、页大小和批次号交给 Pipeline。"""
+
+    args = build_parser().parse_args(
+        [
+            "build-batch",
+            "--data-version",
+            "20260814_07",
+            "--page-size",
+            "300",
+            "--batch-no",
+            "full_cli_test",
+        ]
+    )
+
+    assert args.command == "build-batch"
+    assert args.data_version == "20260814_07"
+    assert args.page_size == 300
+    assert args.batch_no == "full_cli_test"

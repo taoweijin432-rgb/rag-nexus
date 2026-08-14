@@ -1,7 +1,8 @@
 """专家索引流水线命令行入口。
 
-常用顺序：先 ``init-db``，再 ``build --expert-id ...``，最后 ``export`` 和
-``inspect`` 验收。命令输出只包含数量、状态和文件路径，不打印 Chunk 正文。
+常用顺序：先 ``init-db``，再用 ``build`` 重建单专家或用 ``build-batch`` 运行全量，
+最后通过 ``export`` 和 ``inspect`` 验收。命令输出只包含数量、状态和文件路径，
+不打印 Chunk 正文。
 """
 
 from __future__ import annotations
@@ -23,7 +24,7 @@ DEFAULT_DDL = PROJECT_ROOT / "sql" / "001_create_expert_index_tables.sql"
 
 
 def build_parser() -> argparse.ArgumentParser:
-    """定义四个边界明确的子命令。"""
+    """定义数据库初始化、加工、导出和验收子命令。"""
 
     parser = argparse.ArgumentParser(description="专家索引 Chunk 数据加工")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -38,6 +39,23 @@ def build_parser() -> argparse.ArgumentParser:
         default=datetime.now().astimezone().strftime("%Y%m%d_01"),
     )
     build.add_argument("--batch-no")
+
+    build_batch = sub.add_parser(
+        "build-batch",
+        help="按 experts.id 分页执行第一版全量 Chunk 加工",
+    )
+    build_batch.add_argument(
+        "--data-version",
+        default=datetime.now().astimezone().strftime("%Y%m%d_01"),
+        help="本批次使用的业务数据版本",
+    )
+    build_batch.add_argument(
+        "--page-size",
+        type=int,
+        default=200,
+        help="每页候选专家数，范围 1~1000，默认 200",
+    )
+    build_batch.add_argument("--batch-no", help="可选业务批次号；不传时自动生成")
 
     export = sub.add_parser("export", help="导出符合向量化输入契约的 JSONL")
     export.add_argument("--expert-id", type=int, required=True)
@@ -72,6 +90,15 @@ def main(argv: list[str] | None = None) -> None:
         result = ExpertIndexPipeline(settings, repository=repository).build_one(
             args.expert_id,
             data_version=args.data_version,
+            batch_no=args.batch_no,
+        )
+        print(json.dumps(asdict(result), ensure_ascii=False, sort_keys=True))
+    elif args.command == "build-batch":
+        # build_many 内部完成全局互斥、固定扫描上界、分页、专家失败隔离、批次明细和
+        # 生命周期处理；CLI 只负责接收参数并输出不含专家正文的数量摘要。
+        result = ExpertIndexPipeline(settings, repository=repository).build_many(
+            data_version=args.data_version,
+            page_size=args.page_size,
             batch_no=args.batch_no,
         )
         print(json.dumps(asdict(result), ensure_ascii=False, sort_keys=True))

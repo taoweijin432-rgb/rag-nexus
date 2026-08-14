@@ -37,7 +37,7 @@ CREATE TABLE IF NOT EXISTS expert_index_batch (
 
 -- 全量批次的专家级执行明细。
 --
--- 后续 Pipeline 每发现一位候选专家，会为同一 (batch_id, expert_id) 创建或更新一行：
+-- Pipeline 每发现一位候选专家，会为同一 (batch_id, expert_id) 创建或更新一行：
 -- pending 表示等待处理；running 表示已经开始；success 表示正常产出；
 -- rejected 表示专家存在但没有可生成内容；deactivated 表示专家已逻辑删除且历史
 -- Chunk 已停用；failed 表示这一位专家发生异常。批量任务可通过本表继续处理其他专家，
