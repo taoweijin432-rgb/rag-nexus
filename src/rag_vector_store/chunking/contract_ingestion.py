@@ -1,4 +1,9 @@
-"""正式 Contract 的单条与批量向量化、入库编排。"""
+"""正式 Contract 4.0.0 的单条与批量向量化、入库编排。
+
+编排层所有身份统一使用 ``vector_doc_id``（幂等键），彻底移除对 ``chunk_id``
+的依赖。Eligibility 与向量化统一由 ``ContractEmbeddingWorker`` 执行，本模块只负责
+结果对齐、身份一致性与 Repository 写入，不重复实现 Validator / Eligibility。
+"""
 
 from __future__ import annotations
 
@@ -46,21 +51,24 @@ class ContractIngestionError(RuntimeError):
 
 @dataclass(frozen=True)
 class ContractIngestionResult:
-    """单条 Contract ingestion 的稳定结果摘要。"""
+    """单条 Contract ingestion 的稳定结果摘要，以 ``vector_doc_id`` 定位。
 
-    chunk_id: str
+    embedded 与 skipped 都携带 ``vector_doc_id``（skipped 指向对应输入主键），
+    便于调用方按幂等键对齐结果。
+    """
+
     status: Literal["embedded", "skipped"]
-    vector_doc_id: str | None = None
+    vector_doc_id: str
     affected_count: int = 0
     skip_reason: str | None = None
 
     def __post_init__(self) -> None:
-        """确保 embedded 与 skipped 结果不会混合。"""
+        """确保 embedded 与 skipped 结果不会混合，且固定以 vector_doc_id 定位。"""
 
-        if not isinstance(self.chunk_id, str) or not self.chunk_id.strip():
-            raise ValueError("chunk_id 必须是非空字符串")
         if self.status not in ("embedded", "skipped"):
             raise ValueError("status 必须是 embedded 或 skipped")
+        if not isinstance(self.vector_doc_id, str) or not self.vector_doc_id.strip():
+            raise ValueError("vector_doc_id 必须是非空字符串")
         if (
             isinstance(self.affected_count, bool)
             or not isinstance(self.affected_count, int)
@@ -69,16 +77,12 @@ class ContractIngestionResult:
             raise ValueError("affected_count 必须是非负整数")
 
         if self.status == "embedded":
-            if not isinstance(self.vector_doc_id, str) or not self.vector_doc_id.strip():
-                raise ValueError("embedded 结果必须包含 vector_doc_id")
             if self.skip_reason is not None:
                 raise ValueError("embedded 结果不能包含 skip_reason")
             if self.affected_count != 1:
                 raise ValueError("单条 embedded 结果的 affected_count 必须是 1")
             return
 
-        if self.vector_doc_id is not None:
-            raise ValueError("skipped 结果不能包含 vector_doc_id")
         if self.affected_count != 0:
             raise ValueError("skipped 结果的 affected_count 必须是 0")
         if not isinstance(self.skip_reason, str) or not self.skip_reason.strip():
@@ -156,8 +160,8 @@ class ContractIngestionService:
         embedded, skipped = self._single_worker_result(record, embedding_result)
         if skipped is not None:
             return ContractIngestionResult(
-                chunk_id=record.chunk_id,
                 status="skipped",
+                vector_doc_id=record.vector_doc_id,
                 skip_reason=skipped.reason,
             )
 
@@ -168,7 +172,6 @@ class ContractIngestionService:
         mutation = self.repository.upsert_batch([embedded])
         self._validate_repository_result(embedded, mutation)
         return ContractIngestionResult(
-            chunk_id=record.chunk_id,
             status="embedded",
             vector_doc_id=embedded.vector_doc_id,
             affected_count=mutation.affected_count,
@@ -195,15 +198,17 @@ class ContractIngestionService:
             embedded = result.embedded_chunks[0]
             if not isinstance(embedded, EmbeddedContractPreparedChunk):
                 raise ContractIngestionError("Worker 返回了非法 embedded Contract")
-            if embedded.chunk_id != record.chunk_id:
-                raise ContractIngestionError("Worker 返回的 chunk_id 与输入不一致")
+            if embedded.vector_doc_id != record.vector_doc_id:
+                raise ContractIngestionError("Worker 返回的 vector_doc_id 与输入不一致")
             return embedded, None
 
         skipped = result.skipped_chunks[0]
         if not isinstance(skipped, SkippedContractChunk):
             raise ContractIngestionError("Worker 返回了非法 skipped Contract")
-        if skipped.chunk_id != record.chunk_id:
-            raise ContractIngestionError("Worker 返回的 skipped chunk_id 与输入不一致")
+        if skipped.vector_doc_id != record.vector_doc_id:
+            raise ContractIngestionError(
+                "Worker 返回的 skipped vector_doc_id 与输入不一致"
+            )
         return None, skipped
 
     @staticmethod
@@ -236,7 +241,11 @@ class ContractBatchIngestionService:
         self,
         records: Iterable[ExpertChunkEmbeddingInput],
     ) -> ContractBatchIngestionResult:
-        """处理一批输入；任何校验、Embedding 或写入错误都使整批失败。"""
+        """处理一批输入；任何校验、Embedding 或写入错误都使整批失败。
+
+        保持真正批量：Worker 一次向量化全部 eligible 记录，再对全部 embedded
+        做单次 ``Repository.upsert_batch``，不循环调用单条入口。
+        """
 
         items = list(records)
         self._validate_input_records(items)
@@ -249,27 +258,31 @@ class ContractBatchIngestionService:
             self._validate_repository_result(embedded, mutation)
             affected_count = mutation.affected_count
 
-        embedded_by_chunk_id = {item.chunk_id: item for item in embedded}
-        skipped_by_chunk_id = {item.chunk_id: item for item in skipped}
+        embedded_by_vid = {item.vector_doc_id: item for item in embedded}
+        skipped_by_vid = {item.vector_doc_id: item for item in skipped}
         results: list[ContractIngestionResult] = []
         for item in items:
-            embedded_item = embedded_by_chunk_id.get(item.chunk_id)
+            embedded_item = embedded_by_vid.get(item.vector_doc_id)
             if embedded_item is not None:
                 results.append(
                     ContractIngestionResult(
-                        chunk_id=item.chunk_id,
                         status="embedded",
-                        vector_doc_id=embedded_item.vector_doc_id,
+                        vector_doc_id=item.vector_doc_id,
                         affected_count=1,
                     )
                 )
                 continue
 
-            skipped_item = skipped_by_chunk_id[item.chunk_id]
+            skipped_item = skipped_by_vid.get(item.vector_doc_id)
+            if skipped_item is None:
+                # _validate_worker_result 已保证全覆盖，此处仅防御未来修改。
+                raise ContractIngestionError(
+                    f"Worker 结果缺少输入 vector_doc_id: {item.vector_doc_id}"
+                )
             results.append(
                 ContractIngestionResult(
-                    chunk_id=item.chunk_id,
                     status="skipped",
+                    vector_doc_id=item.vector_doc_id,
                     skip_reason=skipped_item.reason,
                 )
             )
@@ -285,14 +298,10 @@ class ContractBatchIngestionService:
     def _validate_input_records(
         records: Sequence[ExpertChunkEmbeddingInput],
     ) -> None:
-        """在调用 Worker 前拒绝非 Contract 和重复批次主键。"""
+        """在调用 Worker 前拒绝非 Contract 和重复批次主键（vector_doc_id）。"""
 
         if not all(isinstance(item, ExpertChunkEmbeddingInput) for item in records):
             raise TypeError("ingest_batch 只接受 ExpertChunkEmbeddingInput")
-
-        chunk_ids = [item.chunk_id for item in records]
-        if len(chunk_ids) != len(set(chunk_ids)):
-            raise ContractIngestionError("一个批次不能包含重复 chunk_id")
 
         vector_doc_ids = [item.vector_doc_id for item in records]
         if len(vector_doc_ids) != len(set(vector_doc_ids)):
@@ -322,21 +331,19 @@ class ContractBatchIngestionService:
         if any(not isinstance(item, SkippedContractChunk) for item in skipped):
             raise ContractIngestionError("Worker 返回了非法 skipped Contract")
 
-        input_chunk_ids = {item.chunk_id for item in records}
-        result_chunk_ids = [item.chunk_id for item in embedded] + [
-            item.chunk_id for item in skipped
+        input_vids = {item.vector_doc_id for item in records}
+        result_vids = [item.vector_doc_id for item in embedded] + [
+            item.vector_doc_id for item in skipped
         ]
-        if len(result_chunk_ids) != len(set(result_chunk_ids)):
-            raise ContractIngestionError("Worker 返回了重复 chunk_id")
-        if set(result_chunk_ids) != input_chunk_ids:
-            raise ContractIngestionError("Worker 返回的 chunk_id 与输入不一致")
-
-        input_by_chunk_id = {item.chunk_id: item for item in records}
-        for item in embedded:
-            if item.vector_doc_id != input_by_chunk_id[item.chunk_id].vector_doc_id:
-                raise ContractIngestionError(
-                    "Worker 返回的 vector_doc_id 与输入不一致"
-                )
+        if len(result_vids) != len(set(result_vids)):
+            raise ContractIngestionError("Worker 返回了重复 vector_doc_id")
+        if set(result_vids) != input_vids:
+            missing = sorted(input_vids - set(result_vids))
+            extra = sorted(set(result_vids) - input_vids)
+            raise ContractIngestionError(
+                f"Worker 返回的 vector_doc_id 与输入不一致 "
+                f"(missing={missing}, extra={extra})"
+            )
         return embedded, skipped
 
     @staticmethod

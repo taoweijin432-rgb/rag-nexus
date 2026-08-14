@@ -1,4 +1,4 @@
-"""专家 Chunk v2.0.0 契约的校验、资格判断与向量化消费链。
+"""专家 Chunk 4.0.0 契约的校验、资格判断与向量化消费链。
 
 本模块负责把正式 Contract 校验成可消费记录、执行 Eligibility 判断，并把唯一的
 ``chunk_text`` 交给 EmbeddingModel。它不负责输入 Mapping 适配、MySQL 连接、任务
@@ -66,7 +66,7 @@ _PII_PATTERNS = (
 
 
 class ContractValidationError(ValueError):
-    """输入记录不符合 v2.0.0 数据契约。"""
+    """输入记录不符合 4.0.0 数据契约。"""
 
 
 class EmbeddingEligibilityError(ValueError):
@@ -75,9 +75,9 @@ class EmbeddingEligibilityError(ValueError):
 
 @dataclass(frozen=True)
 class SkippedContractChunk:
-    """未进入 Embedding 的契约记录及安全原因。"""
+    """未进入向量消费的契约记录及安全原因（以 vector_doc_id 定位）。"""
 
-    chunk_id: str
+    vector_doc_id: str
     reason: str
 
 
@@ -157,20 +157,37 @@ class ContractValidator:
 
         if metadata.is_current is True and metadata.end_month is not None:
             errors.append("is_current=true 时 end_month 必须为 null")
-        if value.chunk_type == "employment":
-            if not metadata.company_name_raw and not metadata.company_name_norm:
-                errors.append("employment 必须提供 company_name_raw 或 company_name_norm")
-            if not metadata.role_name_raw:
-                errors.append("employment 必须提供 role_name_raw")
-            if metadata.start_month is None:
-                errors.append("employment 必须提供 start_month")
-            if metadata.is_current is None:
-                errors.append("employment 必须提供 is_current")
-        if value.chunk_type == "project":
-            if not metadata.project_name:
-                errors.append("project 必须提供 project_name")
-            if not metadata.project_role:
-                errors.append("project 必须提供 project_role")
+
+        # origin_type × chunk_type 与 verification_status × chunk_type 填充规则。
+        # verification_status=rejected 是 profile_summary 的合法值，不属于
+        # Contract 非法，因此这里允许；由 Eligibility 决定是否进入向量消费。
+        if value.chunk_type == "profile_summary":
+            if metadata.origin_type != "compressed_from_source":
+                errors.append(
+                    "profile_summary 的 origin_type 必须是 compressed_from_source"
+                )
+            if metadata.verification_status not in {"source_summary", "rejected"}:
+                errors.append(
+                    "profile_summary 的 verification_status "
+                    "必须是 source_summary 或 rejected"
+                )
+        else:
+            if metadata.origin_type != "source_parsed":
+                errors.append(
+                    f"{value.chunk_type} 的 origin_type 必须是 source_parsed"
+                )
+            if metadata.verification_status != "verified":
+                errors.append(
+                    f"{value.chunk_type} 的 verification_status 必须是 verified"
+                )
+            if metadata.eligible_for_recommendation is not None:
+                errors.append(
+                    "eligible_for_recommendation 只能出现在 profile_summary"
+                )
+
+        # 正式表里 start_month / is_current / company_name_raw / company_name_norm /
+        # role_name_raw / project_name 均为 NULLABLE，文档未规定 employment/project
+        # 必须因所属 chunk_type 强制这些字段非空。因此这里不校验旧 v2 的必填规则。
 
         # PII 检查在 Embedding 前执行，避免敏感信息进入外部模型；错误只返回
         # 安全摘要，不把命中的原文写入日志或异常。
@@ -184,30 +201,26 @@ class ContractValidator:
 
 
 class EmbeddingEligibilityValidator:
-    """根据冻结契约的状态、证据等级和权重判断能否向量化。
+    """决定一条合法 Contract 是否进入正常向量消费。
 
     Eligibility skip 与 Contract invalid 是两类不同结果：前者是记录结构合法但
-    当前不应进入正式向量索引，后者表示输入契约本身不可信。这里不执行删除或
-    tombstone，inactive 等生命周期动作由上层后续流程处理。
+    当前不应进入正式向量索引（``is_active=false`` 或
+    ``verification_status=rejected``），后者表示输入契约本身不可信。这里不执行
+    删除或 tombstone，生命周期动作由上层后续流程处理。
     """
 
-    _ALLOWED_STATUSES = frozenset({"source_evidence", "validated"})
-    _ALLOWED_WEIGHT_TIERS = frozenset({"A", "B"})
-
     def get_skip_reason(self, record: ContractPreparedChunk) -> str | None:
-        """返回跳过原因；返回 None 表示允许进入 Embedding。"""
+        """返回跳过原因；返回 None 表示允许进入向量消费。
+
+        只保留两个规则：``is_active=false`` 与 ``verification_status=rejected``。
+        ``weight_tier`` 是检索权重字段、``eligible_for_recommendation`` 是 profile
+        推荐资格字段，均不影响是否向量化。
+        """
 
         if not record.is_active:
             return "is_active=false"
-        if record.metadata.verification_status not in self._ALLOWED_STATUSES:
-            return "verification_status 不允许正式向量化"
-        if record.metadata.weight_tier not in self._ALLOWED_WEIGHT_TIERS:
-            return "weight_tier 不允许正式向量化"
-        if (
-            record.metadata.origin_type == "fallback_template"
-            and record.metadata.verification_status != "validated"
-        ):
-            return "fallback_template 必须先通过 validated 校验"
+        if record.metadata.verification_status == "rejected":
+            return "verification_status=rejected 不允许进入正常向量消费"
         return None
 
     def is_eligible(self, record: ContractPreparedChunk) -> bool:
@@ -275,7 +288,9 @@ class ContractEmbeddingWorker:
                 eligible.append(prepared)
             else:
                 skipped.append(
-                    SkippedContractChunk(chunk_id=prepared.chunk_id, reason=reason)
+                    SkippedContractChunk(
+                        vector_doc_id=prepared.vector_doc_id, reason=reason
+                    )
                 )
 
         # 没有 eligible 记录时不触碰外部 Embedding 服务，保证 inactive/不合格
@@ -302,7 +317,7 @@ class ContractEmbeddingWorker:
             embedding = _validate_embedding(
                 raw_embedding,
                 expected_dimension=self.expected_dimension,
-                chunk_id=record.chunk_id,
+                vector_doc_id=record.vector_doc_id,
             )
             embedded.append(
                 EmbeddedContractPreparedChunk(
@@ -409,7 +424,7 @@ def _validate_embedding(
     raw_embedding: Sequence[float],
     *,
     expected_dimension: int,
-    chunk_id: str,
+    vector_doc_id: str,
 ) -> list[float]:
     """校验单条向量的类型、有限性和固定维度。
 
@@ -421,21 +436,25 @@ def _validate_embedding(
         raw_embedding,
         Sequence,
     ):
-        raise TypeError(f"chunk {chunk_id!r} 的 embedding 必须是数值序列")
+        raise TypeError(f"vector_doc_id {vector_doc_id!r} 的 embedding 必须是数值序列")
     if not raw_embedding:
-        raise ValueError(f"chunk {chunk_id!r} 的 embedding 不能为空")
+        raise ValueError(f"vector_doc_id {vector_doc_id!r} 的 embedding 不能为空")
 
     embedding: list[float] = []
     for value in raw_embedding:
         if isinstance(value, bool) or not isinstance(value, Real):
-            raise TypeError(f"chunk {chunk_id!r} 的 embedding 元素必须是数值")
+            raise TypeError(
+                f"vector_doc_id {vector_doc_id!r} 的 embedding 元素必须是数值"
+            )
         number = float(value)
         if not math.isfinite(number):
-            raise ValueError(f"chunk {chunk_id!r} 的 embedding 包含 NaN 或 Infinity")
+            raise ValueError(
+                f"vector_doc_id {vector_doc_id!r} 的 embedding 包含 NaN 或 Infinity"
+            )
         embedding.append(number)
     if len(embedding) != expected_dimension:
         raise ValueError(
-            f"chunk {chunk_id!r} 的 embedding dimension 不匹配: "
+            f"vector_doc_id {vector_doc_id!r} 的 embedding dimension 不匹配: "
             f"expected {expected_dimension}, got {len(embedding)}"
         )
     return embedding
