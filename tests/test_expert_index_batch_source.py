@@ -1,0 +1,231 @@
+"""第二阶段全量候选分页与四表一致性读取的 Source 层测试。
+
+测试使用轻量 Fake Connection/Cursor，不访问真实 MySQL，也不触发 Pipeline 或任何写库
+行为。重点锁定分页 SQL、逻辑删除候选保留、参数边界和单专家只读事务顺序。
+"""
+
+from __future__ import annotations
+
+from datetime import datetime
+from typing import Any, Self
+from zoneinfo import ZoneInfo
+
+import pytest
+
+from expert_index.config import DatabaseConfig
+from expert_index.source import MAX_FULL_SCAN_PAGE_SIZE, MySQLSourceAdapter
+
+
+class FakeCursor:
+    """记录 Source 执行的 SQL，并按测试场景返回预设行。"""
+
+    def __init__(
+        self,
+        *,
+        one: dict[str, Any] | None = None,
+        rows: list[dict[str, Any]] | None = None,
+    ) -> None:
+        self.one = one
+        self.rows = rows or []
+        self.executed: list[tuple[str, tuple[object, ...] | None]] = []
+
+    def __enter__(self) -> Self:
+        return self
+
+    def __exit__(self, *_args: object) -> None:
+        return None
+
+    def execute(self, sql: str, params: tuple[object, ...] | None = None) -> None:
+        """保存压缩后的 SQL，便于测试精确检查查询边界和事务顺序。"""
+
+        self.executed.append((" ".join(sql.split()), params))
+
+    def fetchone(self) -> dict[str, Any] | None:
+        return self.one
+
+    def fetchall(self) -> list[dict[str, Any]]:
+        return list(self.rows)
+
+
+class FakeConnection:
+    """提供 Source 本阶段需要的 cursor/rollback/close 最小连接接口。"""
+
+    def __init__(self, cursor: FakeCursor) -> None:
+        self.cursor_instance = cursor
+        self.rollback_count = 0
+        self.closed = False
+
+    def cursor(self) -> FakeCursor:
+        return self.cursor_instance
+
+    def rollback(self) -> None:
+        self.rollback_count += 1
+
+    def close(self) -> None:
+        self.closed = True
+
+
+def _adapter() -> MySQLSourceAdapter:
+    """构造不会主动连接数据库的 Source Adapter。"""
+
+    return MySQLSourceAdapter(DatabaseConfig("127.0.0.1", 3306, "test", "test", "test"))
+
+
+def _patch_connection(
+    monkeypatch: pytest.MonkeyPatch,
+    connection: FakeConnection,
+) -> list[dict[str, Any]]:
+    """替换 PyMySQL connect，并返回用于检查 autocommit 等参数的记录列表。"""
+
+    calls: list[dict[str, Any]] = []
+
+    def connect(**kwargs: Any) -> FakeConnection:
+        calls.append(kwargs)
+        return connection
+
+    monkeypatch.setattr("expert_index.source.pymysql.connect", connect)
+    return calls
+
+
+def test_full_scan_upper_bound_uses_all_expert_rows(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """最大 ID 查询不能过滤 deleted_at，否则逻辑删除专家无法进入停用分支。"""
+
+    cursor = FakeCursor(one={"upper_bound_id": 981})
+    connection = FakeConnection(cursor)
+    connect_calls = _patch_connection(monkeypatch, connection)
+
+    assert _adapter().get_full_scan_upper_bound() == 981
+
+    sql, params = cursor.executed[0]
+    assert sql == "SELECT COALESCE(MAX(id), 0) AS upper_bound_id FROM experts"
+    assert params is None
+    assert "deleted_at" not in sql
+    assert connect_calls[0]["autocommit"] is True
+    assert connection.closed is True
+
+
+def test_full_scan_candidates_use_keyset_and_keep_deleted_experts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """候选页按固定主键区间读取，同时把逻辑删除标记映射到候选模型。"""
+
+    deleted_at = datetime(2026, 8, 14, 11, 30, tzinfo=ZoneInfo("Asia/Shanghai"))
+    cursor = FakeCursor(
+        rows=[
+            {"id": 101, "deleted_at": None},
+            {"id": 105, "deleted_at": deleted_at},
+        ]
+    )
+    connection = FakeConnection(cursor)
+    connect_calls = _patch_connection(monkeypatch, connection)
+
+    candidates = _adapter().load_full_scan_candidates(
+        after_id=100,
+        upper_bound_id=500,
+        limit=2,
+    )
+
+    assert [candidate.id for candidate in candidates] == [101, 105]
+    assert candidates[0].is_deleted is False
+    assert candidates[1].is_deleted is True
+    assert candidates[1].deleted_at == deleted_at
+    sql, params = cursor.executed[0]
+    assert "WHERE id > %s AND id <= %s" in sql
+    assert "ORDER BY id ASC LIMIT %s" in sql
+    assert "deleted_at IS NULL" not in sql
+    assert params == (100, 500, 2)
+    assert connect_calls[0]["autocommit"] is True
+    assert connection.closed is True
+
+
+@pytest.mark.parametrize(
+    ("after_id", "upper_bound_id", "limit"),
+    [
+        (-1, 100, 10),
+        (0, -1, 10),
+        (0, 100, 0),
+        (0, 100, MAX_FULL_SCAN_PAGE_SIZE + 1),
+    ],
+)
+def test_full_scan_candidates_reject_invalid_boundaries(
+    monkeypatch: pytest.MonkeyPatch,
+    after_id: int,
+    upper_bound_id: int,
+    limit: int,
+) -> None:
+    """无效分页参数必须在建立数据库连接前失败。"""
+
+    def unexpected_connect(**_kwargs: Any) -> None:
+        raise AssertionError("参数校验失败时不应连接 MySQL")
+
+    monkeypatch.setattr("expert_index.source.pymysql.connect", unexpected_connect)
+
+    with pytest.raises(ValueError):
+        _adapter().load_full_scan_candidates(
+            after_id=after_id,
+            upper_bound_id=upper_bound_id,
+            limit=limit,
+        )
+
+
+def test_full_scan_candidates_stop_without_query_at_upper_bound(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """游标到达固定上界后直接返回空页，供后续 Pipeline 结束循环。"""
+
+    def unexpected_connect(**_kwargs: Any) -> None:
+        raise AssertionError("到达上界时不应连接 MySQL")
+
+    monkeypatch.setattr("expert_index.source.pymysql.connect", unexpected_connect)
+
+    assert _adapter().load_full_scan_candidates(
+        after_id=500,
+        upper_bound_id=500,
+        limit=100,
+    ) == []
+
+
+def test_load_expert_reads_four_tables_in_one_consistent_snapshot(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """单专家读取必须先开启只读快照，并允许三张经历表全部为空。"""
+
+    profile = {
+        "id": 24,
+        "serial_number": "EXP000024",
+        "company": "虚构测试公司",
+        "job_status": 1,
+        "job_name": "测试岗位",
+        "contact_status": 3,
+        "doubtful_flag": 1,
+        "abroad_flag": 2,
+        "background": "虚构测试背景",
+        "work_years": 8,
+        "updated_at": None,
+        "created_at": None,
+        "deleted_at": None,
+    }
+    cursor = FakeCursor(one=profile, rows=[])
+    connection = FakeConnection(cursor)
+    connect_calls = _patch_connection(monkeypatch, connection)
+
+    aggregate = _adapter().load_expert(24)
+
+    assert aggregate.profile.id == 24
+    assert aggregate.employments == ()
+    assert aggregate.projects == ()
+    assert aggregate.educations == ()
+    executed_sql = [sql for sql, _params in cursor.executed]
+    assert executed_sql[:2] == [
+        "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ",
+        "START TRANSACTION WITH CONSISTENT SNAPSHOT, READ ONLY",
+    ]
+    assert "FROM experts WHERE id = %s AND deleted_at IS NULL" in executed_sql[2]
+    assert "FROM experts_work_experience" in executed_sql[3]
+    assert "FROM experts_project_experience" in executed_sql[4]
+    assert "FROM experts_education_experience" in executed_sql[5]
+    assert connect_calls[0]["autocommit"] is False
+    assert connection.rollback_count == 1
+    assert connection.closed is True

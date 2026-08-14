@@ -12,6 +12,27 @@ from datetime import datetime
 
 
 @dataclass(frozen=True)
+class ExpertCandidate:
+    """第一版全量扫描从 ``experts`` 表读取的最小候选记录。
+
+    候选阶段只需要专家主键和逻辑删除时间，不提前读取正文或三类经历。后续批量
+    Pipeline 将使用 ``id`` 推进分页游标，并根据 ``deleted_at`` 决定是读取四表完整
+    快照，还是直接停用该专家的历史 Chunk。
+
+    字段名与 ``experts`` 源表保持一致，便于审查分页 SQL 与模型映射。
+    """
+
+    id: int  # experts.id：全量主键游标，也是三张经历表关联使用的专家 ID。
+    deleted_at: datetime | None  # experts.deleted_at：非空表示应进入历史 Chunk 停用分支。
+
+    @property
+    def is_deleted(self) -> bool:
+        """返回该候选是否已逻辑删除，供后续批量 Pipeline 选择处理分支。"""
+
+        return self.deleted_at is not None
+
+
+@dataclass(frozen=True)
 class ExpertSource:
     """从 ``experts`` 表白名单读取的专家主档。
     字段名与源表完全一致；不读取姓名、联系方式和旧经历长文本。

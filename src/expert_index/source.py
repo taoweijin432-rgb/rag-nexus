@@ -16,9 +16,14 @@ from .models import (
     EducationSource,
     EmploymentSource,
     ExpertAggregate,
+    ExpertCandidate,
     ExpertSource,
     ProjectSource,
 )
+
+# 第一版把分页大小限制在 1000 以内，防止调用方误传过大 limit，一次读取过多候选。
+# 默认页大小将在后续 CLI/Pipeline 阶段决定；Source 这里只约束数据库访问安全上限。
+MAX_FULL_SCAN_PAGE_SIZE = 1000
 
 
 class ExpertNotFoundError(LookupError):
@@ -31,18 +36,124 @@ class MySQLSourceAdapter:
     def __init__(self, config: DatabaseConfig) -> None:
         self.config = config
 
-    def load_expert(self, expert_id: int) -> ExpertAggregate:
-        """一次连接中读取主档和三类经历，减少跨时刻数据漂移。"""
+    def get_full_scan_upper_bound(self) -> int:
+        """读取第一版全量任务开始时的最大 ``experts.id``。
 
-        if expert_id <= 0:
-            raise ValueError("expert_id 必须大于 0")
+        构成与用途
+        ----------
+        本方法只执行一次 ``MAX(id)`` 查询，并把空表结果转换为 0。后续批量 Pipeline
+        会在任务启动时调用它，把结果保存到 ``expert_index_batch.upper_bound_id``；
+        每页候选查询都限制 ``id <= upper_bound_id``，因此运行期间新增专家不会让当前
+        批次范围无限增长，而是留给下一次全量任务。
+
+        查询故意不排除 ``deleted_at``，因为已逻辑删除专家仍需进入批次，触发历史
+        Chunk 停用。该方法只读取边界，不读取任何专家正文或经历数据。
+        """
+
         connection = pymysql.connect(**self.config.as_kwargs(autocommit=True))
         try:
             with connection.cursor() as cursor:
+                cursor.execute("SELECT COALESCE(MAX(id), 0) AS upper_bound_id FROM experts")
+                row = cursor.fetchone()
+                return int(row["upper_bound_id"]) if row else 0
+        finally:
+            connection.close()
+
+    def load_full_scan_candidates(
+        self,
+        *,
+        after_id: int,
+        upper_bound_id: int,
+        limit: int,
+    ) -> list[ExpertCandidate]:
+        """按主键游标读取一页全量专家候选。
+
+        Parameters
+        ----------
+        after_id:
+            上一页最后完成调度的 ``experts.id``；第一页面传 0。查询使用严格大于，
+            避免相邻页重复读取同一专家。
+        upper_bound_id:
+            :meth:`get_full_scan_upper_bound` 在批次启动时固定的上界。
+        limit:
+            本页最多返回的专家数，必须位于 1 到 ``MAX_FULL_SCAN_PAGE_SIZE`` 之间。
+
+        Returns
+        -------
+        list[ExpertCandidate]
+            按 ``id`` 升序排列的候选。结果包含逻辑删除专家，但不包含正文；后续
+            Pipeline 会逐个选择“完整四表读取”或“停用历史 Chunk”分支。
+
+        Notes
+        -----
+        这里使用 Keyset Pagination，而不是 OFFSET。前者可以利用主键范围扫描，且不会
+        因前面数据新增或删除而让页边界漂移。当前方法只有一条 SELECT，不需要持有
+        多语句一致性事务。
+        """
+
+        if after_id < 0:
+            raise ValueError("after_id 不能小于 0")
+        if upper_bound_id < 0:
+            raise ValueError("upper_bound_id 不能小于 0")
+        if not 1 <= limit <= MAX_FULL_SCAN_PAGE_SIZE:
+            raise ValueError(
+                f"limit 必须位于 1 到 {MAX_FULL_SCAN_PAGE_SIZE} 之间"
+            )
+        # 空源表或游标已经到达固定上界时，无需建立数据库连接。
+        if upper_bound_id == 0 or after_id >= upper_bound_id:
+            return []
+
+        connection = pymysql.connect(**self.config.as_kwargs(autocommit=True))
+        try:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    SELECT id, deleted_at
+                    FROM experts
+                    WHERE id > %s AND id <= %s
+                    ORDER BY id ASC
+                    LIMIT %s
+                    """,
+                    (after_id, upper_bound_id, limit),
+                )
+                return [
+                    ExpertCandidate(
+                        id=int(row["id"]),
+                        deleted_at=row.get("deleted_at"),
+                    )
+                    for row in cursor.fetchall()
+                ]
+        finally:
+            connection.close()
+
+    def load_expert(self, expert_id: int) -> ExpertAggregate:
+        """在同一只读一致性快照中读取一位专家的四表当前数据。
+
+        本方法被现有单专家 Pipeline 调用，后续也会作为第一版全量任务的专家级读取
+        单元。它依次读取专家主档、工作、项目和教育经历，并返回一个
+        :class:`ExpertAggregate`。三张经历表没有关联行时分别返回空元组，属于正常结果。
+
+        四次 SELECT 必须看到同一个数据库时刻，因此连接关闭 autocommit，并由
+        :meth:`_begin_consistent_read` 启动 REPEATABLE READ 的只读一致性快照。方法只读
+        不写，成功和失败都用 rollback 结束事务，最后关闭短连接。
+        """
+
+        if expert_id <= 0:
+            raise ValueError("expert_id 必须大于 0")
+        connection = pymysql.connect(**self.config.as_kwargs(autocommit=False))
+        try:
+            with connection.cursor() as cursor:
+                self._begin_consistent_read(cursor)
                 profile = self._load_profile(cursor, expert_id)
                 employments = self._load_employments(cursor, profile.id)
                 projects = self._load_projects(cursor, profile.id)
                 educations = self._load_educations(cursor, profile.id)
+            # 只读事务无需 commit；rollback 明确结束一致性快照，也避免未来误加入写 SQL
+            # 后被意外提交。异常分支执行相同收口后继续抛出原错误。
+            connection.rollback()
+        except Exception:
+            connection.rollback()
+            raise
         finally:
             connection.close()
         return ExpertAggregate(
@@ -51,6 +162,21 @@ class MySQLSourceAdapter:
             projects=tuple(projects),
             educations=tuple(educations),
         )
+
+    @staticmethod
+    def _begin_consistent_read(cursor: Any) -> None:
+        """为 :meth:`load_expert` 启动四表一致的只读数据库快照。
+
+        第一条语句把当前事务隔离级别固定为 REPEATABLE READ，第二条语句立即创建一致性
+        快照并声明只读。后续主档、工作、项目、教育四次 SELECT 都使用该快照，
+        避免读取过程中业务库恰好更新某张经历表而形成“半新半旧”的专家聚合。
+
+        本函数只负责事务开端，不负责 commit/rollback；事务结束和连接关闭统一由
+        :meth:`load_expert` 管理。
+        """
+
+        cursor.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
+        cursor.execute("START TRANSACTION WITH CONSISTENT SNAPSHOT, READ ONLY")
 
     @staticmethod
     def _load_profile(cursor: Any, expert_id: int) -> ExpertSource:
