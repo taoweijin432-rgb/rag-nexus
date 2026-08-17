@@ -1,8 +1,12 @@
-"""三类标准 Chunk 的确定性构建器。
+"""把标准化后的 Stage 数据组装为三类最终 Chunk。
 
-构建器只消费中间模型，不直接读取数据库。超长任职和项目在同一个来源记录内
-切分，并重复相同的公司/岗位/项目头；不同来源记录永不合并。profile_summary
-按契约最多一条，使用“抽取式压缩”选择能完整放入上限的前若干句，不让模型改写。
+可以把本文件理解成“文本排版器”：normalize.py 已经负责清洗和标准化字段，本文件
+只决定这些字段以什么标题、顺序和长度组成 chunk_text，再补齐 Metadata、唯一 ID
+和哈希，最终得到可交给 Validator 和 Repository 的 ChunkRecord。
+
+构建器不读取数据库，也不会使用模型改写事实。超长任职和项目只在同一来源记录内部
+切分，并在每个子块重复公司、岗位或项目公共头；不同来源记录永不合并。
+profile_summary 每位专家最多一条，超长背景采用抽取式压缩，尽量保留完整原句。
 """
 
 from __future__ import annotations
@@ -17,6 +21,8 @@ from .config import Settings
 from .models import ChunkRecord, EmploymentStage, ProfileStage, ProjectStage
 from .normalize import canonical_json, sha256_value
 
+# 三类 Chunk 的字符硬上限。Profile 超长时做抽取式压缩；任职和项目超长时拆成多个
+# 同源子块。Validator 会使用同一份配置再次检查，防止超长正文进入 expert_chunk。
 HARD_LIMITS = {"profile_summary": 600, "employment": 900, "project": 1000}
 
 
@@ -37,7 +43,11 @@ def build_vector_doc_id(
 
 
 class ChunkFactory:
-    """把一位专家的三类 Stage 对象转换为完整 Chunk 集合。"""
+    """把一位专家的三类 Stage 对象转换为最终 Chunk 集合。
+
+    Pipeline 每处理一位专家都会调用本对象；本类只做确定性构建，不负责校验、
+    数据库事务或向量化，因此相同 Stage 输入会得到相同正文、ID 和哈希。
+    """
 
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
@@ -48,10 +58,17 @@ class ChunkFactory:
         employments: Iterable[EmploymentStage],
         projects: Iterable[ProjectStage],
     ) -> list[ChunkRecord]:
-        """按 profile、employment、project 的稳定顺序生成 Chunk。"""
+        """按画像、工作、项目的固定顺序生成这位专家的全部 Chunk。
+
+        一条工作或项目经历可能因为正文过长返回多个 Chunk，所以这里使用 extend
+        展开结果。固定顺序便于测试、导出和人工检查，但每条记录的真正唯一性仍由
+        vector_doc_id 保证。
+        """
 
         chunks: list[ChunkRecord] = []
+        # Profile 最多一条；即使为空不生成，也继续处理后面的工作和项目经历。
         chunks.extend(self.build_profile(profile))
+        # 每条经历独立构建，不把不同公司的工作内容拼进同一个 Chunk。
         for employment in employments:
             chunks.extend(self.build_employment(profile.serial_number, employment))
         for project in projects:
@@ -59,16 +76,24 @@ class ChunkFactory:
         return chunks
 
     def build_profile(self, item: ProfileStage) -> list[ChunkRecord]:
-        """每位专家最多构建一条导航画像；完全空白时不生成。"""
+        """用主档关键事实生成最多一条 profile_summary。
 
+        正文只展示当前/最近公司、岗位和背景；工作年限、教育、联系资格等字段放在
+        Metadata 中，不重复塞入正文。公司、岗位和背景全部为空时返回空列表，表示
+        这类 Chunk 没有足够内容，而不是构造只有标题的无意义文本。
+        """
+
+        # 教育信息目前只进入 Metadata，不能单独支撑一条画像正文。
         if not any((item.company_name_norm, item.role_name_raw, item.background_clean)):
             return []
+        # 使用列表逐行组装，最后统一以换行连接，便于控制顺序并跳过空字段。
         lines = ["[专家能力概述]"]
         if item.company_name_norm or item.role_name_raw:
             current = " · ".join(part for part in (item.company_name_norm, item.role_name_raw) if part)
             lines.append(f"当前/最近任职：{current}")
         prefix = "\n".join(lines)
         if item.background_clean:
+            # 先扣除标题、任职行和“核心背景”标签占用的字符，把剩余空间留给背景原文。
             budget = HARD_LIMITS["profile_summary"] - len(prefix) - len("\n核心背景：")
             # 抽取完整句而非在字符中间硬截断；若首句自身过长，再按标点短语切分。
             background = _extractive_fit(item.background_clean, max(budget, 1))
@@ -119,11 +144,17 @@ class ChunkFactory:
         ]
 
     def build_employment(self, serial_number: str | None, item: EmploymentStage) -> list[ChunkRecord]:
-        """生成同一任职段的一个或多个 Chunk，不跨 source_field_id。"""
+        """把一条工作经历排版成一个或多个 employment Chunk。
+
+        header 保存每个子块都必须具备的公司、岗位、时间等上下文；sections 保存可能
+        很长的职责和成果。正文没有超限时生成一条，超限时只拆 sections，并在每个
+        子块重复 header，保证单独检索任一子块时仍然知道它属于哪段任职。
+        """
 
         # 公司和岗位至少要有一个，且职责/成果可以为空；绝不补造不存在的职责。
         if not any((item.company_name_raw, item.company_name_norm, item.role_name_raw)):
             return []
+        # header 是任职的公共身份信息；_append 会自动跳过没有来源值的行。
         header = ["[任职经历]"]
         _append(header, "公司", item.company_name_norm or item.company_name_raw)
         _append(header, "岗位", item.role_name_raw)
@@ -132,11 +163,13 @@ class ChunkFactory:
         if item.is_current is not None:
             _append(header, "任职状态", "当前任职" if item.is_current else "历史任职")
         _append(header, "业务领域", "、".join(item.industry_codes) or None)
+        # subtype 只在超长切分后标记子块语义；未超长时整条 Chunk 的 subtype 为 None。
         sections = [
             ("工作职责", item.responsibilities_clean, "responsibility"),
             ("代表性成果", item.achievements_clean, "achievement"),
         ]
         pieces = _render_pieces(header, sections, HARD_LIMITS["employment"])
+        # enumerate 从 0 生成稳定 chunk_index；相同源记录重复构建时 vector_doc_id 不变。
         return [
             self._record(
                 expert_id=item.expert_id,
@@ -178,10 +211,17 @@ class ChunkFactory:
         ]
 
     def build_project(self, serial_number: str | None, item: ProjectStage) -> list[ChunkRecord]:
-        """生成单项目 Chunk；结构化字段缺失时保留空值，不捏造占位信息。"""
+        """把一条项目经历排版成一个或多个 project Chunk。
 
+        项目名称、客户和日期组成公共头，目标、工作内容、结果组成正文区段。缺少的
+        结构化事实保持为空，不从上下文猜测；超长时沿用任职经历相同的分块方式，
+        且不同 source_field_id 的项目永远不会合并。
+        """
+
+        # 名称、目标、工作内容至少存在一项才尝试生成；最终契约仍由 Validator 复核。
         if not any((item.project_name, item.objective_clean, item.actions_clean)):
             return []
+        # 每个项目子块都重复这一公共头，避免向量召回到子块后失去项目上下文。
         header = ["[项目经历]"]
         _append(header, "项目名称", item.project_name)
         _append(header, "所属公司/客户", item.company_or_client_norm or item.company_or_client_raw)
@@ -195,6 +235,7 @@ class ChunkFactory:
             ("项目结果", item.results_clean, "result"),
         ]
         pieces = _render_pieces(header, sections, HARD_LIMITS["project"])
+        # pieces 的数量同时写入每条记录的 chunk_total，便于下游了解同源分片总数。
         return [
             self._record(
                 expert_id=item.expert_id,
@@ -273,15 +314,23 @@ class ChunkFactory:
         chunk_index: int = 0,
         chunk_total: int = 1,
     ) -> ChunkRecord:
-        """集中生成 ID、哈希和版本，避免三类 Builder 产生细微漂移。"""
+        """把已经排版好的正文和 Metadata 统一封装成 ChunkRecord。
 
+        三类 Builder 都走这个入口，因此 ID 公式、字符数、正文哈希、Metadata 哈希、
+        版本号和初始激活状态只有一份实现。以后修改公共字段时只需检查这里，避免
+        profile、employment、project 各自实现后出现细微差异。
+        """
+
+        # 去掉模板拼接后可能留下的首尾空白；后面的字符数和 content_hash 都以该值为准。
         normalized = text.strip()
+        # 唯一 ID 只使用稳定业务键和分片序号，不使用数据库自增 ID 或构建批次号。
         vector_doc_id = build_vector_doc_id(
             expert_id=expert_id,
             chunk_type=chunk_type,
             source_field_id=source_field_id,
             chunk_index=chunk_index,
         )
+        # 把数据库无时区时间转换成接口契约使用的带时区版本字符串。
         source_version = _iso_with_zone(source_updated_at, self.settings.timezone)
         # metadata_hash 只覆盖最终会作为 Metadata 暴露的稳定扁平字段，不包含
         # chunk_text/content_hash，因此可以独立识别“正文不变、Metadata 变化”。
@@ -337,6 +386,8 @@ class ChunkFactory:
             is_active=True,
             build_batch_id=build_batch_id,
         )
+        # ChunkRecord 是不可变 dataclass，先以空哈希创建，再通过 replace 返回补齐哈希的
+        # 新对象；这样计算函数可以直接读取完整 Metadata，而不会修改原对象。
         return replace(record, metadata_hash=calculate_metadata_hash(record))
 
 
@@ -390,20 +441,31 @@ def metadata_hash_payload(chunk: ChunkRecord) -> dict[str, object]:
 
 
 def calculate_metadata_hash(chunk: ChunkRecord) -> str:
-    """按稳定 JSON 编码计算 Metadata SHA-256。"""
+    """把 Metadata 按固定字段顺序编码后计算 SHA-256。
+
+    相同 Metadata 会得到相同哈希，便于下游识别“正文不变、只有 Metadata 变化”的
+    情况，从而跳过重复 Embedding，只更新 Milvus Metadata。
+    """
 
     return sha256_value(canonical_json(metadata_hash_payload(chunk)))
 
 
 def _append(lines: list[str], label: str, value: str | None) -> None:
-    """只输出有来源值的模板行，避免“未知”占位污染语义。"""
+    """有来源值时才追加“标签：值”，为空时不生成这一行。
+
+    该小函数让三类正文采用相同的空值策略，避免出现“公司：None”之类无意义文本。
+    """
 
     if value:
         lines.append(f"{label}：{value}")
 
 
 def _extractive_fit(text: str, limit: int) -> str:
-    """按句子/短语选择完整来源片段，输出长度不超过 limit。"""
+    """在长度上限内尽量保留完整原句，用于压缩 Profile 背景。
+
+    这里只做“从前往后选取”，不会总结或改写：先按句号等句末标点选择完整句；
+    第一整句仍放不下时再按逗号等短语边界选择，最后才按字符上限截取。
+    """
 
     if len(text) <= limit:
         return text
@@ -432,13 +494,19 @@ def _render_pieces(
     sections: list[tuple[str, str | None, str]],
     hard_limit: int,
 ) -> list[tuple[str | None, str]]:
-    """先尝试单块；超长时按语义区段和句子切为多个同源子块。"""
+    """把公共头和正文区段渲染为一个或多个同源文本块。
 
+    未超限时保留完整文本并返回一块；超限时分别拆职责、成果或项目区段，每一块都
+    带上相同公共头。返回值同时携带 subtype，供 Builder 写入 Chunk Metadata。
+    """
+
+    # 先拼出最理想的完整正文；长度允许时无需拆分，subtype 用 None 表示整块内容。
     body_lines = [f"{label}：{value}" for label, value, _ in sections if value]
     full = "\n".join(header_lines + body_lines)
     if len(full) <= hard_limit:
         return [(None, full)]
     prefix = "\n".join(header_lines)
+    # capacity 是扣除公共头和换行后，单个正文区段真正可使用的字符数。
     capacity = hard_limit - len(prefix) - 1
     if capacity <= 20:
         raise ValueError("Chunk 公共头已超过长度上限，无法安全切分")
@@ -453,7 +521,11 @@ def _render_pieces(
 
 
 def _split_text(text: str, limit: int) -> list[str]:
-    """按段落/句子装箱；单句超长时才按字符边界切分。"""
+    """把长正文尽量按完整句子装入多个不超过 limit 的片段。
+
+    多个短句会在不超限的前提下合并；只有单句本身超过上限时才按字符边界硬切，
+    因此通常不会把一句正常长度的话拆到两个 Chunk 中。
+    """
 
     if len(text) <= limit:
         return [text]
@@ -477,7 +549,11 @@ def _split_text(text: str, limit: int) -> list[str]:
 
 
 def _iso_with_zone(value: datetime | None, timezone_name: str) -> str:
-    """数据库 DATETIME 无时区；按配置时区解释后输出契约要求的 ISO 8601。"""
+    """把数据库 DATETIME 按项目时区解释为稳定的 ISO 8601 版本字符串。
+
+    该值用于 source_version 和 Metadata 追溯，不参与正文排版。来源时间为空时返回
+    固定的 unknown，而不是使用当前运行时间，保证重复构建仍得到相同结果。
+    """
 
     if value is None:
         # 来源表允许 updated_at 为空，source_version 仍需稳定且非空。
