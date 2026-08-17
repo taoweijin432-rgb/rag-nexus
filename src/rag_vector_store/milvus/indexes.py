@@ -20,7 +20,9 @@ class IndexSpec:
     """一个 Milvus Index 的声明，不包含任何 Client 操作。
 
     向量索引携带 metric 和构建参数；scalar 索引只声明字段和类型。当前 Contract
-    集合由一个向量索引和冻结的 11 个 INVERTED 索引组成。
+    集合由一个向量索引（``embedding_vector``）和 3 个 INVERTED 标量索引
+    （``expert_id`` / ``chunk_type`` / ``eligible_for_recommendation``）组成，
+    与 ``contract.CONTRACT_SCALAR_INDEX_FIELDS`` 保持一致。
     """
 
     field_name: str

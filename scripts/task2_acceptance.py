@@ -92,6 +92,7 @@ _STAGES = (
     "embedding",
     "milvus_upsert",
     "vector_doc_id_query",
+    "skipped_absent_query",
     "expert_id_query",
     "missing_id_query",
     "no_deprecated_query",
@@ -122,7 +123,7 @@ class AcceptanceFailure(RuntimeError):
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    """执行真实 7 条 E2E 验收并输出终端摘要及 JSON 报告。
+    """执行真实业务数据 E2E 验收并输出终端摘要及 JSON 报告。
 
     主链路编排（按顺序调用正式组件，不复制业务逻辑）：
         1. _read_mysql_records   # MySqlExpertChunkReader（真实 MySQL → Contract 4.0.0）
@@ -132,7 +133,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         5. _build_embedding_worker  # CompanyCloudEmbeddingModel + ContractEmbeddingWorker
         6. _count_valid_and_eligible # ContractValidator + Eligibility 预检
         7. _ingest_records       # ContractBatchIngestionService.ingest_batch
-        8. _verify_queries       # vector_doc_id / expert_id / missing PK 回查
+        8. _verify_queries       # embedded 主键 / skipped 缺席 / expert_id / missing 回查
         9. _check_no_deprecated_fields
         10. _check_v13_unchanged  # v13 before/after 对比
 
@@ -261,8 +262,32 @@ def _new_report(args: argparse.Namespace) -> dict[str, Any]:
             "upsert_ids": [],
             "skipped_ids": [],
         },
+        "quality": {
+            # 验收输出增强：分布/长度/原因/数量统计，只做展示，不影响正式链路。
+            "chunk_type_distribution": {},
+            "chunk_text_length": {
+                "count": 0,
+                "min": 0,
+                "max": 0,
+                "mean": 0.0,
+                "total_chars": 0,
+            },
+            "contract_validation_failures": {},
+            "eligibility_skipped": {},
+            "embedding": {
+                "embedded_count": 0,
+                "dimensions": [],
+            },
+            "milvus": {
+                "written": 0,
+                "vector_doc_id_queried": 0,
+                "vector_doc_id_found": 0,
+                "expert_id_queried": 0,
+            },
+        },
         "queries": {
             "vector_doc_id": [],
+            "skipped_absent": [],
             "expert_id": {},
             "missing_id": {
                 "vector_doc_id": _MISSING_VECTOR_DOC_ID,
@@ -590,6 +615,34 @@ def _count_valid_and_eligible(
     )
     report["input"]["skipped_count"] = len(skipped_entries)
     report["input"]["skipped"] = skipped_entries
+
+    # quality 统计：chunk_type 分布 + chunk_text 长度 + 校验失败原因 + 跳过原因。
+    quality = report["quality"]
+    quality["chunk_type_distribution"] = dict(
+        sorted(Counter(record.chunk_type for record in records).items())
+    )
+    text_lengths = [len(record.chunk_text) for record in records]
+    quality["chunk_text_length"] = (
+        {
+            "count": len(text_lengths),
+            "min": min(text_lengths) if text_lengths else 0,
+            "max": max(text_lengths) if text_lengths else 0,
+            "mean": _mean(text_lengths),
+            "total_chars": sum(text_lengths),
+        }
+        if text_lengths
+        else {"count": 0, "min": 0, "max": 0, "mean": 0.0, "total_chars": 0}
+    )
+    quality["contract_validation_failures"] = dict(
+        Counter(
+            _classify_validation_failure(entry["error"]["message"])
+            for entry in invalid_entries
+        )
+    )
+    quality["eligibility_skipped"] = dict(
+        Counter(entry["reason"] for entry in skipped_entries)
+    )
+
     if invalid_entries:
         report["failures"].extend(
             {
@@ -668,6 +721,15 @@ def _ingest_records(
 
     embedding_report = report["embedding"]
     embedding_report["observed_dimensions"] = [model.dimension]
+
+    # quality 统计：实际 Embedding 数量与维度。
+    quality_embedding = report["quality"]["embedding"]
+    quality_embedding["embedded_count"] = result.embedded_count
+    quality_embedding["dimensions"] = [model.dimension]
+
+    # quality 统计：Milvus 实际写入（affected）数量。
+    report["quality"]["milvus"]["written"] = result.affected_count
+
     _pass(report, "embedding")
     _pass(report, "milvus_upsert")
 
@@ -678,15 +740,28 @@ def _verify_queries(
     report: dict[str, Any],
     model: CompanyCloudEmbeddingModel,
 ) -> None:
-    """执行主键、专家过滤、模型空间和不存在 ID 的只读精确回查。"""
+    """对 Milvus 做只读回查：主键、skipped 缺席、专家过滤、模型空间、不存在 ID。
 
-    record_by_vector_id = {record.vector_doc_id: record for record in records}
+    只对**已写入（eligible/embedded）** 的记录要求存在，并要求
+    **skipped（Eligibility 跳过）** 记录在 Milvus 中**不存在**；不再把全部输入
+    ``records`` 当成必然已写入。这样存在合法 skipped（rejected / is_active=false）
+    时不会误报失败。skipped 集合取自实际 ingestion 结果
+    ``report["ingestion"]["skipped_ids"]``，未经过读取/校验的记录不在此列。
+    """
+
+    embedded_ids = set(report["ingestion"]["upsert_ids"])
+    skipped_ids = set(report["ingestion"]["skipped_ids"])
+    # 只回查实际嵌入写入的记录；skipped 记录单独用缺失性验证。
+    eligible_records = [
+        record for record in records if record.vector_doc_id in embedded_ids
+    ]
+    expected_by_vector_id = {record.vector_doc_id: record for record in records}
     client = repository.client
     collection_name = repository.settings.collection_name
 
     _begin(report, "vector_doc_id_query")
     vector_results: list[dict[str, Any]] = []
-    for record in records:
+    for record in eligible_records:
         result: dict[str, Any] = {
             "vector_doc_id": record.vector_doc_id,
             "found": False,
@@ -724,13 +799,38 @@ def _verify_queries(
     else:
         _pass(report, "vector_doc_id_query")
 
+    _begin(report, "skipped_absent_query")
+    skipped_results: list[dict[str, Any]] = []
+    for skipped_id in sorted(skipped_ids):
+        result: dict[str, Any] = {
+            "vector_doc_id": skipped_id,
+            "absent": False,
+        }
+        try:
+            result["absent"] = (
+                repository.get_by_vector_doc_id(skipped_id) is None
+            )
+            if not result["absent"]:
+                raise ValueError("合法性跳过的记录不应存在于 Milvus")
+        except Exception as exc:  # noqa: BLE001
+            result["error"] = _safe_error(exc)
+            _record_failure(report, "skipped_absent_query", exc, skipped_id)
+        skipped_results.append(result)
+    report["queries"]["skipped_absent"] = skipped_results
+    if any("error" in result for result in skipped_results):
+        report["stages"]["skipped_absent_query"] = "FAIL"
+    else:
+        _pass(report, "skipped_absent_query")
+
     _begin(report, "expert_id_query")
     expert_results: dict[str, Any] = {}
-    for expert_id in sorted({record.expert_id for record in records}):
+    for expert_id in sorted({record.expert_id for record in eligible_records}):
         result: dict[str, Any] = {
             "expert_id": expert_id,
             "row_count": 0,
-            "expected_count": sum(record.expert_id == expert_id for record in records),
+            "expected_count": sum(
+                record.expert_id == expert_id for record in eligible_records
+            ),
         }
         try:
             rows = _query_rows(client, collection_name, f"expert_id == {expert_id}")
@@ -740,7 +840,7 @@ def _verify_queries(
             )
             result["expected_vector_doc_ids"] = sorted(
                 record.vector_doc_id
-                for record in records
+                for record in eligible_records
                 if record.expert_id == expert_id
             )
             result["exact_set_match"] = (
@@ -750,7 +850,7 @@ def _verify_queries(
             field_checks = []
             for row in rows:
                 vector_doc_id = row.get("vector_doc_id")
-                expected_record = record_by_vector_id.get(vector_doc_id)
+                expected_record = expected_by_vector_id.get(vector_doc_id)
                 if expected_record is None:
                     field_checks.append(False)
                 else:
@@ -789,6 +889,14 @@ def _verify_queries(
         report["stages"]["missing_id_query"] = "FAIL"
     else:
         _pass(report, "missing_id_query")
+
+    # quality 统计：Milvus 回查数量（vector_doc_id 查询/命中、expert_id 查询）。
+    quality_milvus = report["quality"]["milvus"]
+    quality_milvus["vector_doc_id_queried"] = len(vector_results)
+    quality_milvus["vector_doc_id_found"] = sum(
+        1 for result in vector_results if result.get("found")
+    )
+    quality_milvus["expert_id_queried"] = len(expert_results)
 
 
 def _check_no_deprecated_fields(report: dict[str, Any]) -> None:
@@ -1099,6 +1207,53 @@ def _error_message(exc: Exception) -> str:
     return _safe_error(exc)["message"]
 
 
+# Contract 校验失败原因 → 摘要分类关键词（用于 quality 统计，不改正式校验逻辑）。
+# 分类只读错误消息做展示聚合；识别的类别覆盖 Validator 当前主要校验项。
+_CONTRACT_VALIDATION_FAILURE_CATEGORIES = (
+    ("char_count 与 chunk_text 实际字符数", "char_count"),
+    ("content_hash 与 chunk_text 的 SHA-256", "content_hash"),
+    ("chunk_subtype", "chunk_subtype"),
+    ("chunk_index", "chunk_index"),
+    ("chunk_text 超过", "chunk_text 超长"),
+    ("UTF-8 字节数超过", "chunk_text 超长"),
+    ("chunk_text 去除首尾空白后不能为空", "chunk_text 为空"),
+    ("回车符", "控制字符"),
+    ("控制字符", "控制字符"),
+    ("邮箱", "PII"),
+    ("手机号", "PII"),
+    ("身份证", "PII"),
+    ("银行卡", "PII"),
+    ("原始 URL", "PII"),
+    ("IP 地址", "PII"),
+    ("微信号", "PII"),
+    ("origin_type", "origin_type"),
+    ("erification_status", "verification_status"),
+    ("eligible_for_recommendation", "eligible_for_recommendation"),
+    ("end_month 必须为 null", "is_current/end_month"),
+)
+
+
+def _classify_validation_failure(message: str) -> str:
+    """把一条 Contract 校验错误消息归类为稳定摘要原因。
+
+    只在错误消息中查找已知关键词；无法归类时返回 "other"。用于质量报告统计，
+    不改变正式校验逻辑或异常语义。
+    """
+
+    for keyword, category in _CONTRACT_VALIDATION_FAILURE_CATEGORIES:
+        if keyword in message:
+            return category
+    return "other"
+
+
+def _mean(values: Sequence[int]) -> float:
+    """返回整数序列的均值（空序列返回 0.0）。"""
+
+    if not values:
+        return 0.0
+    return sum(values) / len(values)
+
+
 def _row_dimension(row: Mapping[str, Any]) -> int | None:
     embedding = row.get("embedding")
     return len(embedding) if isinstance(embedding, list) else None
@@ -1162,6 +1317,54 @@ def _print_summary(report: Mapping[str, Any], report_path: Path | None) -> None:
         f"{v13['collection']} exists={v13.get('exists')} "
         f"before={v13.get('before_count')} after={v13.get('after_count')} "
         f"unchanged={v13.get('unchanged')}"
+    )
+    # quality 统计展示（JSON 报告中是权威来源，这里给终端可读摘要）。
+    quality = report["quality"]
+    print(
+        "quality chunk_type: "
+        + ", ".join(
+            f"{key}={count}"
+            for key, count in sorted(quality["chunk_type_distribution"].items())
+        )
+    )
+    text_len = quality["chunk_text_length"]
+    print(
+        "quality chunk_text_len: "
+        f"count={text_len['count']} min={text_len['min']} "
+        f"max={text_len['max']} mean={text_len['mean']:.1f} "
+        f"total={text_len['total_chars']}"
+    )
+    validation_failures = quality["contract_validation_failures"]
+    if validation_failures:
+        print(
+            "quality validation_failures: "
+            + ", ".join(
+                f"{key}={count}"
+                for key, count in sorted(validation_failures.items())
+            )
+        )
+    eligibility_skipped = quality["eligibility_skipped"]
+    if eligibility_skipped:
+        print(
+            "quality eligibility_skipped: "
+            + ", ".join(
+                f"{key}={count}"
+                for key, count in sorted(eligibility_skipped.items())
+            )
+        )
+    quality_embedding = quality["embedding"]
+    print(
+        "quality embedding: "
+        f"embedded={quality_embedding['embedded_count']} "
+        f"dimensions={quality_embedding['dimensions']}"
+    )
+    quality_milvus = quality["milvus"]
+    print(
+        "quality milvus: "
+        f"written={quality_milvus['written']} "
+        f"vector_doc_id_queried={quality_milvus['vector_doc_id_queried']} "
+        f"vector_doc_id_found={quality_milvus['vector_doc_id_found']} "
+        f"expert_id_queried={quality_milvus['expert_id_queried']}"
     )
     if report["failures"]:
         print(f"failures: {len(report['failures'])}")
