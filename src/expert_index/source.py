@@ -284,6 +284,10 @@ class MySQLSourceAdapter:
         教育经历只为 profile_summary 提供学校和专业 Metadata，不产生独立 Chunk。
         查询仍带上 ``deleted_at`` 字段，使 Source 模型能和真实源表逐列审查；由于
         WHERE 条件已经过滤，正常返回的该字段必然为空。
+
+        排序只使用两套环境都存在的 ``id``。本机源表虽然有 ``start_date/end_date``，
+        公司中间表已在脱敏加工时移除这两列；而当前 EducationSource 和最终 Metadata
+        都不使用教育起止日期，因此按主键稳定升序既不损失业务字段，又能兼容两套表。
         """
 
         cursor.execute(
@@ -292,8 +296,7 @@ class MySQLSourceAdapter:
                    updated_at, created_at, deleted_at
             FROM experts_education_experience
             WHERE expert_id = %s AND deleted_at IS NULL
-            ORDER BY COALESCE(end_date, '9999-12-31') DESC,
-                     start_date DESC, id ASC
+            ORDER BY id ASC
             """,
             (expert_id,),
         )

@@ -226,6 +226,10 @@ def test_load_expert_reads_four_tables_in_one_consistent_snapshot(
     assert "FROM experts_work_experience" in executed_sql[3]
     assert "FROM experts_project_experience" in executed_sql[4]
     assert "FROM experts_education_experience" in executed_sql[5]
+    # 教育中间表没有 start_date/end_date；只按两套环境共有的主键稳定排序。
+    assert "ORDER BY id ASC" in executed_sql[5]
+    assert "start_date" not in executed_sql[5]
+    assert "end_date" not in executed_sql[5]
     assert connect_calls[0]["autocommit"] is False
     assert connection.rollback_count == 1
     assert connection.closed is True

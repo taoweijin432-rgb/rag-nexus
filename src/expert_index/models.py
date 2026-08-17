@@ -234,14 +234,14 @@ class ChunkRecord:
     start_month: str | None  # 任职/项目开始月份，格式 YYYYMM。
     end_month: str | None  # 任职/项目结束月份，格式 YYYYMM。
     is_current: bool | None  # 是否当前任职；项目和主档 Chunk 通常为空。
-    industry_codes: tuple[str, ...]  # 去重排序后的行业标签代码。
+    industry_codes: tuple[str, ...]  # 去重排序后的行业标签代码。模型在当前其他字段中抽取过来的内容，是为了语义拓展用的
     function_codes: tuple[str, ...]  # profile_summary 的职能代码；本期只保留字段，值为空。
-    topic_codes: tuple[str, ...]  # 去重排序后的业务主题标签代码。
+    topic_codes: tuple[str, ...]  # 去重排序后的业务主题标签代码。模型在当前其他字段中抽取过来的内容，是为了语义拓展用的
     school_names_raw: tuple[str, ...]  # 仅 profile_summary 使用的学校原始名集合。
     major_names_raw: tuple[str, ...]  # 仅 profile_summary 使用的专业原始名集合。
     eligible_for_recommendation: bool | None  # 仅 profile_summary 使用；其他类型必须为 None。
     origin_type: str  # source_parsed 或 compressed_from_source。
-    verification_status: str  # verified 或 source_summary。
+    verification_status: str  # verified 或 source_summary，如果是存疑/未知则为 rejected，受doubtful_flag字段影响。
     weight_tier: str  # 检索权重等级，如 A/B。
     chunk_policy_version: str  # Chunk 模板与切分规则版本。
     metadata_schema_version: str  # Metadata 数据契约版本。
