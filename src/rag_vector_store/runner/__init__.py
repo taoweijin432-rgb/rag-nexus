@@ -9,12 +9,15 @@ Runner 只负责编排，不实现业务逻辑：
 - 不实现 Task State 持久化（复用 TaskStateStore）
 """
 
+from .async_executor import AsyncTaskExecutor, TaskSubmission
 from .pipeline_runner import (
     PipelineRunnerError,
     VectorizationPipelineRunner,
 )
 
 __all__ = [
+    "AsyncTaskExecutor",
     "PipelineRunnerError",
+    "TaskSubmission",
     "VectorizationPipelineRunner",
 ]
