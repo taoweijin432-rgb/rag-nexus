@@ -24,7 +24,9 @@ TaskItemStatus = Literal["pending", "success", "skipped", "failed"]
 TaskSource = Literal["full_batch", "api_submit"]
 
 # ── 条目结果 ──
-TaskItemResult = Literal["embedded", "skipped"]
+# result 是 VARCHAR(128)，存 embedded / 跳过原因 / NULL；
+# Literal 只用于类型注释，不限制字段值。
+TaskItemResult = str | None
 
 # 时间字段使用 DATETIME(6) 微秒精度（与 DDL 一致）。
 # naive datetime 统一按 Asia/Shanghai 解释（与 Reader database_timezone 约定一致）。

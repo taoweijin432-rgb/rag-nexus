@@ -66,7 +66,7 @@ class FakeConnection:
         self.rollbacks = 0
         self.closed = False
 
-    def cursor(self) -> FakeCursor:
+    def cursor(self, cursorclass: Any = None) -> FakeCursor:
         return self.cursor_instance
 
     def commit(self) -> None:
@@ -382,7 +382,7 @@ def test_driver_error_is_sanitized() -> None:
             self.closed = True
 
     class BrokenConnection:
-        def cursor(self) -> BrokenCursor:
+        def cursor(self, cursorclass: Any = None) -> BrokenCursor:
             return BrokenCursor()
 
         def commit(self) -> None:
@@ -395,7 +395,7 @@ def test_driver_error_is_sanitized() -> None:
             pass
 
     store = _new_store({})
-    store._connection = None
+    store._local.connection = None
     # 用 monkeypatch 无法，直接构造带坏连接的 store
     class _BrokenStore(TaskStateStore):
         @property

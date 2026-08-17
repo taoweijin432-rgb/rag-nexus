@@ -55,6 +55,18 @@ class TaskStateMySQLSettings(MySQLSettings):
 
         return cls(**values)
 
+    @property
+    def connector_kwargs(self) -> dict[str, Any]:
+        """覆写父类，显式设置 ``autocommit=True``。
+
+        Task State Store 每条 SQL 独立提交，不依赖跨语句事务；
+        显式 autocommit 避免隐式事务在多线程连接池中残留状态。
+        """
+
+        kwargs = super().connector_kwargs
+        kwargs["autocommit"] = True
+        return kwargs
+
 
 def _env_get(
     env: Mapping[str, str],

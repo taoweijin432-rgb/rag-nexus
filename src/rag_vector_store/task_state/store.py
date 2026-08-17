@@ -17,6 +17,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Sequence
 from datetime import datetime, timezone
+from threading import local as thread_local
 from typing import Any
 
 from pydantic import ValidationError
@@ -57,23 +58,26 @@ class TaskStateStore:
         self.settings = settings
         self.connector_factory = connector_factory
         self.database_timezone = database_timezone
-        self._connection: MySQLConnection | None = None
+        self._local = thread_local()
 
     @property
     def connection(self) -> MySQLConnection:
-        """延迟创建共享连接（同一 Store 实例复用）。"""
+        """延迟创建线程局部连接（每个线程拥有独立连接）。"""
 
-        if self._connection is None:
-            self._connection = MySQLConnection(
+        conn = getattr(self._local, "connection", None)
+        if conn is None:
+            conn = MySQLConnection(
                 self.settings,
                 connector_factory=self.connector_factory,
             )
-        return self._connection
+            self._local.connection = conn
+        return conn
 
     def close(self) -> None:
-        if self._connection is not None:
-            self._connection.close()
-            self._connection = None
+        conn = getattr(self._local, "connection", None)
+        if conn is not None:
+            conn.close()
+            self._local.connection = None
 
     # ── 任务级 ──
 
@@ -349,8 +353,17 @@ class TaskStateStore:
         sql: str,
         params: tuple[Any, ...] = (),
     ) -> list[dict[str, Any]]:
+        try:
+            from pymysql.cursors import DictCursor
+        except ImportError:
+            DictCursor = None  # type: ignore[assignment, misc]
+
         conn = self.connection.connection
-        cursor = conn.cursor()
+        cursor = (
+            conn.cursor(DictCursor)  # type: ignore[call-arg]
+            if DictCursor is not None
+            else conn.cursor()
+        )
         try:
             cursor.execute(sql, params)
             rows = cursor.fetchall()
