@@ -2,7 +2,7 @@
 
 本模块按照固定顺序组织领域链路：
 
-``Source → Normalize/Stage → Chunk → Validator → MySQL``
+``Source → Normalize/Stage → Chunk → Validator → MySQL → optional Vector Sync``
 
 各模块职责保持清晰边界：
 
@@ -23,11 +23,14 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime
+from zoneinfo import ZoneInfo
 
 from .chunk_builder import ChunkFactory
 from .config import Settings
-from .models import ExpertCandidate
+from .contract_bridge import chunk_records_to_contracts
+from .models import ChunkRecord, ExpertCandidate
 from .normalize import normalize_aggregate
+from .ports import ExpertVectorSyncPort
 from .repository import MySQLIndexRepository
 from .source import MAX_FULL_SCAN_PAGE_SIZE, MySQLSourceAdapter
 from .validators import validate_chunks
@@ -109,10 +112,12 @@ class ExpertIndexPipeline:
         *,
         source: MySQLSourceAdapter | None = None,
         repository: MySQLIndexRepository | None = None,
+        vector_sync: ExpertVectorSyncPort | None = None,
     ) -> None:
         self.settings = settings
         self.source = source or MySQLSourceAdapter(settings.source_db)
         self.repository = repository or MySQLIndexRepository(settings.index_db)
+        self.vector_sync = vector_sync
         self.factory = ChunkFactory(settings)
 
     def build_one(
@@ -318,6 +323,7 @@ class ExpertIndexPipeline:
                                 candidate.id,
                                 build_batch_id=batch_id,
                             )
+                            self._sync_expert_vectors(candidate.id, [])
                             terminal_status = "deactivated"
                             result_code = "expert_deleted"
                         else:
@@ -485,6 +491,7 @@ class ExpertIndexPipeline:
                 projects,
                 reason="no_chunkable_content",
             )
+            self._sync_expert_vectors(expert_id, [])
             return "rejected"
 
         validate_chunks(chunks)
@@ -494,9 +501,32 @@ class ExpertIndexPipeline:
             projects,
             chunks,
         )
-        # 只有 Repository 事务成功提交后才记录 Chunk 数，失败事务保持 0。
+        # Repository 已提交后记录真实产出数；向量同步若失败，外层会把本专家标记为
+        # failed，但保留该数量，便于重跑时根据 MySQL/Milvus 当前状态进行幂等修复。
         progress.chunk_count = len(chunks)
+        self._sync_expert_vectors(expert_id, chunks)
         return "success"
+
+    def _sync_expert_vectors(
+        self,
+        expert_id: int,
+        chunks: list[ChunkRecord],
+    ) -> None:
+        """可选地把一位专家的当前 Chunk 快照同步到下游公共 Python 服务。
+
+        默认未注入 ``vector_sync`` 时保持原 MySQL 行为。生产 CLI 只有显式传入
+        ``--vectorize`` 才会注入；测试可使用 Fake，避免真实 Embedding/Milvus 写入。
+        """
+
+        if self.vector_sync is None:
+            return
+        updated_at = datetime.now(ZoneInfo(self.settings.timezone))
+        contracts = chunk_records_to_contracts(
+            chunks,
+            updated_at=updated_at,
+            timezone_name=self.settings.timezone,
+        )
+        self.vector_sync.sync_expert(expert_id, contracts)
 
 
 def _validate_data_version(data_version: str) -> None:

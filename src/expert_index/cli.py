@@ -39,6 +39,11 @@ def build_parser() -> argparse.ArgumentParser:
         default=datetime.now().astimezone().strftime("%Y%m%d_01"),
     )
     build.add_argument("--batch-no")
+    build.add_argument(
+        "--vectorize",
+        action="store_true",
+        help="显式调用下游 Python 服务同步 Embedding/Milvus；默认只写本机索引库",
+    )
 
     build_batch = sub.add_parser(
         "build-batch",
@@ -56,6 +61,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="每页候选专家数，范围 1~1000，默认 200",
     )
     build_batch.add_argument("--batch-no", help="可选业务批次号；不传时自动生成")
+    build_batch.add_argument(
+        "--vectorize",
+        action="store_true",
+        help="显式调用下游 Python 服务同步 Embedding/Milvus；默认只写本机索引库",
+    )
 
     export = sub.add_parser("export", help="导出符合向量化输入契约的 JSONL")
     export.add_argument("--expert-id", type=int, required=True)
@@ -87,7 +97,11 @@ def main(argv: list[str] | None = None) -> None:
         repository.initialize_schema(args.ddl)
         print(json.dumps({"status": "ok", "schema": settings.index_db.database}, ensure_ascii=False))
     elif args.command == "build":
-        result = ExpertIndexPipeline(settings, repository=repository).build_one(
+        result = _build_pipeline(
+            settings,
+            repository,
+            vectorize=args.vectorize,
+        ).build_one(
             args.expert_id,
             data_version=args.data_version,
             batch_no=args.batch_no,
@@ -96,7 +110,11 @@ def main(argv: list[str] | None = None) -> None:
     elif args.command == "build-batch":
         # build_many 内部完成全局互斥、固定扫描上界、分页、专家失败隔离、批次明细和
         # 生命周期处理；CLI 只负责接收参数并输出不含专家正文的数量摘要。
-        result = ExpertIndexPipeline(settings, repository=repository).build_many(
+        result = _build_pipeline(
+            settings,
+            repository,
+            vectorize=args.vectorize,
+        ).build_many(
             data_version=args.data_version,
             page_size=args.page_size,
             batch_no=args.batch_no,
@@ -111,6 +129,29 @@ def main(argv: list[str] | None = None) -> None:
     elif args.command == "seed-test-expert":
         fixture = ensure_complete_test_expert(settings.source_db)
         print(json.dumps(asdict(fixture), ensure_ascii=False, sort_keys=True))
+
+
+def _build_pipeline(
+    settings: Settings,
+    repository: MySQLIndexRepository,
+    *,
+    vectorize: bool,
+) -> ExpertIndexPipeline:
+    """组装上游 Pipeline；只有显式开启时才创建真实下游服务。"""
+
+    if not vectorize:
+        return ExpertIndexPipeline(settings, repository=repository)
+
+    from rag_vector_store import create_vector_ingestion_service
+
+    from .vector_sync import ExpertVectorSynchronizer
+
+    vector_service = create_vector_ingestion_service()
+    return ExpertIndexPipeline(
+        settings,
+        repository=repository,
+        vector_sync=ExpertVectorSynchronizer(vector_service),
+    )
 
 
 if __name__ == "__main__":

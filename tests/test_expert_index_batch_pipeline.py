@@ -15,6 +15,7 @@ from zoneinfo import ZoneInfo
 
 import pytest
 
+from expert_contracts import ExpertChunkEmbeddingInput
 from expert_index.cli import build_parser
 from expert_index.config import DatabaseConfig, Settings
 from expert_index.models import ExpertAggregate, ExpertCandidate, ExpertSource
@@ -167,9 +168,25 @@ class FakeRepository:
         self.progress_calls.append(kwargs)
 
 
+class FakeVectorSync:
+    """记录 Pipeline 交付的正式 Contract 快照。"""
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[int, list[ExpertChunkEmbeddingInput]]] = []
+
+    def sync_expert(
+        self,
+        expert_id: int,
+        records: list[ExpertChunkEmbeddingInput],
+    ) -> object:
+        self.calls.append((expert_id, list(records)))
+        return object()
+
+
 def _pipeline(
     source: FakeSource,
     repository: FakeRepository,
+    vector_sync: FakeVectorSync | None = None,
 ) -> ExpertIndexPipeline:
     """通过依赖注入创建不连接数据库的真实 Pipeline。"""
 
@@ -177,6 +194,7 @@ def _pipeline(
         _settings(),
         source=source,  # type: ignore[arg-type]
         repository=repository,  # type: ignore[arg-type]
+        vector_sync=vector_sync,
     )
 
 
@@ -204,6 +222,29 @@ def test_build_one_reuses_expert_core_and_keeps_existing_result() -> None:
     ]
     assert repository.persisted_expert_ids == [24]
     assert repository.finish_calls[-1][1]["status"] == "success"
+
+
+def test_build_one_passes_strict_contract_snapshot_to_optional_vector_sync() -> None:
+    """显式注入向量同步后，MySQL 成功产出的 Chunk 应以内存 Contract 交付。"""
+
+    source = FakeSource([ExpertCandidate(id=25, deleted_at=None)])
+    repository = FakeRepository()
+    vector_sync = FakeVectorSync()
+
+    result = _pipeline(source, repository, vector_sync).build_one(
+        25,
+        data_version="20260818_01",
+        batch_no="single_vector_sync_test",
+    )
+
+    assert result.chunk_count == 1
+    assert len(vector_sync.calls) == 1
+    expert_id, records = vector_sync.calls[0]
+    assert expert_id == 25
+    assert len(records) == 1
+    assert isinstance(records[0], ExpertChunkEmbeddingInput)
+    assert records[0].contract_version == "4.0.0"
+    assert records[0].vector_doc_id.startswith("expert:25:profile_summary:")
 
 
 def test_build_many_paginates_and_continues_after_one_expert_fails() -> None:
@@ -256,8 +297,9 @@ def test_build_many_deactivates_deleted_candidate_without_loading_source() -> No
     deleted_at = datetime(2026, 8, 14, 12, 30, tzinfo=ZoneInfo("Asia/Shanghai"))
     source = FakeSource([ExpertCandidate(id=40, deleted_at=deleted_at)])
     repository = FakeRepository()
+    vector_sync = FakeVectorSync()
 
-    result = _pipeline(source, repository).build_many(
+    result = _pipeline(source, repository, vector_sync).build_many(
         data_version="20260814_03",
         batch_no="full_deleted_pending_test",
     )
@@ -268,6 +310,7 @@ def test_build_many_deactivates_deleted_candidate_without_loading_source() -> No
     assert source.loaded_ids == []
     assert repository.persisted_expert_ids == []
     assert repository.deactivated_expert_ids == [40]
+    assert vector_sync.calls == [(40, [])]
     finished = [event for event in repository.events if event[0] == "finished"]
     assert finished[0][1][2]["status"] == "deactivated"
     assert finished[0][1][2]["result_code"] == "expert_deleted"
@@ -284,8 +327,9 @@ def test_build_many_rejects_no_content_and_continues_next_expert() -> None:
         empty_ids={50},
     )
     repository = FakeRepository()
+    vector_sync = FakeVectorSync()
 
-    result = _pipeline(source, repository).build_many(
+    result = _pipeline(source, repository, vector_sync).build_many(
         data_version="20260814_04",
         page_size=1,
         batch_no="full_empty_pending_test",
@@ -298,6 +342,8 @@ def test_build_many_rejects_no_content_and_continues_next_expert() -> None:
     assert result.extracted_count == 2
     assert repository.persisted_expert_ids == [60]
     assert repository.rejected_expert_ids == [50]
+    assert vector_sync.calls[0] == (50, [])
+    assert len(vector_sync.calls[1][1]) == 1
     statuses = [
         event[1][2]["status"]
         for event in repository.events
@@ -356,6 +402,7 @@ def test_cli_exposes_full_batch_entry_with_explicit_page_size() -> None:
             "300",
             "--batch-no",
             "full_cli_test",
+            "--vectorize",
         ]
     )
 
@@ -363,3 +410,4 @@ def test_cli_exposes_full_batch_entry_with_explicit_page_size() -> None:
     assert args.data_version == "20260814_07"
     assert args.page_size == 300
     assert args.batch_no == "full_cli_test"
+    assert args.vectorize is True
