@@ -19,6 +19,10 @@ from expert_contracts import ExpertChunkEmbeddingInput
 from rag_vector_store.chunking.contract_pipeline import (
     ContractValidationError,
 )
+from rag_vector_store.ingestion.models import (
+    VectorIngestionResult,
+    VectorItemResult,
+)
 from rag_vector_store.reconciliation import (
     FullVectorReconciliationService,
 )
@@ -129,7 +133,6 @@ def existing_row(
 
 def make_service(repo: FakeReconRepository) -> FullVectorReconciliationService:
     return FullVectorReconciliationService(repo)
-
 
 # ---------------------------------------------------------------------------
 # 正常分类
@@ -328,3 +331,288 @@ def test_reconcile_all_empty_snapshot_is_pure_diff() -> None:
     assert result.stale_count == 1
     assert result.stale_sample == ("expert:900001:profile_summary:old:0",)
     # dry-run 阶段不执行任何删除（Fake 无删除能力）
+
+# ---------------------------------------------------------------------------
+# 正向同步 apply_positive_changes
+# ---------------------------------------------------------------------------
+
+
+class FakePositiveRepository(FakeReconRepository):
+    """在只读 Fake 基础上增加可注入的安全守卫（用于正向同步测试）。"""
+
+    def __init__(
+        self,
+        rows: list[dict[str, Any]] | None = None,
+        *,
+        list_error: Exception | None = None,
+        guard_error: Exception | None = None,
+    ) -> None:
+        super().__init__(rows, list_error=list_error)
+        self.guard_error = guard_error
+        self.guard_calls: list[dict[str, Any]] = []
+
+    def assert_destructive_maintenance_allowed(self, **kwargs: Any) -> dict[str, Any]:
+        self.guard_calls.append(kwargs)
+        if self.guard_error is not None:
+            raise self.guard_error
+        return {"collection_name": "expert_candidates_v14_contract_dev", "authorized": True}
+
+
+class FakeIngestionService:
+    """记录 upsert / update_metadata 调用的 Fake（内部可注入失败与定制结果）。"""
+
+    def __init__(
+        self,
+        *,
+        upsert_result: Any | None = None,
+        metadata_result: Any | None = None,
+        upsert_error: Exception | None = None,
+        metadata_error: Exception | None = None,
+    ) -> None:
+        self.upsert_result = upsert_result
+        self.metadata_result = metadata_result
+        self.upsert_error = upsert_error
+        self.metadata_error = metadata_error
+        self.upsert_calls: list[list[Any]] = []
+        self.metadata_calls: list[list[Any]] = []
+
+    def upsert_chunks(self, chunks: list[Any]) -> VectorIngestionResult:
+        self.upsert_calls.append(list(chunks))
+        if self.upsert_error is not None:
+            raise self.upsert_error
+        if self.upsert_result is not None:
+            return self.upsert_result
+        return VectorIngestionResult(
+            results=[
+                VectorItemResult(vector_doc_id=c.vector_doc_id, status="embedded")
+                for c in chunks
+            ]
+        )
+
+    def update_metadata(self, chunks: list[Any]) -> VectorIngestionResult:
+        self.metadata_calls.append(list(chunks))
+        if self.metadata_error is not None:
+            raise self.metadata_error
+        if self.metadata_result is not None:
+            return self.metadata_result
+        return VectorIngestionResult(
+            results=[
+                VectorItemResult(
+                    vector_doc_id=c.vector_doc_id,
+                    status="metadata_updated",
+                )
+                for c in chunks
+            ]
+        )
+
+
+def make_positive_service(
+    repo: FakePositiveRepository,
+    ingestion: FakeIngestionService,
+) -> FullVectorReconciliationService:
+    return FullVectorReconciliationService(repo, ingestion=ingestion)
+
+
+def _upsert_with_failed(chunks: list[Any]) -> VectorIngestionResult:
+    return VectorIngestionResult(
+        results=[
+            VectorItemResult(
+                vector_doc_id=c.vector_doc_id,
+                status="failed",
+                error_message="boom",
+            )
+            for c in chunks
+        ]
+    )
+
+
+def _empty_result() -> VectorIngestionResult:
+    return VectorIngestionResult(results=[])
+
+
+def test_apply_missing_routes_to_upsert() -> None:
+    record = make_record(0)  # Milvus 中不存在 -> missing
+    repo = FakePositiveRepository([])
+    ing = FakeIngestionService()
+    result = make_positive_service(repo, ing).apply_positive_changes([record])
+
+    assert result.missing_count == 1
+    assert result.embedded_count == 1
+    assert ib_ids(ing.upsert_calls) == [[record.vector_doc_id]]
+    assert ing.metadata_calls == []
+    assert repo.guard_calls == [{}]
+
+
+def test_apply_content_changed_routes_to_upsert() -> None:
+    record = make_record(0)
+    repo = FakePositiveRepository(
+        [existing_row(record.vector_doc_id, "1" * 64, record.metadata_hash)]
+    )
+    ing = FakeIngestionService()
+    result = make_positive_service(repo, ing).apply_positive_changes([record])
+
+    assert result.content_changed_count == 1
+    assert result.embedded_count == 1
+    assert ib_ids(ing.upsert_calls) == [[record.vector_doc_id]]
+    assert ing.metadata_calls == []
+
+
+def test_apply_metadata_changed_routes_to_update_metadata() -> None:
+    record = make_record(0)
+    repo = FakePositiveRepository(
+        [existing_row(record.vector_doc_id, record.content_hash, "2" * 64)]
+    )
+    ing = FakeIngestionService()
+    result = make_positive_service(repo, ing).apply_positive_changes([record])
+
+    assert result.metadata_changed_count == 1
+    assert result.metadata_updated_count == 1
+    assert ing.upsert_calls == []
+    assert ib_ids(ing.metadata_calls) == [[record.vector_doc_id]]
+
+
+def test_apply_unchanged_is_zero_write() -> None:
+    record = make_record(0)
+    repo = FakePositiveRepository(
+        [existing_row(record.vector_doc_id, record.content_hash, record.metadata_hash)]
+    )
+    ing = FakeIngestionService()
+    result = make_positive_service(repo, ing).apply_positive_changes([record])
+
+    assert result.unchanged_count == 1
+    assert result.embedded_count == 0
+    assert result.metadata_updated_count == 0
+    assert ing.upsert_calls == []
+    assert ing.metadata_calls == []
+    # 守卫仍被调用（本次 Full Reconciliation 运行在授权的维护 Collection 上）
+    assert repo.guard_calls == [{}]
+
+
+def test_apply_stale_is_never_deleted() -> None:
+    record = make_record(0)
+    repo = FakePositiveRepository(
+        [
+            existing_row(record.vector_doc_id, record.content_hash, record.metadata_hash),
+            existing_row("expert:900001:profile_summary:stale:0", "s" * 64, "s" * 64),
+        ]
+    )
+    ing = FakeIngestionService()
+    result = make_positive_service(repo, ing).apply_positive_changes([record])
+
+    assert result.unchanged_count == 1
+    assert result.stale_count == 1
+    # stale 只统计，绝不删除：无任何删除调用能力
+    assert not hasattr(repo, "delete_by_vector_doc_ids")
+    assert not hasattr(ing, "delete_vectors")
+
+
+def test_apply_mixed_diff() -> None:
+    records = default_records(4)
+    missing = records[0]
+    content_changed = records[1]
+    metadata_changed = records[2]
+    unchanged = records[3]
+    repo = FakePositiveRepository(
+        [
+            existing_row(content_changed.vector_doc_id, "1" * 64, content_changed.metadata_hash),
+            existing_row(metadata_changed.vector_doc_id, metadata_changed.content_hash, "2" * 64),
+            existing_row(unchanged.vector_doc_id, unchanged.content_hash, unchanged.metadata_hash),
+            existing_row("expert:900001:profile_summary:stale:0", "s" * 64, "s" * 64),
+        ]
+    )
+    ing = FakeIngestionService()
+    result = make_positive_service(repo, ing).apply_positive_changes(records)
+
+    assert result.missing_count == 1
+    assert result.content_changed_count == 1
+    assert result.metadata_changed_count == 1
+    assert result.unchanged_count == 1
+    assert result.stale_count == 1
+    assert result.embedded_count == 2
+    assert result.metadata_updated_count == 1
+    # 顺序：missing 先、content_changed 后，一并 upsert
+    assert ib_ids(ing.upsert_calls) == [
+        [missing.vector_doc_id, content_changed.vector_doc_id]
+    ]
+    assert ib_ids(ing.metadata_calls) == [[metadata_changed.vector_doc_id]]
+    # stale 未删除
+    assert not hasattr(repo, "delete_by_vector_doc_ids")
+
+
+def test_apply_upsert_failure_is_fail_closed() -> None:
+    record = make_record(0)
+    repo = FakePositiveRepository([])
+    ing = FakeIngestionService(
+        upsert_result=_upsert_with_failed([record])
+    )
+
+    with pytest.raises(RuntimeError, match="出现失败项|不一致"):
+        make_positive_service(repo, ing).apply_positive_changes([record])
+
+    # 失败后不再执行 delete（fake 无删除能力）
+    assert not hasattr(repo, "delete_by_vector_doc_ids")
+
+
+def test_apply_upsert_count_mismatch_is_fail_closed() -> None:
+    record = make_record(0)
+    repo = FakePositiveRepository([])
+    ing = FakeIngestionService(upsert_result=_empty_result())  # 0 成功 vs 计划 1
+
+    with pytest.raises(RuntimeError, match="实际成功数量与计划不一致"):
+        make_positive_service(repo, ing).apply_positive_changes([record])
+
+
+def test_apply_metadata_failure_is_fail_closed() -> None:
+    record = make_record(0)
+    repo = FakePositiveRepository(
+        [existing_row(record.vector_doc_id, record.content_hash, "2" * 64)]
+    )
+    ing = FakeIngestionService(
+        metadata_result=_upsert_with_failed([record])
+    )
+
+    with pytest.raises(RuntimeError, match="失败项|不一致"):
+        make_positive_service(repo, ing).apply_positive_changes([record])
+
+
+def test_apply_metadata_count_mismatch_is_fail_closed() -> None:
+    record = make_record(0)
+    repo = FakePositiveRepository(
+        [existing_row(record.vector_doc_id, record.content_hash, "2" * 64)]
+    )
+    ing = FakeIngestionService(metadata_result=_empty_result())
+
+    with pytest.raises(RuntimeError, match="实际成功数量与计划不一致"):
+        make_positive_service(repo, ing).apply_positive_changes([record])
+
+
+def test_apply_guard_failure_is_zero_write() -> None:
+    record = make_record(0)  # missing -> 本应 upsert
+    repo = FakePositiveRepository([], guard_error=RuntimeError("未获授权"))
+    ing = FakeIngestionService()
+
+    with pytest.raises(RuntimeError, match="未获授权"):
+        make_positive_service(repo, ing).apply_positive_changes([record])
+
+    # 任何写操作前守卫失败 -> 零写入
+    assert ing.upsert_calls == []
+    assert ing.metadata_calls == []
+    assert repo.guard_calls == [{}]
+
+
+def test_apply_requires_ingestion() -> None:
+    repo = FakePositiveRepository([])
+    service = FullVectorReconciliationService(repo)  # 未注入 ingestion
+
+    with pytest.raises(RuntimeError, match="ingestion"):
+        service.apply_positive_changes([make_record(0)])
+
+
+def ib_ids(calls: list[list[Any]]) -> list[list[str]]:
+    """从 upsert / update_metadata 调用记录中抽取 vector_doc_id 列表。
+
+    计划中的记录是 ``ContractPreparedChunk``（与原始 ``ExpertChunkEmbeddingInput``
+    是不同实例），因此断言用 ``vector_doc_id`` 而非对象相等。
+    """
+
+    return [[c.vector_doc_id for c in batch] for batch in calls]

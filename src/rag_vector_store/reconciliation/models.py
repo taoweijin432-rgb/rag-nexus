@@ -33,6 +33,9 @@ class FullVectorReconciliationResult(BaseModel):
         - ``unchanged_count``：content_hash 与 metadata_hash 均相同。
         - ``stale_count``：Milvus 有、desired 无。
         - ``stale_sample``：stale 的最小采样 ID（最多 20 个，供抽查）。
+        - ``embedded_count``：正向执行实际 upsert 成功数（dry-run 恒为 0）。
+        - ``metadata_updated_count``：正向执行实际 update_metadata
+          成功数（dry-run 恒为 0）。
     """
 
     model_config = ConfigDict(extra="forbid", frozen=True)
@@ -48,6 +51,8 @@ class FullVectorReconciliationResult(BaseModel):
     unchanged_count: int = Field(default=0, ge=0)
     stale_count: int = Field(default=0, ge=0)
     stale_sample: tuple[str, ...] = ()
+    embedded_count: int = Field(default=0, ge=0)
+    metadata_updated_count: int = Field(default=0, ge=0)
 
     @model_validator(mode="after")
     def check_count_consistency(self) -> FullVectorReconciliationResult:
@@ -74,5 +79,9 @@ class FullVectorReconciliationResult(BaseModel):
         if len(self.stale_sample) > min(self.stale_count, _STALE_SAMPLE_LIMIT):
             raise ValueError(
                 "stale_sample 长度不能超过 stale_count 或 20"
+            )
+        if self.embedded_count + self.metadata_updated_count > self.desired_count:
+            raise ValueError(
+                "embedded_count + metadata_updated_count 不能超过 desired_count"
             )
         return self
