@@ -266,6 +266,46 @@ class ContractMilvusVectorRepository:
             expected_ids=self._primary_keys(items),
         )
 
+    def delete_by_vector_doc_ids(
+        self,
+        vector_doc_ids: Sequence[str],
+    ) -> MutationResult:
+        """按 vector_doc_id 集合删除 Milvus 实体。
+
+        语义：
+            - 按主键精确删除，幂等；不存在的 vector_doc_id 不视为错误（不参与计数）。
+            - 空列表安全返回（不发起 SDK 调用）。
+            - 本方法不生成或修改 vector_doc_id，只透传调用方提供的主键。
+            - 返回 ``MutationResult``，其中 ``affected_count`` 为实际删除条数、
+              ``primary_keys`` 为空（pymilvus delete 不返回已删主键列表）。
+
+        Args:
+            vector_doc_ids: 待删除的主键集合。
+
+        Returns:
+            MutationResult：``affected_count`` 为实际删除条数。
+        """
+
+        cleaned: list[str] = []
+        seen: set[str] = set()
+        for vector_doc_id in vector_doc_ids:
+            if not isinstance(vector_doc_id, str) or not vector_doc_id.strip():
+                raise ValueError("vector_doc_id 必须是非空字符串")
+            normalized = vector_doc_id.strip()
+            if normalized not in seen:
+                seen.add(normalized)
+                cleaned.append(normalized)
+
+        if not cleaned:
+            return MutationResult(affected_count=0)
+
+        response = self._get_client().delete(
+            collection_name=self.settings.collection_name,
+            ids=cleaned,
+            **self._timeout_kwargs(),
+        )
+        return MutationResult(affected_count=_delete_count(response))
+
     def get_by_vector_doc_id(
         self,
         vector_doc_id: str,
@@ -302,6 +342,70 @@ class ContractMilvusVectorRepository:
         if not isinstance(rows[0], Mapping):
             raise TypeError("Milvus query 返回了非法 Entity 结构")
         return dict(rows[0])
+
+    def query_by_expert_id(
+        self,
+        expert_id: int,
+        *,
+        output_fields: Sequence[str] | None = None,
+    ) -> list[dict[str, object]]:
+        """按 ``expert_id`` 查询该专家的全部向量记录（默认不含 embedding）。
+
+        语义：
+            - 基于标量字段 ``expert_id`` 过滤（INT64 索引字段），分页遍历全部匹配行。
+            - 默认只返回最小字段集 ``vector_doc_id`` / ``expert_id`` /
+              ``content_hash`` / ``metadata_hash``，供上游做残留差集判断；
+              不返回 embedding，避免大字段拉取。
+            - 调用方可通过 ``output_fields`` 显式扩展返回字段。
+
+        Args:
+            expert_id: 专家 ID（INT64）。
+            output_fields: 要返回的字段；默认最小字段集。
+
+        Returns:
+            list[dict[str, object]]：按查询顺序返回每行的字段字典。
+        """
+
+        if isinstance(expert_id, bool) or not isinstance(expert_id, int):
+            raise ValueError(  # noqa: TRY004
+                "expert_id 必须是整数"
+            )
+        if expert_id < 1:
+            raise ValueError("expert_id 必须是正整数")
+
+        fields = list(
+            output_fields
+            if output_fields is not None
+            else ["vector_doc_id", "expert_id", "content_hash", "metadata_hash"]
+        )
+        if not fields or any(
+            not isinstance(field, str) or not field.strip() for field in fields
+        ):
+            raise ValueError("output_fields 必须是非空字符串序列")
+
+        iterator = self._get_client().query_iterator(
+            collection_name=self.settings.collection_name,
+            batch_size=1000,
+            limit=-1,
+            filter=f"expert_id == {int(expert_id)}",
+            output_fields=fields,
+            consistency_level="Strong",
+            **self._timeout_kwargs(),
+        )
+        rows: list[dict[str, object]] = []
+        try:
+            while True:
+                batch = iterator.next()
+                if not isinstance(batch, list) or not all(
+                    isinstance(row, Mapping) for row in batch
+                ):
+                    raise TypeError("Milvus expert_id iterator 返回了非法 Entity 批次")
+                if not batch:
+                    break
+                rows.extend(dict(row) for row in batch)
+        finally:
+            iterator.close()
+        return rows
 
     def search(
         self,
@@ -602,6 +706,24 @@ def _mutation_result(
         affected_count=count,
         primary_keys=primary_keys,
     )
+
+
+def _delete_count(response: Any) -> int:
+    """解析 pymilvus delete 响应，返回实际删除条数。
+
+    delete 用于删除不存在的向量：请求的 ID 可能部分或全部未命中，因此这里只
+    读取实际 ``delete_count``，不要求与请求数量一致（存在视为成功）。响应格式
+    兼容 pymilvus 2.3.2+（``{'delete_count': N}``）及更早版本。
+    """
+
+    if not isinstance(response, Mapping):
+        raise TypeError("Milvus delete 响应必须是 Mapping")
+    count = response.get("delete_count")
+    if isinstance(count, bool) or not isinstance(count, int):
+        raise TypeError("Milvus delete 响应缺少合法的 delete_count")
+    if count < 0:
+        raise ValueError("Milvus delete_count 不能为负数")
+    return count
 
 
 def _normalize_search_embedding(embedding: Sequence[float]) -> list[float]:

@@ -27,6 +27,7 @@ FIXTURE_PATH = (
     / "expert_chunk_embedding_input_v4.jsonl"
 )
 _DEFAULT_UPSERT_RESPONSE = object()
+_DEFAULT_DELETE_RESPONSE = object()
 
 
 class FakeEmbeddingModel:
@@ -78,9 +79,11 @@ class FakeContractMilvusClient:
         self.query_calls: list[dict[str, Any]] = []
         self.query_iterator_calls: list[dict[str, Any]] = []
         self.search_calls: list[dict[str, Any]] = []
+        self.delete_calls: list[dict[str, Any]] = []
         self.rows: dict[str, dict[str, Any]] = {}
         self.drop_calls: list[str] = []
         self.upsert_response: object = _DEFAULT_UPSERT_RESPONSE
+        self.delete_response: object = _DEFAULT_DELETE_RESPONSE
         self.model_space_batches: list[object] | None = None
         self.iterator_error_on_call: int | None = None
         self.last_query_iterator: FakeQueryIterator | None = None
@@ -138,6 +141,19 @@ class FakeContractMilvusClient:
             else self.upsert_response
         )
 
+    def delete(self, **kwargs: Any) -> Any:
+        self.delete_calls.append(kwargs)
+        ids = [str(item) for item in kwargs["ids"]]
+        deleted = [item for item in ids if item in self.rows]
+        for item in deleted:
+            del self.rows[item]
+        response = {"delete_count": len(deleted)}
+        return (
+            response
+            if self.delete_response is _DEFAULT_DELETE_RESPONSE
+            else self.delete_response
+        )
+
     def query(self, **kwargs: Any) -> list[dict[str, Any]]:
         self.query_calls.append(kwargs)
         ids = kwargs.get("ids")
@@ -147,8 +163,23 @@ class FakeContractMilvusClient:
 
     def query_iterator(self, **kwargs: Any) -> FakeQueryIterator:
         self.query_iterator_calls.append(kwargs)
+        rows = list(self.rows.values())
+        if kwargs.get("filter", "").startswith("expert_id == "):
+            expert_id = int(kwargs["filter"].split("== ")[1])
+            rows = [
+                row
+                for row in rows
+                if row.get("expert_id") == expert_id
+                or str(row.get("expert_id")) == str(expert_id)
+            ]
+        output_fields = kwargs.get("output_fields")
+        if output_fields:
+            rows = [
+                {field: row.get(field) for field in output_fields if field in row}
+                for row in rows
+            ]
         batches = (
-            [list(self.rows.values())]
+            [rows]
             if self.model_space_batches is None
             else self.model_space_batches
         )
@@ -690,3 +721,190 @@ def test_contract_repository_search_preserves_search_hit_and_filter() -> None:
         "metric_type": "COSINE",
         "params": {"ef": 64},
     }
+
+
+def test_contract_repository_delete_by_vector_doc_ids() -> None:
+    client = FakeContractMilvusClient(exists=True)
+    repository = ContractMilvusVectorRepository(
+        contract_settings(),
+        vector_dimension=1024,
+        client=client,
+    )
+    client.description = repository._build_schema(1024).to_dict()
+    chunks = embedded_contract_chunks()
+    repository.upsert_batch(chunks)
+
+    target = chunks[0].vector_doc_id
+    result = repository.delete_by_vector_doc_ids([target])
+
+    assert client.delete_calls == [
+        {
+            "collection_name": "expert_candidates_v14_contract_dev",
+            "ids": [target],
+        }
+    ]
+    assert result.affected_count == 1
+    assert result.primary_keys == []
+    # 其余记录仍保留
+    assert client.rows.get(chunks[1].vector_doc_id)
+
+
+def test_contract_repository_delete_empty_list_is_noop() -> None:
+    client = FakeContractMilvusClient(exists=True)
+    repository = ContractMilvusVectorRepository(
+        contract_settings(),
+        vector_dimension=1024,
+        client=client,
+    )
+
+    result = repository.delete_by_vector_doc_ids([])
+
+    assert result.affected_count == 0
+    assert result.primary_keys == []
+    assert client.delete_calls == []
+    assert client.query_iterator_calls == []
+
+
+def test_contract_repository_delete_multiple_ids() -> None:
+    client = FakeContractMilvusClient(exists=True)
+    repository = ContractMilvusVectorRepository(
+        contract_settings(),
+        vector_dimension=1024,
+        client=client,
+    )
+    client.description = repository._build_schema(1024).to_dict()
+    chunks = embedded_contract_chunks()
+    repository.upsert_batch(chunks)
+
+    ids = [chunk.vector_doc_id for chunk in chunks]
+    result = repository.delete_by_vector_doc_ids(ids)
+
+    assert result.affected_count == 3
+    assert client.delete_calls[0]["ids"] == ids
+    assert client.rows == {}
+
+
+def test_contract_repository_delete_dedupes_ids() -> None:
+    client = FakeContractMilvusClient(exists=True)
+    repository = ContractMilvusVectorRepository(
+        contract_settings(),
+        vector_dimension=1024,
+        client=client,
+    )
+    chunks = embedded_contract_chunks()
+    target = chunks[0].vector_doc_id
+
+    repository.delete_by_vector_doc_ids([target, target])
+
+    assert client.delete_calls[0]["ids"] == [target]
+
+
+def test_contract_repository_delete_non_existent_is_not_error() -> None:
+    client = FakeContractMilvusClient(exists=True)
+    repository = ContractMilvusVectorRepository(
+        contract_settings(),
+        vector_dimension=1024,
+        client=client,
+    )
+
+    result = repository.delete_by_vector_doc_ids(["expert:1:profile_summary:1:0"])
+
+    assert result.affected_count == 0
+    assert result.primary_keys == []
+
+
+def test_contract_repository_delete_rejects_invalid_ids() -> None:
+    repository = ContractMilvusVectorRepository(
+        contract_settings(),
+        vector_dimension=1024,
+        client=object(),
+    )
+
+    with pytest.raises(ValueError, match="必须是"):
+        repository.delete_by_vector_doc_ids([""])
+
+    with pytest.raises(ValueError, match="必须是"):
+        repository.delete_by_vector_doc_ids(["valid", 123])
+
+
+def test_contract_repository_delete_wraps_driver_error() -> None:
+    client = FakeContractMilvusClient(exists=True)
+    client.delete_response = {"delete_count": "not-an-int"}
+    repository = ContractMilvusVectorRepository(
+        contract_settings(),
+        vector_dimension=1024,
+        client=client,
+    )
+
+    with pytest.raises(TypeError, match="delete_count"):
+        repository.delete_by_vector_doc_ids(["expert:1:profile_summary:1:0"])
+
+
+def test_contract_repository_query_by_expert_id_returns_minimal_fields() -> None:
+    client = FakeContractMilvusClient(exists=True)
+    repository = ContractMilvusVectorRepository(
+        contract_settings(),
+        vector_dimension=1024,
+        client=client,
+    )
+    client.description = repository._build_schema(1024).to_dict()
+    chunks = embedded_contract_chunks()
+    repository.upsert_batch(chunks)
+
+    rows = repository.query_by_expert_id(900001)
+
+    assert len(rows) == 3
+    assert all(set(row) == {"vector_doc_id", "expert_id", "content_hash", "metadata_hash"}
+               for row in rows)
+    # embedding 不在输出字段
+    assert "embedding" not in client.query_iterator_calls[-1]["output_fields"]
+    # 过滤表达式正确
+    assert client.query_iterator_calls[-1]["filter"] == "expert_id == 900001"
+
+
+def test_contract_repository_query_by_expert_id_empty() -> None:
+    client = FakeContractMilvusClient(exists=True)
+    repository = ContractMilvusVectorRepository(
+        contract_settings(),
+        vector_dimension=1024,
+        client=client,
+    )
+    client.description = repository._build_schema(1024).to_dict()
+    repository.upsert_batch(embedded_contract_chunks())
+
+    rows = repository.query_by_expert_id(999999)
+
+    assert rows == []
+    assert client.last_query_iterator is not None
+    assert client.last_query_iterator.closed is True
+
+
+def test_contract_repository_query_by_expert_id_custom_output_fields() -> None:
+    client = FakeContractMilvusClient(exists=True)
+    repository = ContractMilvusVectorRepository(
+        contract_settings(),
+        vector_dimension=1024,
+        client=client,
+    )
+    client.description = repository._build_schema(1024).to_dict()
+    repository.upsert_batch(embedded_contract_chunks())
+
+    rows = repository.query_by_expert_id(
+        900001,
+        output_fields=["vector_doc_id", "expert_id"],
+    )
+
+    assert all(set(row) == {"vector_doc_id", "expert_id"} for row in rows)
+
+
+def test_contract_repository_query_by_expert_id_rejects_bad_expert_id() -> None:
+    repository = ContractMilvusVectorRepository(
+        contract_settings(),
+        vector_dimension=1024,
+        client=object(),
+    )
+
+    with pytest.raises(ValueError, match="expert_id"):
+        repository.query_by_expert_id(0)
+    with pytest.raises(ValueError, match="expert_id"):
+        repository.query_by_expert_id(True)
