@@ -36,24 +36,48 @@ class MySQLSourceAdapter:
     def __init__(self, config: DatabaseConfig) -> None:
         self.config = config
 
-    def get_full_scan_upper_bound(self) -> int:
-        """读取第一版全量任务开始时的最大 ``experts.id``。
+    def get_full_scan_upper_bound(
+        self,
+        *,
+        max_experts: int | None = None,
+    ) -> int:
+        """读取批量任务固定的 ``experts.id`` 上界。
 
         构成与用途
         ----------
-        本方法只执行一次 ``MAX(id)`` 查询，并把空表结果转换为 0。后续批量 Pipeline
-        会在任务启动时调用它，把结果保存到 ``expert_index_batch.upper_bound_id``；
-        每页候选查询都限制 ``id <= upper_bound_id``，因此运行期间新增专家不会让当前
-        批次范围无限增长，而是留给下一次全量任务。
+        ``max_experts=None`` 时读取全表 ``MAX(id)``；传入正整数 N 时，查询按 ID 升序
+        的前 N 位候选，并以其中最后一个 ID 作为上界。后续每页都限制
+        ``id <= upper_bound_id``，因此批次不会超过指定专家数，运行期间新增专家也不会
+        扩大当前范围。
 
         查询故意不排除 ``deleted_at``，因为已逻辑删除专家仍需进入批次，触发历史
         Chunk 停用。该方法只读取边界，不读取任何专家正文或经历数据。
         """
 
+        if max_experts is not None and (
+            isinstance(max_experts, bool)
+            or not isinstance(max_experts, int)
+            or max_experts < 1
+        ):
+            raise ValueError("max_experts 必须是正整数或 None")
+
         connection = pymysql.connect(**self.config.as_kwargs(autocommit=True))
         try:
             with connection.cursor() as cursor:
-                cursor.execute("SELECT COALESCE(MAX(id), 0) AS upper_bound_id FROM experts")
+                if max_experts is None:
+                    cursor.execute(
+                        "SELECT COALESCE(MAX(id), 0) AS upper_bound_id FROM experts"
+                    )
+                else:
+                    cursor.execute(
+                        """
+                        SELECT COALESCE(MAX(id), 0) AS upper_bound_id
+                        FROM (
+                            SELECT id FROM experts ORDER BY id ASC LIMIT %s
+                        ) AS scoped_experts
+                        """,
+                        (max_experts,),
+                    )
                 row = cursor.fetchone()
                 return int(row["upper_bound_id"]) if row else 0
         finally:

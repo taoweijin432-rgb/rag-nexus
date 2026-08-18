@@ -106,6 +106,44 @@ def test_full_scan_upper_bound_uses_all_expert_rows(
     assert connection.closed is True
 
 
+def test_full_scan_upper_bound_limits_to_first_n_experts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """指定 max_experts 时应以按 ID 排序的前 N 位候选确定固定上界。"""
+
+    cursor = FakeCursor(one={"upper_bound_id": 505})
+    connection = FakeConnection(cursor)
+    connect_calls = _patch_connection(monkeypatch, connection)
+
+    assert _adapter().get_full_scan_upper_bound(max_experts=500) == 505
+
+    sql, params = cursor.executed[0]
+    assert "SELECT id FROM experts ORDER BY id ASC LIMIT %s" in sql
+    assert "SELECT COALESCE(MAX(id), 0) AS upper_bound_id" in sql
+    assert "deleted_at" not in sql
+    assert params == (500,)
+    assert connect_calls[0]["autocommit"] is True
+    assert connection.closed is True
+
+
+@pytest.mark.parametrize("max_experts", [0, -1, True, 1.5])
+def test_full_scan_upper_bound_rejects_invalid_max_experts_before_connect(
+    monkeypatch: pytest.MonkeyPatch,
+    max_experts: object,
+) -> None:
+    """无效候选上限不能触发源库连接。"""
+
+    def unexpected_connect(**_kwargs: Any) -> None:
+        raise AssertionError("参数校验失败时不应连接 MySQL")
+
+    monkeypatch.setattr("expert_index.source.pymysql.connect", unexpected_connect)
+
+    with pytest.raises(ValueError, match="max_experts"):
+        _adapter().get_full_scan_upper_bound(
+            max_experts=max_experts,  # type: ignore[arg-type]
+        )
+
+
 def test_full_scan_candidates_use_keyset_and_keep_deleted_experts(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

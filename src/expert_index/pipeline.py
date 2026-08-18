@@ -208,12 +208,14 @@ class ExpertIndexPipeline:
         *,
         data_version: str,
         page_size: int = 200,
+        max_experts: int | None = None,
         batch_no: str | None = None,
     ) -> BatchBuildResult:
-        """在全局加工锁内运行第一版全量任务。
+        """在全局加工锁内运行全量或限定专家数量的批量任务。
 
         锁从固定来源上界之前一直持有到批次终态写回之后，保证同一时间只有一个全量
-        或单专家加工任务。实际分页和专家处理由 :meth:`_build_many_locked` 完成。
+        或单专家加工任务。``max_experts`` 限制本批次最多覆盖的候选专家数；Source 会
+        在启动时把扫描上界收缩到前 N 位候选的最后一个 ID，而不是在循环中途截断。
         """
 
         _validate_data_version(data_version)
@@ -221,10 +223,17 @@ class ExpertIndexPipeline:
             raise ValueError(
                 f"page_size 必须位于 1 到 {MAX_FULL_SCAN_PAGE_SIZE} 之间"
             )
+        if max_experts is not None and (
+            isinstance(max_experts, bool)
+            or not isinstance(max_experts, int)
+            or max_experts < 1
+        ):
+            raise ValueError("max_experts 必须是正整数或 None")
         with self.repository.build_lock("full"):
             return self._build_many_locked(
                 data_version=data_version,
                 page_size=page_size,
+                max_experts=max_experts,
                 batch_no=batch_no,
             )
 
@@ -233,6 +242,7 @@ class ExpertIndexPipeline:
         *,
         data_version: str,
         page_size: int,
+        max_experts: int | None,
         batch_no: str | None,
     ) -> BatchBuildResult:
         """按固定主键上界全量加工专家，并可靠记录每页进度。
@@ -256,8 +266,11 @@ class ExpertIndexPipeline:
         新批次，不自动恢复中断批次；数据库中的页游标与专家明细已为后续续跑留下基础。
         """
 
-        # 先固定来源上界，再创建批次；即使任务运行期间新增专家，本轮范围也不会改变。
-        upper_bound_id = self.source.get_full_scan_upper_bound()
+        # 先固定来源上界，再创建批次；max_experts 会把上界收缩为前 N 位候选的最后
+        # 一个 ID。即使任务运行期间新增专家，本轮范围也不会改变。
+        upper_bound_id = self.source.get_full_scan_upper_bound(
+            max_experts=max_experts,
+        )
         actual_batch_no = batch_no or _full_batch_no()
         batch_id = self.repository.start_batch(
             actual_batch_no,

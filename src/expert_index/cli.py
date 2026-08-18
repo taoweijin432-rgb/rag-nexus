@@ -54,6 +54,11 @@ def build_parser() -> argparse.ArgumentParser:
         default=200,
         help="每页候选专家数，范围 1~1000，默认 200",
     )
+    build_batch.add_argument(
+        "--max-experts",
+        type=int,
+        help="本批次最多处理的候选专家数；不传时处理固定上界内全部专家",
+    )
     build_batch.add_argument("--batch-no", help="可选业务批次号；不传时自动生成")
 
     # 该命令是显式测试数据写入入口，不会在 init-db/build 中自动运行。
@@ -86,6 +91,7 @@ def main(argv: list[str] | None = None) -> None:
         result = _build_pipeline(settings, repository).build_many(
             data_version=args.data_version,
             page_size=args.page_size,
+            max_experts=args.max_experts,
             batch_no=args.batch_no,
         )
         print(json.dumps(asdict(result), ensure_ascii=False, sort_keys=True))

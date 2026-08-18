@@ -65,12 +65,16 @@ class FakeSource:
         self.failed_ids = failed_ids or set()
         self.empty_ids = empty_ids or set()
         self.upper_bound_calls = 0
+        self.upper_bound_limits: list[int | None] = []
         self.page_calls: list[tuple[int, int, int]] = []
         self.loaded_ids: list[int] = []
 
-    def get_full_scan_upper_bound(self) -> int:
+    def get_full_scan_upper_bound(self, *, max_experts: int | None = None) -> int:
         self.upper_bound_calls += 1
-        return max((candidate.id for candidate in self.candidates), default=0)
+        self.upper_bound_limits.append(max_experts)
+        candidates = sorted(self.candidates, key=lambda candidate: candidate.id)
+        scoped = candidates if max_experts is None else candidates[:max_experts]
+        return max((candidate.id for candidate in scoped), default=0)
 
     def load_full_scan_candidates(
         self,
@@ -288,6 +292,36 @@ def test_build_many_paginates_and_continues_after_one_expert_fails() -> None:
     ]
 
 
+def test_build_many_limits_scope_to_first_n_candidates() -> None:
+    """max_experts 应在分页前收缩固定上界，并只处理前 N 位候选。"""
+
+    source = FakeSource(
+        [
+            ExpertCandidate(id=10, deleted_at=None),
+            ExpertCandidate(id=20, deleted_at=None),
+            ExpertCandidate(id=30, deleted_at=None),
+        ]
+    )
+    repository = FakeRepository()
+
+    result = _pipeline(source, repository).build_many(
+        data_version="20260818_02",
+        page_size=1,
+        max_experts=2,
+        batch_no="limited_batch_test",
+    )
+
+    assert result.status == "success"
+    assert result.upper_bound_id == 20
+    assert result.cursor_id == 20
+    assert result.candidate_count == 2
+    assert source.upper_bound_limits == [2]
+    assert source.page_calls == [(0, 20, 1), (10, 20, 1)]
+    assert source.loaded_ids == [10, 20]
+    assert repository.persisted_expert_ids == [10, 20]
+    assert repository.start_calls[0][2]["upper_bound_id"] == 20
+
+
 def test_build_many_deactivates_deleted_candidate_without_loading_source() -> None:
     """deleted 专家不读取正文，完成历史停用后记为 deactivated。"""
 
@@ -387,6 +421,25 @@ def test_build_many_rejects_invalid_page_size_before_source_access(page_size: in
     assert repository.start_calls == []
 
 
+@pytest.mark.parametrize("max_experts", [0, -1, True, 1.5])
+def test_build_many_rejects_invalid_max_experts_before_source_access(
+    max_experts: object,
+) -> None:
+    """无效范围限制必须在查询上界和创建批次前失败。"""
+
+    source = FakeSource([ExpertCandidate(id=1, deleted_at=None)])
+    repository = FakeRepository()
+
+    with pytest.raises(ValueError, match="max_experts"):
+        _pipeline(source, repository).build_many(
+            data_version="20260818_03",
+            max_experts=max_experts,  # type: ignore[arg-type]
+        )
+
+    assert source.upper_bound_calls == 0
+    assert repository.start_calls == []
+
+
 def test_cli_exposes_full_batch_entry_with_explicit_page_size() -> None:
     """build-batch 命令应把全量版本、页大小和批次号交给 Pipeline。"""
 
@@ -397,6 +450,8 @@ def test_cli_exposes_full_batch_entry_with_explicit_page_size() -> None:
             "20260814_07",
             "--page-size",
             "300",
+            "--max-experts",
+            "500",
             "--batch-no",
             "full_cli_test",
         ]
@@ -405,5 +460,6 @@ def test_cli_exposes_full_batch_entry_with_explicit_page_size() -> None:
     assert args.command == "build-batch"
     assert args.data_version == "20260814_07"
     assert args.page_size == 300
+    assert args.max_experts == 500
     assert args.batch_no == "full_cli_test"
     assert not hasattr(args, "vectorize")
