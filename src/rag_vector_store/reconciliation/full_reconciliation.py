@@ -27,11 +27,20 @@ from __future__ import annotations
 from collections.abc import Sequence
 from dataclasses import dataclass
 
+from pymilvus.exceptions import MilvusException
+
 from expert_contracts.models import ContractPreparedChunk, ExpertChunkEmbeddingInput
 
 from ..chunking.contract_pipeline import (
+    ContractValidationError,
     ContractValidator,
     EmbeddingEligibilityValidator,
+)
+from ..ingestion.errors import (
+    VectorContractError,
+    VectorInconsistentStateError,
+    VectorIngestionError,
+    VectorMilvusError,
 )
 from ..ingestion.vector_ingestion import VectorIngestionService
 from ..milvus.repository import ContractMilvusVectorRepository
@@ -39,6 +48,18 @@ from .models import FullVectorReconciliationResult
 
 _STALE_SAMPLE_LIMIT = 20
 _DELETE_BATCH_SIZE = 200
+
+# Milvus 边界（Repository 扫描 / schema / guard / SDK）会抛出的底层异常类型。
+# 这些在具体调用边界统一转换为 ``VectorMilvusError``；不包含 AttributeError /
+# AssertionError 等程序 bug（避免掩盖真实代码缺陷）。
+_MILVUS_BOUNDARY_TYPES = (ValueError, TypeError, RuntimeError, MilvusException)
+
+
+def _safe_message(error: Exception) -> str:
+    """构造不含内部细节的安全错误摘要（类型 + 截断消息）。"""
+
+    text = str(error)
+    return f"{type(error).__name__}: {text[:200]}"
 
 
 @dataclass(frozen=True)
@@ -126,7 +147,7 @@ class FullVectorReconciliationService:
         """
 
         if self.ingestion is None:
-            raise RuntimeError(
+            raise VectorIngestionError(
                 "apply_positive_changes 需要注入 VectorIngestionService（ingestion）"
             )
 
@@ -163,7 +184,7 @@ class FullVectorReconciliationService:
         """
 
         if self.ingestion is None:
-            raise RuntimeError(
+            raise VectorIngestionError(
                 "apply_full_reconciliation 需要注入 VectorIngestionService（ingestion）"
             )
 
@@ -174,7 +195,7 @@ class FullVectorReconciliationService:
         # 注意：基于原始输入是否为空，而非 desired_ids 是否为空——
         # chunks 非空但全部被 Eligibility 跳过不属于「空 snapshot」，走正常 reconciliation。
         if len(chunks) == 0 and plan.existing_count > 0:
-            raise RuntimeError(
+            raise VectorInconsistentStateError(
                 "apply_full_reconciliation 空快照 + 非空 Collection：禁止清空整个 "
                 "Collection，已停止（不执行任何 mutation）"
             )
@@ -196,7 +217,7 @@ class FullVectorReconciliationService:
         # 7. 删除后再读取并做最终一致性验证。
         final_existing, final_count = self._list_existing()
         if set(final_existing) != desired_ids:
-            raise RuntimeError(
+            raise VectorInconsistentStateError(
                 "apply_full_reconciliation 最终一致性验证失败："
                 f"final_existing({len(final_existing)}) != desired({len(desired_ids)})"
             )
@@ -226,21 +247,28 @@ class FullVectorReconciliationService:
         """
 
         # 任何写操作前先通过维护 Collection 安全守卫（fail-closed）。
+        # Milvus 边界（未授权 / 不存在 / schema 不兼容 / SDK）统一转
+        # VectorMilvusError，保留原始异常作为 cause。
         assert self.ingestion is not None
-        self.repository.assert_destructive_maintenance_allowed()
+        try:
+            self.repository.assert_destructive_maintenance_allowed()
+        except _MILVUS_BOUNDARY_TYPES as error:
+            raise VectorMilvusError(_safe_message(error)) from error
 
         embedded = 0
         metadata_updated = 0
 
         upsert_chunks = list(plan.missing) + list(plan.content_changed)
         if upsert_chunks:
+            # upsert_chunks / update_metadata 属于 VectorIngestionService 边界：
+            # 其已抛出的 Vector*Error 原样保留，不重复包装。
             upsert_result = self.ingestion.upsert_chunks(upsert_chunks)
             if upsert_result.failed_count != 0:
-                raise RuntimeError(
+                raise VectorInconsistentStateError(
                     "reconcile 正向 upsert 出现失败项，已停止（不执行 stale delete）"
                 )
             if upsert_result.embedded_count != len(upsert_chunks):
-                raise RuntimeError(
+                raise VectorInconsistentStateError(
                     "reconcile 正向 upsert 实际成功数量与计划不一致："
                     f"期望 {len(upsert_chunks)}，实际 {upsert_result.embedded_count}"
                 )
@@ -249,11 +277,11 @@ class FullVectorReconciliationService:
         if plan.metadata_changed:
             metadata_result = self.ingestion.update_metadata(plan.metadata_changed)
             if metadata_result.failed_count != 0:
-                raise RuntimeError(
+                raise VectorInconsistentStateError(
                     "reconcile update_metadata 出现失败项，已停止（不执行 stale delete）"
                 )
             if metadata_result.metadata_updated_count != len(plan.metadata_changed):
-                raise RuntimeError(
+                raise VectorInconsistentStateError(
                     "reconcile update_metadata 实际成功数量与计划不一致："
                     f"期望 {len(plan.metadata_changed)}，"
                     f"实际 {metadata_result.metadata_updated_count}"
@@ -295,14 +323,19 @@ class FullVectorReconciliationService:
         desired_ids: set[str] = set()
 
         for chunk in chunks:
-            record = self.validator.validate(chunk)
+            # Validator 边界：Contract 校验失败 / 输入类型错误 -> VectorContractError。
+            # 保留原始异常作为 cause。
+            try:
+                record = self.validator.validate(chunk)
+            except (ContractValidationError, TypeError) as error:
+                raise VectorContractError(_safe_message(error)) from error
             reason = self.eligibility_validator.get_skip_reason(record)
             if reason is not None:
                 skipped_count += 1
                 continue
             vector_doc_id = record.vector_doc_id
             if vector_doc_id in desired_ids:
-                raise ValueError(
+                raise VectorInconsistentStateError(
                     "reconcile 输入的 eligible 快照包含重复 vector_doc_id: "
                     f"{vector_doc_id!r}"
                 )
@@ -350,10 +383,15 @@ class FullVectorReconciliationService:
     def _list_existing(self) -> tuple[dict[str, tuple[str, str]], int]:
         """读取 Milvus 现有向量状态，返回 (id→(content_hash, metadata_hash), 行数)。
 
-        任一行字段不可信即 fail-closed（不返回不可信的 diff）。
+        Milvus 边界（扫描失败 / SDK 异常）统一转 ``VectorMilvusError``；
+        读取到的行字段不可信则 fail-closed，转 ``VectorInconsistentStateError``。
         """
 
-        existing_rows = self.repository.list_all_vector_states()
+        try:
+            existing_rows = self.repository.list_all_vector_states()
+        except _MILVUS_BOUNDARY_TYPES as error:
+            raise VectorMilvusError(_safe_message(error)) from error
+
         existing: dict[str, tuple[str, str]] = {}
         for row in existing_rows:
             vector_doc_id = row.get("vector_doc_id")
@@ -367,7 +405,7 @@ class FullVectorReconciliationService:
                 and isinstance(metadata_hash, str)
                 and bool(metadata_hash.strip())
             ):
-                raise RuntimeError(
+                raise VectorInconsistentStateError(
                     "Milvus 现有向量状态字段不可信：vector_doc_id / content_hash / "
                     "metadata_hash 必须是非空字符串"
                 )

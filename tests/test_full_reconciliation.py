@@ -16,8 +16,12 @@ from typing import Any
 import pytest
 
 from expert_contracts import ExpertChunkEmbeddingInput
-from rag_vector_store.chunking.contract_pipeline import (
-    ContractValidationError,
+from rag_vector_store.ingestion.errors import (
+    VectorContractError,
+    VectorEmbeddingError,
+    VectorInconsistentStateError,
+    VectorIngestionError,
+    VectorMilvusError,
 )
 from rag_vector_store.ingestion.models import (
     VectorDeletionResult,
@@ -263,7 +267,7 @@ def test_reconcile_all_fails_on_contract_invalid() -> None:
     bad = make_record(0, content_hash="f" * 64)  # content_hash 与 chunk_text 不符
     repo = FakeReconRepository()
 
-    with pytest.raises(ContractValidationError):
+    with pytest.raises(VectorContractError):
         make_service(repo).reconcile_all([bad])
 
     # 未触碰 Milvus（input 无效时不读）
@@ -275,7 +279,7 @@ def test_reconcile_all_fails_on_duplicate_desired_id() -> None:
     dup = make_record(0)  # 相同 vector_doc_id
     repo = FakeReconRepository()
 
-    with pytest.raises(ValueError, match="重复 vector_doc_id"):
+    with pytest.raises(VectorInconsistentStateError, match="重复 vector_doc_id"):
         make_service(repo).reconcile_all([r0, dup])
 
     # 未触碰 Milvus
@@ -285,7 +289,7 @@ def test_reconcile_all_fails_on_duplicate_desired_id() -> None:
 def test_reconcile_all_fails_on_repository_list_error() -> None:
     repo = FakeReconRepository(list_error=RuntimeError("milvus list failed"))
 
-    with pytest.raises(RuntimeError, match="milvus list failed"):
+    with pytest.raises(VectorMilvusError, match="milvus list failed"):
         make_service(repo).reconcile_all(default_records(1))
 
 
@@ -294,7 +298,7 @@ def test_reconcile_all_fails_on_untrustworthy_existing_state() -> None:
         [{"vector_doc_id": "x", "content_hash": None, "metadata_hash": None}]
     )
 
-    with pytest.raises(RuntimeError, match="状态字段不可信"):
+    with pytest.raises(VectorInconsistentStateError, match="状态字段不可信"):
         make_service(repo).reconcile_all(default_records(1))
 
 
@@ -580,7 +584,7 @@ def test_apply_upsert_failure_is_fail_closed() -> None:
         upsert_result=_upsert_with_failed([record])
     )
 
-    with pytest.raises(RuntimeError, match="出现失败项|不一致"):
+    with pytest.raises(VectorInconsistentStateError, match="出现失败项|不一致"):
         make_positive_service(repo, ing).apply_positive_changes([record])
 
     # 失败后不再执行 delete（fake 无删除能力）
@@ -592,7 +596,7 @@ def test_apply_upsert_count_mismatch_is_fail_closed() -> None:
     repo = FakePositiveRepository([])
     ing = FakeIngestionService(upsert_result=_empty_result())  # 0 成功 vs 计划 1
 
-    with pytest.raises(RuntimeError, match="实际成功数量与计划不一致"):
+    with pytest.raises(VectorInconsistentStateError, match="实际成功数量与计划不一致"):
         make_positive_service(repo, ing).apply_positive_changes([record])
 
 
@@ -605,7 +609,7 @@ def test_apply_metadata_failure_is_fail_closed() -> None:
         metadata_result=_upsert_with_failed([record])
     )
 
-    with pytest.raises(RuntimeError, match="失败项|不一致"):
+    with pytest.raises(VectorInconsistentStateError, match="失败项|不一致"):
         make_positive_service(repo, ing).apply_positive_changes([record])
 
 
@@ -616,7 +620,7 @@ def test_apply_metadata_count_mismatch_is_fail_closed() -> None:
     )
     ing = FakeIngestionService(metadata_result=_empty_result())
 
-    with pytest.raises(RuntimeError, match="实际成功数量与计划不一致"):
+    with pytest.raises(VectorInconsistentStateError, match="实际成功数量与计划不一致"):
         make_positive_service(repo, ing).apply_positive_changes([record])
 
 
@@ -625,7 +629,7 @@ def test_apply_guard_failure_is_zero_write() -> None:
     repo = FakePositiveRepository([], guard_error=RuntimeError("未获授权"))
     ing = FakeIngestionService()
 
-    with pytest.raises(RuntimeError, match="未获授权"):
+    with pytest.raises(VectorMilvusError, match="未获授权"):
         make_positive_service(repo, ing).apply_positive_changes([record])
 
     # 任何写操作前守卫失败 -> 零写入
@@ -638,7 +642,7 @@ def test_apply_requires_ingestion() -> None:
     repo = FakePositiveRepository([])
     service = FullVectorReconciliationService(repo)  # 未注入 ingestion
 
-    with pytest.raises(RuntimeError, match="ingestion"):
+    with pytest.raises(VectorIngestionError, match="ingestion"):
         service.apply_positive_changes([make_record(0)])
 
 
@@ -728,7 +732,7 @@ def test_full_recon_positive_write_failure_no_delete() -> None:
     )
     ing = FakeIngestionService(upsert_result=_upsert_with_failed([record]))
 
-    with pytest.raises(RuntimeError, match="失败项"):
+    with pytest.raises(VectorInconsistentStateError, match="失败项"):
         make_positive_service(repo, ing).apply_full_reconciliation([record])
 
     assert ing.delete_calls == []
@@ -746,7 +750,7 @@ def test_full_recon_existing_after_write_read_failure_no_delete() -> None:
     repo.list_error = RuntimeError("milvus list failed after write")
     ing = FakeIngestionService()
 
-    with pytest.raises(RuntimeError, match="milvus list failed"):
+    with pytest.raises(VectorMilvusError, match="milvus list failed"):
         make_positive_service(repo, ing).apply_full_reconciliation([record])
 
     assert ing.delete_calls == []
@@ -757,7 +761,7 @@ def test_full_recon_guard_failure_zero_mutation() -> None:
     repo = FakePositiveRepository([], guard_error=RuntimeError("未获授权"))
     ing = FakeIngestionService()
 
-    with pytest.raises(RuntimeError, match="未获授权"):
+    with pytest.raises(VectorMilvusError, match="未获授权"):
         make_positive_service(repo, ing).apply_full_reconciliation([record])
 
     assert ing.upsert_calls == []
@@ -771,7 +775,7 @@ def test_full_recon_empty_snapshot_non_empty_collection_fails() -> None:
     )
     ing = FakeIngestionService()
 
-    with pytest.raises(RuntimeError, match="空快照"):
+    with pytest.raises(VectorInconsistentStateError, match="空快照"):
         make_positive_service(repo, ing).apply_full_reconciliation([])
 
     # 守卫在空快照检查之后才调用，故 guard/upsert/delete 均未触发
@@ -833,16 +837,16 @@ def test_full_recon_delete_batch_failure_stops_subsequent() -> None:
         list_rows_sequence=[stale, [desired_row] + stale, [desired_row]],
     )
     ing = FakeIngestionService(
-        delete_error=RuntimeError("delete batch failed"),
+        delete_error=VectorMilvusError("delete batch failed"),
     )
     service = FullVectorReconciliationService(
         repo, ingestion=ing, delete_batch_size=1
     )
 
-    with pytest.raises(RuntimeError, match="delete batch failed"):
+    with pytest.raises(VectorMilvusError, match="delete batch failed"):
         service.apply_full_reconciliation(desired)
 
-    # 第一批失败后立即停止后续批次
+    # 第一批失败后立即停止后续批次；VectorMilvusError 原样保留不被吞掉
     assert len(ing.delete_calls) == 1
 
 
@@ -871,7 +875,7 @@ def test_full_recon_final_mismatch_fail_closed() -> None:
         list_rows_sequence=[[stale], [stale], [stale]],
     )
     ing = FakeIngestionService()
-    with pytest.raises(RuntimeError, match="最终一致性验证失败"):
+    with pytest.raises(VectorInconsistentStateError, match="最终一致性验证失败"):
         make_positive_service(repo, ing).apply_full_reconciliation([record])
 
 
@@ -900,3 +904,131 @@ def test_full_recon_apply_positive_behavior_unchanged() -> None:
     assert result.final_existing_count == 0
     assert result.consistent is True
     assert ing.delete_calls == []
+
+
+# ---------------------------------------------------------------------------
+# 公共异常边界
+# ---------------------------------------------------------------------------
+
+
+def test_ingestion_vector_milvus_error_passes_through_unchanged() -> None:
+    """VectorIngestionService 已抛出的 VectorMilvusError 原样保留，不重复包装。"""
+
+    record = make_record(0)
+    repo = FakePositiveRepository([])
+    ing = FakeIngestionService(upsert_error=VectorMilvusError("upsert infra failed"))
+
+    with pytest.raises(VectorMilvusError, match="upsert infra failed"):
+        make_positive_service(repo, ing).apply_positive_changes([record])
+
+    # 不再继续任何后续动作（delete 未执行）
+    assert ing.delete_calls == []
+
+
+def test_ingestion_vector_embedding_error_passes_through_unchanged() -> None:
+    """Embedding 层已有 VectorEmbeddingError 原样保留，不重复包装。"""
+
+    record = make_record(0)
+    repo = FakePositiveRepository([])
+    ing = FakeIngestionService(upsert_error=VectorEmbeddingError("embed failed"))
+
+    with pytest.raises(VectorEmbeddingError, match="embed failed"):
+        make_positive_service(repo, ing).apply_positive_changes([record])
+
+
+def test_ingestion_vector_error_is_not_swallowed_by_delete() -> None:
+    """delete_vectors 阶段已抛出的 VectorMilvusError 不被 swallow。"""
+
+    desired = default_records(1)
+    desired_row = existing_row(
+        desired[0].vector_doc_id, desired[0].content_hash, desired[0].metadata_hash
+    )
+    stale_row = existing_row(
+        "expert:900001:profile_summary:stale:0", "s" * 64, "s" * 64
+    )
+    repo = FakePositiveRepository(
+        rows=[],
+        list_rows_sequence=[
+            [desired_row, stale_row],
+            [desired_row, stale_row],
+            [desired_row],
+        ],
+    )
+    ing = FakeIngestionService(
+        delete_error=VectorMilvusError("delete infra failed"),
+    )
+
+    with pytest.raises(VectorMilvusError, match="delete infra failed"):
+        make_positive_service(repo, ing).apply_full_reconciliation(desired)
+
+    # 已尝试删除（非零执行），但错误不被吞掉
+    assert len(ing.delete_calls) >= 1
+
+
+def test_contract_error_preserves_original_cause() -> None:
+    """Contract 非法被包装为 VectorContractError 且保留原始异常作为 cause。"""
+
+    # 直接构造一条会触发 TypeError 的输入（非 ExpertChunkEmbeddingInput）
+    repo = FakePositiveRepository()
+    with pytest.raises(VectorContractError) as excinfo:
+        make_service(repo).reconcile_all([{"not": "a contract"}])
+
+    assert isinstance(excinfo.value.__cause__, TypeError)
+
+
+def test_milvus_error_preserves_original_cause() -> None:
+    """Milvus 扫描失败被包装为 VectorMilvusError 且保留原始异常作为 cause。"""
+
+    original = RuntimeError("milvus list failed")
+    repo = FakeReconRepository(list_error=original)
+
+    with pytest.raises(VectorMilvusError) as excinfo:
+        make_service(repo).reconcile_all(default_records(1))
+
+    assert excinfo.value.__cause__ is original
+
+
+def test_guard_error_preserves_original_cause() -> None:
+    """destructive guard 失败被包装为 VectorMilvusError 且保留原始 cause。"""
+
+    original = RuntimeError("未获授权")
+    repo = FakePositiveRepository([], guard_error=original)
+    ing = FakeIngestionService()
+
+    with pytest.raises(VectorMilvusError) as excinfo:
+        make_positive_service(repo, ing).apply_positive_changes([make_record(0)])
+
+    assert excinfo.value.__cause__ is original
+
+
+def test_duplicate_desired_is_inconsistent_state_error() -> None:
+    """重复 desired vector_doc_id -> VectorInconsistentStateError（无 Milvus 触碰）。"""
+
+    r0 = make_record(0)
+    repo = FakePositiveRepository()
+
+    with pytest.raises(VectorInconsistentStateError, match="重复 vector_doc_id"):
+        make_service(repo).reconcile_all([r0, make_record(0)])
+
+    assert repo.list_calls == []
+
+
+def test_malformed_existing_state_is_inconsistent_state_error() -> None:
+    """existing 状态字段不可信 -> VectorInconsistentStateError。"""
+
+    repo = FakePositiveRepository(
+        [{"vector_doc_id": "x", "content_hash": "c", "metadata_hash": ""}]
+    )
+
+    with pytest.raises(VectorInconsistentStateError, match="状态字段不可信"):
+        make_service(repo).reconcile_all(default_records(1))
+
+
+def test_wiring_error_is_vector_ingestion_error() -> None:
+    """未注入 ingestion 时属于服务装配错误 -> VectorIngestionError（非底层异常泄漏）。"""
+
+    repo = FakePositiveRepository([])
+    service = FullVectorReconciliationService(repo)
+
+    with pytest.raises(VectorIngestionError, match="ingestion"):
+        service.apply_full_reconciliation([])
