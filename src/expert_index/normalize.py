@@ -34,7 +34,7 @@ from .models import (
     ProjectStage,
 )
 
-# PII 规则同时服务于两道防线：clean_text 在标准化阶段删除，validators.py 在落库前
+# PII 规则同时服务于两道防线：clean_text 在标准化阶段删除，validators.py 在交付前
 # 通过 pii_hits 再检查一次。命中信息只能记录类别和数量，绝不能打印或写日志原值。
 PII_PATTERNS: dict[str, re.Pattern[str]] = {
     "email": re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}"),
@@ -142,7 +142,7 @@ def clean_text(value: Any) -> str:
 def pii_hits(value: str) -> dict[str, int]:
     """检查清洗后文本是否仍含 PII，只返回类别及命中数量。
 
-    本函数由 ``validators.py`` 在 Chunk 落库前调用，是 ``clean_text`` 之后的第二道
+    本函数由 ``validators.py`` 在 Chunk 交给下游前调用，是 ``clean_text`` 之后的第二道
     安全防线。返回值不包含匹配原文，因此可以用于报错定位而不会再次泄露敏感信息。
     """
 

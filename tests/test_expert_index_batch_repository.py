@@ -195,24 +195,23 @@ def test_full_batch_finish_persists_final_cursor_and_all_expert_counts(
     assert connection.commit_count == 1
 
 
-def test_deleted_expert_cleanup_is_one_idempotent_transaction(
+def test_deleted_expert_stage_cleanup_is_one_idempotent_transaction(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """逻辑删除分支应清理 Stage 并查询全部 active Chunk 进行停用。"""
+    """逻辑删除分支只清理并标记 Stage，不再读写 expert_chunk。"""
 
     cursor = RecordingCursor(rows=[])
     connection = RecordingConnection(cursor)
     _patch_connection(monkeypatch, connection)
 
-    deactivated = _repository().deactivate_deleted_expert(24, build_batch_id=801)
+    _repository().mark_deleted_stage(24, build_batch_id=801)
 
     sql_calls = [sql for sql, _params in cursor.executed]
-    assert deactivated == 0
     assert "DELETE FROM expert_index_employment_stage" in sql_calls[0]
     assert "DELETE FROM expert_index_project_stage" in sql_calls[1]
     assert "reject_reason='expert_deleted'" in sql_calls[2]
-    assert "FROM expert_chunk" in sql_calls[3]
-    assert "FOR UPDATE" in sql_calls[3]
+    assert len(sql_calls) == 3
+    assert all("expert_chunk" not in sql for sql in sql_calls)
     assert connection.commit_count == 1
     assert connection.rollback_count == 0
 

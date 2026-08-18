@@ -70,7 +70,7 @@ class _ContractModel(BaseModel):
 
 
 class ExpertChunkMetadata(_ContractModel):
-    """契约中的业务 Metadata（正式 expert_chunk 三类 Chunk 字段并集）。
+    """契约中的业务 Metadata（三类 Chunk 有效字段并集）。
 
     该模型不再携带 ``vector_doc_id``；向量主键只存在于 Contract 顶层。
     不适用当前 ``chunk_type`` 的字段由上游填充为 ``None``/空数组。
@@ -166,11 +166,11 @@ class ExpertChunkVersions(_ContractModel):
 
 
 class ExpertChunkEmbeddingInput(_ContractModel):
-    """一条待向量化的正式 ``expert_chunk`` 输入记录（导出契约 4.0.0）。
+    """一条待向量化的正式内存输入记录（Contract 4.0.0）。
 
     在主链路中的位置：
         - 产生：由上游 Builder（expert_index 侧）生成，或由
-          ``MySqlExpertChunkReader.map_row`` 从 MySQL ``expert_chunk`` 扁平行组装。
+          上游 ``contract_bridge`` 从 ``ChunkRecord`` 直接组装。
         - 消费：``ContractValidator.validate``（校验）→ ``ContractEmbeddingWorker``
           （Eligibility + Embedding）→ ``ContractIngestionService`` /
           ``ContractBatchIngestionService``（入库编排）。

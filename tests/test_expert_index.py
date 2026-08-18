@@ -6,17 +6,13 @@
 
 from __future__ import annotations
 
-import json
-import tempfile
 import unittest
 from dataclasses import fields, replace
 from datetime import datetime
-from pathlib import Path
 from zoneinfo import ZoneInfo
 
-from expert_index.chunk_builder import ChunkFactory, calculate_metadata_hash
+from expert_index.chunk_builder import ChunkFactory
 from expert_index.config import DatabaseConfig, Settings
-from expert_index.exporter import export_jsonl
 from expert_index.models import (
     ChunkRecord,
     EducationSource,
@@ -394,149 +390,10 @@ class RepositoryMappingTest(unittest.TestCase):
         profile, employments, projects = normalize_aggregate(
             _aggregate(), data_version="20260812_01", build_batch_id=1
         )
-        chunk = ChunkFactory(_settings()).build_all(profile, employments, projects)[0]
         cursor = CountingCursor()
         MySQLIndexRepository._upsert_profile(cursor, profile)
         MySQLIndexRepository._insert_employment(cursor, employments[0])
         MySQLIndexRepository._insert_project(cursor, projects[0])
-        MySQLIndexRepository._upsert_chunk(cursor, chunk)
-
-    def test_final_chunk_insert_omits_removed_columns(self) -> None:
-        """最终表 INSERT 不得重新携带已删除的五个物理列。"""
-
-        captured: list[str] = []
-
-        class CapturingCursor:
-            @staticmethod
-            def execute(sql: str, params: tuple[object, ...]) -> None:
-                captured.append(sql.split("ON DUPLICATE KEY UPDATE", 1)[0])
-
-        profile, employments, projects = normalize_aggregate(
-            _aggregate(), data_version="20260813_03", build_batch_id=1
-        )
-        chunk = ChunkFactory(_settings()).build_all(profile, employments, projects)[0]
-        MySQLIndexRepository._upsert_chunk(CapturingCursor(), chunk)
-        insert_sql = captured[0]
-        for removed in (
-            "chunk_id",
-            "token_count_estimate",
-            "source_item_key",
-            "dictionary_version",
-            "data_version",
-        ):
-            self.assertNotIn(removed, insert_sql)
-
-    def test_stale_chunks_are_deactivated_after_snapshot_rebuild(self) -> None:
-        """旧 Chunk 停用时必须同步重算包含 is_active 的 metadata_hash。"""
-
-        calls: list[tuple[str, tuple[object, ...]]] = []
-
-        profile, employments, projects = normalize_aggregate(
-            _aggregate(), data_version="20260814_01", build_batch_id=1
-        )
-        active = ChunkFactory(_settings()).build_all(profile, employments, projects)[0]
-        row = dict(active.__dict__)
-        for field_name in (
-            "industry_codes",
-            "function_codes",
-            "topic_codes",
-            "school_names_raw",
-            "major_names_raw",
-        ):
-            row[field_name] = json.dumps(list(row[field_name]), ensure_ascii=False)
-
-        class RecordingCursor:
-            def execute(self, sql: str, params: tuple[object, ...]) -> None:
-                calls.append((" ".join(sql.split()), params))
-
-            @staticmethod
-            def fetchall() -> list[dict[str, object]]:
-                return [row]
-
-        count = MySQLIndexRepository._deactivate_stale_chunks(
-            RecordingCursor(),
-            active.expert_id,
-            [],
-            build_batch_id=9,
-        )
-        self.assertEqual(1, count)
-        self.assertIn("FOR UPDATE", calls[0][0])
-        self.assertIn("SET is_active=0, metadata_hash=%s", calls[1][0])
-        expected_hash = calculate_metadata_hash(
-            replace(active, is_active=False, build_batch_id=9)
-        )
-        self.assertEqual(
-            (expected_hash, 9, active.vector_doc_id),
-            calls[1][1],
-        )
-        self.assertNotEqual(active.metadata_hash, expected_hash)
-
-
-class ExporterTest(unittest.TestCase):
-    """验证 MySQL 行到固定 JSONL 契约的映射。"""
-
-    def test_export_jsonl(self) -> None:
-        now = datetime(2026, 8, 11, 10, 0, 0, tzinfo=ZoneInfo("Asia/Shanghai"))
-        text = "[专家能力概述]\n核心背景：虚构测试资料"
-        row = {
-            "expert_id": 24,
-            "serial_number": "EXP000024",
-            "chunk_type": "profile_summary",
-            "chunk_subtype": None,
-            "chunk_index": 0,
-            "chunk_total": 1,
-            "chunk_text": text,
-            "char_count": len(text),
-            "content_hash": sha256_value(text),
-            "metadata_hash": "b" * 64,
-            "vector_doc_id": "expert:24:profile_summary:24:0",
-            "source_table": "experts+experts_education_experience",
-            "source_field": "company+job_name+background+school_name+major",
-            "source_field_id": "24",
-            "source_version": "2026-08-11T10:00:00+08:00",
-            "source_updated_at": now,
-            "source_hash": "a" * 64,
-            "company_name_raw": "虚构公司",
-            "company_name_norm": "虚构公司",
-            "role_name_raw": "产品经理",
-            "role_code": None,
-            "role_level": None,
-            "job_status_norm": None,
-            "abroad_flag_norm": 1,
-            "work_years": 8,
-            "project_name": None,
-            "start_month": None,
-            "end_month": None,
-            "is_current": None,
-            "industry_codes": "[]",
-            "function_codes": "[]",
-            "topic_codes": "[]",
-            "school_names_raw": '["华东流程测试大学"]',
-            "major_names_raw": '["信息管理与信息系统"]',
-            "eligible_for_recommendation": None,
-            "origin_type": "compressed_from_source",
-            "verification_status": "source_summary",
-            "weight_tier": "B",
-            "chunk_policy_version": "1.3",
-            "metadata_schema_version": "3.0",
-            "is_active": 1,
-            "updated_at": now,
-        }
-        with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / "chunks.jsonl"
-            self.assertEqual(1, export_jsonl([row], path, "Asia/Shanghai"))
-            contract = json.loads(path.read_text(encoding="utf-8"))
-        self.assertEqual("4.0.0", contract["contract_version"])
-        self.assertEqual(text, contract["chunk_text"])
-        self.assertNotIn("source_record_id", contract["source"])
-        self.assertEqual("company+job_name+background+school_name+major", contract["source"]["source_field"])
-        self.assertEqual("24", contract["source"]["source_field_id"])
-        self.assertEqual(
-            "expert:24:profile_summary:24:0",
-            contract["metadata"]["vector_doc_id"],
-        )
-        self.assertNotIn("data_version", contract["versions"])
-        self.assertNotIn("dictionary_version", contract["versions"])
 
 
 if __name__ == "__main__":

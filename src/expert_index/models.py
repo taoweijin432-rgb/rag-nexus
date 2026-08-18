@@ -1,7 +1,7 @@
 """Source、Stage 与最终 Chunk 的显式领域模型。
 
 Source 模型严格使用 MySQL 源表列名，审查时可以直接与 SELECT 字段逐一对照；
-Stage 模型使用清洗和标准化后的业务语义名；ChunkRecord 对应最终 expert_chunk。
+Stage 模型使用清洗和标准化后的业务语义名；ChunkRecord 是内存中的下游输入快照。
 所有模型都刻意排除姓名、联系方式、报价等禁止进入向量化链路的字段。
 """
 
@@ -199,10 +199,10 @@ class ProjectStage:
 
 @dataclass(frozen=True)
 class ChunkRecord:
-    """与扁平化 ``expert_chunk`` 表一一对应的最终记录。
+    """上游生成并交给 Contract Bridge 的内存 Chunk 记录。
 
-    表中不再保存 ``metadata_json``。三类 Chunk Metadata 的字段并集均在本模型中
-    显式声明；不适用于当前 ``chunk_type`` 的字段保存为 ``None`` 或空元组。
+    三类 Chunk Metadata 的有效字段并集在本模型中显式声明；不适用于当前
+    ``chunk_type`` 的字段使用 ``None`` 或空元组。该对象不写入中间 MySQL 表。
     """
 
     expert_id: int  # Chunk 所属专家 ID，对应 experts.id。

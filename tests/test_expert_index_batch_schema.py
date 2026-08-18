@@ -73,6 +73,14 @@ def test_initial_schema_contains_expert_level_batch_items() -> None:
     assert "error_message VARCHAR(512) NULL" in item
 
 
+def test_initial_schema_does_not_create_legacy_expert_chunk_table() -> None:
+    """新环境只创建 Batch/Stage；Chunk 通过内存调用交付下游。"""
+
+    schema = _read(INITIAL_SCHEMA)
+
+    assert "CREATE TABLE IF NOT EXISTS expert_chunk" not in schema
+
+
 def test_existing_database_migration_is_additive_and_complete() -> None:
     """005 只能增加批量结构，不能删除当前单专家链路使用的表或字段。"""
 

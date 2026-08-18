@@ -120,20 +120,18 @@ class FakeRepository:
     def finish_batch(self, batch_id: int, **kwargs: Any) -> None:
         self.finish_calls.append((batch_id, kwargs))
 
-    def persist_expert(
+    def persist_stage_snapshot(
         self,
         profile: Any,
         employments: list[Any],
         projects: list[Any],
-        chunks: list[Any],
     ) -> int:
         """模拟一位专家事务成功，并返回 Pipeline 约定的 Stage 行数。"""
 
         self.persisted_expert_ids.append(profile.expert_id)
-        assert chunks
         return 1 + len(employments) + len(projects)
 
-    def persist_rejected_expert(
+    def persist_rejected_stage_snapshot(
         self,
         profile: Any,
         employments: list[Any],
@@ -141,18 +139,17 @@ class FakeRepository:
         *,
         reason: str,
     ) -> int:
-        """模拟保存 rejected Stage 并停用旧 Chunk 的专家事务。"""
+        """模拟保存 rejected Stage 的专家事务。"""
 
         assert reason == "no_chunkable_content"
         self.rejected_expert_ids.append(profile.expert_id)
         return 1 + len(employments) + len(projects)
 
-    def deactivate_deleted_expert(self, expert_id: int, *, build_batch_id: int) -> int:
-        """模拟逻辑删除专家的历史 Chunk 停用事务。"""
+    def mark_deleted_stage(self, expert_id: int, *, build_batch_id: int) -> None:
+        """模拟逻辑删除专家的 Stage 清理事务。"""
 
         assert build_batch_id == 701
         self.deactivated_expert_ids.append(expert_id)
-        return 1
 
     def prepare_batch_items(self, batch_id: int, expert_ids: list[int]) -> None:
         self.events.append(("prepare", (batch_id, expert_ids)))
@@ -194,7 +191,7 @@ def _pipeline(
         _settings(),
         source=source,  # type: ignore[arg-type]
         repository=repository,  # type: ignore[arg-type]
-        vector_sync=vector_sync,
+        vector_sync=vector_sync or FakeVectorSync(),
     )
 
 
@@ -224,8 +221,8 @@ def test_build_one_reuses_expert_core_and_keeps_existing_result() -> None:
     assert repository.finish_calls[-1][1]["status"] == "success"
 
 
-def test_build_one_passes_strict_contract_snapshot_to_optional_vector_sync() -> None:
-    """显式注入向量同步后，MySQL 成功产出的 Chunk 应以内存 Contract 交付。"""
+def test_build_one_passes_strict_contract_snapshot_to_vector_sync() -> None:
+    """Stage 成功提交后，产出的 Chunk 应以内存 Contract 交给下游。"""
 
     source = FakeSource([ExpertCandidate(id=25, deleted_at=None)])
     repository = FakeRepository()
@@ -402,7 +399,6 @@ def test_cli_exposes_full_batch_entry_with_explicit_page_size() -> None:
             "300",
             "--batch-no",
             "full_cli_test",
-            "--vectorize",
         ]
     )
 
@@ -410,4 +406,4 @@ def test_cli_exposes_full_batch_entry_with_explicit_page_size() -> None:
     assert args.data_version == "20260814_07"
     assert args.page_size == 300
     assert args.batch_no == "full_cli_test"
-    assert args.vectorize is True
+    assert not hasattr(args, "vectorize")

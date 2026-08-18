@@ -2,7 +2,7 @@
 
 可以把本文件理解成“文本排版器”：normalize.py 已经负责清洗和标准化字段，本文件
 只决定这些字段以什么标题、顺序和长度组成 chunk_text，再补齐 Metadata、唯一 ID
-和哈希，最终得到可交给 Validator 和 Repository 的 ChunkRecord。
+和哈希，最终得到可交给 Validator 和 Contract Bridge 的 ChunkRecord。
 
 构建器不读取数据库，也不会使用模型改写事实。超长任职和项目只在同一来源记录内部
 切分，并在每个子块重复公司、岗位或项目公共头；不同来源记录永不合并。
@@ -22,7 +22,7 @@ from .models import ChunkRecord, EmploymentStage, ProfileStage, ProjectStage
 from .normalize import canonical_json, sha256_value
 
 # 三类 Chunk 的字符硬上限。Profile 超长时做抽取式压缩；任职和项目超长时拆成多个
-# 同源子块。Validator 会使用同一份配置再次检查，防止超长正文进入 expert_chunk。
+# 同源子块。Validator 会使用同一份配置再次检查，防止超长正文进入下游 Contract。
 HARD_LIMITS = {"profile_summary": 600, "employment": 900, "project": 1000}
 
 
@@ -362,7 +362,7 @@ class ChunkFactory:
             role_level=role_level,
             job_status_norm=job_status_norm,
             abroad_flag_norm=abroad_flag_norm,
-            # expert_chunk 使用 DECIMAL 保存工作年限，PyMySQL 读回后会表现为小数。
+            # 下游 Contract 使用 Decimal 表示工作年限，先保留稳定的十进制语义。
             # 生成时也统一为 float，避免 8 与 8.0 的 JSON 表示差异导致停用重算哈希漂移。
             work_years=float(work_years) if work_years is not None else None,
             project_name=project_name,

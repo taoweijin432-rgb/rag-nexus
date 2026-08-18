@@ -106,7 +106,7 @@ class ContractValidator:
 
     调用时机：
         ``ContractEmbeddingWorker.embed`` 在每条记录进入 Embedding 前调用；
-        验收脚本 ``scripts/task2_acceptance.py`` 的预检统计也复用本类。
+        上游内存同步的预检统计也复用本类。
 
     输入：
         可以是原始 Mapping 或严格的 ``ExpertChunkEmbeddingInput``。
@@ -300,7 +300,7 @@ class ContractEmbeddingWorker:
     调用时机：
         - ``ContractIngestionService.ingest_one``（单条路径）；
         - ``ContractBatchIngestionService.ingest_batch``（批量路径）；
-        - 验收脚本 ``scripts/task2_acceptance.py`` 的预检复用其内部 Validator。
+        - 上游内存同步的预检复用其内部 Validator。
 
     输入：
         ``Iterable[ExpertChunkEmbeddingInput]`` —— 尚未经过消费端校验/资格判断的记录。

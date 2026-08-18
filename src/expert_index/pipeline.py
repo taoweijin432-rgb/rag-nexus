@@ -2,7 +2,7 @@
 
 本模块按照固定顺序组织领域链路：
 
-``Source → Normalize/Stage → Chunk → Validator → MySQL → optional Vector Sync``
+``Source → Normalize/Stage → Chunk → Validator → Stage MySQL → Vector Sync``
 
 各模块职责保持清晰边界：
 
@@ -10,7 +10,7 @@
 * ``normalize.py``：清洗和标准化来源字段，生成 Stage 对象；
 * ``chunk_builder.py``：生成三类 Chunk Text 与扁平 Metadata；
 * ``validators.py``：在写库前验证文本、ID、哈希、枚举和 PII；
-* ``repository.py``：管理批次，并以专家为事务单位保存 Stage 与 Chunk；
+* ``repository.py``：管理批次，并以专家为事务单位保存 Stage；
 * 本文件：决定调用顺序、分页循环、失败隔离、计数累加和批次状态。
 
 第三阶段把原 ``build_one`` 中的核心加工抽为 ``_process_expert``；第四阶段新增
@@ -45,7 +45,7 @@ class BuildResult:
     """一次单专家加工任务返回给 CLI/API 的安全数量摘要。
 
     ``build_one`` 创建并结束一个 ``single`` 批次后返回该对象。它不包含 Chunk 正文
-    或经历信息；真正的加工结果保存在 ``expert_chunk``，批次统计由 Repository 写入
+    或经历信息；Chunk 仅在本次调用内存中存在，批次统计由 Repository 写入
     ``expert_index_batch``。
     """
 
@@ -112,7 +112,7 @@ class ExpertIndexPipeline:
         *,
         source: MySQLSourceAdapter | None = None,
         repository: MySQLIndexRepository | None = None,
-        vector_sync: ExpertVectorSyncPort | None = None,
+        vector_sync: ExpertVectorSyncPort,
     ) -> None:
         self.settings = settings
         self.source = source or MySQLSourceAdapter(settings.source_db)
@@ -317,9 +317,9 @@ class ExpertIndexPipeline:
                     error_type: str | None = None
                     try:
                         if candidate.is_deleted:
-                            # 删除候选不读取四表正文；Repository 在单事务中清理 Stage、
-                            # 停用全部历史 Chunk 并按 inactive Metadata 重算哈希。
-                            self.repository.deactivate_deleted_expert(
+                            # 删除候选不读取四表正文；Repository 只清理 Stage，空快照
+                            # 通过内存同步交给下游删除该专家的历史向量。
+                            self.repository.mark_deleted_stage(
                                 candidate.id,
                                 build_batch_id=batch_id,
                             )
@@ -460,8 +460,8 @@ class ExpertIndexPipeline:
         * Normalize 生成 Profile/Employment/Project Stage；
         * ChunkFactory 生成三类 Chunk；
         * Validator 在入库前执行完整契约检查；
-        * 有 Chunk 时，Repository 原子保存 Stage、Chunk 并停用陈旧 Chunk；
-        * 无 Chunk 时，Repository 原子保存 rejected Stage 并停用全部旧 Chunk。
+        * 有 Chunk 时，Repository 原子保存 Stage，随后以内存 Contract 同步下游；
+        * 无 Chunk 时，Repository 保存 rejected Stage，并以下游空快照删除旧向量。
 
         返回 ``success`` 或 ``rejected``。任何意外异常仍原样抛给外层：单专家入口会把
         批次记为 failed；全量入口会把当前专家记为 failed 并继续下一位。``progress``
@@ -484,8 +484,8 @@ class ExpertIndexPipeline:
         chunks = self.factory.build_all(profile, employments, projects)
         if not chunks:
             # “专家存在但无可生成内容”是业务拒绝而非程序错误。保存当前 Stage、标记
-            # rejected，并同步停用上次构建的全部 Chunk，避免旧数据继续被下游使用。
-            progress.stage_count = self.repository.persist_rejected_expert(
+            # rejected，并通过下游空快照删除旧向量，避免旧数据继续参与检索。
+            progress.stage_count = self.repository.persist_rejected_stage_snapshot(
                 profile,
                 employments,
                 projects,
@@ -495,14 +495,13 @@ class ExpertIndexPipeline:
             return "rejected"
 
         validate_chunks(chunks)
-        progress.stage_count = self.repository.persist_expert(
+        progress.stage_count = self.repository.persist_stage_snapshot(
             profile,
             employments,
             projects,
-            chunks,
         )
-        # Repository 已提交后记录真实产出数；向量同步若失败，外层会把本专家标记为
-        # failed，但保留该数量，便于重跑时根据 MySQL/Milvus 当前状态进行幂等修复。
+        # Stage 已提交后记录本轮内存产出数；向量同步若失败，外层会把本专家标记为
+        # failed，重跑时由下游当前状态和哈希完成幂等修复。
         progress.chunk_count = len(chunks)
         self._sync_expert_vectors(expert_id, chunks)
         return "success"
@@ -512,14 +511,8 @@ class ExpertIndexPipeline:
         expert_id: int,
         chunks: list[ChunkRecord],
     ) -> None:
-        """可选地把一位专家的当前 Chunk 快照同步到下游公共 Python 服务。
+        """把一位专家的当前 Chunk 快照同步到下游公共 Python 服务。"""
 
-        默认未注入 ``vector_sync`` 时保持原 MySQL 行为。生产 CLI 只有显式传入
-        ``--vectorize`` 才会注入；测试可使用 Fake，避免真实 Embedding/Milvus 写入。
-        """
-
-        if self.vector_sync is None:
-            return
         updated_at = datetime.now(ZoneInfo(self.settings.timezone))
         contracts = chunk_records_to_contracts(
             chunks,

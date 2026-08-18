@@ -1,4 +1,4 @@
-"""Chunk 落库前的契约与安全校验。
+"""Chunk 交给下游 Contract Bridge 前的契约与安全校验。
 
 校验失败会抛出 ChunkValidationError，由流水线回滚这一位专家的整个事务，避免
 profile 已更新但经历仍是旧版本的半成品状态。

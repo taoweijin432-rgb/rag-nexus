@@ -1,7 +1,7 @@
 """MySQL 同步连接生命周期与安全错误封装。
 
 本模块是 MySQL Adapter 的基础设施层，只负责按配置创建/关闭连接和隐藏驱动
-敏感错误；它不执行业务 SQL、不读取 ``expert_chunk``，也不管理 Task State 或
+敏感错误；它不执行业务 SQL，也不管理 Task State 或
 checkpoint。上层 Reader/Repository 通过它复用一致的连接和异常边界。
 """
 
@@ -20,7 +20,7 @@ class MySQLConnectionError(RuntimeError):
 class MySQLConnection:
     """延迟创建并可安全关闭的同步 MySQL 连接。
 
-    本模块只负责连接生命周期，不执行任何业务 SQL，也不实现 ``expert_chunk``
+    本模块只负责连接生命周期，不执行任何业务 SQL，也不实现业务表
     Reader。连接采用延迟创建，便于只构造配置或执行本地单元测试时不触碰数据库。
     """
 

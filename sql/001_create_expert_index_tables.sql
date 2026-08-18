@@ -8,7 +8,7 @@ CREATE TABLE IF NOT EXISTS expert_index_batch (
     id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
     batch_no VARCHAR(64) NOT NULL,
     run_mode VARCHAR(16) NOT NULL COMMENT 'full/incremental/replay/single',
-    -- data_version 属于加工批次与 Stage，不再进入最终 expert_chunk。
+    -- data_version 属于加工批次与 Stage，不进入下游内存 Contract。
     -- 先允许 NULL，保证第一阶段只升级表结构时，现有 single 命令仍能正常创建批次；
     -- 后续批量编排接入后，full 批次必须显式写入该值。
     data_version VARCHAR(64) NULL COMMENT '本批次使用的业务数据版本',
@@ -167,71 +167,4 @@ CREATE TABLE IF NOT EXISTS expert_index_project_stage (
     UNIQUE KEY uk_expert_project_source (source_table, source_field_id, source_item_key),
     KEY idx_expert_project_expert (expert_id),
     KEY idx_expert_project_source_updated (source_updated_at, source_field_id)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
-
-CREATE TABLE IF NOT EXISTS expert_chunk (
-    id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
-    vector_doc_id VARCHAR(256) NOT NULL COMMENT 'Milvus 唯一标识，不追加版本后缀',
-    expert_id BIGINT UNSIGNED NOT NULL,
-    serial_number VARCHAR(64) NULL,
-    chunk_type VARCHAR(32) NOT NULL,
-    chunk_subtype VARCHAR(32) NULL,
-    chunk_index SMALLINT UNSIGNED NOT NULL DEFAULT 0,
-    chunk_total SMALLINT UNSIGNED NOT NULL DEFAULT 1,
-    chunk_text MEDIUMTEXT NOT NULL,
-    char_count INT UNSIGNED NOT NULL,
-    -- 以下为三种 Chunk Metadata 的全字段并集；不适用当前类型的字段保存 NULL/[]。
-    source_table VARCHAR(256) NOT NULL COMMENT '来源表；聚合多个来源时使用 + 拼接',
-    source_field VARCHAR(512) NOT NULL COMMENT '参与生成 Chunk 的源列名，+拼接',
-    source_field_id VARCHAR(128) NOT NULL COMMENT '来源行主键 ID',
-    source_version VARCHAR(64) NOT NULL,
-    source_updated_at DATETIME(6) NULL,
-    source_hash CHAR(64) NOT NULL,
-    content_hash CHAR(64) NOT NULL,
-    metadata_hash CHAR(64) NOT NULL COMMENT '稳定 Metadata 的 SHA-256',
-    company_name_raw VARCHAR(512) NULL,
-    company_name_norm VARCHAR(512) NULL,
-    role_name_raw VARCHAR(256) NULL,
-    role_code VARCHAR(128) NULL,
-    role_level VARCHAR(64) NULL,
-    job_status_norm VARCHAR(32) NULL,
-    abroad_flag_norm TINYINT(1) NULL,
-    work_years DECIMAL(5,2) NULL,
-    project_name VARCHAR(512) NULL,
-    start_month CHAR(6) NULL COMMENT '标准年月 YYYYMM',
-    end_month CHAR(6) NULL COMMENT '标准年月 YYYYMM',
-    is_current TINYINT(1) NULL,
-    industry_codes JSON NOT NULL,
-    function_codes JSON NOT NULL,
-    topic_codes JSON NOT NULL,
-    school_names_raw JSON NOT NULL,
-    major_names_raw JSON NOT NULL,
-    eligible_for_recommendation TINYINT(1) NULL COMMENT '仅 profile_summary 使用',
-    origin_type VARCHAR(32) NOT NULL,
-    verification_status VARCHAR(32) NOT NULL,
-    weight_tier CHAR(1) NOT NULL,
-    chunk_policy_version VARCHAR(32) NOT NULL,
-    metadata_schema_version VARCHAR(32) NOT NULL,
-    embedding_model_alias VARCHAR(128) NULL COMMENT '下游完成 Embedding 后回填',
-    embedding_model_version VARCHAR(128) NULL COMMENT '下游完成 Embedding 后回填',
-    indexed_at DATETIME(6) NULL COMMENT '下游写入 Milvus 成功后回填',
-    is_active TINYINT(1) NOT NULL DEFAULT 1,
-    build_batch_id BIGINT UNSIGNED NOT NULL,
-    created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-    updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6)
-        ON UPDATE CURRENT_TIMESTAMP(6),
-    PRIMARY KEY (id),
-    UNIQUE KEY uk_expert_chunk_vector_doc_id (vector_doc_id),
-    KEY idx_expert_chunk_expert_active (expert_id, is_active),
-    KEY idx_expert_chunk_type_active (chunk_type, is_active),
-    KEY idx_expert_chunk_source (source_table, source_field_id),
-    KEY idx_expert_chunk_content_hash (content_hash),
-    KEY idx_expert_chunk_metadata_hash (metadata_hash),
-    CONSTRAINT chk_expert_chunk_position CHECK (chunk_index < chunk_total),
-    CONSTRAINT chk_expert_chunk_type CHECK (
-        chunk_type IN ('profile_summary', 'employment', 'project')
-    ),
-    CONSTRAINT chk_expert_chunk_profile_eligibility CHECK (
-        chunk_type = 'profile_summary' OR eligible_for_recommendation IS NULL
-    )
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;

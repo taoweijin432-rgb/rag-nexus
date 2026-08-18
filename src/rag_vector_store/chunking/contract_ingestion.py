@@ -285,7 +285,7 @@ class ContractBatchIngestionService:
     """编排多条正式 Contract 的校验、向量化和单次批量 Upsert。
 
     调用时机：
-        - 正式批处理入口（例如 ``scripts/task2_acceptance.py`` 的真实业务数据 E2E）；
+        - 正式批处理入口（例如上游 ``ExpertIndexPipeline`` 的内存同步）；
         - 任何需要一次性消费多条 ``ExpertChunkEmbeddingInput`` 的场景。
 
     输入：

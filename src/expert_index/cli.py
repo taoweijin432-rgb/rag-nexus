@@ -1,8 +1,8 @@
 """专家索引流水线命令行入口。
 
-常用顺序：先 ``init-db``，再用 ``build`` 重建单专家或用 ``build-batch`` 运行全量，
-最后通过 ``export`` 和 ``inspect`` 验收。命令输出只包含数量、状态和文件路径，
-不打印 Chunk 正文。
+常用顺序：先 ``init-db``，再用 ``build`` 重建单专家或用 ``build-batch`` 运行全量。
+两类构建命令都会以内存方法调用把 Chunk 交给下游向量服务，不再写入或读取
+``expert_chunk``。命令输出只包含数量和状态，不打印 Chunk 正文。
 """
 
 from __future__ import annotations
@@ -14,7 +14,6 @@ from datetime import datetime
 from pathlib import Path
 
 from .config import Settings
-from .exporter import export_jsonl
 from .pipeline import ExpertIndexPipeline
 from .repository import MySQLIndexRepository
 from .test_fixture import ensure_complete_test_expert
@@ -29,7 +28,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="专家索引 Chunk 数据加工")
     sub = parser.add_subparsers(dest="command", required=True)
 
-    init = sub.add_parser("init-db", help="在派生索引库创建 Batch/Stage/Chunk 表")
+    init = sub.add_parser("init-db", help="在派生索引库创建 Batch/Stage 表")
     init.add_argument("--ddl", type=Path, default=DEFAULT_DDL)
 
     build = sub.add_parser("build", help="完整重建一位专家")
@@ -39,11 +38,6 @@ def build_parser() -> argparse.ArgumentParser:
         default=datetime.now().astimezone().strftime("%Y%m%d_01"),
     )
     build.add_argument("--batch-no")
-    build.add_argument(
-        "--vectorize",
-        action="store_true",
-        help="显式调用下游 Python 服务同步 Embedding/Milvus；默认只写本机索引库",
-    )
 
     build_batch = sub.add_parser(
         "build-batch",
@@ -61,23 +55,6 @@ def build_parser() -> argparse.ArgumentParser:
         help="每页候选专家数，范围 1~1000，默认 200",
     )
     build_batch.add_argument("--batch-no", help="可选业务批次号；不传时自动生成")
-    build_batch.add_argument(
-        "--vectorize",
-        action="store_true",
-        help="显式调用下游 Python 服务同步 Embedding/Milvus；默认只写本机索引库",
-    )
-
-    export = sub.add_parser("export", help="导出符合向量化输入契约的 JSONL")
-    export.add_argument("--expert-id", type=int, required=True)
-    export.add_argument("--output", type=Path, required=True)
-    export.add_argument(
-        "--eligible-only",
-        action="store_true",
-        help="只导出 verified/source_summary 的 A、B 级 active Chunk",
-    )
-
-    inspect = sub.add_parser("inspect", help="查看不含正文的 Chunk 验收统计")
-    inspect.add_argument("--expert-id", type=int, required=True)
 
     # 该命令是显式测试数据写入入口，不会在 init-db/build 中自动运行。
     sub.add_parser(
@@ -97,11 +74,7 @@ def main(argv: list[str] | None = None) -> None:
         repository.initialize_schema(args.ddl)
         print(json.dumps({"status": "ok", "schema": settings.index_db.database}, ensure_ascii=False))
     elif args.command == "build":
-        result = _build_pipeline(
-            settings,
-            repository,
-            vectorize=args.vectorize,
-        ).build_one(
+        result = _build_pipeline(settings, repository).build_one(
             args.expert_id,
             data_version=args.data_version,
             batch_no=args.batch_no,
@@ -110,22 +83,12 @@ def main(argv: list[str] | None = None) -> None:
     elif args.command == "build-batch":
         # build_many 内部完成全局互斥、固定扫描上界、分页、专家失败隔离、批次明细和
         # 生命周期处理；CLI 只负责接收参数并输出不含专家正文的数量摘要。
-        result = _build_pipeline(
-            settings,
-            repository,
-            vectorize=args.vectorize,
-        ).build_many(
+        result = _build_pipeline(settings, repository).build_many(
             data_version=args.data_version,
             page_size=args.page_size,
             batch_no=args.batch_no,
         )
         print(json.dumps(asdict(result), ensure_ascii=False, sort_keys=True))
-    elif args.command == "export":
-        rows = repository.fetch_active_chunks(args.expert_id, eligible_only=args.eligible_only)
-        count = export_jsonl(rows, args.output, settings.timezone)
-        print(json.dumps({"expert_id": args.expert_id, "exported": count, "output": str(args.output)}, ensure_ascii=False))
-    elif args.command == "inspect":
-        print(json.dumps(repository.summary(args.expert_id), ensure_ascii=False, default=str, sort_keys=True))
     elif args.command == "seed-test-expert":
         fixture = ensure_complete_test_expert(settings.source_db)
         print(json.dumps(asdict(fixture), ensure_ascii=False, sort_keys=True))
@@ -134,13 +97,8 @@ def main(argv: list[str] | None = None) -> None:
 def _build_pipeline(
     settings: Settings,
     repository: MySQLIndexRepository,
-    *,
-    vectorize: bool,
 ) -> ExpertIndexPipeline:
-    """组装上游 Pipeline；只有显式开启时才创建真实下游服务。"""
-
-    if not vectorize:
-        return ExpertIndexPipeline(settings, repository=repository)
+    """组装只使用内存 Contract 连接下游的正式 Pipeline。"""
 
     from rag_vector_store import create_vector_ingestion_service
 

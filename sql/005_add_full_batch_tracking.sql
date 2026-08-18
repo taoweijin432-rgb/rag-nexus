@@ -3,11 +3,11 @@
 -- 使用范围：
 -- 1. 已经执行过旧版 001、数据库中已存在 expert_index_batch 的环境执行本迁移；
 -- 2. 新建环境直接执行最新 001，不需要再执行本文件；
--- 3. 本迁移只增加兼容列和新表，不删除或改写现有批次、Stage、Chunk 数据；
+-- 3. 本迁移只增加兼容列和新表，不删除或改写现有批次、Stage 数据；
 -- 4. 执行本迁移后，Repository/Pipeline 才能运行 build-batch 并写入这些字段。
 
 ALTER TABLE expert_index_batch
-    -- data_version 继续属于批次和 Stage，不重新加入最终 expert_chunk。
+    -- data_version 继续属于批次和 Stage，不进入下游内存 Contract。
     -- 允许 NULL 是为了让迁移后的现有 single 命令保持兼容；后续 full 编排必须写入。
     ADD COLUMN data_version VARCHAR(64) NULL
         COMMENT '本批次使用的业务数据版本' AFTER run_mode,
