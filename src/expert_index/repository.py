@@ -31,6 +31,7 @@ from .models import EmploymentStage, ProfileStage, ProjectStage
 BUILD_LOCK_PREFIX = "expert_index_build_v1"
 
 _BATCH_ITEM_FINAL_STATUSES = {"success", "rejected", "deactivated", "failed"}
+MAX_BATCH_ITEM_PAGE_SIZE = 1000
 
 
 class ConcurrentBuildError(RuntimeError):
@@ -39,6 +40,10 @@ class ConcurrentBuildError(RuntimeError):
 
 class BatchNotResumableError(RuntimeError):
     """指定批次不存在、已经完成，或不具备可靠的全量续跑状态。"""
+
+
+class BatchNotRetryableError(RuntimeError):
+    """指定批次不存在，或不是已经完成扫描的 partial full 批次。"""
 
 
 @dataclass(frozen=True)
@@ -55,6 +60,22 @@ class FullBatchCheckpoint:
     failed_count: int
     rejected_count: int
     deactivated_count: int
+    extracted_count: int
+    stage_count: int
+    chunk_count: int
+
+
+@dataclass(frozen=True)
+class BatchItemSummary:
+    """由一个批次的全部专家明细重新聚合出的数量。"""
+
+    candidate_count: int
+    success_count: int
+    failed_count: int
+    rejected_count: int
+    deactivated_count: int
+    pending_count: int
+    running_count: int
     extracted_count: int
     stage_count: int
     chunk_count: int
@@ -359,6 +380,167 @@ class MySQLIndexRepository:
         except Exception:
             connection.rollback()
             raise
+        finally:
+            connection.close()
+
+    def load_partial_batch_for_retry(self, batch_id: int) -> FullBatchCheckpoint:
+        """读取并校验一个可重试失败专家的 partial full 批次。
+
+        批次必须已经扫描到固定上界。方法只读取原批次版本、范围和计数，不修改批次
+        状态；重试期间批次继续保持 partial，使进程异常退出后可以再次执行相同命令。
+        调用方应在外层持有全量构建锁。
+        """
+
+        if isinstance(batch_id, bool) or not isinstance(batch_id, int) or batch_id < 1:
+            raise ValueError("batch_id 必须是正整数")
+
+        connection = pymysql.connect(**self.config.as_kwargs(autocommit=True))
+        try:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    SELECT id, batch_no, run_mode, data_version, status,
+                           cursor_id, upper_bound_id, candidate_count,
+                           success_count, failed_count, rejected_count,
+                           deactivated_count, extracted_count, stage_count,
+                           chunk_count
+                    FROM expert_index_batch
+                    WHERE id=%s
+                    """,
+                    (batch_id,),
+                )
+                row = cursor.fetchone()
+            if not row:
+                raise BatchNotRetryableError(f"批次 {batch_id} 不存在")
+            if row.get("run_mode") != "full" or row.get("status") != "partial":
+                raise BatchNotRetryableError(
+                    f"批次 {batch_id} 不是 partial full 批次，不能重试失败专家"
+                )
+
+            data_version = row.get("data_version")
+            cursor_id = row.get("cursor_id")
+            upper_bound_id = row.get("upper_bound_id")
+            if not data_version or cursor_id is None or upper_bound_id is None:
+                raise BatchNotRetryableError(
+                    f"批次 {batch_id} 缺少 data_version 或扫描游标"
+                )
+            cursor_id = int(cursor_id)
+            upper_bound_id = int(upper_bound_id)
+            if cursor_id < 0 or cursor_id != upper_bound_id:
+                raise BatchNotRetryableError(
+                    f"批次 {batch_id} 尚未完成固定范围扫描，不能重试失败专家"
+                )
+
+            count_names = (
+                "candidate_count",
+                "success_count",
+                "failed_count",
+                "rejected_count",
+                "deactivated_count",
+                "extracted_count",
+                "stage_count",
+                "chunk_count",
+            )
+            counts = {name: int(row.get(name) or 0) for name in count_names}
+            if any(value < 0 for value in counts.values()):
+                raise BatchNotRetryableError(f"批次 {batch_id} 的累计计数无效")
+            return FullBatchCheckpoint(
+                batch_id=int(row["id"]),
+                batch_no=str(row["batch_no"]),
+                data_version=str(data_version),
+                cursor_id=cursor_id,
+                upper_bound_id=upper_bound_id,
+                **counts,
+            )
+        finally:
+            connection.close()
+
+    def load_retryable_batch_item_ids(
+        self,
+        batch_id: int,
+        *,
+        after_expert_id: int,
+        limit: int,
+    ) -> list[int]:
+        """按专家 ID 分页读取 failed 及重试中断遗留的 running 明细。
+
+        同一次调用通过 ``after_expert_id`` 保证每位专家最多尝试一次。running 被纳入
+        范围，是为了让进程在 ``mark_batch_item_running`` 后异常退出时仍可再次恢复。
+        """
+
+        if isinstance(batch_id, bool) or not isinstance(batch_id, int) or batch_id < 1:
+            raise ValueError("batch_id 必须是正整数")
+        if (
+            isinstance(after_expert_id, bool)
+            or not isinstance(after_expert_id, int)
+            or after_expert_id < 0
+        ):
+            raise ValueError("after_expert_id 不能小于 0")
+        if (
+            isinstance(limit, bool)
+            or not isinstance(limit, int)
+            or not 1 <= limit <= MAX_BATCH_ITEM_PAGE_SIZE
+        ):
+            raise ValueError(
+                f"limit 必须位于 1 到 {MAX_BATCH_ITEM_PAGE_SIZE} 之间"
+            )
+
+        connection = pymysql.connect(**self.config.as_kwargs(autocommit=True))
+        try:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    SELECT expert_id
+                    FROM expert_index_batch_item
+                    WHERE batch_id=%s AND expert_id>%s
+                      AND status IN ('failed', 'running')
+                    ORDER BY expert_id ASC
+                    LIMIT %s
+                    """,
+                    (batch_id, after_expert_id, limit),
+                )
+                return [int(row["expert_id"]) for row in cursor.fetchall()]
+        finally:
+            connection.close()
+
+    def summarize_batch_items(self, batch_id: int) -> BatchItemSummary:
+        """从全部专家明细重新计算批次分类数量和阶段数量。"""
+
+        if isinstance(batch_id, bool) or not isinstance(batch_id, int) or batch_id < 1:
+            raise ValueError("batch_id 必须是正整数")
+        connection = pymysql.connect(**self.config.as_kwargs(autocommit=True))
+        try:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    SELECT COUNT(*) AS candidate_count,
+                           COALESCE(SUM(status='success'), 0) AS success_count,
+                           COALESCE(SUM(status='failed'), 0) AS failed_count,
+                           COALESCE(SUM(status='rejected'), 0) AS rejected_count,
+                           COALESCE(SUM(status='deactivated'), 0) AS deactivated_count,
+                           COALESCE(SUM(status='pending'), 0) AS pending_count,
+                           COALESCE(SUM(status='running'), 0) AS running_count,
+                           COALESCE(SUM(extracted_count), 0) AS extracted_count,
+                           COALESCE(SUM(stage_count), 0) AS stage_count,
+                           COALESCE(SUM(chunk_count), 0) AS chunk_count
+                    FROM expert_index_batch_item
+                    WHERE batch_id=%s
+                    """,
+                    (batch_id,),
+                )
+                row = cursor.fetchone() or {}
+            return BatchItemSummary(
+                candidate_count=int(row.get("candidate_count") or 0),
+                success_count=int(row.get("success_count") or 0),
+                failed_count=int(row.get("failed_count") or 0),
+                rejected_count=int(row.get("rejected_count") or 0),
+                deactivated_count=int(row.get("deactivated_count") or 0),
+                pending_count=int(row.get("pending_count") or 0),
+                running_count=int(row.get("running_count") or 0),
+                extracted_count=int(row.get("extracted_count") or 0),
+                stage_count=int(row.get("stage_count") or 0),
+                chunk_count=int(row.get("chunk_count") or 0),
+            )
         finally:
             connection.close()
 

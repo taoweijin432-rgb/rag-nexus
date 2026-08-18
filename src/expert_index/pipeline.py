@@ -95,7 +95,7 @@ class _ExpertProgress:
 
 
 class ExpertIndexPipeline:
-    """提供单专家构建、新建批量任务和断点续跑三个执行入口。
+    """提供单专家构建、新建批量任务、断点续跑和失败重试入口。
 
     默认从配置创建 MySQL Source 和 Repository，也支持注入同接口实现。所有入口共享
     ``_process_expert``，确保单专家与批量任务采用相同的标准化、校验和同步规则。
@@ -256,6 +256,142 @@ class ExpertIndexPipeline:
                 batch_no=checkpoint.batch_no,
                 checkpoint=checkpoint,
             )
+
+    def retry_partial(
+        self,
+        batch_id: int,
+        *,
+        page_size: int = 200,
+    ) -> BatchBuildResult:
+        """只重试一个 partial full 批次中的失败专家。
+
+        方法复用原批次、数据版本和固定扫描范围，不重新扫描成功、拒绝或已停用专家。
+        failed 明细以及上次重试异常退出遗留的 running 明细各尝试一次；结束后从全部
+        批次明细重新聚合数量，全部成功则把批次改为 success，否则仍保持 partial。
+        """
+
+        if isinstance(batch_id, bool) or not isinstance(batch_id, int) or batch_id < 1:
+            raise ValueError("batch_id 必须是正整数")
+        if (
+            isinstance(page_size, bool)
+            or not isinstance(page_size, int)
+            or not 1 <= page_size <= MAX_FULL_SCAN_PAGE_SIZE
+        ):
+            raise ValueError(
+                f"page_size 必须位于 1 到 {MAX_FULL_SCAN_PAGE_SIZE} 之间"
+            )
+        with self.repository.build_lock("full"):
+            checkpoint = self.repository.load_partial_batch_for_retry(batch_id)
+            return self._retry_partial_locked(checkpoint, page_size=page_size)
+
+    def _retry_partial_locked(
+        self,
+        checkpoint: FullBatchCheckpoint,
+        *,
+        page_size: int,
+    ) -> BatchBuildResult:
+        """在已取得全量锁后分页重试失败明细，并用明细汇总收口原批次。"""
+
+        after_expert_id = 0
+        error_summaries: list[dict[str, object]] = []
+        while True:
+            expert_ids = self.repository.load_retryable_batch_item_ids(
+                checkpoint.batch_id,
+                after_expert_id=after_expert_id,
+                limit=page_size,
+            )
+            if not expert_ids:
+                break
+
+            for expert_id in expert_ids:
+                progress = _ExpertProgress(expert_id=expert_id)
+                self.repository.mark_batch_item_running(checkpoint.batch_id, expert_id)
+                terminal_status: str
+                result_code: str | None = None
+                error_type: str | None = None
+                try:
+                    candidate = self.source.load_expert_candidate(expert_id)
+                    if candidate.is_deleted:
+                        self.repository.mark_deleted_stage(
+                            expert_id,
+                            build_batch_id=checkpoint.batch_id,
+                        )
+                        self._sync_expert_vectors(expert_id, [])
+                        terminal_status = "deactivated"
+                        result_code = "expert_deleted"
+                    else:
+                        terminal_status = self._process_expert(
+                            expert_id,
+                            data_version=checkpoint.data_version,
+                            batch_id=checkpoint.batch_id,
+                            progress=progress,
+                        )
+                        if terminal_status == "rejected":
+                            result_code = "no_chunkable_content"
+                except Exception as exc:  # noqa: BLE001
+                    terminal_status = "failed"
+                    result_code = "expert_processing_failed"
+                    error_type = type(exc).__name__
+
+                self.repository.finish_batch_item(
+                    checkpoint.batch_id,
+                    expert_id,
+                    status=terminal_status,
+                    extracted_count=progress.extracted_count,
+                    stage_count=progress.stage_count,
+                    chunk_count=progress.chunk_count,
+                    result_code=result_code,
+                    error_type=error_type,
+                )
+                if terminal_status == "failed" and (
+                    len(error_summaries) < MAX_BATCH_ERROR_SUMMARIES
+                ):
+                    error_summaries.append(
+                        {"expert_id": expert_id, "error_type": error_type}
+                    )
+
+            after_expert_id = expert_ids[-1]
+
+        summary = self.repository.summarize_batch_items(checkpoint.batch_id)
+        unfinished_count = summary.pending_count + summary.running_count
+        final_status = (
+            "partial"
+            if summary.failed_count or unfinished_count
+            else "success"
+        )
+        error_summary = _batch_error_summary(summary.failed_count, error_summaries)
+        if error_summary is None and unfinished_count:
+            error_summary = {"unfinished_item_count": unfinished_count}
+
+        self.repository.finish_batch(
+            checkpoint.batch_id,
+            status=final_status,
+            extracted_count=summary.extracted_count,
+            stage_count=summary.stage_count,
+            chunk_count=summary.chunk_count,
+            rejected_count=summary.rejected_count,
+            cursor_id=checkpoint.upper_bound_id,
+            candidate_count=summary.candidate_count,
+            success_count=summary.success_count,
+            failed_count=summary.failed_count,
+            deactivated_count=summary.deactivated_count,
+            error_summary=error_summary,
+        )
+        return BatchBuildResult(
+            batch_id=checkpoint.batch_id,
+            batch_no=checkpoint.batch_no,
+            status=final_status,
+            upper_bound_id=checkpoint.upper_bound_id,
+            cursor_id=checkpoint.upper_bound_id,
+            candidate_count=summary.candidate_count,
+            success_count=summary.success_count,
+            failed_count=summary.failed_count,
+            rejected_count=summary.rejected_count,
+            deactivated_count=summary.deactivated_count,
+            extracted_count=summary.extracted_count,
+            stage_count=summary.stage_count,
+            chunk_count=summary.chunk_count,
+        )
 
     def _build_many_locked(
         self,

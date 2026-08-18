@@ -13,6 +13,7 @@ import pytest
 from expert_index.config import DatabaseConfig
 from expert_index.repository import (
     BatchNotResumableError,
+    BatchNotRetryableError,
     ConcurrentBuildError,
     MySQLIndexRepository,
 )
@@ -183,6 +184,123 @@ def test_resume_batch_rejects_completed_batch_without_reactivating_it(
     assert len(cursor.executed) == 1
     assert connection.commit_count == 0
     assert connection.rollback_count == 1
+
+
+def test_partial_batch_retry_context_requires_completed_full_scan(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """失败重试必须复用已经扫描到固定上界的 partial full 批次。"""
+
+    cursor = RecordingCursor(
+        one={
+            "id": 801,
+            "batch_no": "partial_retry_batch",
+            "run_mode": "full",
+            "data_version": "20260818_06",
+            "status": "partial",
+            "cursor_id": 40,
+            "upper_bound_id": 40,
+            "candidate_count": 4,
+            "success_count": 3,
+            "failed_count": 1,
+            "rejected_count": 0,
+            "deactivated_count": 0,
+            "extracted_count": 3,
+            "stage_count": 3,
+            "chunk_count": 3,
+        }
+    )
+    connection = RecordingConnection(cursor)
+    _patch_connection(monkeypatch, connection)
+
+    checkpoint = _repository().load_partial_batch_for_retry(801)
+
+    assert checkpoint.batch_no == "partial_retry_batch"
+    assert checkpoint.data_version == "20260818_06"
+    assert checkpoint.cursor_id == checkpoint.upper_bound_id == 40
+    assert len(cursor.executed) == 1
+    assert "FROM expert_index_batch WHERE id=%s" in cursor.executed[0][0]
+    assert all("UPDATE" not in sql for sql, _params in cursor.executed)
+
+
+def test_partial_batch_retry_rejects_non_partial_status(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """success 或未完成批次不能进入失败专家重试。"""
+
+    cursor = RecordingCursor(
+        one={
+            "id": 801,
+            "batch_no": "success_batch",
+            "run_mode": "full",
+            "data_version": "20260818_06",
+            "status": "success",
+            "cursor_id": 40,
+            "upper_bound_id": 40,
+        }
+    )
+    connection = RecordingConnection(cursor)
+    _patch_connection(monkeypatch, connection)
+
+    with pytest.raises(BatchNotRetryableError, match="partial full"):
+        _repository().load_partial_batch_for_retry(801)
+
+
+def test_retryable_items_include_failed_and_interrupted_running_rows(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """重试分页应只返回游标后的 failed/running 专家 ID。"""
+
+    cursor = RecordingCursor(rows=[{"expert_id": 20}, {"expert_id": 30}])
+    connection = RecordingConnection(cursor)
+    _patch_connection(monkeypatch, connection)
+
+    expert_ids = _repository().load_retryable_batch_item_ids(
+        801,
+        after_expert_id=10,
+        limit=50,
+    )
+
+    assert expert_ids == [20, 30]
+    sql, params = cursor.executed[0]
+    assert "status IN ('failed', 'running')" in sql
+    assert "ORDER BY expert_id ASC LIMIT %s" in sql
+    assert params == (801, 10, 50)
+
+
+def test_batch_item_summary_recalculates_all_counts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """重试收口必须以明细聚合结果覆盖旧批次累计值。"""
+
+    cursor = RecordingCursor(
+        one={
+            "candidate_count": 4,
+            "success_count": 2,
+            "failed_count": 1,
+            "rejected_count": 1,
+            "deactivated_count": 0,
+            "pending_count": 0,
+            "running_count": 0,
+            "extracted_count": 4,
+            "stage_count": 4,
+            "chunk_count": 5,
+        }
+    )
+    connection = RecordingConnection(cursor)
+    _patch_connection(monkeypatch, connection)
+
+    summary = _repository().summarize_batch_items(801)
+
+    assert summary.candidate_count == 4
+    assert summary.success_count == 2
+    assert summary.failed_count == 1
+    assert summary.rejected_count == 1
+    assert summary.extracted_count == 4
+    assert summary.stage_count == 4
+    assert summary.chunk_count == 5
+    assert "SUM(status='failed')" in cursor.executed[0][0]
+    assert cursor.executed[0][1] == (801,)
 
 
 def test_batch_item_lifecycle_and_page_progress_use_safe_columns(

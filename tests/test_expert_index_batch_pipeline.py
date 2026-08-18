@@ -20,7 +20,7 @@ from expert_index.cli import build_parser
 from expert_index.config import DatabaseConfig, Settings
 from expert_index.models import ExpertAggregate, ExpertCandidate, ExpertSource
 from expert_index.pipeline import ExpertIndexPipeline
-from expert_index.repository import FullBatchCheckpoint
+from expert_index.repository import BatchItemSummary, FullBatchCheckpoint
 
 
 def _settings() -> Settings:
@@ -68,6 +68,7 @@ class FakeSource:
         self.upper_bound_calls = 0
         self.upper_bound_limits: list[int | None] = []
         self.page_calls: list[tuple[int, int, int]] = []
+        self.candidate_calls: list[int] = []
         self.loaded_ids: list[int] = []
 
     def get_full_scan_upper_bound(self, *, max_experts: int | None = None) -> int:
@@ -97,6 +98,10 @@ class FakeSource:
             raise RuntimeError("虚构 Source 读取失败")
         return _aggregate(expert_id, chunkable=expert_id not in self.empty_ids)
 
+    def load_expert_candidate(self, expert_id: int) -> ExpertCandidate:
+        self.candidate_calls.append(expert_id)
+        return next(candidate for candidate in self.candidates if candidate.id == expert_id)
+
 
 class FakeRepository:
     """记录 Pipeline 的批次和专家事务调用，不执行任何 SQL。"""
@@ -113,6 +118,10 @@ class FakeRepository:
         self.resume_calls: list[int] = []
         self.resume_checkpoint: FullBatchCheckpoint | None = None
         self.fail_finish_item_ids: set[int] = set()
+        self.partial_retry_checkpoint: FullBatchCheckpoint | None = None
+        self.retryable_ids: list[int] = []
+        self.retry_item_calls: list[tuple[int, int, int]] = []
+        self.retry_summary: BatchItemSummary | None = None
 
     @contextmanager
     def build_lock(self, run_mode: str) -> Iterator[None]:
@@ -130,6 +139,32 @@ class FakeRepository:
         if self.resume_checkpoint is None:
             raise AssertionError("测试未配置恢复检查点")
         return self.resume_checkpoint
+
+    def load_partial_batch_for_retry(self, batch_id: int) -> FullBatchCheckpoint:
+        if self.partial_retry_checkpoint is None:
+            raise AssertionError("测试未配置 partial 重试检查点")
+        assert batch_id == self.partial_retry_checkpoint.batch_id
+        return self.partial_retry_checkpoint
+
+    def load_retryable_batch_item_ids(
+        self,
+        batch_id: int,
+        *,
+        after_expert_id: int,
+        limit: int,
+    ) -> list[int]:
+        self.retry_item_calls.append((batch_id, after_expert_id, limit))
+        return [
+            expert_id
+            for expert_id in self.retryable_ids
+            if expert_id > after_expert_id
+        ][:limit]
+
+    def summarize_batch_items(self, batch_id: int) -> BatchItemSummary:
+        assert batch_id == 701
+        if self.retry_summary is None:
+            raise AssertionError("测试未配置重试后的明细汇总")
+        return self.retry_summary
 
     def finish_batch(self, batch_id: int, **kwargs: Any) -> None:
         self.finish_calls.append((batch_id, kwargs))
@@ -208,6 +243,26 @@ def _pipeline(
         source=source,  # type: ignore[arg-type]
         repository=repository,  # type: ignore[arg-type]
         vector_sync=vector_sync or FakeVectorSync(),
+    )
+
+
+def _partial_retry_checkpoint() -> FullBatchCheckpoint:
+    """构造已经完成固定范围扫描的 partial 批次检查点。"""
+
+    return FullBatchCheckpoint(
+        batch_id=701,
+        batch_no="partial_retry_batch",
+        data_version="20260818_06",
+        cursor_id=30,
+        upper_bound_id=30,
+        candidate_count=3,
+        success_count=1,
+        failed_count=2,
+        rejected_count=0,
+        deactivated_count=0,
+        extracted_count=1,
+        stage_count=1,
+        chunk_count=1,
     )
 
 
@@ -380,6 +435,110 @@ def test_resume_many_continues_after_last_complete_page_with_original_scope() ->
     assert source.page_calls == [(20, 40, 1), (30, 40, 1)]
     assert source.loaded_ids == [30, 40]
     assert repository.persisted_expert_ids == [30, 40]
+
+
+def test_retry_partial_only_reprocesses_failed_items_and_finishes_success() -> None:
+    """失败专家全部修复后，应按明细重汇总并把原 partial 批次改为 success。"""
+
+    source = FakeSource(
+        [
+            ExpertCandidate(id=10, deleted_at=None),
+            ExpertCandidate(id=20, deleted_at=None),
+            ExpertCandidate(id=30, deleted_at=None),
+        ]
+    )
+    repository = FakeRepository()
+    repository.partial_retry_checkpoint = _partial_retry_checkpoint()
+    repository.retryable_ids = [20, 30]
+    repository.retry_summary = BatchItemSummary(
+        candidate_count=3,
+        success_count=3,
+        failed_count=0,
+        rejected_count=0,
+        deactivated_count=0,
+        pending_count=0,
+        running_count=0,
+        extracted_count=3,
+        stage_count=3,
+        chunk_count=3,
+    )
+
+    result = _pipeline(source, repository).retry_partial(701, page_size=1)
+
+    assert result.batch_id == 701
+    assert result.batch_no == "partial_retry_batch"
+    assert result.status == "success"
+    assert result.candidate_count == 3
+    assert result.success_count == 3
+    assert result.failed_count == 0
+    assert source.upper_bound_calls == 0
+    assert source.page_calls == []
+    assert source.candidate_calls == [20, 30]
+    assert source.loaded_ids == [20, 30]
+    assert repository.persisted_expert_ids == [20, 30]
+    assert repository.retry_item_calls == [
+        (701, 0, 1),
+        (701, 20, 1),
+        (701, 30, 1),
+    ]
+    assert repository.finish_calls[-1][1]["status"] == "success"
+    assert repository.finish_calls[-1][1]["error_summary"] is None
+
+
+def test_retry_partial_attempts_each_failed_item_once_and_remains_partial() -> None:
+    """专家再次失败时本次只尝试一次，并根据明细汇总保持 partial。"""
+
+    source = FakeSource(
+        [
+            ExpertCandidate(id=10, deleted_at=None),
+            ExpertCandidate(id=20, deleted_at=None),
+        ],
+        failed_ids={20},
+    )
+    repository = FakeRepository()
+    repository.partial_retry_checkpoint = FullBatchCheckpoint(
+        batch_id=701,
+        batch_no="partial_retry_still_failed",
+        data_version="20260818_06",
+        cursor_id=20,
+        upper_bound_id=20,
+        candidate_count=2,
+        success_count=1,
+        failed_count=1,
+        rejected_count=0,
+        deactivated_count=0,
+        extracted_count=1,
+        stage_count=1,
+        chunk_count=1,
+    )
+    repository.retryable_ids = [20]
+    repository.retry_summary = BatchItemSummary(
+        candidate_count=2,
+        success_count=1,
+        failed_count=1,
+        rejected_count=0,
+        deactivated_count=0,
+        pending_count=0,
+        running_count=0,
+        extracted_count=1,
+        stage_count=1,
+        chunk_count=1,
+    )
+
+    result = _pipeline(source, repository).retry_partial(701, page_size=50)
+
+    assert result.status == "partial"
+    assert result.failed_count == 1
+    assert source.candidate_calls == [20]
+    assert source.loaded_ids == [20]
+    assert repository.retry_item_calls == [(701, 0, 50), (701, 20, 50)]
+    failed_item = [event for event in repository.events if event[0] == "finished"][-1]
+    assert failed_item[1][2]["status"] == "failed"
+    finish = repository.finish_calls[-1][1]
+    assert finish["status"] == "partial"
+    assert finish["error_summary"]["sample_errors"] == [
+        {"expert_id": 20, "error_type": "RuntimeError"}
+    ]
 
 
 def test_build_many_deactivates_deleted_candidate_without_loading_source() -> None:
@@ -564,6 +723,21 @@ def test_cli_exposes_resume_batch_without_scope_overrides() -> None:
     assert args.command == "resume-batch"
     assert args.batch_id == 701
     assert args.page_size == 50
+    assert not hasattr(args, "data_version")
+    assert not hasattr(args, "max_experts")
+    assert not hasattr(args, "batch_no")
+
+
+def test_cli_exposes_partial_batch_failed_item_retry() -> None:
+    """retry-batch 只接收原批次 ID 和失败明细分页大小。"""
+
+    args = build_parser().parse_args(
+        ["retry-batch", "--batch-id", "701", "--page-size", "25"]
+    )
+
+    assert args.command == "retry-batch"
+    assert args.batch_id == 701
+    assert args.page_size == 25
     assert not hasattr(args, "data_version")
     assert not hasattr(args, "max_experts")
     assert not hasattr(args, "batch_no")

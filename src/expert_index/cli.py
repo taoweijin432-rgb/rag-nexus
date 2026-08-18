@@ -1,7 +1,7 @@
 """专家索引流水线命令行入口。
 
-常用顺序：先 ``init-db``，再用 ``build`` 重建单专家、用 ``build-batch`` 运行全量，
-或用 ``resume-batch`` 从一个中断批次的可靠页游标继续。
+常用顺序：先 ``init-db``，再用 ``build`` 重建单专家、用 ``build-batch`` 运行全量、
+用 ``resume-batch`` 继续中断批次，或用 ``retry-batch`` 重试 partial 批次失败专家。
 两类构建命令都会以内存方法调用把 Chunk 交给下游向量服务，不再写入或读取
 ``expert_chunk``。命令输出只包含数量和状态，不打印 Chunk 正文。
 """
@@ -79,6 +79,23 @@ def build_parser() -> argparse.ArgumentParser:
         help="续跑每页候选专家数，范围 1~1000，默认 200",
     )
 
+    retry_batch = sub.add_parser(
+        "retry-batch",
+        help="只重试 partial full 批次中的失败专家",
+    )
+    retry_batch.add_argument(
+        "--batch-id",
+        type=int,
+        required=True,
+        help="要重试的 expert_index_batch.id",
+    )
+    retry_batch.add_argument(
+        "--page-size",
+        type=int,
+        default=200,
+        help="每页失败专家数，范围 1~1000，默认 200",
+    )
+
     # 该命令是显式测试数据写入入口，不会在 init-db/build 中自动运行。
     sub.add_parser(
         "seed-test-expert",
@@ -117,6 +134,12 @@ def main(argv: list[str] | None = None) -> None:
         # data_version、扫描上界、批次号和累计计数均从原批次恢复，CLI 只允许调整
         # 本次读取页大小，防止续跑意外改变原任务范围。
         result = _build_pipeline(settings, repository).resume_many(
+            args.batch_id,
+            page_size=args.page_size,
+        )
+        print(json.dumps(asdict(result), ensure_ascii=False, sort_keys=True))
+    elif args.command == "retry-batch":
+        result = _build_pipeline(settings, repository).retry_partial(
             args.batch_id,
             page_size=args.page_size,
         )

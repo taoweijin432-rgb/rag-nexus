@@ -178,6 +178,27 @@ def test_full_scan_candidates_use_keyset_and_keep_deleted_experts(
     assert connection.closed is True
 
 
+def test_load_expert_candidate_reads_lifecycle_without_source_text(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """失败重试只查询主键和删除标记，不提前读取专家正文。"""
+
+    deleted_at = datetime(2026, 8, 18, 16, 0, tzinfo=ZoneInfo("Asia/Shanghai"))
+    cursor = FakeCursor(one={"id": 105, "deleted_at": deleted_at})
+    connection = FakeConnection(cursor)
+    connect_calls = _patch_connection(monkeypatch, connection)
+
+    candidate = _adapter().load_expert_candidate(105)
+
+    assert candidate.id == 105
+    assert candidate.is_deleted is True
+    assert cursor.executed == [
+        ("SELECT id, deleted_at FROM experts WHERE id=%s", (105,))
+    ]
+    assert connect_calls[0]["autocommit"] is True
+    assert connection.closed is True
+
+
 @pytest.mark.parametrize(
     ("after_id", "upper_bound_id", "limit"),
     [

@@ -150,6 +150,33 @@ class MySQLSourceAdapter:
         finally:
             connection.close()
 
+    def load_expert_candidate(self, expert_id: int) -> ExpertCandidate:
+        """读取一位专家的存在状态和逻辑删除标记，不读取任何正文。
+
+        partial 批次重试失败专家时使用该方法重新判断当前生命周期状态：active 专家
+        继续读取四表快照，已逻辑删除专家进入停用分支。物理记录不存在时抛出
+        :class:`ExpertNotFoundError`，由 Pipeline 把本次尝试继续记录为 failed。
+        """
+
+        if isinstance(expert_id, bool) or not isinstance(expert_id, int) or expert_id < 1:
+            raise ValueError("expert_id 必须是正整数")
+        connection = pymysql.connect(**self.config.as_kwargs(autocommit=True))
+        try:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    "SELECT id, deleted_at FROM experts WHERE id=%s",
+                    (expert_id,),
+                )
+                row = cursor.fetchone()
+            if not row:
+                raise ExpertNotFoundError(f"专家 {expert_id} 不存在")
+            return ExpertCandidate(
+                id=int(row["id"]),
+                deleted_at=row.get("deleted_at"),
+            )
+        finally:
+            connection.close()
+
     def load_expert(self, expert_id: int) -> ExpertAggregate:
         """在同一只读一致性快照中读取一位专家的四表当前数据。
 
