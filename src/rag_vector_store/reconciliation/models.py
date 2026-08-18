@@ -36,6 +36,13 @@ class FullVectorReconciliationResult(BaseModel):
         - ``embedded_count``：正向执行实际 upsert 成功数（dry-run 恒为 0）。
         - ``metadata_updated_count``：正向执行实际 update_metadata
           成功数（dry-run 恒为 0）。
+        - ``deleted_count``：全量维护实际删除的 stale 向量数（dry-run /
+          apply_positive_changes 恒为 0）。
+        - ``final_existing_count``：全量维护删除后重新读取的 Collection 向量数
+          （dry-run / apply_positive_changes 恒为 0）。
+        - ``consistent``：全量维护最终一致性验证结果
+          （final_existing_ids == desired_ids；dry-run / apply_positive_changes
+          不参与即保持默认）。
     """
 
     model_config = ConfigDict(extra="forbid", frozen=True)
@@ -53,6 +60,9 @@ class FullVectorReconciliationResult(BaseModel):
     stale_sample: tuple[str, ...] = ()
     embedded_count: int = Field(default=0, ge=0)
     metadata_updated_count: int = Field(default=0, ge=0)
+    deleted_count: int = Field(default=0, ge=0)
+    final_existing_count: int = Field(default=0, ge=0)
+    consistent: bool = True
 
     @model_validator(mode="after")
     def check_count_consistency(self) -> FullVectorReconciliationResult:

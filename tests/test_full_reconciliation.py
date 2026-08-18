@@ -20,6 +20,7 @@ from rag_vector_store.chunking.contract_pipeline import (
     ContractValidationError,
 )
 from rag_vector_store.ingestion.models import (
+    VectorDeletionResult,
     VectorIngestionResult,
     VectorItemResult,
 )
@@ -338,7 +339,11 @@ def test_reconcile_all_empty_snapshot_is_pure_diff() -> None:
 
 
 class FakePositiveRepository(FakeReconRepository):
-    """在只读 Fake 基础上增加可注入的安全守卫（用于正向同步测试）。"""
+    """在只读 Fake 基础上增加可注入的安全守卫（用于正向同步测试）。
+
+    ``list_rows_sequence`` 支持多次 ``list_all_vector_states`` 调用返回不同结果
+    （写后重读、删除后终验），每次调用消耗一帧；耗尽后回落到 ``rows``。
+    """
 
     def __init__(
         self,
@@ -346,10 +351,22 @@ class FakePositiveRepository(FakeReconRepository):
         *,
         list_error: Exception | None = None,
         guard_error: Exception | None = None,
+        list_rows_sequence: list[list[dict[str, Any]]] | None = None,
     ) -> None:
         super().__init__(rows, list_error=list_error)
         self.guard_error = guard_error
         self.guard_calls: list[dict[str, Any]] = []
+        self._list_frames: list[list[dict[str, Any]]] = (
+            list(list_rows_sequence) if list_rows_sequence is not None else []
+        )
+
+    def list_all_vector_states(self, **kwargs: Any) -> list[dict[str, Any]]:
+        self.list_calls.append(kwargs)
+        if self.list_error is not None:
+            raise self.list_error
+        if self._list_frames:
+            return [dict(r) for r in self._list_frames.pop(0)]
+        return [dict(r) for r in self.rows]
 
     def assert_destructive_maintenance_allowed(self, **kwargs: Any) -> dict[str, Any]:
         self.guard_calls.append(kwargs)
@@ -368,13 +385,18 @@ class FakeIngestionService:
         metadata_result: Any | None = None,
         upsert_error: Exception | None = None,
         metadata_error: Exception | None = None,
+        delete_error: Exception | None = None,
+        delete_result: Any | None = None,
     ) -> None:
         self.upsert_result = upsert_result
         self.metadata_result = metadata_result
         self.upsert_error = upsert_error
         self.metadata_error = metadata_error
+        self.delete_error = delete_error
+        self.delete_result = delete_result
         self.upsert_calls: list[list[Any]] = []
         self.metadata_calls: list[list[Any]] = []
+        self.delete_calls: list[list[str]] = []
 
     def upsert_chunks(self, chunks: list[Any]) -> VectorIngestionResult:
         self.upsert_calls.append(list(chunks))
@@ -403,6 +425,18 @@ class FakeIngestionService:
                 )
                 for c in chunks
             ]
+        )
+
+    def delete_vectors(self, vector_doc_ids: list[str]) -> VectorDeletionResult:
+        ids = list(vector_doc_ids)
+        self.delete_calls.append(ids)
+        if self.delete_error is not None:
+            raise self.delete_error
+        if self.delete_result is not None:
+            return self.delete_result
+        return VectorDeletionResult(
+            requested_count=len(ids),
+            deleted_count=len(ids),
         )
 
 
@@ -501,9 +535,9 @@ def test_apply_stale_is_never_deleted() -> None:
 
     assert result.unchanged_count == 1
     assert result.stale_count == 1
-    # stale 只统计，绝不删除：无任何删除调用能力
+    # stale 只统计，绝不删除：Fake 虽提供删除能力，但 apply_positive_changes 不会调用
     assert not hasattr(repo, "delete_by_vector_doc_ids")
-    assert not hasattr(ing, "delete_vectors")
+    assert ing.delete_calls == []
 
 
 def test_apply_mixed_diff() -> None:
@@ -616,3 +650,253 @@ def ib_ids(calls: list[list[Any]]) -> list[list[str]]:
     """
 
     return [[c.vector_doc_id for c in batch] for batch in calls]
+
+
+# ---------------------------------------------------------------------------
+# 全库 reconciliation apply_full_reconciliation
+# ---------------------------------------------------------------------------
+
+
+def test_full_recon_normal_stale_delete() -> None:
+    record = make_record(0)
+    desired_row = existing_row(record.vector_doc_id, record.content_hash, record.metadata_hash)
+    stale_row = existing_row("expert:900001:profile_summary:stale:0", "s" * 64, "s" * 64)
+    # 写前：仅 stale（record 缺失 -> upsert）；写后：record 已存在 + stale 仍在；终验：stale 已删
+    repo = FakePositiveRepository(
+        rows=[stale_row],
+        list_rows_sequence=[
+            [stale_row],
+            [desired_row, stale_row],
+            [desired_row],
+        ],
+    )
+    ing = FakeIngestionService()
+    result = make_positive_service(repo, ing).apply_full_reconciliation([record])
+
+    assert result.embedded_count == 1  # missing -> upsert
+    assert result.deleted_count == 1
+    assert result.final_existing_count == 1  # desired 仍存在
+    assert result.consistent is True
+    assert len(ing.delete_calls) == 1
+    assert ing.delete_calls[0] == ["expert:900001:profile_summary:stale:0"]
+
+
+def test_full_recon_multi_batch_stale_delete() -> None:
+    # delete_batch_size=2，stale 3 条 -> 2 批
+    desired = default_records(1)
+    desired_row = existing_row(desired[0].vector_doc_id, desired[0].content_hash, desired[0].metadata_hash)
+    stale = [
+        existing_row(f"expert:900001:profile_summary:stale{i}:0", "s" * 64, "s" * 64)
+        for i in range(3)
+    ]
+    repo = FakePositiveRepository(
+        rows=[stale[0]],
+        list_rows_sequence=[stale, [desired_row] + stale, [desired_row]],
+    )
+    ing = FakeIngestionService()
+    service = FullVectorReconciliationService(
+        repo, ingestion=ing, delete_batch_size=2
+    )
+    result = service.apply_full_reconciliation(desired)
+
+    assert result.deleted_count == 3
+    assert len(ing.delete_calls) == 2
+    assert len(ing.delete_calls[0]) == 2
+    assert len(ing.delete_calls[1]) == 1
+    assert result.consistent is True
+
+
+def test_full_recon_no_stale_zero_delete() -> None:
+    record = make_record(0)
+    # 写前已有且不变；写后、终验均不变
+    row = existing_row(record.vector_doc_id, record.content_hash, record.metadata_hash)
+    repo = FakePositiveRepository(rows=[row], list_rows_sequence=[[row], [row], [row]])
+    ing = FakeIngestionService()
+    result = make_positive_service(repo, ing).apply_full_reconciliation([record])
+
+    assert result.unchanged_count == 1
+    assert result.deleted_count == 0
+    assert ing.delete_calls == []
+    assert result.consistent is True
+
+
+def test_full_recon_positive_write_failure_no_delete() -> None:
+    record = make_record(0)
+    repo = FakePositiveRepository(
+        rows=[],
+        list_rows_sequence=[[], []],  # 写后、终验
+    )
+    ing = FakeIngestionService(upsert_result=_upsert_with_failed([record]))
+
+    with pytest.raises(RuntimeError, match="失败项"):
+        make_positive_service(repo, ing).apply_full_reconciliation([record])
+
+    assert ing.delete_calls == []
+
+
+def test_full_recon_existing_after_write_read_failure_no_delete() -> None:
+    record = make_record(0)
+    # 第一次读（plan）：返回空；第二次读（写后）：抛异常
+    repo = FakePositiveRepository(
+        rows=[],
+        list_rows_sequence=[],
+    )
+    # 让第二次 list 抛异常：先正常返回一帧，再注入错误
+    repo._list_frames = []
+    repo.list_error = RuntimeError("milvus list failed after write")
+    ing = FakeIngestionService()
+
+    with pytest.raises(RuntimeError, match="milvus list failed"):
+        make_positive_service(repo, ing).apply_full_reconciliation([record])
+
+    assert ing.delete_calls == []
+
+
+def test_full_recon_guard_failure_zero_mutation() -> None:
+    record = make_record(0)
+    repo = FakePositiveRepository([], guard_error=RuntimeError("未获授权"))
+    ing = FakeIngestionService()
+
+    with pytest.raises(RuntimeError, match="未获授权"):
+        make_positive_service(repo, ing).apply_full_reconciliation([record])
+
+    assert ing.upsert_calls == []
+    assert ing.metadata_calls == []
+    assert ing.delete_calls == []
+
+
+def test_full_recon_empty_snapshot_non_empty_collection_fails() -> None:
+    repo = FakePositiveRepository(
+        rows=[existing_row("expert:900001:profile_summary:stale:0", "s" * 64, "s" * 64)],
+    )
+    ing = FakeIngestionService()
+
+    with pytest.raises(RuntimeError, match="空快照"):
+        make_positive_service(repo, ing).apply_full_reconciliation([])
+
+    # 守卫在空快照检查之后才调用，故 guard/upsert/delete 均未触发
+    assert repo.guard_calls == []
+    assert ing.upsert_calls == []
+    assert ing.delete_calls == []
+
+
+def test_full_recon_all_skipped_non_empty_snapshot_does_not_fail() -> None:
+    """chunks 非空但全部被 Eligibility 跳过 → 不是「空 snapshot」，走正常 reconciliation。
+
+    全 skipped 时 desired_ids 为空；existing 全部为 stale → 正常删除并终验。
+    不触发空快照保护。
+    """
+    inactive = make_record(0, is_active=False)
+    stale_row = existing_row(inactive.vector_doc_id, inactive.content_hash, inactive.metadata_hash)
+    repo = FakePositiveRepository(
+        rows=[stale_row],
+        list_rows_sequence=[
+            [stale_row],       # plan 读
+            [stale_row],       # 写后重读（无正向写，desired 空）
+            [],                 # 删后终验
+        ],
+    )
+    ing = FakeIngestionService()
+    result = make_positive_service(repo, ing).apply_full_reconciliation([inactive])
+
+    assert result.input_count == 1
+    assert result.eligible_count == 0
+    assert result.skipped_count == 1
+    assert result.desired_count == 0
+    # existing 中 1 条全部 stale，被删除，终验为空 == desired_ids（空集）
+    assert result.deleted_count == 1
+    assert result.final_existing_count == 0
+    assert result.consistent is True
+
+
+def test_full_recon_empty_snapshot_empty_collection_succeeds() -> None:
+    """空 snapshot + 空 Collection → 正常返回，不触发保护。"""
+    repo = FakePositiveRepository(rows=[])
+    ing = FakeIngestionService()
+    result = make_positive_service(repo, ing).apply_full_reconciliation([])
+
+    assert result.input_count == 0
+    assert result.deleted_count == 0
+    assert result.final_existing_count == 0
+    assert result.consistent is True
+
+
+def test_full_recon_delete_batch_failure_stops_subsequent() -> None:
+    desired = default_records(1)
+    desired_row = existing_row(desired[0].vector_doc_id, desired[0].content_hash, desired[0].metadata_hash)
+    stale = [
+        existing_row(f"expert:900001:profile_summary:stale{i}:0", "s" * 64, "s" * 64)
+        for i in range(3)
+    ]
+    repo = FakePositiveRepository(
+        rows=[stale[0]],
+        list_rows_sequence=[stale, [desired_row] + stale, [desired_row]],
+    )
+    ing = FakeIngestionService(
+        delete_error=RuntimeError("delete batch failed"),
+    )
+    service = FullVectorReconciliationService(
+        repo, ingestion=ing, delete_batch_size=1
+    )
+
+    with pytest.raises(RuntimeError, match="delete batch failed"):
+        service.apply_full_reconciliation(desired)
+
+    # 第一批失败后立即停止后续批次
+    assert len(ing.delete_calls) == 1
+
+
+def test_full_recon_final_equals_desired_success() -> None:
+    record = make_record(0)
+    row = existing_row(record.vector_doc_id, record.content_hash, record.metadata_hash)
+    stale = existing_row("expert:900001:profile_summary:stale:0", "s" * 64, "s" * 64)
+    repo = FakePositiveRepository(
+        rows=[],
+        list_rows_sequence=[[row, stale], [row, stale], [row]],
+    )
+    ing = FakeIngestionService()
+    result = make_positive_service(repo, ing).apply_full_reconciliation([record])
+
+    assert result.deleted_count == 1
+    assert result.final_existing_count == 1
+    assert result.consistent is True
+
+
+def test_full_recon_final_mismatch_fail_closed() -> None:
+    record = make_record(0)
+    stale = existing_row("expert:900001:profile_summary:stale:0", "s" * 64, "s" * 64)
+    # 删除后重读仍返回 stale（模拟删除未生效），终验不一致
+    repo = FakePositiveRepository(
+        rows=[],
+        list_rows_sequence=[[stale], [stale], [stale]],
+    )
+    ing = FakeIngestionService()
+    with pytest.raises(RuntimeError, match="最终一致性验证失败"):
+        make_positive_service(repo, ing).apply_full_reconciliation([record])
+
+
+def test_full_recon_dry_run_behavior_unchanged() -> None:
+    record = make_record(0)
+    repo = FakeReconRepository(
+        [existing_row(record.vector_doc_id, record.content_hash, record.metadata_hash)]
+    )
+    result = FullVectorReconciliationService(repo).reconcile_all([record])
+
+    assert result.embedded_count == 0
+    assert result.metadata_updated_count == 0
+    assert result.deleted_count == 0
+    assert result.final_existing_count == 0
+    assert result.consistent is True
+
+
+def test_full_recon_apply_positive_behavior_unchanged() -> None:
+    record = make_record(0)
+    repo = FakePositiveRepository([])
+    ing = FakeIngestionService()
+    result = make_positive_service(repo, ing).apply_positive_changes([record])
+
+    assert result.embedded_count == 1
+    assert result.deleted_count == 0
+    assert result.final_existing_count == 0
+    assert result.consistent is True
+    assert ing.delete_calls == []
