@@ -70,6 +70,11 @@ from .model_space import (
     build_model_space_id,
 )
 from .models import MutationResult, SearchHit
+from .reconciliation import (
+    FullVectorReconciliationResult,
+    FullVectorReconciliationService,
+    create_full_vector_reconciliation_service,
+)
 
 __all__ = [
     "CONTRACT_SCALAR_INDEX_FIELDS",
@@ -106,6 +111,8 @@ __all__ = [
     "ExpertChunkMetadata",
     "ExpertChunkSource",
     "ExpertChunkVersions",
+    "FullVectorReconciliationResult",
+    "FullVectorReconciliationService",
     "MilvusExpertChunkEntity",
     "MilvusFieldSpec",
     "MilvusRowMapper",
@@ -128,6 +135,7 @@ __all__ = [
     "build_model_space_id",
     "compare_contract_output_schema",
     "contract_milvus_field_specs",
+    "create_full_vector_reconciliation_service",
     "create_vector_ingestion_service",
     "expected_contract_output_fields",
 ]
