@@ -1,22 +1,21 @@
-"""单专家与第一版全量 Chunk 加工的总编排模块。
+"""专家索引加工流程的编排模块。
 
-本模块按照固定顺序组织领域链路：
+本文件负责把源数据读取、标准化、Chunk 构建、契约校验、Stage 持久化和向量同步
+组织成可执行的单专家及批量任务。固定处理顺序为：
 
 ``Source → Normalize/Stage → Chunk → Validator → Stage MySQL → Vector Sync``
 
-各模块职责保持清晰边界：
+本文件只控制执行顺序和任务状态，不实现各阶段的领域规则：
 
 * ``source.py``：扫描全量候选，并读取一位专家的四表一致性快照；
 * ``normalize.py``：清洗和标准化来源字段，生成 Stage 对象；
 * ``chunk_builder.py``：生成三类 Chunk Text 与扁平 Metadata；
 * ``validators.py``：在写库前验证文本、ID、哈希、枚举和 PII；
 * ``repository.py``：管理批次，并以专家为事务单位保存 Stage；
-* 本文件：决定调用顺序、分页循环、失败隔离、计数累加和批次状态。
+* ``vector_sync.py``：把内存中的 Chunk Contract 交给下游向量服务。
 
-第三阶段把原 ``build_one`` 中的核心加工抽为 ``_process_expert``；第四阶段新增
-``build_many``。当前版本在此基础上补齐批次明细、页游标、逻辑删除/无内容生命周期、
-Metadata Hash 重算和第一版全局互斥，使全量任务可以从 CLI 安全启动。
-
+批量任务按固定 ID 上界分页，逐专家隔离领域处理失败，并只在完整一页处理结束后推进
+持久化游标。这样可以从可靠页边界续跑；批次级错误则停止任务并保留最后完整页进度。
 """
 
 from __future__ import annotations
@@ -31,22 +30,20 @@ from .contract_bridge import chunk_records_to_contracts
 from .models import ChunkRecord, ExpertCandidate
 from .normalize import normalize_aggregate
 from .ports import ExpertVectorSyncPort
-from .repository import MySQLIndexRepository
+from .repository import FullBatchCheckpoint, MySQLIndexRepository
 from .source import MAX_FULL_SCAN_PAGE_SIZE, MySQLSourceAdapter
 from .validators import validate_chunks
 
-# 批次错误摘要只保留有限数量的专家 ID 和异常类型。每位专家的完整机器终态写入
-# expert_index_batch_item；这里限制样本长度，避免大批次产生过大的汇总 JSON。
+# 批次主表只保存有限数量的失败样本；每位专家的完整机器终态由批次明细表记录。
 MAX_BATCH_ERROR_SUMMARIES = 20
 
 
 @dataclass(frozen=True)
 class BuildResult:
-    """一次单专家加工任务返回给 CLI/API 的安全数量摘要。
+    """单专家任务完成后返回的批次标识和处理数量。
 
-    ``build_one`` 创建并结束一个 ``single`` 批次后返回该对象。它不包含 Chunk 正文
-    或经历信息；Chunk 仅在本次调用内存中存在，批次统计由 Repository 写入
-    ``expert_index_batch``。
+    该结果不包含源数据或 Chunk 正文；相同统计同时写入批次主表，便于按 ``batch_id``
+    回查执行结果。
     """
 
     batch_id: int  # expert_index_batch.id，用于回查本次运行。
@@ -55,15 +52,14 @@ class BuildResult:
     extracted_count: int  # 1 条主档加工作、项目、教育来源记录数。
     stage_count: int  # 成功事务提交的 Profile、Employment、Project Stage 行数。
     chunk_count: int  # 成功事务提交的最终 Chunk 行数。
-    partial_chunk_count: int  # 旧 CLI 兼容字段；V1.3 当前恒为 0。
+    partial_chunk_count: int  # 当前流程不生成 partial Chunk，因此恒为 0。
 
 
 @dataclass(frozen=True)
 class BatchBuildResult:
-    """第一版全量加工完成后返回的安全批次摘要。
+    """批量任务完成后返回的扫描范围、最终游标和累计数量。
 
-    该对象由 :meth:`ExpertIndexPipeline.build_many` 返回，供未来 CLI、调度平台或 API
-    输出运行结果。它只包含固定上界、最终游标和数量，不包含任何专家原始字段。
+    该对象由新批次和续跑入口共同返回，只包含任务状态和计数，不包含专家原始字段。
 
     ``rejected_count`` 表示存在但无可生成内容的专家数；``deactivated_count`` 表示
     主档已逻辑删除且历史 Chunk 已完成停用的专家数。两者都不是程序失败。
@@ -86,11 +82,10 @@ class BatchBuildResult:
 
 @dataclass
 class _ExpertProgress:
-    """单专家内部可变进度，供成功返回和异常计数共同使用。
+    """记录一位专家在当前调用中已完成阶段的数量。
 
-    ``_process_expert`` 每完成一个阶段就更新相应数量。即使 Normalize、Validator 或
-    Repository 中途抛出异常，外层 ``build_one``/``build_many`` 仍能知道任务已经读取
-    了多少来源记录。该对象只存在于内存，不对应数据库模型，也不向 CLI 直接暴露。
+    ``_process_expert`` 在读取、Stage 持久化和 Chunk 构建完成后分别更新对应字段，
+    使外层在成功或异常时都能记录已经实际发生的数量。该对象只存在于内存。
     """
 
     expert_id: int
@@ -100,10 +95,10 @@ class _ExpertProgress:
 
 
 class ExpertIndexPipeline:
-    """单专家与第一版全量加工流程的总调度器。
+    """提供单专家构建、新建批量任务和断点续跑三个执行入口。
 
-    默认使用真实 MySQL Source/Repository；测试可以注入 Fake 实现。所有清洗、文本
-    构建和 SQL 映射仍由专门模块负责，本类只编排它们，不复制业务规则。
+    默认从配置创建 MySQL Source 和 Repository，也支持注入同接口实现。所有入口共享
+    ``_process_expert``，确保单专家与批量任务采用相同的标准化、校验和同步规则。
     """
 
     def __init__(
@@ -129,9 +124,9 @@ class ExpertIndexPipeline:
     ) -> BuildResult:
         """在全局加工锁内创建 ``single`` 批次并完整重建一位专家。
 
-        第一版 single/full 共用 Repository 的 MySQL 命名锁，因此全量运行期间本命令会
-        立即拒绝启动，不会与全量任务同时改写同一专家。锁释放由上下文管理器保证。
-        实际单专家批次编排由 :meth:`_build_one_locked` 完成。
+        方法先校验专家 ID 和数据版本，再取得 single/full 共用的互斥锁。取得锁后创建
+        批次并执行完整专家处理；已有任务持锁时立即失败，不会并发改写 Stage 或向量。
+        返回成功批次的数量摘要，处理异常由内部批次收口后继续向调用方抛出。
         """
 
         _validate_data_version(data_version)
@@ -151,14 +146,11 @@ class ExpertIndexPipeline:
         data_version: str,
         batch_no: str | None,
     ) -> BuildResult:
-        """执行已经取得互斥锁的单专家批次。
+        """创建并收口一个已经取得互斥锁的单专家批次。
 
-        本函数现在只负责单专家批次的开始、成功/失败收口和返回值；真正的
-        Source→Normalize→Chunk→Validator→Repository 顺序由 ``_process_expert``
-        统一实现，因此以后修正规则不会让单专家和全量路径发生漂移。
-
-        现有 CLI 仍调用本方法，参数和返回结构保持兼容。发生异常时先将批次标记为
-        failed，再继续抛出原异常。
+        成功时把处理数量写入批次主表并返回 ``BuildResult``；异常时把已完成数量和安全
+        错误摘要写入 failed 批次，再原样抛出异常。领域处理统一委托给
+        ``_process_expert``。
         """
 
         actual_batch_no = batch_no or _single_batch_no(expert_id)
@@ -171,7 +163,7 @@ class ExpertIndexPipeline:
                 batch_id=batch_id,
                 progress=progress,
             )
-            # V1.3 不再生成 partial Chunk，保留旧返回字段但固定为 0。
+            # 当前只生成完整 Chunk；返回结构中的 partial 数量固定为 0。
             partial_count = 0
             self.repository.finish_batch(
                 batch_id,
@@ -191,7 +183,7 @@ class ExpertIndexPipeline:
                 partial_chunk_count=partial_count,
             )
         except Exception as exc:
-            # 只记录异常类型与截断后的消息，不记录背景、经历或 Chunk Text。
+            # 批次错误摘要只记录异常类型和截断消息，不保存专家正文或 Chunk Text。
             self.repository.finish_batch(
                 batch_id,
                 status="failed",
@@ -213,9 +205,9 @@ class ExpertIndexPipeline:
     ) -> BatchBuildResult:
         """在全局加工锁内运行全量或限定专家数量的批量任务。
 
-        锁从固定来源上界之前一直持有到批次终态写回之后，保证同一时间只有一个全量
-        或单专家加工任务。``max_experts`` 限制本批次最多覆盖的候选专家数；Source 会
-        在启动时把扫描上界收缩到前 N 位候选的最后一个 ID，而不是在循环中途截断。
+        ``max_experts`` 会在任务开始时把固定扫描上界收缩到前 N 位候选的最后一个 ID，
+        因此限制作用于整个任务范围，而不是在分页循环中途停止。全局锁覆盖上界计算、
+        分页处理和批次收口，防止其他构建任务在此期间并发执行。
         """
 
         _validate_data_version(data_version)
@@ -237,6 +229,34 @@ class ExpertIndexPipeline:
                 batch_no=batch_no,
             )
 
+    def resume_many(
+        self,
+        batch_id: int,
+        *,
+        page_size: int = 200,
+    ) -> BatchBuildResult:
+        """从指定 full 批次最后完整提交页之后继续执行。
+
+        方法在全局锁内恢复原批次的版本、固定上界、可靠游标和累计计数，再进入与新
+        批次相同的分页流程。已提交完整页不会重复处理；未推进游标的中断页会整体重跑。
+        """
+
+        if isinstance(batch_id, bool) or not isinstance(batch_id, int) or batch_id < 1:
+            raise ValueError("batch_id 必须是正整数")
+        if not 1 <= page_size <= MAX_FULL_SCAN_PAGE_SIZE:
+            raise ValueError(
+                f"page_size 必须位于 1 到 {MAX_FULL_SCAN_PAGE_SIZE} 之间"
+            )
+        with self.repository.build_lock("full"):
+            checkpoint = self.repository.resume_batch(batch_id)
+            return self._build_many_locked(
+                data_version=checkpoint.data_version,
+                page_size=page_size,
+                max_experts=None,
+                batch_no=checkpoint.batch_no,
+                checkpoint=checkpoint,
+            )
+
     def _build_many_locked(
         self,
         *,
@@ -244,46 +264,70 @@ class ExpertIndexPipeline:
         page_size: int,
         max_experts: int | None,
         batch_no: str | None,
+        checkpoint: FullBatchCheckpoint | None = None,
     ) -> BatchBuildResult:
-        """按固定主键上界全量加工专家，并可靠记录每页进度。
+        """在已取得互斥锁的前提下执行固定范围分页构建。
 
-        构成
-        ----
-        1. 校验参数并从 Source 固定 ``upper_bound_id``；
-        2. 创建一个 ``full`` 批次；
-        3. 从 ``after_id=0`` 开始按 Keyset Pagination 读取候选页；
-        4. 每页先登记 pending，再按 running→终态记录每位候选；
-        5. active 专家复用 ``_process_expert``，逻辑删除和无内容分别进入
+        执行顺序：
+
+        1. 新任务从 Source 固定 ``upper_bound_id`` 并创建批次；续跑任务恢复原检查点；
+        2. 从新任务的 0 或续跑批次的可靠 ``cursor_id`` 开始 Keyset Pagination；
+        3. 每页先登记 pending，再按 running→终态记录每位候选；
+        4. active 专家复用 ``_process_expert``，逻辑删除和无内容分别进入
            deactivated/rejected，意外异常才计入 failed；
-        6. 每页全部明细可靠落库后，才持久化游标和累计计数；
-        7. 逻辑删除、无内容或陈旧来源导致 Chunk 停用时同步重算 metadata_hash；
-        8. 只要存在专家级 failed，最终批次为 partial，否则为 success；
-        9. 分页或批次记录错误会终止任务并将批次记为 failed。
+        5. 每页全部明细可靠落库后，才持久化游标和累计计数；
+        6. 逻辑删除、无内容或陈旧来源导致 Chunk 停用时同步重算 metadata_hash；
+        7. 只要存在专家级 failed，最终批次为 partial，否则为 success；
+        8. 分页或批次记录错误会终止任务并将批次记为 failed。
 
-        使用位置
-        --------
-        本方法由 ``cli.py build-batch`` 调用，也可供未来调度平台复用。第一版实现全量
-        新批次，不自动恢复中断批次；数据库中的页游标与专家明细已为后续续跑留下基础。
+        返回值反映固定范围内的最终游标和累计结果。续跑不创建新批次，也不会重新计算
+        或扩大原批次扫描上界。
         """
 
-        # 先固定来源上界，再创建批次；max_experts 会把上界收缩为前 N 位候选的最后
-        # 一个 ID。即使任务运行期间新增专家，本轮范围也不会改变。
-        upper_bound_id = self.source.get_full_scan_upper_bound(
-            max_experts=max_experts,
-        )
-        actual_batch_no = batch_no or _full_batch_no()
-        batch_id = self.repository.start_batch(
-            actual_batch_no,
-            "full",
-            data_version=data_version,
-            upper_bound_id=upper_bound_id,
-        )
-
-        cursor_id = 0
-        candidate_count = success_count = failed_count = 0
-        rejected_count = deactivated_count = 0
-        extracted_count = stage_count = chunk_count = 0
+        if checkpoint is None:
+            # 创建批次前固定扫描上界，使任务运行期间新增的专家不进入本次范围。
+            upper_bound_id = self.source.get_full_scan_upper_bound(
+                max_experts=max_experts,
+            )
+            actual_batch_no = batch_no or _full_batch_no()
+            batch_id = self.repository.start_batch(
+                actual_batch_no,
+                "full",
+                data_version=data_version,
+                upper_bound_id=upper_bound_id,
+            )
+            cursor_id = 0
+            candidate_count = success_count = failed_count = 0
+            rejected_count = deactivated_count = 0
+            extracted_count = stage_count = chunk_count = 0
+        else:
+            # 从持久化检查点恢复原批次范围和完整页计数，保持续跑前后统计连续。
+            batch_id = checkpoint.batch_id
+            actual_batch_no = checkpoint.batch_no
+            upper_bound_id = checkpoint.upper_bound_id
+            cursor_id = checkpoint.cursor_id
+            candidate_count = checkpoint.candidate_count
+            success_count = checkpoint.success_count
+            failed_count = checkpoint.failed_count
+            rejected_count = checkpoint.rejected_count
+            deactivated_count = checkpoint.deactivated_count
+            extracted_count = checkpoint.extracted_count
+            stage_count = checkpoint.stage_count
+            chunk_count = checkpoint.chunk_count
         error_summaries: list[dict[str, object]] = []
+        # 该快照只在完整页进度成功落库后更新。批次级错误使用它收口，确保游标与累计
+        # 数量属于同一个页边界，续跑时不会重复累计中断页。
+        reliable_progress = {
+            "cursor_id": cursor_id,
+            "candidate_count": candidate_count,
+            "success_count": success_count,
+            "failed_count": failed_count,
+            "rejected_count": rejected_count,
+            "deactivated_count": deactivated_count,
+            "extracted_count": extracted_count,
+            "stage_count": stage_count,
+            "chunk_count": chunk_count,
+        }
 
         try:
             while cursor_id < upper_bound_id:
@@ -293,8 +337,7 @@ class ExpertIndexPipeline:
                     limit=page_size,
                 )
                 if not candidates:
-                    # Keyset 查询在固定范围内已经没有行。把内存游标推进到固定上界，
-                    # 并同步落库，明确表示固定范围扫描完成。这不会跳过实际返回的记录。
+                    # 固定范围内没有后续候选时，把游标推进到上界并落库，表示扫描完成。
                     cursor_id = upper_bound_id
                     self.repository.update_batch_progress(
                         batch_id,
@@ -308,14 +351,24 @@ class ExpertIndexPipeline:
                         stage_count=stage_count,
                         chunk_count=chunk_count,
                     )
+                    reliable_progress = {
+                        "cursor_id": cursor_id,
+                        "candidate_count": candidate_count,
+                        "success_count": success_count,
+                        "failed_count": failed_count,
+                        "rejected_count": rejected_count,
+                        "deactivated_count": deactivated_count,
+                        "extracted_count": extracted_count,
+                        "stage_count": stage_count,
+                        "chunk_count": chunk_count,
+                    }
                     break
                 _validate_candidate_page(
                     candidates,
                     after_id=cursor_id,
                     upper_bound_id=upper_bound_id,
                 )
-                # 整页先登记 pending。若这里失败，任何候选都不会开始，批次级异常分支
-                # 会结束任务，游标也仍停留在上一页。
+                # 先幂等登记整页明细。登记失败时不开始处理专家，游标保持在上一完整页。
                 self.repository.prepare_batch_items(
                     batch_id,
                     [candidate.id for candidate in candidates],
@@ -330,8 +383,7 @@ class ExpertIndexPipeline:
                     error_type: str | None = None
                     try:
                         if candidate.is_deleted:
-                            # 删除候选不读取四表正文；Repository 只清理 Stage，空快照
-                            # 通过内存同步交给下游删除该专家的历史向量。
+                            # 删除候选不再读取正文；清理 Stage 后用空快照删除下游历史向量。
                             self.repository.mark_deleted_stage(
                                 candidate.id,
                                 build_batch_id=batch_id,
@@ -348,14 +400,14 @@ class ExpertIndexPipeline:
                             )
                             if terminal_status == "rejected":
                                 result_code = "no_chunkable_content"
-                    # 这里只隔离专家领域处理和专家事务异常。下面的批次明细、页游标写入
-                    # 位于 except 之外；它们失败时属于批次级错误，必须终止而不能跳过。
+                    # 只隔离单专家领域处理异常。批次明细或页游标写入失败会继续向外抛出，
+                    # 终止整个批次，避免在审计状态未落库时跳过候选。
                     except Exception as exc:  # noqa: BLE001
                         terminal_status = "failed"
                         result_code = "expert_processing_failed"
                         error_type = type(exc).__name__
 
-                    # 专家终态必须先可靠写入，再累计批次计数和推进页游标。
+                    # 先持久化专家终态，再把该专家计入批次累计数量。
                     self.repository.finish_batch_item(
                         batch_id,
                         candidate.id,
@@ -383,13 +435,12 @@ class ExpertIndexPipeline:
                                 }
                             )
 
-                    # rejected 已提交当前 Stage，failed 可能只完成部分 Source 读取；这些
-                    # 都是已经真实发生的安全数量，因此统一累计。
+                    # 按已实际完成的阶段累计数量；failed 专家也可能已经完成部分读取。
                     extracted_count += progress.extracted_count
                     stage_count += progress.stage_count
                     chunk_count += progress.chunk_count
 
-                # 只有整页批次明细均到达终态后才推进并持久化游标。
+                # 整页明细全部到达终态后，才把游标和累计数量作为同一检查点持久化。
                 cursor_id = candidates[-1].id
                 self.repository.update_batch_progress(
                     batch_id,
@@ -403,27 +454,37 @@ class ExpertIndexPipeline:
                     stage_count=stage_count,
                     chunk_count=chunk_count,
                 )
+                reliable_progress = {
+                    "cursor_id": cursor_id,
+                    "candidate_count": candidate_count,
+                    "success_count": success_count,
+                    "failed_count": failed_count,
+                    "rejected_count": rejected_count,
+                    "deactivated_count": deactivated_count,
+                    "extracted_count": extracted_count,
+                    "stage_count": stage_count,
+                    "chunk_count": chunk_count,
+                }
 
         except Exception as exc:
-            # 页查询、候选顺序或其他编排级异常无法安全跳过，必须终止整个批次。
+            # 批次级错误无法安全跳过。使用最后完整页快照结束批次，使中断页可以重跑。
             self.repository.finish_batch(
                 batch_id,
                 status="failed",
-                extracted_count=extracted_count,
-                stage_count=stage_count,
-                chunk_count=chunk_count,
-                rejected_count=rejected_count,
-                cursor_id=cursor_id,
-                candidate_count=candidate_count,
-                success_count=success_count,
-                failed_count=failed_count,
-                deactivated_count=deactivated_count,
+                extracted_count=reliable_progress["extracted_count"],
+                stage_count=reliable_progress["stage_count"],
+                chunk_count=reliable_progress["chunk_count"],
+                rejected_count=reliable_progress["rejected_count"],
+                cursor_id=reliable_progress["cursor_id"],
+                candidate_count=reliable_progress["candidate_count"],
+                success_count=reliable_progress["success_count"],
+                failed_count=reliable_progress["failed_count"],
+                deactivated_count=reliable_progress["deactivated_count"],
                 error_summary={"error_type": type(exc).__name__},
             )
             raise
 
-        # 最终 finish 放在循环 try 之外：若批次状态写回自身失败，直接向上抛出，避免
-        # 再次调用同一个失败方法并掩盖第一次数据库异常。
+        # 最终状态写回失败时直接抛出，不重复调用同一方法，以免掩盖数据库异常。
         final_status = "partial" if failed_count else "success"
         self.repository.finish_batch(
             batch_id,
@@ -466,9 +527,6 @@ class ExpertIndexPipeline:
     ) -> str:
         """执行一位 active 专家的完整领域链路并返回业务终态。
 
-        该函数是第三阶段抽出的核心复用单元，只被本类的 ``build_one`` 和
-        ``build_many`` 调用：
-
         * Source 读取主档、工作、项目、教育四表一致性快照；
         * Normalize 生成 Profile/Employment/Project Stage；
         * ChunkFactory 生成三类 Chunk；
@@ -476,9 +534,8 @@ class ExpertIndexPipeline:
         * 有 Chunk 时，Repository 原子保存 Stage，随后以内存 Contract 同步下游；
         * 无 Chunk 时，Repository 保存 rejected Stage，并以下游空快照删除旧向量。
 
-        返回 ``success`` 或 ``rejected``。任何意外异常仍原样抛给外层：单专家入口会把
-        批次记为 failed；全量入口会把当前专家记为 failed 并继续下一位。``progress``
-        在每一步成功后更新，供两类入口正确统计。
+        返回 ``success`` 或 ``rejected``。异常原样交给入口处理：单专家入口结束整个
+        批次，批量入口只结束当前专家。``progress`` 保存异常发生前已完成阶段的数量。
         """
 
         aggregate = self.source.load_expert(expert_id)
@@ -496,8 +553,7 @@ class ExpertIndexPipeline:
         )
         chunks = self.factory.build_all(profile, employments, projects)
         if not chunks:
-            # “专家存在但无可生成内容”是业务拒绝而非程序错误。保存当前 Stage、标记
-            # rejected，并通过下游空快照删除旧向量，避免旧数据继续参与检索。
+            # 无可生成内容属于 rejected 业务结果：保存当前 Stage，并用空快照清除旧向量。
             progress.stage_count = self.repository.persist_rejected_stage_snapshot(
                 profile,
                 employments,
@@ -513,8 +569,7 @@ class ExpertIndexPipeline:
             employments,
             projects,
         )
-        # Stage 已提交后记录本轮内存产出数；向量同步若失败，外层会把本专家标记为
-        # failed，重跑时由下游当前状态和哈希完成幂等修复。
+        # Stage 提交后记录 Chunk 数量；向量同步失败时外层会把本专家标记为 failed。
         progress.chunk_count = len(chunks)
         self._sync_expert_vectors(expert_id, chunks)
         return "success"
@@ -524,7 +579,10 @@ class ExpertIndexPipeline:
         expert_id: int,
         chunks: list[ChunkRecord],
     ) -> None:
-        """把一位专家的当前 Chunk 快照同步到下游公共 Python 服务。"""
+        """把 Chunk 转为公共 Contract，并同步一位专家的完整向量快照。
+
+        ``chunks`` 为空时也会调用下游，用于删除该专家已存在但本次不再产出的向量。
+        """
 
         updated_at = datetime.now(ZoneInfo(self.settings.timezone))
         contracts = chunk_records_to_contracts(
@@ -536,7 +594,7 @@ class ExpertIndexPipeline:
 
 
 def _validate_data_version(data_version: str) -> None:
-    """在创建批次前验证业务版本，供单专家和全量入口共同调用。"""
+    """拒绝空数据版本，避免创建无法追踪来源版本的构建批次。"""
 
     if not data_version.strip():
         raise ValueError("data_version 不能为空")
@@ -548,11 +606,10 @@ def _validate_candidate_page(
     after_id: int,
     upper_bound_id: int,
 ) -> None:
-    """防御性检查 Source 返回页的顺序和固定范围。
+    """检查候选页 ID 严格递增，并且位于当前游标和固定上界之间。
 
-    正常 MySQL Source 已通过 ``ORDER BY id ASC`` 保证该契约；此处仍在 Pipeline 边界
-    校验，防止替代 Source、测试 Fake 或未来实现返回重复/倒序 ID，造成游标回退、死循环
-    或专家重复加工。失败属于批次级错误，因此不会继续推进游标。
+    校验失败会终止批次且不推进游标，防止重复、倒序或越界 ID 导致漏处理、重复处理
+    或分页死循环。
     """
 
     ids = [candidate.id for candidate in candidates]
@@ -585,15 +642,13 @@ def _single_batch_no(expert_id: int) -> str:
 
 
 def _full_batch_no() -> str:
-    """生成全量任务业务批次号，供 ``build_many`` 未显式传编号时使用。"""
+    """为未指定批次号的全量任务生成带时间戳的唯一业务编号。"""
 
     timestamp = datetime.now().astimezone().strftime("%Y%m%d%H%M%S%f")
     return f"full_{timestamp}"
 
 
-# 保留旧私有函数名，避免项目外仍有调试脚本直接引用时立即中断；正式调用应通过
-# build_one，由它使用语义更明确的 _single_batch_no。该别名不产生额外行为。
 def _batch_no(expert_id: int) -> str:
-    """兼容旧名称，委托给 :func:`_single_batch_no`。"""
+    """生成与 :func:`_single_batch_no` 相同的单专家批次号。"""
 
     return _single_batch_no(expert_id)

@@ -11,7 +11,11 @@ from typing import Any, Self
 import pytest
 
 from expert_index.config import DatabaseConfig
-from expert_index.repository import ConcurrentBuildError, MySQLIndexRepository
+from expert_index.repository import (
+    BatchNotResumableError,
+    ConcurrentBuildError,
+    MySQLIndexRepository,
+)
 
 
 class RecordingCursor:
@@ -108,6 +112,77 @@ def test_full_batch_start_persists_version_cursor_and_upper_bound(
     assert params == ("full_repository_test", "20260814_01", 999)
     assert connection.commit_count == 1
     assert connection.closed is True
+
+
+def test_resume_batch_reuses_checkpoint_and_reactivates_original_row(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """failed full 批次应在同一事务中恢复原版本、范围、游标和累计计数。"""
+
+    cursor = RecordingCursor(
+        one={
+            "id": 801,
+            "batch_no": "interrupted_full_batch",
+            "run_mode": "full",
+            "data_version": "20260818_04",
+            "status": "failed",
+            "cursor_id": 20,
+            "upper_bound_id": 40,
+            "candidate_count": 2,
+            "success_count": 1,
+            "failed_count": 0,
+            "rejected_count": 1,
+            "deactivated_count": 0,
+            "extracted_count": 2,
+            "stage_count": 2,
+            "chunk_count": 1,
+        }
+    )
+    connection = RecordingConnection(cursor)
+    _patch_connection(monkeypatch, connection)
+
+    checkpoint = _repository().resume_batch(801)
+
+    assert checkpoint.batch_id == 801
+    assert checkpoint.data_version == "20260818_04"
+    assert checkpoint.cursor_id == 20
+    assert checkpoint.upper_bound_id == 40
+    assert checkpoint.candidate_count == 2
+    assert checkpoint.success_count == 1
+    assert checkpoint.rejected_count == 1
+    assert "FOR UPDATE" in cursor.executed[0][0]
+    assert cursor.executed[0][1] == (801,)
+    assert "SET status='running', error_summary=NULL, finished_at=NULL" in cursor.executed[1][0]
+    assert cursor.executed[1][1] == (801,)
+    assert connection.commit_count == 1
+    assert connection.rollback_count == 0
+
+
+def test_resume_batch_rejects_completed_batch_without_reactivating_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """success/partial 已完成扫描，不属于断点续跑，不能改回 running。"""
+
+    cursor = RecordingCursor(
+        one={
+            "id": 801,
+            "batch_no": "completed_full_batch",
+            "run_mode": "full",
+            "data_version": "20260818_04",
+            "status": "partial",
+            "cursor_id": 40,
+            "upper_bound_id": 40,
+        }
+    )
+    connection = RecordingConnection(cursor)
+    _patch_connection(monkeypatch, connection)
+
+    with pytest.raises(BatchNotResumableError, match="不能断点续跑"):
+        _repository().resume_batch(801)
+
+    assert len(cursor.executed) == 1
+    assert connection.commit_count == 0
+    assert connection.rollback_count == 1
 
 
 def test_batch_item_lifecycle_and_page_progress_use_safe_columns(

@@ -1,6 +1,7 @@
 """专家索引流水线命令行入口。
 
-常用顺序：先 ``init-db``，再用 ``build`` 重建单专家或用 ``build-batch`` 运行全量。
+常用顺序：先 ``init-db``，再用 ``build`` 重建单专家、用 ``build-batch`` 运行全量，
+或用 ``resume-batch`` 从一个中断批次的可靠页游标继续。
 两类构建命令都会以内存方法调用把 Chunk 交给下游向量服务，不再写入或读取
 ``expert_chunk``。命令输出只包含数量和状态，不打印 Chunk 正文。
 """
@@ -61,6 +62,23 @@ def build_parser() -> argparse.ArgumentParser:
     )
     build_batch.add_argument("--batch-no", help="可选业务批次号；不传时自动生成")
 
+    resume_batch = sub.add_parser(
+        "resume-batch",
+        help="从中断 full 批次最后完整提交页之后继续加工",
+    )
+    resume_batch.add_argument(
+        "--batch-id",
+        type=int,
+        required=True,
+        help="要恢复的 expert_index_batch.id",
+    )
+    resume_batch.add_argument(
+        "--page-size",
+        type=int,
+        default=200,
+        help="续跑每页候选专家数，范围 1~1000，默认 200",
+    )
+
     # 该命令是显式测试数据写入入口，不会在 init-db/build 中自动运行。
     sub.add_parser(
         "seed-test-expert",
@@ -93,6 +111,14 @@ def main(argv: list[str] | None = None) -> None:
             page_size=args.page_size,
             max_experts=args.max_experts,
             batch_no=args.batch_no,
+        )
+        print(json.dumps(asdict(result), ensure_ascii=False, sort_keys=True))
+    elif args.command == "resume-batch":
+        # data_version、扫描上界、批次号和累计计数均从原批次恢复，CLI 只允许调整
+        # 本次读取页大小，防止续跑意外改变原任务范围。
+        result = _build_pipeline(settings, repository).resume_many(
+            args.batch_id,
+            page_size=args.page_size,
         )
         print(json.dumps(asdict(result), ensure_ascii=False, sort_keys=True))
     elif args.command == "seed-test-expert":

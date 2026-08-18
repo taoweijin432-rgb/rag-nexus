@@ -20,6 +20,7 @@ from expert_index.cli import build_parser
 from expert_index.config import DatabaseConfig, Settings
 from expert_index.models import ExpertAggregate, ExpertCandidate, ExpertSource
 from expert_index.pipeline import ExpertIndexPipeline
+from expert_index.repository import FullBatchCheckpoint
 
 
 def _settings() -> Settings:
@@ -109,6 +110,9 @@ class FakeRepository:
         self.deactivated_expert_ids: list[int] = []
         self.events: list[tuple[str, Any]] = []
         self.progress_calls: list[dict[str, Any]] = []
+        self.resume_calls: list[int] = []
+        self.resume_checkpoint: FullBatchCheckpoint | None = None
+        self.fail_finish_item_ids: set[int] = set()
 
     @contextmanager
     def build_lock(self, run_mode: str) -> Iterator[None]:
@@ -120,6 +124,12 @@ class FakeRepository:
     def start_batch(self, batch_no: str, run_mode: str, **kwargs: Any) -> int:
         self.start_calls.append((batch_no, run_mode, kwargs))
         return 701
+
+    def resume_batch(self, batch_id: int) -> FullBatchCheckpoint:
+        self.resume_calls.append(batch_id)
+        if self.resume_checkpoint is None:
+            raise AssertionError("测试未配置恢复检查点")
+        return self.resume_checkpoint
 
     def finish_batch(self, batch_id: int, **kwargs: Any) -> None:
         self.finish_calls.append((batch_id, kwargs))
@@ -162,6 +172,8 @@ class FakeRepository:
         self.events.append(("running", (batch_id, expert_id)))
 
     def finish_batch_item(self, batch_id: int, expert_id: int, **kwargs: Any) -> None:
+        if expert_id in self.fail_finish_item_ids:
+            raise RuntimeError("虚构批次明细写入失败")
         self.events.append(("finished", (batch_id, expert_id, kwargs)))
 
     def update_batch_progress(self, batch_id: int, **kwargs: Any) -> None:
@@ -322,6 +334,54 @@ def test_build_many_limits_scope_to_first_n_candidates() -> None:
     assert repository.start_calls[0][2]["upper_bound_id"] == 20
 
 
+def test_resume_many_continues_after_last_complete_page_with_original_scope() -> None:
+    """续跑应复用原批次范围和计数，只读取可靠游标之后的候选。"""
+
+    source = FakeSource(
+        [
+            ExpertCandidate(id=10, deleted_at=None),
+            ExpertCandidate(id=20, deleted_at=None),
+            ExpertCandidate(id=30, deleted_at=None),
+            ExpertCandidate(id=40, deleted_at=None),
+        ]
+    )
+    repository = FakeRepository()
+    repository.resume_checkpoint = FullBatchCheckpoint(
+        batch_id=701,
+        batch_no="original_interrupted_batch",
+        data_version="20260818_04",
+        cursor_id=20,
+        upper_bound_id=40,
+        candidate_count=2,
+        success_count=2,
+        failed_count=0,
+        rejected_count=0,
+        deactivated_count=0,
+        extracted_count=2,
+        stage_count=2,
+        chunk_count=2,
+    )
+
+    result = _pipeline(source, repository).resume_many(701, page_size=1)
+
+    assert result.batch_id == 701
+    assert result.batch_no == "original_interrupted_batch"
+    assert result.upper_bound_id == 40
+    assert result.cursor_id == 40
+    assert result.candidate_count == 4
+    assert result.success_count == 4
+    assert result.extracted_count == 4
+    assert result.stage_count == 4
+    assert result.chunk_count == 4
+    assert repository.lock_modes == ["full"]
+    assert repository.resume_calls == [701]
+    assert repository.start_calls == []
+    assert source.upper_bound_calls == 0
+    assert source.page_calls == [(20, 40, 1), (30, 40, 1)]
+    assert source.loaded_ids == [30, 40]
+    assert repository.persisted_expert_ids == [30, 40]
+
+
 def test_build_many_deactivates_deleted_candidate_without_loading_source() -> None:
     """deleted 专家不读取正文，完成历史停用后记为 deactivated。"""
 
@@ -404,6 +464,35 @@ def test_build_many_marks_batch_failed_when_candidate_page_is_invalid() -> None:
     assert repository.finish_calls[-1][1]["status"] == "failed"
 
 
+def test_failed_page_keeps_last_complete_page_counts_for_safe_resume() -> None:
+    """页中途发生编排错误时，批次主表不能写入该页的部分内存计数。"""
+
+    source = FakeSource(
+        [
+            ExpertCandidate(id=10, deleted_at=None),
+            ExpertCandidate(id=20, deleted_at=None),
+        ]
+    )
+    repository = FakeRepository()
+    repository.fail_finish_item_ids = {20}
+
+    with pytest.raises(RuntimeError, match="批次明细写入失败"):
+        _pipeline(source, repository).build_many(
+            data_version="20260818_05",
+            page_size=2,
+            batch_no="failed_mid_page_batch",
+        )
+
+    failed_finish = repository.finish_calls[-1][1]
+    assert failed_finish["status"] == "failed"
+    assert failed_finish["cursor_id"] == 0
+    assert failed_finish["candidate_count"] == 0
+    assert failed_finish["success_count"] == 0
+    assert failed_finish["extracted_count"] == 0
+    assert failed_finish["stage_count"] == 0
+    assert failed_finish["chunk_count"] == 0
+
+
 @pytest.mark.parametrize("page_size", [0, 1001])
 def test_build_many_rejects_invalid_page_size_before_source_access(page_size: int) -> None:
     """无效页大小必须在固定上界查询和批次创建之前失败。"""
@@ -463,3 +552,18 @@ def test_cli_exposes_full_batch_entry_with_explicit_page_size() -> None:
     assert args.max_experts == 500
     assert args.batch_no == "full_cli_test"
     assert not hasattr(args, "vectorize")
+
+
+def test_cli_exposes_resume_batch_without_scope_overrides() -> None:
+    """续跑命令只接收原批次 ID 和本次分页大小。"""
+
+    args = build_parser().parse_args(
+        ["resume-batch", "--batch-id", "701", "--page-size", "50"]
+    )
+
+    assert args.command == "resume-batch"
+    assert args.batch_id == 701
+    assert args.page_size == 50
+    assert not hasattr(args, "data_version")
+    assert not hasattr(args, "max_experts")
+    assert not hasattr(args, "batch_no")

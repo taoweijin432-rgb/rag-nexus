@@ -1,7 +1,6 @@
-"""专家索引派生库的 MySQL Repository（数据访问层）。
+"""专家索引派生库的 MySQL 数据访问层。
 
-这个文件集中管理加工批次和 Stage 快照如何写入 MySQL，自身不负责读取业务源表，
-也不负责清洗文本、生成 Chunk 或传输向量数据。完整职责包括：
+本文件负责索引加工过程中的数据库协调和持久化：
 
 1. 执行受版本控制的建表或迁移 SQL；
 2. 用 MySQL 命名锁协调 single/full 任务，并管理批次主表；
@@ -9,14 +8,9 @@
 4. 保存专家、工作和项目 Stage 当前快照；
 5. 对无内容或已删除专家维护 Stage 的拒绝状态。
 
-最重要的事务边界在 :meth:`persist_stage_snapshot`、
-:meth:`persist_rejected_stage_snapshot` 和 :meth:`mark_deleted_stage`：一位专家的
-Profile、工作和项目 Stage 必须作为整体提交。Chunk 只通过内存 Contract 交给下游，
-不在本 Repository 落库。
-
-本文件不是独立运行脚本，直接运行不会自动写库；它由 ``cli.py`` 和 ``pipeline.py``
-创建并调用。``init-db`` 执行 Batch/Stage 建表，``build`` 与 ``build-batch`` 调用
-批次和 Stage 持久化方法。
+本层不读取业务源表，不清洗文本，不生成 Chunk，也不调用向量服务。一位专家的
+Profile、工作和项目 Stage 始终在同一事务中整体替换；Chunk 仅通过内存 Contract
+传给下游，不在本 Repository 落库。
 """
 
 from __future__ import annotations
@@ -24,6 +18,7 @@ from __future__ import annotations
 import json
 from collections.abc import Iterator
 from contextlib import contextmanager, suppress
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -32,44 +27,58 @@ import pymysql
 from .config import DatabaseConfig
 from .models import EmploymentStage, ProfileStage, ProjectStage
 
-# MySQL 命名锁由连接持有。第一版让 single/full 共用一个全局加工锁，以最简单、可靠的
-# 方式避免两个全量任务并发，也避免全量期间单独重建专家。后续若有并发吞吐需求，可以
-# 在保持本接口不变的前提下升级为“全量锁 + 专家级锁”。
+# single/full 共用一个由 MySQL 连接持有的全局锁，防止构建任务并发改写派生数据。
 BUILD_LOCK_PREFIX = "expert_index_build_v1"
 
 _BATCH_ITEM_FINAL_STATUSES = {"success", "rejected", "deactivated", "failed"}
 
 
 class ConcurrentBuildError(RuntimeError):
-    """另一个专家索引加工任务已持有第一版全局互斥锁。"""
+    """表示另一个专家索引加工任务正在持有全局互斥锁。"""
+
+
+class BatchNotResumableError(RuntimeError):
+    """指定批次不存在、已经完成，或不具备可靠的全量续跑状态。"""
+
+
+@dataclass(frozen=True)
+class FullBatchCheckpoint:
+    """保存全量批次最后完整提交页的游标、范围和累计数量。"""
+
+    batch_id: int
+    batch_no: str
+    data_version: str
+    cursor_id: int
+    upper_bound_id: int
+    candidate_count: int
+    success_count: int
+    failed_count: int
+    rejected_count: int
+    deactivated_count: int
+    extracted_count: int
+    stage_count: int
+    chunk_count: int
 
 
 class MySQLIndexRepository:
-    """封装索引派生表的全部 MySQL 操作。
+    """封装批次跟踪和 Stage 当前快照的全部 MySQL 操作。
 
-    ``MySQLSourceAdapter`` 只从业务源表读取，Repository 只管理派生表，因此源库读取
-    与索引库写入不会相互耦合。测试可以用假 Repository 替换本类而无需连接 MySQL。
+    每个公开方法自行管理短连接；需要原子更新多张 Stage 表的方法会在同一连接事务中
+    提交或回滚。构造对象只保存连接配置，不立即访问数据库。
     """
 
     def __init__(self, config: DatabaseConfig) -> None:
-        # 保存索引库连接配置。这里只保存参数，不会在构造对象时立即建立连接；
-        # 每个公开操作都会创建自己的短连接，并在 finally 中可靠关闭。
+        # 仅保存索引库连接配置，实际连接由各公开操作按需创建并关闭。
         self.config = config
 
     @contextmanager
     def build_lock(self, run_mode: str) -> Iterator[None]:
-        """在一次 single/full 加工期间持有 MySQL 命名锁。
+        """在一次 single/full 加工的完整生命周期内持有 MySQL 命名锁。
 
-        功能与用途
-        ----------
-        Pipeline 在创建批次之前进入本上下文，并在整次任务完成或抛出异常后退出。
-        ``GET_LOCK(..., 0)`` 不等待：若已有任务运行，立即抛出
-        :class:`ConcurrentBuildError`，因此不会出现两个全量任务同时写批次游标，也不会
-        出现单专家任务与全量任务同时重建同一专家。
-
-        锁只用于任务编排，不包裹业务 SQL 事务。连接必须在整个 ``yield`` 期间保持打开，
-        因为关闭连接会让 MySQL 自动释放命名锁。``run_mode`` 只用于校验和错误说明；
-        第一版 single/full 刻意共用同一个锁名，以正确性优先。
+        ``GET_LOCK(..., 0)`` 不等待；锁已被占用时立即抛出
+        :class:`ConcurrentBuildError`。锁连接在上下文退出前保持打开，保证批次创建、处理
+        和收口期间没有其他 single/full 任务并发执行。该锁只负责任务互斥，不作为业务
+        SQL 的事务连接。
         """
 
         if run_mode not in {"single", "full"}:
@@ -90,52 +99,49 @@ class MySQLIndexRepository:
             yield
         finally:
             if acquired:
-                # RELEASE_LOCK 失败不应掩盖 Pipeline 原本的业务异常；连接关闭后 MySQL
-                # 仍会兜底释放该会话持有的命名锁。
+                # 释放失败不覆盖原业务异常；关闭连接仍会释放该会话持有的命名锁。
                 with suppress(Exception), connection.cursor() as cursor:
                     cursor.execute("SELECT RELEASE_LOCK(%s)", (lock_name,))
             connection.close()
 
     def initialize_schema(self, sql_path: Path) -> None:
-        """执行指定的建表或迁移 SQL 文件。
+        """在一个连接中依次执行 SQL 文件中的全部非空语句。
 
         Parameters
         ----------
         sql_path:
-            SQL 文件路径。新库通常传入 ``001_create_expert_index_tables.sql``；已有库
-            做结构升级时传入对应迁移脚本，例如 ``004``。
+            要执行的建表或迁移 SQL 文件路径。
 
         Effects
         -------
         - 按分号拆分并依次执行文件内 SQL；
         - 全部语句成功后提交；
-        - 任意语句失败时回滚当前连接并把原异常继续抛给 CLI；
-        - 本方法只执行文件已有内容，不会自行删除或创建额外业务表。
+        - 任意语句失败时回滚当前连接并继续抛出原异常；
+        - 只执行文件内已有语句，不生成额外 DDL。
 
         Notes
         -----
-        DDL 在不同 MySQL 版本中可能隐式提交，因此迁移脚本仍应设计为可审查、可备份，
-        不能仅依赖 Python 的 rollback 保证所有结构变化都可撤销。
+        MySQL DDL 可能隐式提交，因此 rollback 只能撤销数据库仍允许回滚的部分。
         """
 
-        # 统一用 UTF-8 读取版本库中的 SQL，避免中文 COMMENT 受系统编码影响。
+        # 固定使用 UTF-8，确保 SQL 中的中文注释和字段说明按预期读取。
         script = sql_path.read_text(encoding="utf-8")
-        # 当前项目 SQL 不包含存储过程，因此可以安全地按分号切成单条语句；空语句丢弃。
+        # SQL 文件不包含存储过程，可按分号拆分并忽略空语句。
         statements = [statement.strip() for statement in script.split(";") if statement.strip()]
-        # DDL 需要显式 commit，因此此处不开启 autocommit。
+        # 关闭自动提交，在语句全部执行后统一提交连接。
         connection = pymysql.connect(**self.config.as_kwargs())
         try:
             with connection.cursor() as cursor:
                 for statement in statements:
                     cursor.execute(statement)
-            # 只有所有语句都没有异常时才提交连接级事务。
+            # 全部语句成功后统一提交。
             connection.commit()
         except Exception:
-            # 尽可能撤销尚未被 MySQL 隐式提交的语句，再把异常交给上层处理。
+            # 回滚仍处于事务中的语句，再把异常交给调用方。
             connection.rollback()
             raise
         finally:
-            # 无论成功还是失败都关闭连接，避免 CLI 多次运行后耗尽连接数。
+            # 无论成功或失败都关闭本次连接。
             connection.close()
 
     def start_batch(
@@ -148,10 +154,9 @@ class MySQLIndexRepository:
     ) -> int:
         """创建一条 ``running`` 状态的构建批次，并返回批次主键。
 
-        ``single`` 保留原来的最小 INSERT，兼容尚未执行 005 迁移的单专家环境。
-        ``full`` 必须同时提供 ``data_version`` 和固定的 ``upper_bound_id``，并把初始
-        ``cursor_id`` 写为 0；Pipeline 随后通过 :meth:`update_batch_progress` 按页推进。
-        返回的自增 ``batch_id`` 会进入 Stage、Chunk 和专家级批次明细。
+        ``single`` 只写入批次号、运行模式和状态。``full`` 还要求数据版本和固定扫描
+        上界，并把初始游标设为 0。返回的 ``batch_id`` 用于关联 Stage 和专家级批次
+        明细；批量任务随后通过 :meth:`update_batch_progress` 按完整页推进游标。
         """
 
         if run_mode == "full":
@@ -174,7 +179,7 @@ class MySQLIndexRepository:
                         (batch_no, data_version, upper_bound_id),
                     )
                 else:
-                    # single 不依赖 005 新列，保留现有数据库的向后兼容能力。
+                    # single 批次不需要全量扫描版本、游标和固定上界。
                     cursor.execute(
                         """
                         INSERT INTO expert_index_batch(batch_no, run_mode, status)
@@ -182,9 +187,9 @@ class MySQLIndexRepository:
                         """,
                         (batch_no, run_mode),
                     )
-                # lastrowid 是刚插入 expert_index_batch 的自增主键。
+                # 返回刚创建批次的自增主键，供后续数据关联使用。
                 batch_id = int(cursor.lastrowid)
-            # 批次必须先落库，后续 Source/Normalize 失败时才能回写 failed 状态。
+            # 先提交 running 批次，后续任何阶段失败时才能回写其最终状态。
             connection.commit()
             return batch_id
         finally:
@@ -208,15 +213,11 @@ class MySQLIndexRepository:
     ) -> None:
         """写回批次最终状态、各阶段计数和结束时间。
 
-        该方法通常由 Pipeline 的成功或异常分支调用。它只更新批次统计，不写 Stage
-        或 Chunk。``error_summary`` 会序列化为 JSON；调用方只能传异常类型、简短说明
-        等安全信息，不应放入专家背景、工作描述、项目正文或联系方式。
+        本方法只更新批次主表，不写 Stage 或 Chunk。``single`` 写入处理数量和错误摘要；
+        ``full`` 还必须完整提供最终游标及专家分类计数。两种模式都会设置结束时间。
 
-        Effects
-        -------
-        full 调用额外传入最终游标和五类专家计数；single 不传这些参数，继续使用旧列。
-        两种模式都会写入结束时间。该分支设计让单专家命令不强依赖 005 迁移，同时让
-        全量批次主表能完整反映最终处理结果。
+        ``error_summary`` 会序列化为 JSON，只应包含异常类型、机器码或简短安全说明，
+        不应包含专家背景、经历正文、联系方式或 Chunk Text。
         """
 
         full_counts = (
@@ -270,12 +271,102 @@ class MySQLIndexRepository:
         finally:
             connection.close()
 
+    def resume_batch(self, batch_id: int) -> FullBatchCheckpoint:
+        """锁定并重新激活中断的 full 批次，返回可靠页级检查点。
+
+        只允许恢复 ``running`` 或 ``failed`` 的 full 批次。``success`` 已完成，
+        ``partial`` 也已扫描至固定上界，因此两者都不能续跑。方法在一个事务中校验批次
+        类型、状态、游标和累计计数，将状态改回 running，并清除结束时间和错误摘要。
+        返回值供 Pipeline 从原版本、固定上界和最后完整页之后继续处理。
+        """
+
+        if isinstance(batch_id, bool) or not isinstance(batch_id, int) or batch_id < 1:
+            raise ValueError("batch_id 必须是正整数")
+
+        connection = pymysql.connect(**self.config.as_kwargs())
+        try:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    SELECT id, batch_no, run_mode, data_version, status,
+                           cursor_id, upper_bound_id, candidate_count,
+                           success_count, failed_count, rejected_count,
+                           deactivated_count, extracted_count, stage_count,
+                           chunk_count
+                    FROM expert_index_batch
+                    WHERE id=%s
+                    FOR UPDATE
+                    """,
+                    (batch_id,),
+                )
+                row = cursor.fetchone()
+                if not row:
+                    raise BatchNotResumableError(f"批次 {batch_id} 不存在")
+                if row.get("run_mode") != "full":
+                    raise BatchNotResumableError(
+                        f"批次 {batch_id} 不是 full 批次，不能断点续跑"
+                    )
+                status = row.get("status")
+                if status not in {"running", "failed"}:
+                    raise BatchNotResumableError(
+                        f"批次 {batch_id} 状态为 {status}，不能断点续跑"
+                    )
+
+                data_version = row.get("data_version")
+                cursor_id = row.get("cursor_id")
+                upper_bound_id = row.get("upper_bound_id")
+                if not data_version or cursor_id is None or upper_bound_id is None:
+                    raise BatchNotResumableError(
+                        f"批次 {batch_id} 缺少 data_version 或扫描游标"
+                    )
+                cursor_id = int(cursor_id)
+                upper_bound_id = int(upper_bound_id)
+                if cursor_id < 0 or upper_bound_id < 0 or cursor_id > upper_bound_id:
+                    raise BatchNotResumableError(f"批次 {batch_id} 的扫描游标无效")
+
+                count_names = (
+                    "candidate_count",
+                    "success_count",
+                    "failed_count",
+                    "rejected_count",
+                    "deactivated_count",
+                    "extracted_count",
+                    "stage_count",
+                    "chunk_count",
+                )
+                counts = {name: int(row.get(name) or 0) for name in count_names}
+                if any(value < 0 for value in counts.values()):
+                    raise BatchNotResumableError(f"批次 {batch_id} 的累计计数无效")
+
+                checkpoint = FullBatchCheckpoint(
+                    batch_id=int(row["id"]),
+                    batch_no=str(row["batch_no"]),
+                    data_version=str(data_version),
+                    cursor_id=cursor_id,
+                    upper_bound_id=upper_bound_id,
+                    **counts,
+                )
+                cursor.execute(
+                    """
+                    UPDATE expert_index_batch
+                    SET status='running', error_summary=NULL, finished_at=NULL
+                    WHERE id=%s
+                    """,
+                    (batch_id,),
+                )
+            connection.commit()
+            return checkpoint
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+
     def prepare_batch_items(self, batch_id: int, expert_ids: list[int]) -> None:
         """在处理一页候选前，幂等登记该页专家的 ``pending`` 明细。
 
-        Pipeline 每取得并校验一页候选后调用一次。唯一键 ``(batch_id, expert_id)``
-        保证重复登记不会产生重复行；冲突时不覆盖已有状态，便于保留已完成结果。
-        本方法只准备明细，不表示专家已经开始处理。
+        唯一键 ``(batch_id, expert_id)`` 保证重复登记不产生新行，冲突时也不覆盖已有
+        状态。该操作只声明本页候选已进入批次，不表示专家已经开始处理。
         """
 
         if not expert_ids:
@@ -300,11 +391,10 @@ class MySQLIndexRepository:
             connection.close()
 
     def mark_batch_item_running(self, batch_id: int, expert_id: int) -> None:
-        """把一位已登记专家标记为 running，并增加本批次尝试次数。
+        """把已登记专家标记为 running，并重置本次尝试的结果字段。
 
-        该方法在 Pipeline 真正读取或停用专家之前调用。重新尝试时会清理上次终态计数
-        和结果码；``started_at`` 记录本次开始时间。若明细不存在，受影响行数为 0，
-        Pipeline 的测试会通过调用顺序防止这种用法。
+        每次调用都会增加 ``attempt_count``，清空上次计数、结果码、错误和结束时间，
+        并记录新的开始时间。后续处理结果由 :meth:`finish_batch_item` 写入。
         """
 
         connection = pymysql.connect(**self.config.as_kwargs())
@@ -341,8 +431,8 @@ class MySQLIndexRepository:
 
         只接受 success/rejected/deactivated/failed 四个终态。``result_code`` 用于区分
         ``expert_deleted``、``no_chunkable_content`` 等可预期业务结果；``error_type``
-        只保存异常类名。本方法不接收异常消息、源字段或 Chunk Text，避免批次明细泄露
-        真实数据。它由 Pipeline 在单个专家处理完成后调用。
+        只保存异常类名。方法同时写入本次实际处理数量和结束时间，不接收异常消息、
+        源字段或 Chunk Text。
         """
 
         if status not in _BATCH_ITEM_FINAL_STATUSES:
@@ -385,9 +475,9 @@ class MySQLIndexRepository:
     ) -> None:
         """在一整页专家到达终态后，持久化全量游标与累计计数。
 
-        Pipeline 只有在该页所有批次明细都成功写成终态后才调用本方法。因此数据库中的
-        ``cursor_id`` 永远不会越过尚未可靠记录的专家，为以后断点续跑保留可信基础。
-        当前第一版仍从 0 开始新任务，不自动恢复旧批次。
+        该方法把游标和所有累计数量作为同一个页级检查点写入 running 批次。Pipeline
+        只在整页明细全部到达终态后调用，因此中断时游标不会越过未可靠记录的专家；
+        续跑从该游标之后开始，未完成页会整体重跑。
         """
 
         connection = pymysql.connect(**self.config.as_kwargs())
@@ -425,6 +515,7 @@ class MySQLIndexRepository:
             专家级 Stage，一位专家只有一行，按 ``expert_id`` Upsert。
         employments/projects:
             本轮从有效源记录生成的工作、项目 Stage 完整列表。
+
         Effects
         -------
         1. Upsert 专家 Stage；
@@ -438,12 +529,12 @@ class MySQLIndexRepository:
             落一张 Stage 表，而是已聚合进 Profile Stage 的学校和专业数组。
         """
 
-        # 一位专家的全部写操作共用此连接，才能形成同一个数据库事务。
+        # 一位专家的全部 Stage 写入共用同一连接和事务。
         connection = pymysql.connect(**self.config.as_kwargs())
         try:
             with connection.cursor() as cursor:
                 self._replace_stage_snapshot(cursor, profile, employments, projects)
-            # commit 是这位专家的新快照对其他连接正式可见的时刻。
+            # 全部表更新成功后，新快照才整体对其他连接可见。
             connection.commit()
             return 1 + len(employments) + len(projects)
         except Exception:
@@ -462,14 +553,9 @@ class MySQLIndexRepository:
     ) -> int:
         """保存“存在但无可生成内容”的当前 Stage，并标记拒绝原因。
 
-        用途
-        ----
-        ``Pipeline._process_expert`` 已完成四表读取和标准化，但 ChunkFactory 返回空列表
-        时调用本方法。该情况是可预期的 rejected 业务结果。Profile、经历 Stage 刷新和
-        Profile 拒绝标记在同一个专家事务中完成；历史向量由 Pipeline 的下游空快照删除。
-
-        返回值仍是本轮 Stage 行数，供批次统计使用。``reason`` 只允许安全机器码，不能
-        传入源数据或异常正文。
+        方法先整体替换 Profile、工作和项目 Stage，再在同一事务中把 Profile 标记为
+        rejected。``reason`` 只接受安全机器码。返回本轮 Stage 行数；向量删除不属于
+        本事务，由 Pipeline 另行发送空快照。
         """
 
         safe_reason = _safe_identifier(reason, max_length=64)
@@ -499,11 +585,9 @@ class MySQLIndexRepository:
     def mark_deleted_stage(self, expert_id: int, *, build_batch_id: int) -> None:
         """清理已逻辑删除专家的经历 Stage，并标记 Profile Stage。
 
-        全量候选扫描会保留 ``experts.deleted_at`` 非空的行，但不会再读取其四表正文。
-        Pipeline 对这类候选调用本方法：清空工作/项目当前 Stage，将已有 Profile Stage
-        标记为 rejected。历史向量通过随后传给下游的空快照删除。
-
-        所有修改属于一个事务；不存在历史 Stage 时也是成功的幂等操作。
+        在同一事务中删除工作和项目 Stage，并把已存在的 Profile Stage 标记为
+        ``rejected/expert_deleted``。没有历史 Stage 时不会新增占位数据，操作仍成功。
+        本方法不读取源正文，也不删除向量；向量由 Pipeline 通过空快照清理。
         """
 
         if expert_id <= 0 or build_batch_id <= 0:
@@ -544,9 +628,8 @@ class MySQLIndexRepository:
     ) -> None:
         """在调用方事务内替换一位专家的 Stage 当前快照。
 
-        ``persist_stage_snapshot`` 和 ``persist_rejected_stage_snapshot`` 共用这个内部
-        步骤，避免两条路径的 Profile/经历保存规则产生漂移。本方法不提交也不回滚，
-        事务由公开方法管理。
+        先 Upsert Profile，再删除该专家旧工作和项目 Stage，最后插入本轮完整经历列表。
+        本方法不提交或回滚，事务由调用它的公开方法统一管理。
         """
 
         self._upsert_profile(cursor, profile)
@@ -565,13 +648,11 @@ class MySQLIndexRepository:
 
     @staticmethod
     def _upsert_profile(cursor: Any, item: ProfileStage) -> None:
-        """插入或更新一行专家级 Stage。
+        """在调用方事务中插入或更新一行 Profile Stage。
 
-        ``expert_index_stage.expert_id`` 是主键：首次构建执行 INSERT，重复构建触发
-        ``ON DUPLICATE KEY UPDATE``。更新时会清除旧拒绝原因并恢复 ``stage_status``
-        为 ready。学校、专业元组在写入 JSON 列前转换为列表并严格序列化。
-
-        该私有方法不 commit，事务由公开 Stage 快照方法统一控制。
+        以 ``expert_id`` 为主键执行 Upsert，完整覆盖标准化字段、来源哈希、数据版本和
+        构建批次。更新已有行时恢复 ``stage_status=ready`` 并清除旧拒绝原因；学校和
+        专业集合序列化为 JSON 数组。本方法不提交事务。
         """
 
         cursor.execute(
@@ -614,12 +695,10 @@ class MySQLIndexRepository:
 
     @staticmethod
     def _insert_employment(cursor: Any, item: EmploymentStage) -> None:
-        """插入一条工作经历 Stage 当前快照。
+        """在调用方事务中插入一条标准化后的工作经历 Stage。
 
-        调用前，Stage 快照方法已删除该专家的全部旧工作 Stage，因此这里只需
-        INSERT，不需要 Upsert。``source_field_id`` 可回查源表行；``source_item_key``
-        仍保留在中间层用于 Same Segment 和快照唯一约束，但不进入下游 Contract。
-        行业、主题元组以 JSON 数组写入。该方法不提交事务。
+        旧工作快照已由调用方删除，因此这里只执行 INSERT。来源定位字段随 Stage 保存，
+        行业和主题集合序列化为 JSON 数组。本方法不提交事务。
         """
 
         cursor.execute(
@@ -648,10 +727,10 @@ class MySQLIndexRepository:
 
     @staticmethod
     def _insert_project(cursor: Any, item: ProjectStage) -> None:
-        """把一条已经清洗、标准化完成的项目经历 Stage，插入MySQL的expert_index_project_stage 中间表。
-        它接收两个参数：
-            cursor：当前数据库事务的游标，用来执行 SQL。
-            item：一条 ProjectStage 对象，包含项目名称、公司、日期、描述、来源追踪和版本信息。
+        """在调用方事务中插入一条标准化后的项目经历 Stage。
+
+        旧项目快照已由调用方删除，因此这里只执行 INSERT。项目内容、来源定位、数据
+        版本和构建批次一并写入，行业和主题集合序列化为 JSON 数组。本方法不提交事务。
         """
 
         cursor.execute(
@@ -679,21 +758,20 @@ class MySQLIndexRepository:
         )
 
 def _json(value: Any) -> str:
-    """将数组或字典转换为可写入 MySQL JSON 列的确定性字符串。
+    """把数组或字典序列化为稳定且符合 JSON 标准的紧凑字符串。
 
-    ``sort_keys=True`` 使字典键顺序稳定；紧凑分隔符减少无意义空格；中文保持可读；
-    ``allow_nan=False`` 禁止写入 JSON 标准不支持的 NaN/Infinity。非法值会立即抛出
-    异常，并由外层专家事务回滚，而不是把坏数据静默写入派生表。
+    字典键排序保证相同输入得到相同字符串；中文不转义；NaN 和 Infinity 会触发异常，
+    从而由外层事务回滚，而不是写入非标准 JSON。
     """
 
     return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False)
 
 
 def _safe_identifier(value: str | None, *, max_length: int) -> str | None:
-    """清理写入批次明细的机器标识，拒绝正文式内容。
+    """截断并校验写入批次明细的机器标识。
 
-    result_code/error_type 只允许字母、数字、下划线、点和短横线。这样 Repository 的
-    接口层就能阻止调用方误把异常消息或专家正文写入批次审计表。
+    空值返回 ``None``；非空值只允许字母、数字、下划线、点和短横线，防止把异常消息
+    或专家正文误写入 ``result_code``、``error_type`` 等审计字段。
     """
 
     if value is None:
