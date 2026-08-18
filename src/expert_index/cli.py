@@ -29,7 +29,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="专家索引 Chunk 数据加工")
     sub = parser.add_subparsers(dest="command", required=True)
 
-    init = sub.add_parser("init-db", help="在派生索引库创建 Batch/Stage 表")
+    init = sub.add_parser("init-db", help="在派生索引库创建批次状态表")
     init.add_argument("--ddl", type=Path, default=DEFAULT_DDL)
 
     build = sub.add_parser("build", help="完整重建一位专家")

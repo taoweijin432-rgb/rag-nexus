@@ -1,17 +1,17 @@
 """专家索引加工流程的编排模块。
 
-本文件负责把源数据读取、标准化、Chunk 构建、契约校验、Stage 持久化和向量同步
+本文件负责把源数据读取、内存标准化、Chunk 构建、契约校验和向量同步
 组织成可执行的单专家及批量任务。固定处理顺序为：
 
-``Source → Normalize/Stage → Chunk → Validator → Stage MySQL → Vector Sync``
+``Source → Normalize/Stage（内存） → Chunk → Validator → Vector Sync``
 
 本文件只控制执行顺序和任务状态，不实现各阶段的领域规则：
 
 * ``source.py``：扫描全量候选，并读取一位专家的四表一致性快照；
 * ``normalize.py``：清洗和标准化来源字段，生成 Stage 对象；
 * ``chunk_builder.py``：生成三类 Chunk Text 与扁平 Metadata；
-* ``validators.py``：在写库前验证文本、ID、哈希、枚举和 PII；
-* ``repository.py``：管理批次，并以专家为事务单位保存 Stage；
+* ``validators.py``：在向量同步前验证文本、ID、哈希、枚举和 PII；
+* ``repository.py``：持久化批次、专家明细和分页检查点；
 * ``vector_sync.py``：把内存中的 Chunk Contract 交给下游向量服务。
 
 批量任务按固定 ID 上界分页，逐专家隔离领域处理失败，并只在完整一页处理结束后推进
@@ -50,8 +50,8 @@ class BuildResult:
     batch_no: str  # 单专家业务批次号；调用方不传时由 _single_batch_no 自动生成。
     expert_id: int  # 本次重建的 experts.id。
     extracted_count: int  # 1 条主档加工作、项目、教育来源记录数。
-    stage_count: int  # 成功事务提交的 Profile、Employment、Project Stage 行数。
-    chunk_count: int  # 成功事务提交的最终 Chunk 行数。
+    stage_count: int  # 不再持久化 Stage，因此新任务恒为 0。
+    chunk_count: int  # 成功同步到下游的最终 Chunk 行数。
     partial_chunk_count: int  # 当前流程不生成 partial Chunk，因此恒为 0。
 
 
@@ -71,26 +71,25 @@ class BatchBuildResult:
     upper_bound_id: int  # 启动时固定的最大 experts.id。
     cursor_id: int  # 本轮内存中最后完成调度的专家 ID。
     candidate_count: int  # 实际遍历的专家候选数，包括逻辑删除候选。
-    success_count: int  # 正常完成读取、生成、校验和事务落库的专家数。
+    success_count: int  # 正常完成读取、生成、校验和向量同步的专家数。
     failed_count: int  # 本轮发生异常但未阻止后续处理的专家数。
     rejected_count: int  # 存在但没有可生成内容，并已停用旧 Chunk 的专家数。
     deactivated_count: int  # 主档逻辑删除，并已停用历史 Chunk 的专家数。
     extracted_count: int  # 所有已推进专家读取到的四表来源记录总数。
-    stage_count: int  # 所有成功专家提交的 Stage 总数。
-    chunk_count: int  # 所有成功专家提交的 Chunk 总数。
+    stage_count: int  # 纯内存构建新增量为 0；续跑旧批次时保留其历史值。
+    chunk_count: int  # 已生成的 Chunk 总数；同步失败专家可能已产生 Chunk。
 
 
 @dataclass
 class _ExpertProgress:
     """记录一位专家在当前调用中已完成阶段的数量。
 
-    ``_process_expert`` 在读取、Stage 持久化和 Chunk 构建完成后分别更新对应字段，
-    使外层在成功或异常时都能记录已经实际发生的数量。该对象只存在于内存。
+    ``_process_expert`` 在来源读取和 Chunk 构建完成后更新对应字段，使外层在成功或
+    异常时都能记录已经实际发生的数量。该对象只存在于内存。
     """
 
     expert_id: int
     extracted_count: int = 0
-    stage_count: int = 0
     chunk_count: int = 0
 
 
@@ -125,7 +124,7 @@ class ExpertIndexPipeline:
         """在全局加工锁内创建 ``single`` 批次并完整重建一位专家。
 
         方法先校验专家 ID 和数据版本，再取得 single/full 共用的互斥锁。取得锁后创建
-        批次并执行完整专家处理；已有任务持锁时立即失败，不会并发改写 Stage 或向量。
+        批次并执行完整专家处理；已有任务持锁时立即失败，不会并发改写批次或向量。
         返回成功批次的数量摘要，处理异常由内部批次收口后继续向调用方抛出。
         """
 
@@ -169,7 +168,7 @@ class ExpertIndexPipeline:
                 batch_id,
                 status="success",
                 extracted_count=progress.extracted_count,
-                stage_count=progress.stage_count,
+                stage_count=0,
                 chunk_count=progress.chunk_count,
                 rejected_count=1 if outcome == "rejected" else 0,
             )
@@ -178,7 +177,7 @@ class ExpertIndexPipeline:
                 batch_no=actual_batch_no,
                 expert_id=expert_id,
                 extracted_count=progress.extracted_count,
-                stage_count=progress.stage_count,
+                stage_count=0,
                 chunk_count=progress.chunk_count,
                 partial_chunk_count=partial_count,
             )
@@ -188,7 +187,7 @@ class ExpertIndexPipeline:
                 batch_id,
                 status="failed",
                 extracted_count=progress.extracted_count,
-                stage_count=progress.stage_count,
+                stage_count=0,
                 chunk_count=progress.chunk_count,
                 rejected_count=1,
                 error_summary={"error_type": type(exc).__name__, "message": str(exc)[:400]},
@@ -312,10 +311,6 @@ class ExpertIndexPipeline:
                 try:
                     candidate = self.source.load_expert_candidate(expert_id)
                     if candidate.is_deleted:
-                        self.repository.mark_deleted_stage(
-                            expert_id,
-                            build_batch_id=checkpoint.batch_id,
-                        )
                         self._sync_expert_vectors(expert_id, [])
                         terminal_status = "deactivated"
                         result_code = "expert_deleted"
@@ -338,7 +333,7 @@ class ExpertIndexPipeline:
                     expert_id,
                     status=terminal_status,
                     extracted_count=progress.extracted_count,
-                    stage_count=progress.stage_count,
+                    stage_count=0,
                     chunk_count=progress.chunk_count,
                     result_code=result_code,
                     error_type=error_type,
@@ -519,11 +514,7 @@ class ExpertIndexPipeline:
                     error_type: str | None = None
                     try:
                         if candidate.is_deleted:
-                            # 删除候选不再读取正文；清理 Stage 后用空快照删除下游历史向量。
-                            self.repository.mark_deleted_stage(
-                                candidate.id,
-                                build_batch_id=batch_id,
-                            )
+                            # 删除候选不读取正文，直接用空快照删除下游历史向量。
                             self._sync_expert_vectors(candidate.id, [])
                             terminal_status = "deactivated"
                             result_code = "expert_deleted"
@@ -549,7 +540,7 @@ class ExpertIndexPipeline:
                         candidate.id,
                         status=terminal_status,
                         extracted_count=progress.extracted_count,
-                        stage_count=progress.stage_count,
+                        stage_count=0,
                         chunk_count=progress.chunk_count,
                         result_code=result_code,
                         error_type=error_type,
@@ -571,9 +562,8 @@ class ExpertIndexPipeline:
                                 }
                             )
 
-                    # 按已实际完成的阶段累计数量；failed 专家也可能已经完成部分读取。
+                    # 按已实际完成的阶段累计数量；failed 专家也可能已读取来源或生成 Chunk。
                     extracted_count += progress.extracted_count
-                    stage_count += progress.stage_count
                     chunk_count += progress.chunk_count
 
                 # 整页明细全部到达终态后，才把游标和累计数量作为同一检查点持久化。
@@ -664,11 +654,11 @@ class ExpertIndexPipeline:
         """执行一位 active 专家的完整领域链路并返回业务终态。
 
         * Source 读取主档、工作、项目、教育四表一致性快照；
-        * Normalize 生成 Profile/Employment/Project Stage；
+        * Normalize 在内存中生成 Profile/Employment/Project Stage；
         * ChunkFactory 生成三类 Chunk；
-        * Validator 在入库前执行完整契约检查；
-        * 有 Chunk 时，Repository 原子保存 Stage，随后以内存 Contract 同步下游；
-        * 无 Chunk 时，Repository 保存 rejected Stage，并以下游空快照删除旧向量。
+        * Validator 在向量同步前执行完整契约检查；
+        * 有 Chunk 时，通过内存 Contract 同步完整专家快照；
+        * 无 Chunk 时，通过空快照删除该专家的旧向量。
 
         返回 ``success`` 或 ``rejected``。异常原样交给入口处理：单专家入口结束整个
         批次，批量入口只结束当前专家。``progress`` 保存异常发生前已完成阶段的数量。
@@ -689,23 +679,12 @@ class ExpertIndexPipeline:
         )
         chunks = self.factory.build_all(profile, employments, projects)
         if not chunks:
-            # 无可生成内容属于 rejected 业务结果：保存当前 Stage，并用空快照清除旧向量。
-            progress.stage_count = self.repository.persist_rejected_stage_snapshot(
-                profile,
-                employments,
-                projects,
-                reason="no_chunkable_content",
-            )
+            # 无可生成内容属于 rejected 业务结果，用空快照清除旧向量。
             self._sync_expert_vectors(expert_id, [])
             return "rejected"
 
         validate_chunks(chunks)
-        progress.stage_count = self.repository.persist_stage_snapshot(
-            profile,
-            employments,
-            projects,
-        )
-        # Stage 提交后记录 Chunk 数量；向量同步失败时外层会把本专家标记为 failed。
+        # 校验完成后记录 Chunk 数量；向量同步失败时外层会把本专家标记为 failed。
         progress.chunk_count = len(chunks)
         self._sync_expert_vectors(expert_id, chunks)
         return "success"

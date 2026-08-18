@@ -388,27 +388,6 @@ def test_full_batch_finish_persists_final_cursor_and_all_expert_counts(
     assert connection.commit_count == 1
 
 
-def test_deleted_expert_stage_cleanup_is_one_idempotent_transaction(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """逻辑删除分支只清理并标记 Stage，不再读写 expert_chunk。"""
-
-    cursor = RecordingCursor(rows=[])
-    connection = RecordingConnection(cursor)
-    _patch_connection(monkeypatch, connection)
-
-    _repository().mark_deleted_stage(24, build_batch_id=801)
-
-    sql_calls = [sql for sql, _params in cursor.executed]
-    assert "DELETE FROM expert_index_employment_stage" in sql_calls[0]
-    assert "DELETE FROM expert_index_project_stage" in sql_calls[1]
-    assert "reject_reason='expert_deleted'" in sql_calls[2]
-    assert len(sql_calls) == 3
-    assert all("expert_chunk" not in sql for sql in sql_calls)
-    assert connection.commit_count == 1
-    assert connection.rollback_count == 0
-
-
 def test_batch_item_rejects_message_like_result_code_before_connect(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

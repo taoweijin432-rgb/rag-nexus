@@ -1,16 +1,14 @@
-"""专家索引派生库的 MySQL 数据访问层。
+"""专家索引任务状态的 MySQL 数据访问层。
 
-本文件负责索引加工过程中的数据库协调和持久化：
+本文件负责索引加工过程中的任务协调和状态持久化：
 
 1. 执行受版本控制的建表或迁移 SQL；
 2. 用 MySQL 命名锁协调 single/full 任务，并管理批次主表；
-3. 记录每位候选专家的 pending、running 和最终状态，以及页游标；
-4. 保存专家、工作和项目 Stage 当前快照；
-5. 对无内容或已删除专家维护 Stage 的拒绝状态。
+3. 记录每位候选专家的 pending、running 和最终状态；
+4. 持久化全量任务的处理范围、页游标与累计计数。
 
-本层不读取业务源表，不清洗文本，不生成 Chunk，也不调用向量服务。一位专家的
-Profile、工作和项目 Stage 始终在同一事务中整体替换；Chunk 仅通过内存 Contract
-传给下游，不在本 Repository 落库。
+本层不读取业务源表，不清洗文本，不持久化 Stage 或 Chunk，也不调用向量服务。
+标准化结果和 Chunk 通过内存 Contract 交给下游，只有可恢复的任务状态写入索引库。
 """
 
 from __future__ import annotations
@@ -25,7 +23,6 @@ from typing import Any
 import pymysql
 
 from .config import DatabaseConfig
-from .models import EmploymentStage, ProfileStage, ProjectStage
 
 # single/full 共用一个由 MySQL 连接持有的全局锁，防止构建任务并发改写派生数据。
 BUILD_LOCK_PREFIX = "expert_index_build_v1"
@@ -82,10 +79,10 @@ class BatchItemSummary:
 
 
 class MySQLIndexRepository:
-    """封装批次跟踪和 Stage 当前快照的全部 MySQL 操作。
+    """封装构建互斥、批次跟踪和专家明细的 MySQL 操作。
 
-    每个公开方法自行管理短连接；需要原子更新多张 Stage 表的方法会在同一连接事务中
-    提交或回滚。构造对象只保存连接配置，不立即访问数据库。
+    每个公开方法自行管理短连接并在操作结束后提交或关闭。构造对象只保存连接配置，
+    不立即访问数据库。
     """
 
     def __init__(self, config: DatabaseConfig) -> None:
@@ -683,267 +680,12 @@ class MySQLIndexRepository:
         finally:
             connection.close()
 
-    def persist_stage_snapshot(
-        self,
-        profile: ProfileStage,
-        employments: list[EmploymentStage],
-        projects: list[ProjectStage],
-    ) -> int:
-        """在一个事务中保存一位专家的完整 Stage 快照。
-
-        Parameters
-        ----------
-        profile:
-            专家级 Stage，一位专家只有一行，按 ``expert_id`` Upsert。
-        employments/projects:
-            本轮从有效源记录生成的工作、项目 Stage 完整列表。
-
-        Effects
-        -------
-        1. Upsert 专家 Stage；
-        2. 删除该专家旧工作/项目 Stage，再插入本轮完整 Stage 快照；
-        3. 全部成功才 commit，任意失败则 rollback。
-
-        Returns
-        -------
-        int
-            本轮 Stage 行数，即 ``1 + 工作经历数 + 项目经历数``。教育经历不会单独
-            落一张 Stage 表，而是已聚合进 Profile Stage 的学校和专业数组。
-        """
-
-        # 一位专家的全部 Stage 写入共用同一连接和事务。
-        connection = pymysql.connect(**self.config.as_kwargs())
-        try:
-            with connection.cursor() as cursor:
-                self._replace_stage_snapshot(cursor, profile, employments, projects)
-            # 全部表更新成功后，新快照才整体对其他连接可见。
-            connection.commit()
-            return 1 + len(employments) + len(projects)
-        except Exception:
-            connection.rollback()
-            raise
-        finally:
-            connection.close()
-
-    def persist_rejected_stage_snapshot(
-        self,
-        profile: ProfileStage,
-        employments: list[EmploymentStage],
-        projects: list[ProjectStage],
-        *,
-        reason: str,
-    ) -> int:
-        """保存“存在但无可生成内容”的当前 Stage，并标记拒绝原因。
-
-        方法先整体替换 Profile、工作和项目 Stage，再在同一事务中把 Profile 标记为
-        rejected。``reason`` 只接受安全机器码。返回本轮 Stage 行数；向量删除不属于
-        本事务，由 Pipeline 另行发送空快照。
-        """
-
-        safe_reason = _safe_identifier(reason, max_length=64)
-        if not safe_reason:
-            raise ValueError("rejected reason 不能为空")
-        connection = pymysql.connect(**self.config.as_kwargs())
-        try:
-            with connection.cursor() as cursor:
-                self._replace_stage_snapshot(cursor, profile, employments, projects)
-                cursor.execute(
-                    """
-                    UPDATE expert_index_stage
-                    SET stage_status='rejected', reject_reason=%s,
-                        build_batch_id=%s
-                    WHERE expert_id=%s
-                    """,
-                    (safe_reason, profile.build_batch_id, profile.expert_id),
-                )
-            connection.commit()
-            return 1 + len(employments) + len(projects)
-        except Exception:
-            connection.rollback()
-            raise
-        finally:
-            connection.close()
-
-    def mark_deleted_stage(self, expert_id: int, *, build_batch_id: int) -> None:
-        """清理已逻辑删除专家的经历 Stage，并标记 Profile Stage。
-
-        在同一事务中删除工作和项目 Stage，并把已存在的 Profile Stage 标记为
-        ``rejected/expert_deleted``。没有历史 Stage 时不会新增占位数据，操作仍成功。
-        本方法不读取源正文，也不删除向量；向量由 Pipeline 通过空快照清理。
-        """
-
-        if expert_id <= 0 or build_batch_id <= 0:
-            raise ValueError("expert_id 和 build_batch_id 必须大于 0")
-        connection = pymysql.connect(**self.config.as_kwargs())
-        try:
-            with connection.cursor() as cursor:
-                cursor.execute(
-                    "DELETE FROM expert_index_employment_stage WHERE expert_id=%s",
-                    (expert_id,),
-                )
-                cursor.execute(
-                    "DELETE FROM expert_index_project_stage WHERE expert_id=%s",
-                    (expert_id,),
-                )
-                cursor.execute(
-                    """
-                    UPDATE expert_index_stage
-                    SET stage_status='rejected', reject_reason='expert_deleted',
-                        build_batch_id=%s
-                    WHERE expert_id=%s
-                    """,
-                    (build_batch_id, expert_id),
-                )
-            connection.commit()
-        except Exception:
-            connection.rollback()
-            raise
-        finally:
-            connection.close()
-
-    def _replace_stage_snapshot(
-        self,
-        cursor: Any,
-        profile: ProfileStage,
-        employments: list[EmploymentStage],
-        projects: list[ProjectStage],
-    ) -> None:
-        """在调用方事务内替换一位专家的 Stage 当前快照。
-
-        先 Upsert Profile，再删除该专家旧工作和项目 Stage，最后插入本轮完整经历列表。
-        本方法不提交或回滚，事务由调用它的公开方法统一管理。
-        """
-
-        self._upsert_profile(cursor, profile)
-        cursor.execute(
-            "DELETE FROM expert_index_employment_stage WHERE expert_id=%s",
-            (profile.expert_id,),
-        )
-        cursor.execute(
-            "DELETE FROM expert_index_project_stage WHERE expert_id=%s",
-            (profile.expert_id,),
-        )
-        for item in employments:
-            self._insert_employment(cursor, item)
-        for item in projects:
-            self._insert_project(cursor, item)
-
-    @staticmethod
-    def _upsert_profile(cursor: Any, item: ProfileStage) -> None:
-        """在调用方事务中插入或更新一行 Profile Stage。
-
-        以 ``expert_id`` 为主键执行 Upsert，完整覆盖标准化字段、来源哈希、数据版本和
-        构建批次。更新已有行时恢复 ``stage_status=ready`` 并清除旧拒绝原因；学校和
-        专业集合序列化为 JSON 数组。本方法不提交事务。
-        """
-
-        cursor.execute(
-            """
-            INSERT INTO expert_index_stage(
-                expert_id, serial_number, company_name_raw, company_name_norm,
-                company_normalization_status, role_name_raw, role_code, role_level,
-                job_status_norm, abroad_flag_norm, background_clean,
-                school_names_json, major_names_json, work_years,
-                eligible_for_recommendation, verification_status, source_hash,
-                source_updated_at, data_version, stage_status, build_batch_id
-            ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,'ready',%s)
-            ON DUPLICATE KEY UPDATE
-                serial_number=VALUES(serial_number), company_name_raw=VALUES(company_name_raw),
-                company_name_norm=VALUES(company_name_norm),
-                company_normalization_status=VALUES(company_normalization_status),
-                role_name_raw=VALUES(role_name_raw), role_code=VALUES(role_code),
-                role_level=VALUES(role_level), job_status_norm=VALUES(job_status_norm),
-                abroad_flag_norm=VALUES(abroad_flag_norm),
-                background_clean=VALUES(background_clean),
-                school_names_json=VALUES(school_names_json),
-                major_names_json=VALUES(major_names_json), work_years=VALUES(work_years),
-                eligible_for_recommendation=VALUES(eligible_for_recommendation),
-                verification_status=VALUES(verification_status),
-                source_hash=VALUES(source_hash), source_updated_at=VALUES(source_updated_at),
-                data_version=VALUES(data_version), stage_status='ready', reject_reason=NULL,
-                build_batch_id=VALUES(build_batch_id)
-            """,
-            (
-                item.expert_id, item.serial_number, item.company_name_raw, item.company_name_norm,
-                item.company_normalization_status, item.role_name_raw, item.role_code,
-                item.role_level, item.job_status_norm, item.abroad_flag_norm,
-                item.background_clean, _json(list(item.school_names_raw)),
-                _json(list(item.major_names_raw)), item.work_years,
-                item.eligible_for_recommendation, item.verification_status, item.source_hash,
-                item.source_updated_at, item.data_version,
-                item.build_batch_id,
-            ),
-        )
-
-    @staticmethod
-    def _insert_employment(cursor: Any, item: EmploymentStage) -> None:
-        """在调用方事务中插入一条标准化后的工作经历 Stage。
-
-        旧工作快照已由调用方删除，因此这里只执行 INSERT。来源定位字段随 Stage 保存，
-        行业和主题集合序列化为 JSON 数组。本方法不提交事务。
-        """
-
-        cursor.execute(
-            """
-            INSERT INTO expert_index_employment_stage(
-                expert_id, source_table, source_field, source_field_id, source_item_key,
-                company_name_raw, company_name_norm, company_normalization_status,
-                role_name_raw, role_code, role_level, start_month, end_month, is_current,
-                responsibilities_clean, achievements_clean, industry_codes_json,
-                topic_codes_json, source_hash, source_updated_at,
-                data_version, build_batch_id
-            ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
-            """,
-            (
-                item.expert_id, item.source_table, item.source_field, item.source_field_id,
-                item.source_item_key,
-                item.company_name_raw, item.company_name_norm,
-                item.company_normalization_status, item.role_name_raw, item.role_code,
-                item.role_level, item.start_month, item.end_month, item.is_current,
-                item.responsibilities_clean, item.achievements_clean,
-                _json(list(item.industry_codes)), _json(list(item.topic_codes)),
-                item.source_hash, item.source_updated_at, item.data_version,
-                item.build_batch_id,
-            ),
-        )
-
-    @staticmethod
-    def _insert_project(cursor: Any, item: ProjectStage) -> None:
-        """在调用方事务中插入一条标准化后的项目经历 Stage。
-
-        旧项目快照已由调用方删除，因此这里只执行 INSERT。项目内容、来源定位、数据
-        版本和构建批次一并写入，行业和主题集合序列化为 JSON 数组。本方法不提交事务。
-        """
-
-        cursor.execute(
-            """
-            INSERT INTO expert_index_project_stage(
-                expert_id, source_table, source_field, source_field_id, source_item_key,
-                project_name,
-                company_or_client_raw, company_or_client_norm,
-                company_normalization_status, start_month, end_month,
-                objective_clean, actions_clean, results_clean, industry_codes_json,
-                topic_codes_json, source_hash, source_updated_at,
-                data_version, build_batch_id
-            ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
-            """,
-            (
-                item.expert_id, item.source_table, item.source_field, item.source_field_id,
-                item.source_item_key, item.project_name, item.company_or_client_raw,
-                item.company_or_client_norm,
-                item.company_normalization_status, item.start_month,
-                item.end_month, item.objective_clean, item.actions_clean, item.results_clean,
-                _json(list(item.industry_codes)), _json(list(item.topic_codes)),
-                item.source_hash, item.source_updated_at, item.data_version,
-                item.build_batch_id,
-            ),
-        )
 
 def _json(value: Any) -> str:
-    """把数组或字典序列化为稳定且符合 JSON 标准的紧凑字符串。
+    """把批次错误摘要序列化为稳定且符合 JSON 标准的紧凑字符串。
 
     字典键排序保证相同输入得到相同字符串；中文不转义；NaN 和 Infinity 会触发异常，
-    从而由外层事务回滚，而不是写入非标准 JSON。
+    避免向批次主表写入非标准 JSON。
     """
 
     return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False)

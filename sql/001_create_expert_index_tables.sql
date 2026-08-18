@@ -1,4 +1,4 @@
--- 专家索引派生表初始化脚本。
+-- 专家索引任务状态表初始化脚本。
 --
 -- 重要边界：本脚本只能在派生索引库执行。演示环境没有单独的索引库配置时，CLI 会使用 DB_NAME；
 -- 生产环境必须通过 INDEX_DB_NAME 指向独立 Schema。
@@ -8,7 +8,7 @@ CREATE TABLE IF NOT EXISTS expert_index_batch (
     id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
     batch_no VARCHAR(64) NOT NULL,
     run_mode VARCHAR(16) NOT NULL COMMENT 'full/incremental/replay/single',
-    -- data_version 属于加工批次与 Stage，不进入下游内存 Contract。
+    -- data_version 属于加工批次，不进入下游内存 Contract。
     -- 先允许 NULL，保证第一阶段只升级表结构时，现有 single 命令仍能正常创建批次；
     -- 后续批量编排接入后，full 批次必须显式写入该值。
     data_version VARCHAR(64) NULL COMMENT '本批次使用的业务数据版本',
@@ -19,13 +19,14 @@ CREATE TABLE IF NOT EXISTS expert_index_batch (
     -- full 批次开始时固定 experts.id 的上界，防止运行期间新增专家让任务范围不断增长。
     upper_bound_id BIGINT UNSIGNED NULL COMMENT '全量批次启动时固定的最大专家 ID',
     -- candidate/success/failed/deactivated/rejected 均按“专家数”统计；
-    -- extracted/stage/chunk 则保持现有含义，按来源记录、Stage、Chunk 行数统计。
+    -- extracted/chunk 按来源记录和 Chunk 行数统计；stage_count 仅为旧批次兼容字段，
+    -- 纯内存标准化链路不再增加该值。
     candidate_count INT UNSIGNED NOT NULL DEFAULT 0,
     success_count INT UNSIGNED NOT NULL DEFAULT 0,
     failed_count INT UNSIGNED NOT NULL DEFAULT 0,
     deactivated_count INT UNSIGNED NOT NULL DEFAULT 0,
     extracted_count INT UNSIGNED NOT NULL DEFAULT 0,
-    stage_count INT UNSIGNED NOT NULL DEFAULT 0,
+    stage_count INT UNSIGNED NOT NULL DEFAULT 0 COMMENT '旧 Stage 批次兼容计数，新任务恒为 0',
     chunk_count INT UNSIGNED NOT NULL DEFAULT 0,
     rejected_count INT UNSIGNED NOT NULL DEFAULT 0,
     error_summary JSON NULL,
@@ -54,7 +55,7 @@ CREATE TABLE IF NOT EXISTS expert_index_batch_item (
         COMMENT 'pending/running/success/rejected/deactivated/failed',
     attempt_count SMALLINT UNSIGNED NOT NULL DEFAULT 0 COMMENT '本批次内实际处理尝试次数',
     extracted_count INT UNSIGNED NOT NULL DEFAULT 0 COMMENT '该专家读取的四表来源记录数',
-    stage_count INT UNSIGNED NOT NULL DEFAULT 0 COMMENT '该专家成功保存的 Stage 行数',
+    stage_count INT UNSIGNED NOT NULL DEFAULT 0 COMMENT '旧 Stage 批次兼容计数，新任务恒为 0',
     chunk_count INT UNSIGNED NOT NULL DEFAULT 0 COMMENT '该专家本轮生成的 Chunk 行数',
     result_code VARCHAR(64) NULL
         COMMENT '安全机器码，如 no_chunkable_content/expert_deleted',
@@ -72,99 +73,4 @@ CREATE TABLE IF NOT EXISTS expert_index_batch_item (
     CONSTRAINT chk_expert_batch_item_status CHECK (
         status IN ('pending', 'running', 'success', 'rejected', 'deactivated', 'failed')
     )
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
-
-CREATE TABLE IF NOT EXISTS expert_index_stage (
-    expert_id BIGINT UNSIGNED NOT NULL,
-    serial_number VARCHAR(64) NULL,
-    company_name_raw VARCHAR(512) NULL,
-    company_name_norm VARCHAR(512) NULL,
-    company_normalization_status VARCHAR(32) NOT NULL DEFAULT 'unknown',
-    role_name_raw VARCHAR(256) NULL,
-    role_code VARCHAR(128) NULL,
-    role_level VARCHAR(64) NULL,
-    job_status_norm VARCHAR(32) NULL,
-    abroad_flag_norm TINYINT(1) NULL,
-    background_clean MEDIUMTEXT NULL,
-    school_names_json JSON NOT NULL,
-    major_names_json JSON NOT NULL,
-    work_years DECIMAL(5,2) NULL,
-    eligible_for_recommendation TINYINT(1) NULL,
-    verification_status VARCHAR(32) NOT NULL COMMENT 'doubtful_flag 映射结果',
-    source_hash CHAR(64) NOT NULL,
-    source_updated_at DATETIME(6) NULL,
-    data_version VARCHAR(64) NOT NULL,
-    stage_status VARCHAR(16) NOT NULL DEFAULT 'ready',
-    reject_reason VARCHAR(512) NULL,
-    build_batch_id BIGINT UNSIGNED NOT NULL,
-    created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-    updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6)
-        ON UPDATE CURRENT_TIMESTAMP(6),
-    PRIMARY KEY (expert_id),
-    KEY idx_expert_stage_batch (build_batch_id),
-    KEY idx_expert_stage_source_updated (source_updated_at, expert_id)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
-
-CREATE TABLE IF NOT EXISTS expert_index_employment_stage (
-    id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
-    expert_id BIGINT UNSIGNED NOT NULL,
-    source_table VARCHAR(128) NOT NULL COMMENT '物理来源表名',
-    source_field VARCHAR(512) NOT NULL COMMENT '参与生成 Chunk 的源列名，+拼接',
-    source_field_id VARCHAR(128) NOT NULL COMMENT '来源行主键 ID',
-    source_item_key VARCHAR(128) NOT NULL COMMENT '稳定业务项键',
-    company_name_raw VARCHAR(512) NULL,
-    company_name_norm VARCHAR(512) NULL,
-    company_normalization_status VARCHAR(32) NOT NULL DEFAULT 'unknown',
-    role_name_raw VARCHAR(256) NULL,
-    role_code VARCHAR(128) NULL,
-    role_level VARCHAR(64) NULL,
-    start_month CHAR(6) NULL COMMENT '标准年月 YYYYMM',
-    end_month CHAR(6) NULL COMMENT '标准年月 YYYYMM',
-    is_current TINYINT(1) NULL,
-    responsibilities_clean MEDIUMTEXT NULL,
-    achievements_clean MEDIUMTEXT NULL,
-    industry_codes_json JSON NOT NULL,
-    topic_codes_json JSON NOT NULL,
-    source_hash CHAR(64) NOT NULL,
-    source_updated_at DATETIME(6) NULL,
-    data_version VARCHAR(64) NOT NULL,
-    build_batch_id BIGINT UNSIGNED NOT NULL,
-    created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-    updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6)
-        ON UPDATE CURRENT_TIMESTAMP(6),
-    PRIMARY KEY (id),
-    UNIQUE KEY uk_expert_emp_source (source_table, source_field_id, source_item_key),
-    KEY idx_expert_emp_expert (expert_id),
-    KEY idx_expert_emp_source_updated (source_updated_at, source_field_id)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
-
-CREATE TABLE IF NOT EXISTS expert_index_project_stage (
-    id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
-    expert_id BIGINT UNSIGNED NOT NULL,
-    source_table VARCHAR(128) NOT NULL COMMENT '物理来源表名',
-    source_field VARCHAR(512) NOT NULL COMMENT '参与生成 Chunk 的源列名，+拼接',
-    source_field_id VARCHAR(128) NOT NULL COMMENT '来源行主键 ID',
-    source_item_key VARCHAR(128) NOT NULL COMMENT '稳定业务项键',
-    project_name VARCHAR(512) NULL,
-    company_or_client_raw VARCHAR(512) NULL,
-    company_or_client_norm VARCHAR(512) NULL,
-    company_normalization_status VARCHAR(32) NOT NULL DEFAULT 'unknown',
-    start_month CHAR(6) NULL COMMENT '标准年月 YYYYMM',
-    end_month CHAR(6) NULL COMMENT '标准年月 YYYYMM',
-    objective_clean MEDIUMTEXT NULL,
-    actions_clean MEDIUMTEXT NULL,
-    results_clean MEDIUMTEXT NULL,
-    industry_codes_json JSON NOT NULL,
-    topic_codes_json JSON NOT NULL,
-    source_hash CHAR(64) NOT NULL,
-    source_updated_at DATETIME(6) NULL,
-    data_version VARCHAR(64) NOT NULL,
-    build_batch_id BIGINT UNSIGNED NOT NULL,
-    created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-    updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6)
-        ON UPDATE CURRENT_TIMESTAMP(6),
-    PRIMARY KEY (id),
-    UNIQUE KEY uk_expert_project_source (source_table, source_field_id, source_item_key),
-    KEY idx_expert_project_expert (expert_id),
-    KEY idx_expert_project_source_updated (source_updated_at, source_field_id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;

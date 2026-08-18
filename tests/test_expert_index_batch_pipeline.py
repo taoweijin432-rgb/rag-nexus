@@ -110,9 +110,6 @@ class FakeRepository:
         self.lock_modes: list[str] = []
         self.start_calls: list[tuple[str, str, dict[str, Any]]] = []
         self.finish_calls: list[tuple[int, dict[str, Any]]] = []
-        self.persisted_expert_ids: list[int] = []
-        self.rejected_expert_ids: list[int] = []
-        self.deactivated_expert_ids: list[int] = []
         self.events: list[tuple[str, Any]] = []
         self.progress_calls: list[dict[str, Any]] = []
         self.resume_calls: list[int] = []
@@ -168,37 +165,6 @@ class FakeRepository:
 
     def finish_batch(self, batch_id: int, **kwargs: Any) -> None:
         self.finish_calls.append((batch_id, kwargs))
-
-    def persist_stage_snapshot(
-        self,
-        profile: Any,
-        employments: list[Any],
-        projects: list[Any],
-    ) -> int:
-        """模拟一位专家事务成功，并返回 Pipeline 约定的 Stage 行数。"""
-
-        self.persisted_expert_ids.append(profile.expert_id)
-        return 1 + len(employments) + len(projects)
-
-    def persist_rejected_stage_snapshot(
-        self,
-        profile: Any,
-        employments: list[Any],
-        projects: list[Any],
-        *,
-        reason: str,
-    ) -> int:
-        """模拟保存 rejected Stage 的专家事务。"""
-
-        assert reason == "no_chunkable_content"
-        self.rejected_expert_ids.append(profile.expert_id)
-        return 1 + len(employments) + len(projects)
-
-    def mark_deleted_stage(self, expert_id: int, *, build_batch_id: int) -> None:
-        """模拟逻辑删除专家的 Stage 清理事务。"""
-
-        assert build_batch_id == 701
-        self.deactivated_expert_ids.append(expert_id)
 
     def prepare_batch_items(self, batch_id: int, expert_ids: list[int]) -> None:
         self.events.append(("prepare", (batch_id, expert_ids)))
@@ -261,7 +227,7 @@ def _partial_retry_checkpoint() -> FullBatchCheckpoint:
         rejected_count=0,
         deactivated_count=0,
         extracted_count=1,
-        stage_count=1,
+        stage_count=0,
         chunk_count=1,
     )
 
@@ -281,19 +247,18 @@ def test_build_one_reuses_expert_core_and_keeps_existing_result() -> None:
     assert result.batch_id == 701
     assert result.expert_id == 24
     assert result.extracted_count == 1
-    assert result.stage_count == 1
+    assert result.stage_count == 0
     assert result.chunk_count == 1
     assert result.partial_chunk_count == 0
     assert repository.lock_modes == ["single"]
     assert repository.start_calls == [
         ("single_pipeline_refactor_test", "single", {})
     ]
-    assert repository.persisted_expert_ids == [24]
     assert repository.finish_calls[-1][1]["status"] == "success"
 
 
 def test_build_one_passes_strict_contract_snapshot_to_vector_sync() -> None:
-    """Stage 成功提交后，产出的 Chunk 应以内存 Contract 交给下游。"""
+    """内存标准化生成的 Chunk 应通过 Contract 直接交给下游。"""
 
     source = FakeSource([ExpertCandidate(id=25, deleted_at=None)])
     repository = FakeRepository()
@@ -341,11 +306,10 @@ def test_build_many_paginates_and_continues_after_one_expert_fails() -> None:
     assert result.success_count == 2
     assert result.failed_count == 1
     assert result.extracted_count == 2
-    assert result.stage_count == 2
+    assert result.stage_count == 0
     assert result.chunk_count == 2
     assert source.page_calls == [(0, 30, 2), (20, 30, 2)]
     assert source.loaded_ids == [10, 20, 30]
-    assert repository.persisted_expert_ids == [10, 30]
     assert repository.start_calls[0][2] == {
         "data_version": "20260814_02",
         "upper_bound_id": 30,
@@ -385,7 +349,7 @@ def test_build_many_limits_scope_to_first_n_candidates() -> None:
     assert source.upper_bound_limits == [2]
     assert source.page_calls == [(0, 20, 1), (10, 20, 1)]
     assert source.loaded_ids == [10, 20]
-    assert repository.persisted_expert_ids == [10, 20]
+    assert result.stage_count == 0
     assert repository.start_calls[0][2]["upper_bound_id"] == 20
 
 
@@ -413,7 +377,7 @@ def test_resume_many_continues_after_last_complete_page_with_original_scope() ->
         rejected_count=0,
         deactivated_count=0,
         extracted_count=2,
-        stage_count=2,
+        stage_count=0,
         chunk_count=2,
     )
 
@@ -426,7 +390,7 @@ def test_resume_many_continues_after_last_complete_page_with_original_scope() ->
     assert result.candidate_count == 4
     assert result.success_count == 4
     assert result.extracted_count == 4
-    assert result.stage_count == 4
+    assert result.stage_count == 0
     assert result.chunk_count == 4
     assert repository.lock_modes == ["full"]
     assert repository.resume_calls == [701]
@@ -434,7 +398,6 @@ def test_resume_many_continues_after_last_complete_page_with_original_scope() ->
     assert source.upper_bound_calls == 0
     assert source.page_calls == [(20, 40, 1), (30, 40, 1)]
     assert source.loaded_ids == [30, 40]
-    assert repository.persisted_expert_ids == [30, 40]
 
 
 def test_retry_partial_only_reprocesses_failed_items_and_finishes_success() -> None:
@@ -459,7 +422,7 @@ def test_retry_partial_only_reprocesses_failed_items_and_finishes_success() -> N
         pending_count=0,
         running_count=0,
         extracted_count=3,
-        stage_count=3,
+        stage_count=0,
         chunk_count=3,
     )
 
@@ -475,7 +438,6 @@ def test_retry_partial_only_reprocesses_failed_items_and_finishes_success() -> N
     assert source.page_calls == []
     assert source.candidate_calls == [20, 30]
     assert source.loaded_ids == [20, 30]
-    assert repository.persisted_expert_ids == [20, 30]
     assert repository.retry_item_calls == [
         (701, 0, 1),
         (701, 20, 1),
@@ -508,7 +470,7 @@ def test_retry_partial_attempts_each_failed_item_once_and_remains_partial() -> N
         rejected_count=0,
         deactivated_count=0,
         extracted_count=1,
-        stage_count=1,
+        stage_count=0,
         chunk_count=1,
     )
     repository.retryable_ids = [20]
@@ -521,7 +483,7 @@ def test_retry_partial_attempts_each_failed_item_once_and_remains_partial() -> N
         pending_count=0,
         running_count=0,
         extracted_count=1,
-        stage_count=1,
+        stage_count=0,
         chunk_count=1,
     )
 
@@ -558,8 +520,7 @@ def test_build_many_deactivates_deleted_candidate_without_loading_source() -> No
     assert result.failed_count == 0
     assert result.deactivated_count == 1
     assert source.loaded_ids == []
-    assert repository.persisted_expert_ids == []
-    assert repository.deactivated_expert_ids == [40]
+    assert result.stage_count == 0
     assert vector_sync.calls == [(40, [])]
     finished = [event for event in repository.events if event[0] == "finished"]
     assert finished[0][1][2]["status"] == "deactivated"
@@ -567,7 +528,7 @@ def test_build_many_deactivates_deleted_candidate_without_loading_source() -> No
 
 
 def test_build_many_rejects_no_content_and_continues_next_expert() -> None:
-    """无内容专家刷新 Stage、停用旧 Chunk 并记为 rejected，不算程序失败。"""
+    """无内容专家用空快照停用旧 Chunk 并记为 rejected，不算程序失败。"""
 
     source = FakeSource(
         [
@@ -590,8 +551,7 @@ def test_build_many_rejects_no_content_and_continues_next_expert() -> None:
     assert result.failed_count == 0
     assert result.rejected_count == 1
     assert result.extracted_count == 2
-    assert repository.persisted_expert_ids == [60]
-    assert repository.rejected_expert_ids == [50]
+    assert result.stage_count == 0
     assert vector_sync.calls[0] == (50, [])
     assert len(vector_sync.calls[1][1]) == 1
     statuses = [
@@ -619,7 +579,6 @@ def test_build_many_marks_batch_failed_when_candidate_page_is_invalid() -> None:
             batch_no="full_invalid_page_test",
         )
 
-    assert repository.persisted_expert_ids == []
     assert repository.finish_calls[-1][1]["status"] == "failed"
 
 

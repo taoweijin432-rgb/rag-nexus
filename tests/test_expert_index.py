@@ -34,7 +34,6 @@ from expert_index.normalize import (
     recommendation_eligibility,
     sha256_value,
 )
-from expert_index.repository import MySQLIndexRepository
 from expert_index.source import MySQLSourceAdapter
 from expert_index.test_fixture import (
     EDUCATION_FIXTURES,
@@ -370,30 +369,6 @@ class ChunkFactoryTest(unittest.TestCase):
         )[0]
         self.assertEqual(original.content_hash, changed.content_hash)
         self.assertNotEqual(original.metadata_hash, changed.metadata_hash)
-
-
-class RepositoryMappingTest(unittest.TestCase):
-    """不连接 MySQL，仅锁定 Repository SQL 占位符与模型参数数量。"""
-
-    def test_insert_parameter_counts_match_sql(self) -> None:
-        class CountingCursor:
-            def execute(self, sql: str, params: tuple[object, ...]) -> None:
-                self.assert_equal(sql.count("%s"), len(params))
-
-            @staticmethod
-            def assert_equal(expected: int, actual: int) -> None:
-                if expected != actual:
-                    raise AssertionError(
-                        f"SQL 占位符数={expected}，参数数={actual}"
-                    )
-
-        profile, employments, projects = normalize_aggregate(
-            _aggregate(), data_version="20260812_01", build_batch_id=1
-        )
-        cursor = CountingCursor()
-        MySQLIndexRepository._upsert_profile(cursor, profile)
-        MySQLIndexRepository._insert_employment(cursor, employments[0])
-        MySQLIndexRepository._insert_project(cursor, projects[0])
 
 
 if __name__ == "__main__":

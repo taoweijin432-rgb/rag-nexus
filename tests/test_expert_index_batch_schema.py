@@ -1,8 +1,8 @@
-"""第一版全量加工批次表的静态 DDL 契约测试。
+"""全量加工批次状态表的静态 DDL 契约测试。
 
 本文件只读取版本库中的 SQL 文本，不连接或修改 MySQL。它用于第一阶段审查：确保
-新建库使用的 001 和现有库使用的 005 都准备了相同的批次跟踪能力。后续 Repository
-开始写入这些字段时，还需要另行补充 SQL 参数映射和真实 MySQL 集成测试。
+新建库使用的 001 和现有库使用的 005 都准备了相同的批次跟踪能力，并确保新环境
+不再创建已停用的 Stage/Chunk 持久化表。
 """
 
 from __future__ import annotations
@@ -73,12 +73,19 @@ def test_initial_schema_contains_expert_level_batch_items() -> None:
     assert "error_message VARCHAR(512) NULL" in item
 
 
-def test_initial_schema_does_not_create_legacy_expert_chunk_table() -> None:
-    """新环境只创建 Batch/Stage；Chunk 通过内存调用交付下游。"""
+def test_initial_schema_only_creates_batch_state_tables() -> None:
+    """新环境只创建批次状态表，Stage 与 Chunk 都通过内存链路处理。"""
 
     schema = _read(INITIAL_SCHEMA)
 
-    assert "CREATE TABLE IF NOT EXISTS expert_chunk" not in schema
+    assert schema.count("CREATE TABLE IF NOT EXISTS") == 2
+    for removed_table in (
+        "expert_index_stage",
+        "expert_index_employment_stage",
+        "expert_index_project_stage",
+        "expert_chunk",
+    ):
+        assert f"CREATE TABLE IF NOT EXISTS {removed_table}" not in schema
 
 
 def test_existing_database_migration_is_additive_and_complete() -> None:

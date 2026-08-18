@@ -3,11 +3,11 @@
 -- 使用范围：
 -- 1. 已经执行过旧版 001、数据库中已存在 expert_index_batch 的环境执行本迁移；
 -- 2. 新建环境直接执行最新 001，不需要再执行本文件；
--- 3. 本迁移只增加兼容列和新表，不删除或改写现有批次、Stage 数据；
+-- 3. 本迁移只增加兼容列和新表，不删除或改写现有批次及历史 Stage 数据；
 -- 4. 执行本迁移后，Repository/Pipeline 才能运行 build-batch 并写入这些字段。
 
 ALTER TABLE expert_index_batch
-    -- data_version 继续属于批次和 Stage，不进入下游内存 Contract。
+    -- data_version 属于批次，不进入下游内存 Contract。
     -- 允许 NULL 是为了让迁移后的现有 single 命令保持兼容；后续 full 编排必须写入。
     ADD COLUMN data_version VARCHAR(64) NULL
         COMMENT '本批次使用的业务数据版本' AFTER run_mode,
@@ -16,7 +16,7 @@ ALTER TABLE expert_index_batch
         COMMENT '最后完成调度的专家 ID 游标',
     ADD COLUMN upper_bound_id BIGINT UNSIGNED NULL
         COMMENT '全量批次启动时固定的最大专家 ID' AFTER cursor_id,
-    -- 以下五列按专家计数；原有 extracted/stage/chunk 继续按数据行计数。
+    -- 以下五列按专家计数；原有 stage_count 仅保留旧批次兼容语义。
     ADD COLUMN candidate_count INT UNSIGNED NOT NULL DEFAULT 0 AFTER upper_bound_id,
     ADD COLUMN success_count INT UNSIGNED NOT NULL DEFAULT 0 AFTER candidate_count,
     ADD COLUMN failed_count INT UNSIGNED NOT NULL DEFAULT 0 AFTER success_count,
@@ -32,7 +32,7 @@ CREATE TABLE IF NOT EXISTS expert_index_batch_item (
         COMMENT 'pending/running/success/rejected/deactivated/failed',
     attempt_count SMALLINT UNSIGNED NOT NULL DEFAULT 0 COMMENT '本批次内实际处理尝试次数',
     extracted_count INT UNSIGNED NOT NULL DEFAULT 0 COMMENT '该专家读取的四表来源记录数',
-    stage_count INT UNSIGNED NOT NULL DEFAULT 0 COMMENT '该专家成功保存的 Stage 行数',
+    stage_count INT UNSIGNED NOT NULL DEFAULT 0 COMMENT '旧 Stage 批次兼容计数，新任务恒为 0',
     chunk_count INT UNSIGNED NOT NULL DEFAULT 0 COMMENT '该专家本轮生成的 Chunk 行数',
     result_code VARCHAR(64) NULL
         COMMENT '安全机器码，如 no_chunkable_content/expert_deleted',
