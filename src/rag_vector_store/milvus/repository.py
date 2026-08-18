@@ -26,6 +26,7 @@ from .compatibility import (
 from .compatibility import (
     compare_model_space,
     compare_schema_specs,
+    field_map,
 )
 from .contract import MilvusRowMapper
 from .indexes import build_index_params, index_specs, vector_index_spec
@@ -163,6 +164,108 @@ class ContractMilvusVectorRepository:
             descriptions,
             index_specs(self.settings),
         ).as_dict()
+
+    def assert_destructive_maintenance_allowed(
+        self,
+        *,
+        expected_dimension: int | None = None,
+    ) -> dict[str, object]:
+        """Full Sync 删除 stale vectors 前的 Collection 安全 preflight（fail-closed）。
+
+        该方法只对当前 Repository 已绑定的 ``settings.collection_name`` 做只读
+        检查，不接收调用方传入的任意 Collection 名。普通 CRUD 不应、也无需
+        调用它；只有 Full Sync 在准备物理删除 stale vectors 前必须显式通过，
+        否则 fail-closed。
+
+        检查项（任一项失败即抛异常，不执行任何删除）：
+            1. 授权：当前 ``collection_name`` 必须在
+               ``destructive_maintenance_collections``（默认空，即默认不允许任何
+               destructive cleanup）；历史 / 受保护 Collection 因此天然被拒绝。
+            2. 存在：当前 Collection 必须真实存在。
+            3. Schema 兼容：与正式 Contract Collection 兼容。
+            4. 主键字段必须为 ``vector_doc_id``。
+            5. ``auto_id`` 必须为 False。
+            6. ``embedding`` 向量字段必须存在。
+            7. embedding 维度与正式模型空间（默认期望维度）一致。
+
+        Args:
+            expected_dimension: 期望的向量维度；省略时使用 Repository 已配置维度。
+
+        Returns:
+            dict[str, object]：只读安全摘要，供 Full Sync 报告使用。
+        """
+
+        dimension = self._resolve_vector_dimension(expected_dimension)
+        collection_name = self.settings.collection_name
+
+        if collection_name not in self.settings.destructive_maintenance_collections:
+            raise RuntimeError(
+                f"Collection {collection_name!r} 未获授权执行 destructive maintenance；"
+                "请在环境变量 MILVUS_ALLOWED_DESTRUCTIVE_COLLECTIONS 中显式声明"
+            )
+
+        active_client = self._get_client()
+        if not active_client.has_collection(collection_name=collection_name):
+            raise RuntimeError(
+                f"Collection {collection_name!r} 不存在，无法执行 destructive maintenance"
+            )
+
+        description = active_client.describe_collection(
+            collection_name=collection_name
+        )
+
+        fields = description.get("fields", [])
+        # 逐项显式校验结构性不变量，先于整体 Schema 对比给出精确的可定位错误。
+        primary_fields = [
+            field.get("name")
+            for field in fields
+            if isinstance(field, Mapping) and field.get("is_primary")
+        ]
+        if primary_fields != ["vector_doc_id"]:
+            raise ValueError(
+                f"Collection {collection_name!r} 主键字段必须为 vector_doc_id，"
+                f"实际为 {primary_fields!r}"
+            )
+        if description.get("auto_id", False):
+            raise ValueError(
+                f"Collection {collection_name!r} 的 auto_id 必须为 False，"
+                "禁止 destructive maintenance"
+            )
+        embedding_field = field_map(description).get("embedding")
+        if embedding_field is None:
+            raise ValueError(
+                f"Collection {collection_name!r} 缺少向量字段 embedding"
+            )
+        params = embedding_field.get("params")
+        embedding_dim = (
+            params.get("dim") if isinstance(params, Mapping) else None
+        )
+        if embedding_dim != dimension:
+            raise ValueError(
+                f"Collection {collection_name!r} 的 embedding 维度 {embedding_dim!r} "
+                f"与期望维度 {dimension} 不一致"
+            )
+
+        # 最后整体对比：任何其他与正式契约 Schema 的差异都 fail-closed。
+        difference = self.compare_contract_schema(description, dimension)
+        if not difference["compatible"]:
+            raise ValueError(
+                f"Milvus contract collection {collection_name!r} 与正式契约 schema "
+                "不兼容，禁止 destructive maintenance: "
+                f"{json.dumps(difference, ensure_ascii=False, sort_keys=True)}"
+            )
+
+        return {
+            "collection_name": collection_name,
+            "authorized": True,
+            "schema_mode": self.settings.schema_mode,
+            "collection_exists": True,
+            "schema_compatible": True,
+            "primary_key": "vector_doc_id",
+            "auto_id": False,
+            "embedding_field": "embedding",
+            "embedding_dim": dimension,
+        }
 
     def initialize(self, vector_dimension: int) -> None:
         """建立连接，并创建或校验集合 Schema。
@@ -403,6 +506,78 @@ class ContractMilvusVectorRepository:
                 if not batch:
                     break
                 rows.extend(dict(row) for row in batch)
+        finally:
+            iterator.close()
+        return rows
+
+    def list_all_vector_states(
+        self,
+        *,
+        output_fields: Sequence[str] | None = None,
+    ) -> list[dict[str, object]]:
+        """列出当前 Collection 中全部向量的最小状态（默认不含 embedding）。
+
+        语义：
+            - 用于全量更新 / 残留对账：读取当前全部存在的 ``vector_doc_id``
+              及其 ``content_hash`` / ``metadata_hash``，供差异判断与 stale 计算；
+              不返回 embedding，避免大字段拉取。
+            - 基于 ``embedding_dim >= 0`` 的全量过滤表达式，使用与内部
+              model-space 一致性检查相同的分页遍历模式。
+            - 全量结果出现重复 ``vector_doc_id`` 时 fail-closed：视为读取结果
+              不可信，抛 ``RuntimeError``，不静默去重。
+            - 调用方可通过 ``output_fields`` 显式扩展返回字段。
+
+        Args:
+            output_fields: 要返回的字段；默认最小字段集
+              ``vector_doc_id`` / ``content_hash`` / ``metadata_hash``。
+
+        Returns:
+            list[dict[str, object]]：按查询顺序返回每行的字段字典。
+        """
+
+        fields = list(
+            output_fields
+            if output_fields is not None
+            else ["vector_doc_id", "content_hash", "metadata_hash"]
+        )
+        if not fields or any(
+            not isinstance(field, str) or not field.strip() for field in fields
+        ):
+            raise ValueError("output_fields 必须是非空字符串序列")
+
+        iterator = self._get_client().query_iterator(
+            collection_name=self.settings.collection_name,
+            batch_size=1000,
+            limit=-1,
+            filter="embedding_dim >= 0",
+            output_fields=fields,
+            consistency_level="Strong",
+            **self._timeout_kwargs(),
+        )
+        rows: list[dict[str, object]] = []
+        seen_ids: set[str] = set()
+        check_duplicates = "vector_doc_id" in fields
+        try:
+            while True:
+                batch = iterator.next()
+                if not isinstance(batch, list) or not all(
+                    isinstance(row, Mapping) for row in batch
+                ):
+                    raise TypeError("Milvus 全量状态 iterator 返回了非法 Entity 批次")
+                if not batch:
+                    break
+                for row in batch:
+                    projected = dict(row)
+                    rows.append(projected)
+                    if check_duplicates:
+                        vector_doc_id = projected.get("vector_doc_id")
+                        if isinstance(vector_doc_id, str):
+                            if vector_doc_id in seen_ids:
+                                raise RuntimeError(
+                                    "Milvus 全量状态扫描返回了重复 vector_doc_id: "
+                                    f"{vector_doc_id!r}"
+                                )
+                            seen_ids.add(vector_doc_id)
         finally:
             iterator.close()
         return rows

@@ -44,6 +44,7 @@ class MilvusSettings(BaseModel):
     index_params: dict[str, Any] = Field(
         default_factory=lambda: {"M": 16, "efConstruction": 200}
     )
+    destructive_maintenance_collections: tuple[str, ...] = ()
 
     @model_validator(mode="after")
     def validate_authentication(self) -> MilvusSettings:
@@ -109,6 +110,17 @@ class MilvusSettings(BaseModel):
             if not isinstance(parsed_index_params, dict):
                 raise ValueError("MILVUS_INDEX_PARAMS 必须是 JSON 对象")
             values["index_params"] = parsed_index_params
+
+        destructive_raw = _optional(env, "MILVUS_ALLOWED_DESTRUCTIVE_COLLECTIONS")
+        values["destructive_maintenance_collections"] = (
+            tuple(
+                name.strip()
+                for name in destructive_raw.split(",")
+                if name.strip()
+            )
+            if destructive_raw is not None
+            else ()
+        )
 
         return cls(**values)
 

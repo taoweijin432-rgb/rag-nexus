@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from datetime import datetime, timezone
 from decimal import Decimal
 from pathlib import Path
@@ -908,3 +908,350 @@ def test_contract_repository_query_by_expert_id_rejects_bad_expert_id() -> None:
         repository.query_by_expert_id(0)
     with pytest.raises(ValueError, match="expert_id"):
         repository.query_by_expert_id(True)
+
+
+def test_contract_repository_list_all_vector_states_returns_minimal_fields() -> None:
+    client = FakeContractMilvusClient(exists=True)
+    repository = ContractMilvusVectorRepository(
+        contract_settings(),
+        vector_dimension=1024,
+        client=client,
+    )
+    client.description = repository._build_schema(1024).to_dict()
+    repository.upsert_batch(embedded_contract_chunks())
+
+    rows = repository.list_all_vector_states()
+
+    assert len(rows) == 3
+    assert all(
+        set(row) == {"vector_doc_id", "content_hash", "metadata_hash"}
+        for row in rows
+    )
+    # embedding 不在输出字段
+    assert "embedding" not in client.query_iterator_calls[-1]["output_fields"]
+    # 全量过滤表达式 + 分页参数正确
+    assert client.query_iterator_calls[-1]["filter"] == "embedding_dim >= 0"
+    assert client.query_iterator_calls[-1]["batch_size"] == 1000
+    assert client.query_iterator_calls[-1]["limit"] == -1
+    assert client.last_query_iterator is not None
+    assert client.last_query_iterator.closed is True
+
+
+def test_contract_repository_list_all_vector_states_empty() -> None:
+    client = FakeContractMilvusClient(exists=True)
+    repository = ContractMilvusVectorRepository(
+        contract_settings(),
+        vector_dimension=1024,
+        client=client,
+    )
+    client.description = repository._build_schema(1024).to_dict()
+
+    rows = repository.list_all_vector_states()
+
+    assert rows == []
+    assert client.last_query_iterator is not None
+    assert client.last_query_iterator.closed is True
+
+
+def test_contract_repository_list_all_vector_states_custom_output_fields() -> None:
+    client = FakeContractMilvusClient(exists=True)
+    repository = ContractMilvusVectorRepository(
+        contract_settings(),
+        vector_dimension=1024,
+        client=client,
+    )
+    client.description = repository._build_schema(1024).to_dict()
+    repository.upsert_batch(embedded_contract_chunks())
+
+    rows = repository.list_all_vector_states(
+        output_fields=["vector_doc_id", "expert_id"],
+    )
+
+    assert all(set(row) == {"vector_doc_id", "expert_id"} for row in rows)
+
+
+def test_contract_repository_list_all_vector_states_rejects_bad_output_fields() -> None:
+    repository = ContractMilvusVectorRepository(
+        contract_settings(),
+        vector_dimension=1024,
+        client=object(),
+    )
+
+    with pytest.raises(ValueError, match="output_fields"):
+        repository.list_all_vector_states(output_fields=[])
+    with pytest.raises(ValueError, match="output_fields"):
+        repository.list_all_vector_states(output_fields=["  "])
+
+
+def test_contract_repository_list_all_vector_states_merges_batches() -> None:
+    client = FakeContractMilvusClient(exists=True)
+    repository = ContractMilvusVectorRepository(
+        contract_settings(),
+        vector_dimension=1024,
+        client=client,
+    )
+    client.description = repository._build_schema(1024).to_dict()
+    repository.upsert_batch(embedded_contract_chunks())
+    rows_expected = list(client.rows.values())
+    client.model_space_batches = [rows_expected[:1], rows_expected[1:]]
+
+    rows = repository.list_all_vector_states()
+
+    assert len(rows) == 3
+    assert client.last_query_iterator is not None
+    assert client.last_query_iterator.next_calls == 3
+    assert client.last_query_iterator.closed is True
+
+
+def test_contract_repository_list_all_vector_states_rejects_malformed_batch() -> None:
+    client = FakeContractMilvusClient(exists=True)
+    repository = ContractMilvusVectorRepository(
+        contract_settings(),
+        vector_dimension=1024,
+        client=client,
+    )
+    client.description = repository._build_schema(1024).to_dict()
+    client.model_space_batches = [[{"vector_doc_id": "expert:900001:profile_summary:1:0"}], ["not-a-row"]]
+
+    with pytest.raises(TypeError, match="非法 Entity 批次"):
+        repository.list_all_vector_states()
+
+    assert client.last_query_iterator is not None
+    assert client.last_query_iterator.closed is True
+
+
+def test_contract_repository_list_all_vector_states_rejects_duplicate_ids() -> None:
+    client = FakeContractMilvusClient(exists=True)
+    repository = ContractMilvusVectorRepository(
+        contract_settings(),
+        vector_dimension=1024,
+        client=client,
+    )
+    client.description = repository._build_schema(1024).to_dict()
+    repository.upsert_batch(embedded_contract_chunks())
+    rows_expected = list(client.rows.values())
+    # 同一 Entity 跨批次重复出现，模拟读取结果不可信
+    duplicate_row = rows_expected[0]
+    client.model_space_batches = [[duplicate_row], [duplicate_row]]
+
+    with pytest.raises(RuntimeError, match="重复 vector_doc_id"):
+        repository.list_all_vector_states()
+
+    assert client.last_query_iterator is not None
+    assert client.last_query_iterator.closed is True
+
+
+def _destructive_settings(
+    *,
+    collection_name: str = "expert_candidates_v14_contract_dev",
+    allowed: tuple[str, ...] = ("expert_candidates_v14_contract_dev",),
+) -> MilvusSettings:
+    return MilvusSettings(
+        collection_name=collection_name,
+        index_type="HNSW",
+        metric_type="COSINE",
+        index_params={"M": 16, "efConstruction": 200},
+        destructive_maintenance_collections=list(allowed),
+    )
+
+
+def _destructive_description(repository: Any) -> dict[str, Any]:
+    return repository._build_schema(1024).to_dict()
+
+
+def _replace_field(
+    description: dict[str, Any],
+    field_name: str,
+    **overrides: Any,
+) -> dict[str, Any]:
+    fields = []
+    for field in description.get("fields", []):
+        item = dict(field)
+        if item.get("name") == field_name:
+            item = {**item, **overrides}
+        fields.append(item)
+    return {**description, "fields": fields}
+
+
+def _drop_field(description: dict[str, Any], field_name: str) -> dict[str, Any]:
+    fields = [
+        field
+        for field in description.get("fields", [])
+        if not (isinstance(field, Mapping) and field.get("name") == field_name)
+    ]
+    return {**description, "fields": fields}
+
+
+class DescribeFailingClient(FakeContractMilvusClient):
+    def __init__(self) -> None:
+        super().__init__(exists=True)
+
+    def describe_collection(self, collection_name: str) -> dict[str, Any]:
+        raise RuntimeError("milvus describe failed")
+
+
+def test_destructive_maintenance_allowed_passes_on_contract_collection() -> None:
+    client = FakeContractMilvusClient(exists=True)
+    repository = ContractMilvusVectorRepository(
+        _destructive_settings(),
+        vector_dimension=1024,
+        client=client,
+    )
+    client.description = _destructive_description(repository)
+
+    result = repository.assert_destructive_maintenance_allowed()
+
+    assert result["collection_name"] == "expert_candidates_v14_contract_dev"
+    assert result["authorized"] is True
+    assert result["schema_compatible"] is True
+    assert result["primary_key"] == "vector_doc_id"
+    assert result["auto_id"] is False
+    assert result["embedding_field"] == "embedding"
+    assert result["embedding_dim"] == 1024
+    assert client.drop_calls == []
+
+
+def test_destructive_maintenance_denied_without_authorization() -> None:
+    # 默认白名单为空 -> fail-closed
+    repository = ContractMilvusVectorRepository(
+        contract_settings(),
+        vector_dimension=1024,
+        client=object(),
+    )
+
+    with pytest.raises(RuntimeError, match="未获授权"):
+        repository.assert_destructive_maintenance_allowed()
+
+
+def test_destructive_maintenance_denied_for_historical_collection() -> None:
+    # 历史 / 受保护 Collection 不在白名单 -> 拒绝
+    repository = ContractMilvusVectorRepository(
+        _destructive_settings(collection_name="expert_candidates_v1"),
+        vector_dimension=1024,
+        client=object(),
+    )
+
+    with pytest.raises(RuntimeError, match="未获授权"):
+        repository.assert_destructive_maintenance_allowed()
+
+
+def test_destructive_maintenance_denied_when_collection_missing() -> None:
+    client = FakeContractMilvusClient(exists=False)
+    repository = ContractMilvusVectorRepository(
+        _destructive_settings(),
+        vector_dimension=1024,
+        client=client,
+    )
+
+    with pytest.raises(RuntimeError, match="不存在"):
+        repository.assert_destructive_maintenance_allowed()
+
+
+def test_destructive_maintenance_rejects_wrong_primary_key() -> None:
+    client = FakeContractMilvusClient(exists=True)
+    repository = ContractMilvusVectorRepository(
+        _destructive_settings(),
+        vector_dimension=1024,
+        client=client,
+    )
+    description = _destructive_description(repository)
+    description = _replace_field(description, "vector_doc_id", is_primary=False)
+    description = _replace_field(description, "expert_id", is_primary=True)
+    client.description = description
+
+    with pytest.raises(ValueError, match="主键字段必须为 vector_doc_id"):
+        repository.assert_destructive_maintenance_allowed()
+
+
+def test_destructive_maintenance_rejects_auto_id_enabled() -> None:
+    client = FakeContractMilvusClient(exists=True)
+    repository = ContractMilvusVectorRepository(
+        _destructive_settings(),
+        vector_dimension=1024,
+        client=client,
+    )
+    description = _destructive_description(repository)
+    description["auto_id"] = True
+    client.description = description
+
+    with pytest.raises(ValueError, match="auto_id"):
+        repository.assert_destructive_maintenance_allowed()
+
+
+def test_destructive_maintenance_rejects_missing_vector_field() -> None:
+    client = FakeContractMilvusClient(exists=True)
+    repository = ContractMilvusVectorRepository(
+        _destructive_settings(),
+        vector_dimension=1024,
+        client=client,
+    )
+    description = _drop_field(_destructive_description(repository), "embedding")
+    client.description = description
+
+    with pytest.raises(ValueError, match="缺少向量字段 embedding"):
+        repository.assert_destructive_maintenance_allowed()
+
+
+def test_destructive_maintenance_rejects_dimension_mismatch() -> None:
+    client = FakeContractMilvusClient(exists=True)
+    repository = ContractMilvusVectorRepository(
+        _destructive_settings(),
+        vector_dimension=1024,
+        client=client,
+    )
+    description = _replace_field(
+        _destructive_description(repository),
+        "embedding",
+        params={"dim": 512},
+    )
+    client.description = description
+
+    with pytest.raises(ValueError, match="维度"):
+        repository.assert_destructive_maintenance_allowed()
+
+
+def test_destructive_maintenance_rejects_incompatible_schema() -> None:
+    client = FakeContractMilvusClient(exists=True)
+    repository = ContractMilvusVectorRepository(
+        _destructive_settings(),
+        vector_dimension=1024,
+        client=client,
+    )
+    # 结构性检查通过，但字段容量与正式契约不一致 -> 整体不兼容
+    description = _replace_field(
+        _destructive_description(repository),
+        "chunk_text",
+        params={"max_length": 1234},
+    )
+    client.description = description
+
+    with pytest.raises(ValueError, match="不兼容"):
+        repository.assert_destructive_maintenance_allowed()
+
+
+def test_destructive_maintenance_fail_closed_on_describe_error() -> None:
+    client = DescribeFailingClient()
+    repository = ContractMilvusVectorRepository(
+        _destructive_settings(),
+        vector_dimension=1024,
+        client=client,
+    )
+
+    with pytest.raises(RuntimeError, match="milvus describe failed"):
+        repository.assert_destructive_maintenance_allowed()
+
+
+def test_destructive_maintenance_gate_does_not_affect_ordinary_crud() -> None:
+    # 未授权 destructive maintenance 的配置下，普通写入照常可用。
+    client = FakeContractMilvusClient(exists=True)
+    repository = ContractMilvusVectorRepository(
+        contract_settings(),
+        vector_dimension=1024,
+        client=client,
+    )
+    client.description = repository._build_schema(1024).to_dict()
+
+    result = repository.upsert_batch(embedded_contract_chunks())
+
+    assert result.affected_count == 3
+    assert client.upsert_calls

@@ -97,6 +97,32 @@ def test_milvus_defaults_match_v13_and_credentials_are_secret() -> None:
         )
 
 
+def test_milvus_destructive_maintenance_collections_default_and_parse() -> None:
+    # 默认空：不允许任何 Collection 执行 destructive cleanup（fail-closed）。
+    assert MilvusSettings.from_env({}).destructive_maintenance_collections == ()
+    assert MilvusSettings().destructive_maintenance_collections == ()
+
+    settings = MilvusSettings.from_env(
+        {
+            "MILVUS_ALLOWED_DESTRUCTIVE_COLLECTIONS": (
+                "expert_candidates_v14_contract_dev, stray ,  "
+            ),
+        }
+    )
+    assert settings.destructive_maintenance_collections == (
+        "expert_candidates_v14_contract_dev",
+        "stray",
+    )
+    assert settings.collection_name in settings.destructive_maintenance_collections
+
+
+def test_milvus_destructive_maintenance_explicit_model_value() -> None:
+    settings = MilvusSettings(
+        destructive_maintenance_collections=["a", "b"],
+    )
+    assert settings.destructive_maintenance_collections == ("a", "b")
+
+
 def _description_from_specs(specs: tuple[Any, ...]) -> dict[str, Any]:
     fields: list[dict[str, Any]] = []
     for spec in specs:
