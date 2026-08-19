@@ -4,10 +4,12 @@ from expert_contracts import (
     EXPERT_CHUNK_CONTRACT_VERSION,
     ContractPreparedChunk,
     EmbeddedContractPreparedChunk,
+    EmploymentMetadata,
     ExpertChunkEmbeddingInput,
-    ExpertChunkMetadata,
     ExpertChunkSource,
     ExpertChunkVersions,
+    ProfileSummaryMetadata,
+    ProjectMetadata,
 )
 
 from .chunking import (
@@ -107,8 +109,8 @@ __all__ = [
     "EmbeddingEligibilityError",
     "EmbeddingEligibilityValidator",
     "EmbeddingModel",
+    "EmploymentMetadata",
     "ExpertChunkEmbeddingInput",
-    "ExpertChunkMetadata",
     "ExpertChunkSource",
     "ExpertChunkVersions",
     "FullVectorReconciliationResult",
@@ -118,6 +120,8 @@ __all__ = [
     "MilvusRowMapper",
     "MilvusSettings",
     "MutationResult",
+    "ProfileSummaryMetadata",
+    "ProjectMetadata",
     "SearchHit",
     "SkippedContractChunk",
     "VectorContractError",

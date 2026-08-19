@@ -13,7 +13,6 @@ from typing import Any
 
 from ..config import MilvusSettings
 from .schemas.contract import CONTRACT_SCALAR_INDEX_FIELDS
-from .schemas.contract_v15 import V15_SCALAR_INDEX_FIELDS
 
 
 @dataclass(frozen=True)
@@ -97,26 +96,14 @@ def index_specs_v15(settings: MilvusSettings) -> tuple[IndexSpec, ...]:
         - V15 只读索引对比基准。
 
     构成：
-        1 个向量索引（``embedding_vector``，HNSW/COSINE，参数来自环境配置）+
-        1 个 INVERTED 标量索引（``expert_id``，见
-        ``schemas.contract_v15.V15_SCALAR_INDEX_FIELDS``）。
+        仅 1 个向量索引（``embedding_vector``，HNSW/COSINE，参数来自环境配置）。
 
-    V15 不提前为 ``content_hash`` / ``metadata_hash`` / JSON 建立索引，也不为
-    ``chunk_type`` / ``eligible_for_recommendation`` 保留 projection/index。
+    V15 纯 4 字段阶段不保留任何 scalar index（``expert_id`` 等已进入 flat
+    metadata JSON），也不为 ``chunk_type`` / ``eligible_for_recommendation``
+    保留 projection/index；JSON path index 在真实 V15 E2E 后单独评估。
     """
 
-    vector = vector_index_spec(settings)
-    return (
-        vector,
-        *(
-            IndexSpec(
-                field_name=field_name,
-                index_name=f"{field_name}_inverted",
-                index_type="INVERTED",
-            )
-            for field_name in V15_SCALAR_INDEX_FIELDS
-        ),
-    )
+    return (vector_index_spec(settings),)
 
 
 def build_index_params(

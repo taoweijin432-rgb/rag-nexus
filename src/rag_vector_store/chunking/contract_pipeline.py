@@ -196,7 +196,13 @@ class ContractValidator:
         if actual_hash != value.content_hash:
             errors.append("content_hash 与 chunk_text 的 SHA-256 不一致")
 
-        if metadata.is_current is True and metadata.end_month is not None:
+        # 时间跨字段约束：is_current 只存在于 employment Metadata，
+        # 只有 employment 需要执行 is_current=true 时 end_month 必须为 null。
+        if (
+            value.chunk_type == "employment"
+            and metadata.is_current is True
+            and metadata.end_month is not None
+        ):
             errors.append("is_current=true 时 end_month 必须为 null")
 
         # origin_type × chunk_type 与 verification_status × chunk_type 填充规则。
@@ -221,7 +227,9 @@ class ContractValidator:
                 errors.append(
                     f"{value.chunk_type} 的 verification_status 必须是 verified"
                 )
-            if metadata.eligible_for_recommendation is not None:
+            # per-type 后 employment/project Metadata 已不含该字段（结构上不可能
+            # 存在）；保留 getattr 防御性检查，避免未来回归成 superset。
+            if getattr(metadata, "eligible_for_recommendation", None) is not None:
                 errors.append(
                     "eligible_for_recommendation 只能出现在 profile_summary"
                 )

@@ -18,6 +18,10 @@
     若调用方显式注入 ``repository``，该对象会原样传回
     ``create_vector_ingestion_service(repository=...)``，因此 ingestion 内部
     与 reconciliation 仍共享同一 repository 对象，一致性不受影响。
+
+    ``schema_profile``（v14/v15）控制 Repository 的持久化 profile，透传给
+    ``create_vector_ingestion_service()``；reconciliation 与 ingestion 因此
+    共享同一个 V15（或 V14）Repository 实例。
 """
 
 from __future__ import annotations
@@ -30,8 +34,13 @@ from ..chunking.contract_pipeline import (
 )
 from ..config import MilvusSettings
 from ..embedding_adapters.company_cloud import CompanyCloudEmbeddingModel
-from ..ingestion.factory import create_vector_ingestion_service
+from ..ingestion.factory import (
+    _VALID_PROFILES,
+    SchemaProfile,
+    create_vector_ingestion_service,
+)
 from ..milvus.contract import MilvusRowMapper
+from ..milvus.contract_v15 import MilvusV15RowMapper
 from ..milvus.repository import ContractMilvusVectorRepository
 from ..model_space import FORMAL_EMBEDDING_MODEL_SPACE_ID
 from .full_reconciliation import (
@@ -47,24 +56,35 @@ def create_full_vector_reconciliation_service(
     repository: ContractMilvusVectorRepository | None = None,
     embedding_worker: ContractEmbeddingWorker | None = None,
     validator: ContractValidator | None = None,
-    row_mapper: MilvusRowMapper | None = None,
+    row_mapper: MilvusRowMapper | MilvusV15RowMapper | None = None,
     eligibility_validator: EmbeddingEligibilityValidator | None = None,
     expected_dimension: int = EXPECTED_EMBEDDING_DIMENSION,
     formal_model_space_id: str = FORMAL_EMBEDDING_MODEL_SPACE_ID,
     delete_batch_size: int = _DELETE_BATCH_SIZE,
+    schema_profile: SchemaProfile = "v14",
 ) -> FullVectorReconciliationService:
     """从环境配置（或注入组件）组装完整的 ``FullVectorReconciliationService``。
 
     依赖链：
         ``CompanyCloudEmbeddingModel.from_env()`` -> ``ContractEmbeddingWorker``
         -> ``ContractBatchIngestionService``；``MilvusSettings.from_env()`` ->
-        ``ContractMilvusVectorRepository``。全部经由
+        ``schema_profile`` 对应的 Milvus Repository。全部经由
         ``create_vector_ingestion_service()`` 构建，随后以其内部同一 repository
         组装 ``FullVectorReconciliationService``。
+
+    Args:
+        schema_profile: 持久化 profile，``v14``（默认，现有行为不变）或 ``v15``。
+            ``v15`` 时 reconciliation 与 ingestion 共享同一个
+            ``ContractMilvusV15VectorRepository`` 实例。
 
     允许通过关键字注入部分或全部依赖用于测试 / 自定义组装，未注入项自动从环境读取；
     每个参数语义与 ``create_vector_ingestion_service()`` 一致。
     """
+
+    if schema_profile not in _VALID_PROFILES:
+        raise ValueError(
+            f"schema_profile 必须为 'v14' 或 'v15'，收到 {schema_profile!r}"
+        )
 
     if validator is None:
         validator = ContractValidator()
@@ -77,6 +97,7 @@ def create_full_vector_reconciliation_service(
         row_mapper=row_mapper,
         expected_dimension=expected_dimension,
         formal_model_space_id=formal_model_space_id,
+        schema_profile=schema_profile,
     )
     return FullVectorReconciliationService(
         ingestion.repository,

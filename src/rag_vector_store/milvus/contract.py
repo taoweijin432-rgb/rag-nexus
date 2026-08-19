@@ -19,7 +19,10 @@ from collections.abc import Mapping, Sequence
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
-from expert_contracts.models import EmbeddedContractPreparedChunk
+from expert_contracts.models import (
+    EmbeddedContractPreparedChunk,
+    metadata_model_for_chunk_type,
+)
 
 from .schemas.contract import (
     CONTRACT_SCALAR_INDEX_FIELDS,
@@ -165,7 +168,7 @@ class MilvusRowMapper:
             contract_version=chunk.contract_version,
             verification_status=chunk.metadata.verification_status,
             eligible_for_recommendation=(
-                chunk.metadata.eligible_for_recommendation
+                getattr(chunk.metadata, "eligible_for_recommendation", None)
             ),
             weight_tier=chunk.metadata.weight_tier,
             is_active=chunk.is_active,
@@ -229,6 +232,15 @@ class MilvusRowMapper:
 
         # 反向映射只还原已有 Entity，不生成新向量。Metadata-only/audit-only 更新
         # 依赖旧向量和新 Contract 字段重新构造完整 Upsert 行。
+        # per-type 后：按行中 chunk_type 挑选对应 Metadata 模型声明字段，
+        # 历史 superset 行中不适用于该类型的占位字段会被丢弃（机械投影，
+        # 不保留 null/[] 占位）。
+        metadata_model = metadata_model_for_chunk_type(row.get("chunk_type"))
+        picked_metadata = {
+            key: metadata[key]
+            for key in metadata_model.model_fields
+            if key in metadata
+        }
         payload = {
             "contract_version": row.get("contract_version"),
             "vector_doc_id": row.get("vector_doc_id"),
@@ -242,7 +254,7 @@ class MilvusRowMapper:
             "char_count": row.get("char_count"),
             "content_hash": row.get("content_hash"),
             "metadata_hash": row.get("metadata_hash"),
-            "metadata": dict(metadata),
+            "metadata": picked_metadata,
             "source": dict(source),
             "versions": dict(versions),
             "is_active": row.get("is_active"),

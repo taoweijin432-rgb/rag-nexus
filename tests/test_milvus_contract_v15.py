@@ -1,9 +1,10 @@
 """V15 精简 Milvus Schema / Entity / RowMapper 单元测试。
 
 覆盖：
-    - V15 字段数量 = 7、精确字段集合、PK / auto_id / dynamic / dim；
-    - V15 index 只有 embedding 向量索引 + expert_id INVERTED；
-    - to_entity 只产出 7 个物理字段，metadata 为单层 flat JSON；
+    - V15 字段数量 = 4、精确字段集合、PK / auto_id / dynamic / dim；
+    - V15 index 只有 embedding 向量索引（无任何 scalar index）；
+    - to_entity 只产出 4 个物理字段，metadata 为单层 flat JSON；
+    - expert_id / content_hash / metadata_hash 已进入 metadata，不再是一级字段；
     - 一级字段不重复出现在 metadata；namespace 键被禁止；key 冲突 fail-closed；
     - null / [] / Decimal / datetime 序列化语义；source / versions 平铺；
     - from_row round-trip：embedding、hash、update_metadata 所需字段完整恢复；
@@ -49,15 +50,15 @@ FIXTURE_PATH = (
     / "expert_chunk_embedding_input_v4.jsonl"
 )
 
+# V15 纯 4 字段：expert_id / content_hash / metadata_hash 已进入 flat metadata。
 V15_FIELD_NAMES = (
     "vector_doc_id",
-    "expert_id",
-    "content_hash",
-    "metadata_hash",
     "chunk_text",
     "embedding",
     "metadata",
 )
+# 从一级字段迁移进 metadata 的字段。
+V15_MOVED_TO_METADATA = ("expert_id", "content_hash", "metadata_hash")
 
 
 class FakeEmbeddingModel:
@@ -95,9 +96,9 @@ def v15_settings() -> MilvusSettings:
 # ---------- Schema：字段数量 / 精确集合 / PK / auto_id / dynamic / dim ----------
 
 
-def test_v15_field_count_is_seven() -> None:
+def test_v15_field_count_is_four() -> None:
     specs = v15_milvus_field_specs(1024)
-    assert len(specs) == 7
+    assert len(specs) == 4
 
 
 def test_v15_field_set_exact() -> None:
@@ -106,13 +107,13 @@ def test_v15_field_set_exact() -> None:
     types = {spec.name: spec.datatype for spec in specs}
     assert types == {
         "vector_doc_id": "VARCHAR",
-        "expert_id": "INT64",
-        "content_hash": "VARCHAR",
-        "metadata_hash": "VARCHAR",
         "chunk_text": "VARCHAR",
         "embedding": "FLOAT_VECTOR",
         "metadata": "JSON",
     }
+    # 不再存在 expert_id / content_hash / metadata_hash 一级字段
+    for moved in V15_MOVED_TO_METADATA:
+        assert moved not in types
 
 
 def test_v15_schema_pk_auto_id_dynamic_dim() -> None:
@@ -125,7 +126,7 @@ def test_v15_schema_pk_auto_id_dynamic_dim() -> None:
     assert fields["embedding"].dtype == DataType.FLOAT_VECTOR
     assert fields["embedding"].dim == 1024
     assert fields["metadata"].dtype == DataType.JSON
-    assert len(schema.fields) == 7
+    assert len(schema.fields) == 4
 
 
 def test_v15_schema_rejects_missing_dimension() -> None:
@@ -133,42 +134,44 @@ def test_v15_schema_rejects_missing_dimension() -> None:
         build_v15_schema(v15_settings(), None)
 
 
-# ---------- Index：只有 embedding 向量 + expert_id INVERTED ----------
+# ---------- Index：只有 embedding 向量索引 ----------
 
 
-def test_v15_index_specs_only_vector_and_expert_id() -> None:
+def test_v15_index_specs_only_vector_index() -> None:
     specs = index_specs_v15(v15_settings())
-    assert len(specs) == 2
-    assert [spec.field_name for spec in specs] == ["embedding", "expert_id"]
+    assert len(specs) == 1
+    assert [spec.field_name for spec in specs] == ["embedding"]
     assert specs[0].index_type == "HNSW"
     assert specs[0].metric_type == "COSINE"
-    assert specs[1].index_type == "INVERTED"
-    assert specs[1].index_name == "expert_id_inverted"
-    assert V15_SCALAR_INDEX_FIELDS == ("expert_id",)
+    assert specs[0].index_name == "embedding_vector"
+    # 不再有 expert_id INVERTED / 任何 scalar index
+    assert V15_SCALAR_INDEX_FIELDS == ()
 
 
-def test_v15_index_specs_do_not_include_v14_scalar_fields() -> None:
+def test_v15_index_specs_do_not_include_any_scalar_field() -> None:
     v15_names = {spec.field_name for spec in index_specs_v15(v15_settings())}
     for field in CONTRACT_SCALAR_INDEX_FIELDS:
-        if field != "expert_id":
-            assert field not in v15_names
+        assert field not in v15_names
+    for moved in V15_MOVED_TO_METADATA:
+        assert moved not in v15_names
 
 
-# ---------- to_entity：7 个物理字段 + flat metadata ----------
+# ---------- to_entity：4 个物理字段 + flat metadata ----------
 
 
-def test_v15_to_entity_only_seven_physical_fields() -> None:
+def test_v15_to_entity_only_four_physical_fields() -> None:
     chunk = v15_embedded_chunks()[1]
     entity = MilvusV15RowMapper().to_entity(chunk)
 
     assert isinstance(entity, MilvusV15Entity)
     assert tuple(entity.model_dump().keys()) == V15_FIELD_NAMES
     assert entity.vector_doc_id == chunk.vector_doc_id
-    assert entity.expert_id == chunk.expert_id
-    assert entity.content_hash == chunk.content_hash
-    assert entity.metadata_hash == chunk.metadata_hash
     assert entity.chunk_text == chunk.chunk_text
     assert entity.embedding == chunk.embedding
+    # expert_id / content_hash / metadata_hash 已进入 metadata，不再是实体属性
+    assert not hasattr(entity, "expert_id")
+    assert not hasattr(entity, "content_hash")
+    assert not hasattr(entity, "metadata_hash")
 
 
 def test_v15_metadata_is_flat_json() -> None:
@@ -193,10 +196,23 @@ def test_v15_metadata_no_namespace_keys() -> None:
     assert not _V15_NAMESPACE_KEYS.intersection(entity.metadata.keys())
 
 
-def test_v15_metadata_required_top_level_fields_present() -> None:
+def test_v15_moved_fields_in_metadata() -> None:
+    """expert_id / content_hash / metadata_hash 进入 metadata，值原样透传。"""
     chunk = v15_embedded_chunks()[1]
     flat = MilvusV15RowMapper().to_entity(chunk).metadata
+    assert flat["expert_id"] == chunk.expert_id
+    assert flat["content_hash"] == chunk.content_hash
+    assert flat["metadata_hash"] == chunk.metadata_hash
+
+
+def test_v15_metadata_required_top_level_fields_present() -> None:
+    chunk = v15_embedded_chunks()[1]  # employment
+    flat = MilvusV15RowMapper().to_entity(chunk).metadata
+    # 顶层 Contract 的非物理字段平铺进 flat metadata（不含 metadata_hash 自身计算）。
     for key in (
+        "expert_id",
+        "content_hash",
+        "metadata_hash",
         "serial_number",
         "chunk_type",
         "chunk_subtype",
@@ -205,7 +221,6 @@ def test_v15_metadata_required_top_level_fields_present() -> None:
         "char_count",
         "contract_version",
         "verification_status",
-        "eligible_for_recommendation",
         "weight_tier",
         "is_active",
         "updated_at",
@@ -215,6 +230,19 @@ def test_v15_metadata_required_top_level_fields_present() -> None:
         "embedding_model_version",
     ):
         assert key in flat, f"flat metadata 缺少 {key!r}"
+    # per-type：employment 不输出 profile 专属字段，禁止占位。
+    for profile_only in (
+        "eligible_for_recommendation",
+        "job_status_norm",
+        "abroad_flag_norm",
+        "work_years",
+        "function_codes",
+        "school_names_raw",
+        "major_names_raw",
+    ):
+        assert profile_only not in flat, (
+            f"employment flat metadata 不应含 profile 专属字段 {profile_only!r}"
+        )
     assert flat["embedding_dim"] == len(chunk.embedding)
     assert flat["embedding_model_alias"] == chunk.embedding_model_alias
     assert flat["embedding_model_version"] == chunk.embedding_model_version
@@ -252,14 +280,28 @@ def test_v15_metadata_business_fields_flattened() -> None:
 def test_v15_null_and_empty_array_preserved() -> None:
     chunk = v15_embedded_chunks()[2]  # project：大量 null / 空数组
     flat = MilvusV15RowMapper().to_entity(chunk).metadata
-    assert flat["role_code"] is None
-    assert flat["job_status_norm"] is None
-    assert flat["work_years"] is None
-    assert flat["is_current"] is None
+    # per-type：project 不输出 profile/employment 专属字段，禁止占位。
+    for other_type_field in (
+        "role_code",
+        "role_level",
+        "role_name_raw",
+        "job_status_norm",
+        "abroad_flag_norm",
+        "work_years",
+        "is_current",
+        "function_codes",
+        "school_names_raw",
+        "major_names_raw",
+        "eligible_for_recommendation",
+    ):
+        assert other_type_field not in flat, (
+            f"project flat metadata 不应含其他类型字段 {other_type_field!r}"
+        )
+    # 公共字段与 project 专属字段的 null / 空数组语义仍保留。
     assert flat["industry_codes"] == chunk.metadata.industry_codes
-    assert flat["function_codes"] == []
-    assert flat["school_names_raw"] == []
-    assert flat["major_names_raw"] == []
+    assert flat["topic_codes"] == chunk.metadata.topic_codes
+    assert flat["company_name_raw"] is None or isinstance(flat["company_name_raw"], str)
+    assert flat["project_name"] == chunk.metadata.project_name
 
 
 def test_v15_decimal_work_years_serialized_as_string() -> None:
@@ -407,9 +449,6 @@ def test_v15_entity_rejects_non_finite_embedding() -> None:
     with pytest.raises(ValueError, match="有限浮点数"):
         MilvusV15Entity(
             vector_doc_id="expert:1:profile_summary:1:0",
-            expert_id=1,
-            content_hash="a" * 64,
-            metadata_hash="b" * 64,
             chunk_text="x",
             embedding=[float("nan"), 0.1],
             metadata={},
@@ -422,13 +461,10 @@ def test_v15_entity_rejects_extra_fields() -> None:
     with pytest.raises(ValidationError):
         MilvusV15Entity(
             vector_doc_id="expert:1:profile_summary:1:0",
-            expert_id=1,
-            content_hash="a" * 64,
-            metadata_hash="b" * 64,
             chunk_text="x",
             embedding=[0.1],
             metadata={},
-            chunk_type="employment",  # type: ignore[call-arg]
+            expert_id=1,  # type: ignore[call-arg]
         )
 
 
@@ -449,9 +485,6 @@ def test_v15_metadata_json_size_limit() -> None:
     big_metadata["huge"] = "x" * 70000
     oversized = MilvusV15Entity(
         vector_doc_id=entity.vector_doc_id,
-        expert_id=entity.expert_id,
-        content_hash=entity.content_hash,
-        metadata_hash=entity.metadata_hash,
         chunk_text=entity.chunk_text,
         embedding=entity.embedding,
         metadata=big_metadata,

@@ -14,11 +14,13 @@ from typing import Any
 
 # 四种版本各自管理不同兼容边界，不能合并成一个含义模糊的 version。
 CHUNK_POLICY_VERSION = "1.3"
-# V1.3 取消 metadata_json，并按三种 Chunk 类型使用扁平字段规范，属于主版本变化。
-METADATA_SCHEMA_VERSION = "3.0"
+# 4.0：Metadata 从三类 superset 改为按 chunk_type 分类组装（per-type），
+# 不适用于当前类型的字段不再输出占位，属于主版本变化。
+METADATA_SCHEMA_VERSION = "4.0"
 DICTIONARY_VERSION = "2026.08"
-# v4 删除最终表/导出中的 chunk_id、source_item_key、dictionary_version、data_version。
-CONTRACT_VERSION = "4.0.0"
+# v4 删除最终表/导出中的 chunk_id、source_item_key、dictionary_version、data_version；
+# 4.1 将 ExpertChunkEmbeddingInput.metadata 从统一 superset 改为 per-type 模型。
+CONTRACT_VERSION = "4.1.0"
 
 _ENV_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 

@@ -50,7 +50,7 @@ def make_record(
     text = "[专家能力概述]\n虚构测试专家具备知识检索系统建设经验。"
     source_field_id = f"profile-{index}"
     return ExpertChunkEmbeddingInput(
-        contract_version="4.0.0",
+        contract_version="4.1.0",
         vector_doc_id=vector_doc_id
         or f"expert:900001:profile_summary:{source_field_id}:0",
         expert_id=900001,
@@ -72,10 +72,6 @@ def make_record(
             "job_status_norm": "active",
             "abroad_flag_norm": False,
             "work_years": None,
-            "project_name": None,
-            "start_month": None,
-            "end_month": None,
-            "is_current": None,
             "industry_codes": ["artificial_intelligence"],
             "function_codes": [],
             "topic_codes": ["knowledge_retrieval"],
@@ -94,7 +90,7 @@ def make_record(
             "source_updated_at": "2026-08-12T10:00:00+08:00",
             "source_hash": "a" * 64,
         },
-        versions={"chunk_policy_version": "1.3", "metadata_schema_version": "3.0"},
+        versions={"chunk_policy_version": "1.3", "metadata_schema_version": "4.0"},
         is_active=is_active,
         updated_at="2026-08-12T10:05:00+08:00",
     )

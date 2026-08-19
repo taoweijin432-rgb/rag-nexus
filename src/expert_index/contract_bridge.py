@@ -14,10 +14,12 @@ from zoneinfo import ZoneInfo
 
 from expert_contracts import (
     EXPERT_CHUNK_CONTRACT_VERSION,
+    EmploymentMetadata,
     ExpertChunkEmbeddingInput,
-    ExpertChunkMetadata,
     ExpertChunkSource,
     ExpertChunkVersions,
+    ProfileSummaryMetadata,
+    ProjectMetadata,
 )
 
 from .models import ChunkRecord
@@ -49,6 +51,56 @@ def chunk_record_to_contract(
         if chunk.work_years is not None
         else None
     )
+    # 按 chunk_type 构造对应 Metadata：不输出其他类型的字段占位。
+    if chunk.chunk_type == "profile_summary":
+        metadata = ProfileSummaryMetadata(
+            company_name_raw=chunk.company_name_raw,
+            company_name_norm=chunk.company_name_norm,
+            role_name_raw=chunk.role_name_raw,
+            role_code=chunk.role_code,
+            role_level=chunk.role_level,
+            job_status_norm=chunk.job_status_norm,
+            abroad_flag_norm=chunk.abroad_flag_norm,
+            work_years=work_years,
+            industry_codes=list(chunk.industry_codes),
+            function_codes=list(chunk.function_codes),
+            topic_codes=list(chunk.topic_codes),
+            school_names_raw=list(chunk.school_names_raw),
+            major_names_raw=list(chunk.major_names_raw),
+            eligible_for_recommendation=chunk.eligible_for_recommendation,
+            origin_type=chunk.origin_type,
+            verification_status=chunk.verification_status,
+            weight_tier=chunk.weight_tier,
+        )
+    elif chunk.chunk_type == "employment":
+        metadata = EmploymentMetadata(
+            company_name_raw=chunk.company_name_raw,
+            company_name_norm=chunk.company_name_norm,
+            role_name_raw=chunk.role_name_raw,
+            role_code=chunk.role_code,
+            role_level=chunk.role_level,
+            start_month=chunk.start_month,
+            end_month=chunk.end_month,
+            is_current=chunk.is_current,
+            industry_codes=list(chunk.industry_codes),
+            topic_codes=list(chunk.topic_codes),
+            origin_type=chunk.origin_type,
+            verification_status=chunk.verification_status,
+            weight_tier=chunk.weight_tier,
+        )
+    else:
+        metadata = ProjectMetadata(
+            company_name_raw=chunk.company_name_raw,
+            company_name_norm=chunk.company_name_norm,
+            project_name=chunk.project_name,
+            start_month=chunk.start_month,
+            end_month=chunk.end_month,
+            industry_codes=list(chunk.industry_codes),
+            topic_codes=list(chunk.topic_codes),
+            origin_type=chunk.origin_type,
+            verification_status=chunk.verification_status,
+            weight_tier=chunk.weight_tier,
+        )
     return ExpertChunkEmbeddingInput(
         contract_version=EXPERT_CHUNK_CONTRACT_VERSION,
         vector_doc_id=chunk.vector_doc_id,
@@ -62,29 +114,7 @@ def chunk_record_to_contract(
         char_count=chunk.char_count,
         content_hash=chunk.content_hash,
         metadata_hash=chunk.metadata_hash,
-        metadata=ExpertChunkMetadata(
-            company_name_raw=chunk.company_name_raw,
-            company_name_norm=chunk.company_name_norm,
-            role_name_raw=chunk.role_name_raw,
-            role_code=chunk.role_code,
-            role_level=chunk.role_level,
-            job_status_norm=chunk.job_status_norm,
-            abroad_flag_norm=chunk.abroad_flag_norm,
-            work_years=work_years,
-            project_name=chunk.project_name,
-            start_month=chunk.start_month,
-            end_month=chunk.end_month,
-            is_current=chunk.is_current,
-            industry_codes=list(chunk.industry_codes),
-            function_codes=list(chunk.function_codes),
-            topic_codes=list(chunk.topic_codes),
-            school_names_raw=list(chunk.school_names_raw),
-            major_names_raw=list(chunk.major_names_raw),
-            eligible_for_recommendation=chunk.eligible_for_recommendation,
-            origin_type=chunk.origin_type,
-            verification_status=chunk.verification_status,
-            weight_tier=chunk.weight_tier,
-        ),
+        metadata=metadata,
         source=ExpertChunkSource(
             source_table=chunk.source_table,
             source_field=chunk.source_field,

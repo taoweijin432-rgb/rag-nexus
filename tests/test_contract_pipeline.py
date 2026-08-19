@@ -14,6 +14,7 @@ from decimal import Decimal
 from typing import Any
 
 import pytest
+from pydantic import ValidationError
 
 from expert_contracts.models import ExpertChunkEmbeddingInput
 from rag_vector_store.chunking.contract_pipeline import (
@@ -36,25 +37,12 @@ def _text(chunk_type: str) -> str:
 
 
 def _metadata(chunk_type: str) -> dict[str, Any]:
+    """按 chunk_type 构造对应 Metadata 字段（不输出其他类型的占位）。"""
     common: dict[str, Any] = {
         "company_name_raw": "某公司",
         "company_name_norm": "某标准公司",
-        "role_name_raw": "产品经理",
-        "role_code": "product_manager",
-        "role_level": "manager",
-        "job_status_norm": None,
-        "abroad_flag_norm": None,
-        "work_years": None,
-        "project_name": None,
-        "start_month": None,
-        "end_month": None,
-        "is_current": None,
         "industry_codes": [],
-        "function_codes": [],
         "topic_codes": [],
-        "school_names_raw": [],
-        "major_names_raw": [],
-        "eligible_for_recommendation": None,
         "origin_type": "source_parsed",
         "verification_status": "verified",
         "weight_tier": "A",
@@ -70,7 +58,6 @@ def _metadata(chunk_type: str) -> dict[str, Any]:
                 "job_status_norm": "active",
                 "abroad_flag_norm": False,
                 "work_years": Decimal("12.00"),
-                "industry_codes": ["artificial_intelligence"],
                 "function_codes": ["product_management"],
                 "school_names_raw": ["测试大学"],
                 "major_names_raw": ["软件工程"],
@@ -83,6 +70,9 @@ def _metadata(chunk_type: str) -> dict[str, Any]:
     elif chunk_type == "employment":
         common.update(
             {
+                "role_name_raw": "产品经理",
+                "role_code": "product_manager",
+                "role_level": "manager",
                 "start_month": "202301",
                 "end_month": None,
                 "is_current": True,
@@ -95,7 +85,6 @@ def _metadata(chunk_type: str) -> dict[str, Any]:
                 "project_name": "某项目",
                 "start_month": "202401",
                 "end_month": "202406",
-                "industry_codes": [],
             }
         )
     return common
@@ -128,7 +117,7 @@ def make_record(
     if _set_eligible:
         meta["eligible_for_recommendation"] = eligible
     return ExpertChunkEmbeddingInput(
-        contract_version="4.0.0",
+        contract_version="4.1.0",
         vector_doc_id=f"expert:7:{chunk_type}:{sid}:0",
         expert_id=7,
         serial_number="SN-7",
@@ -149,7 +138,7 @@ def make_record(
             "source_updated_at": "2026-08-11T10:00:00+08:00",
             "source_hash": "a" * 64,
         },
-        versions={"chunk_policy_version": "1.3", "metadata_schema_version": "3.0"},
+        versions={"chunk_policy_version": "1.3", "metadata_schema_version": "4.0"},
         is_active=is_active,
         updated_at="2026-08-11T10:05:00+08:00",
     )
@@ -220,10 +209,11 @@ def test_profile_with_verified_is_invalid() -> None:
 
 
 def test_non_profile_with_eligible_for_recommendation_is_invalid() -> None:
-    with pytest.raises(ContractValidationError, match="eligible_for_recommendation"):
-        _validator().validate(
-            make_record("employment", _set_eligible=True, eligible=True)
-        )
+    # per-type 后 employment Metadata 不含 eligible_for_recommendation 字段，
+    # 传入该字段在 Contract 构造层即被 extra=forbid 拒绝（fail-closed 语义不变，
+    # 从“Validator 拒绝”提前到“Contract 构造拒绝”）。
+    with pytest.raises(ValidationError, match="extra_forbidden"):
+        make_record("employment", _set_eligible=True, eligible=True)
 
 
 def test_wrong_origin_type_is_invalid() -> None:

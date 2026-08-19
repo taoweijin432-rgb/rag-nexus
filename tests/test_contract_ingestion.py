@@ -104,7 +104,7 @@ def make_record(index: int = 0) -> ExpertChunkEmbeddingInput:
     source_field_id = f"profile-{index}"
     vector_doc_id = f"expert:900001:profile_summary:{source_field_id}:0"
     return ExpertChunkEmbeddingInput(
-        contract_version="4.0.0",
+        contract_version="4.1.0",
         vector_doc_id=vector_doc_id,
         expert_id=900001,
         serial_number="DEV900001",
@@ -125,10 +125,6 @@ def make_record(index: int = 0) -> ExpertChunkEmbeddingInput:
             "job_status_norm": "active",
             "abroad_flag_norm": False,
             "work_years": None,
-            "project_name": None,
-            "start_month": None,
-            "end_month": None,
-            "is_current": None,
             "industry_codes": ["artificial_intelligence"],
             "function_codes": [],
             "topic_codes": ["knowledge_retrieval"],
@@ -147,7 +143,7 @@ def make_record(index: int = 0) -> ExpertChunkEmbeddingInput:
             "source_updated_at": "2026-08-12T10:00:00+08:00",
             "source_hash": "a" * 64,
         },
-        versions={"chunk_policy_version": "1.3", "metadata_schema_version": "3.0"},
+        versions={"chunk_policy_version": "1.3", "metadata_schema_version": "4.0"},
         is_active=True,
         updated_at="2026-08-12T10:05:00+08:00",
     )

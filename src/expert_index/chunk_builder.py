@@ -397,9 +397,14 @@ def metadata_hash_payload(chunk: ChunkRecord) -> dict[str, object]:
     ``content_hash`` 被刻意排除，确保正文变化与 Metadata 变化可以分别判断；
     ``indexed_at``、Embedding 模型字段和数据库更新时间由下游或数据库产生，也不应
     导致上游相同业务 Metadata 的哈希漂移。
+
+    4.1.0 变更：Metadata 改为按 ``chunk_type`` 分类组装后，hash payload 只包含
+    “公共字段 + 当前 ``chunk_type`` 实际存在的 Metadata 字段”；不适用于当前类型
+    的字段不再以 ``None``/``[]`` 占位参与哈希。
     """
 
-    return {
+    payload: dict[str, object] = {
+        # 身份 / 切分 / 来源 / 版本 / 有效性公共字段。
         "vector_doc_id": chunk.vector_doc_id,
         "expert_id": chunk.expert_id,
         "serial_number": chunk.serial_number,
@@ -413,24 +418,11 @@ def metadata_hash_payload(chunk: ChunkRecord) -> dict[str, object]:
         "source_version": chunk.source_version,
         "source_updated_at": chunk.source_updated_at,
         "source_hash": chunk.source_hash,
+        # 公共业务 Metadata。
         "company_name_raw": chunk.company_name_raw,
         "company_name_norm": chunk.company_name_norm,
-        "role_name_raw": chunk.role_name_raw,
-        "role_code": chunk.role_code,
-        "role_level": chunk.role_level,
-        "job_status_norm": chunk.job_status_norm,
-        "abroad_flag_norm": chunk.abroad_flag_norm,
-        "work_years": chunk.work_years,
-        "project_name": chunk.project_name,
-        "start_month": chunk.start_month,
-        "end_month": chunk.end_month,
-        "is_current": chunk.is_current,
         "industry_codes": list(chunk.industry_codes),
-        "function_codes": list(chunk.function_codes),
         "topic_codes": list(chunk.topic_codes),
-        "school_names_raw": list(chunk.school_names_raw),
-        "major_names_raw": list(chunk.major_names_raw),
-        "eligible_for_recommendation": chunk.eligible_for_recommendation,
         "origin_type": chunk.origin_type,
         "verification_status": chunk.verification_status,
         "weight_tier": chunk.weight_tier,
@@ -438,6 +430,42 @@ def metadata_hash_payload(chunk: ChunkRecord) -> dict[str, object]:
         "metadata_schema_version": chunk.metadata_schema_version,
         "is_active": chunk.is_active,
     }
+    # 当前 chunk_type 专属业务 Metadata：只参与本类型实际存在的字段。
+    if chunk.chunk_type == "profile_summary":
+        payload.update(
+            {
+                "role_name_raw": chunk.role_name_raw,
+                "role_code": chunk.role_code,
+                "role_level": chunk.role_level,
+                "job_status_norm": chunk.job_status_norm,
+                "abroad_flag_norm": chunk.abroad_flag_norm,
+                "work_years": chunk.work_years,
+                "function_codes": list(chunk.function_codes),
+                "school_names_raw": list(chunk.school_names_raw),
+                "major_names_raw": list(chunk.major_names_raw),
+                "eligible_for_recommendation": chunk.eligible_for_recommendation,
+            }
+        )
+    elif chunk.chunk_type == "employment":
+        payload.update(
+            {
+                "role_name_raw": chunk.role_name_raw,
+                "role_code": chunk.role_code,
+                "role_level": chunk.role_level,
+                "start_month": chunk.start_month,
+                "end_month": chunk.end_month,
+                "is_current": chunk.is_current,
+            }
+        )
+    else:
+        payload.update(
+            {
+                "project_name": chunk.project_name,
+                "start_month": chunk.start_month,
+                "end_month": chunk.end_month,
+            }
+        )
+    return payload
 
 
 def calculate_metadata_hash(chunk: ChunkRecord) -> str:

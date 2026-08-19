@@ -245,8 +245,10 @@ def test_milvus_row_mapper_preserves_scalars_and_nested_contracts() -> None:
     assert entity.metadata_hash == chunk.metadata_hash
     assert entity.verification_status == chunk.metadata.verification_status
     assert entity.weight_tier == chunk.metadata.weight_tier
-    assert entity.eligible_for_recommendation == (
-        chunk.metadata.eligible_for_recommendation
+    # per-type 后 employment/project Metadata 不含 eligible_for_recommendation，
+    # 标量投影 fallback 为 None。
+    assert entity.eligible_for_recommendation == getattr(
+        chunk.metadata, "eligible_for_recommendation", None
     )
     # source_field 只进入 source_ext，不保留独立 Scalar
     assert entity.source_ext["source_field"] == chunk.source.source_field

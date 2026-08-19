@@ -6,32 +6,44 @@ V15 与 v14 的关系：
     - 本类是同一套 CRUD / Query / Safety 编排的 V15 变体，通过整体替换 base
       Repository 的持久化 profile 实现，不复制任何 CRUD 逻辑，也不在方法内
       按版本分支：
-        * Schema：``v15_milvus_field_specs``（7 字段）+ ``build_v15_schema``；
-        * 行映射：``MilvusV15RowMapper``（7 字段 + flat metadata JSON）；
-        * 索引：``index_specs_v15``（embedding HNSW/COSINE + expert_id INVERTED）；
-        * 全量扫描 filter：基于一级 ``expert_id INT64`` 的恒真合法范围
-          （``expert_id >= 0``），Full Reconciliation 状态扫描不依赖 JSON；
-          模型空间一致性检查仍允许读取 metadata JSON（V15 的
+        * Schema：``v15_milvus_field_specs``（4 字段）+ ``build_v15_schema``；
+        * 行映射：``MilvusV15RowMapper``（4 字段 + flat metadata JSON）；
+        * 索引：``index_specs_v15``（仅 embedding HNSW/COSINE）；
+        * 全量扫描 filter：基于一级 PK ``vector_doc_id`` 的恒真合法范围
+          （``vector_doc_id != ""``），Full Reconciliation 状态扫描不依赖
+          任何不存在的 V15 scalar；
+        * 模型空间一致性检查从 metadata JSON 读取（V15 的
           ``embedding_model_alias`` / ``embedding_model_version`` /
           ``embedding_dim`` 位于其中）。
 
-V15 物理 Schema（7 字段，dynamic=False）：
+V15 物理 Schema（4 字段，dynamic=False）：
 
     vector_doc_id  VARCHAR PK (auto_id=False)
-    expert_id      INT64                  <- 唯一 INVERTED scalar index
-    content_hash   VARCHAR(64)
-    metadata_hash  VARCHAR(64)
     chunk_text     VARCHAR(8192)
     embedding      FLOAT_VECTOR(1024)
-    metadata       JSON（单层 flat，其余全部 Contract 信息）
+    metadata       JSON（单层 flat，其余全部 Contract 信息，
+                   含 expert_id / content_hash / metadata_hash）
+
+所有 CRUD 统一通过 ``vector_doc_id`` 定位：
+    - upsert：直接使用传入 Contract 的 ``vector_doc_id``（不生成 / 不重算）；
+    - update_metadata：按 ``vector_doc_id`` 读旧 Entity → 保留原 embedding →
+      重建 chunk_text/metadata → 同 PK upsert（不重新 Embedding）；
+    - delete / get：按 PK ``vector_doc_id``。
+
+``query_by_expert_id`` 是迁移期兼容路径（``expert_index`` 仍依赖
+``list_vectors_by_expert(expert_id)``）：V15 通过 flat metadata JSON path
+``metadata["expert_id"] == N`` 查询，不把 expert_id 重新提升为一级字段。
+``list_all_vector_states`` 物理读取 ``["vector_doc_id", "metadata"]``，再从
+metadata 提取 ``content_hash`` / ``metadata_hash`` —— 这是纯 4 字段设计明确
+接受的 tradeoff，不为了优化而重新增加 hash scalar。
 
 职责边界与 base Repository 完全一致：不负责 Contract Validation、Eligibility、
 Embedding、Task State；不创建真实 Collection（是否创建由调用方结合
 ``allow_collection_creation`` 决定）；不修改 .env；不迁移真实数据。
 
-检索（``search``）暂未接通：V15 没有 ``chunk_type`` / ``expert_id`` 之外的
-一级过滤字段（``chunk_type`` 已进入 metadata JSON），检索语义需要单独设计，
-本任务不进入检索功能，调用直接抛 ``NotImplementedError``。
+检索（``search``）暂未接通：V15 没有一级 ``chunk_type`` / ``expert_id`` 过滤
+字段（已进入 metadata JSON），检索语义需要单独设计，本任务不进入检索功能，
+调用直接抛 ``NotImplementedError``。
 """
 
 from __future__ import annotations
@@ -45,6 +57,9 @@ from .repository import ContractMilvusVectorRepository
 from .schemas.contract_v15 import build_v15_schema, v15_milvus_field_specs
 
 __all__ = ["ContractMilvusV15VectorRepository"]
+
+# V15 不存在的一级字段（已进入 flat metadata JSON）：禁止作为一级 output field。
+_V15_FORBIDDEN_TOP_LEVEL_FIELDS = ("expert_id", "content_hash", "metadata_hash")
 
 
 class ContractMilvusV15VectorRepository(ContractMilvusVectorRepository):
@@ -63,11 +78,11 @@ class ContractMilvusV15VectorRepository(ContractMilvusVectorRepository):
     _schema_builder = staticmethod(build_v15_schema)
     _index_specs_fn = staticmethod(index_specs_v15)
     _row_mapper_cls = MilvusV15RowMapper
-    # 全量扫描 filter：不依赖 JSON——使用一级 expert_id INT64 的恒真合法范围
-    # （所有落库 Entity 的 expert_id 都 >= 1，见 Contract 校验）。
-    # 模型空间一致性检查仍允许读取 metadata JSON（model_space 三个字段在
-    # flat metadata 内），这是 Mapping 已冻结的 V15 事实，不重新提升为一级。
-    _full_scan_filter = "expert_id >= 0"
+    # 全量扫描 filter：不依赖任何不存在的 V15 scalar——使用一级 PK
+    # vector_doc_id（VARCHAR，必填非空）的恒真合法范围 ``vector_doc_id != ""``。
+    # 所有落库 Entity 的 PK 都是非空字符串，因此该表达式等价于全库扫描。
+    # 不使用 metadata JSON path（如 metadata["embedding_dim"]）做全库 filter。
+    _full_scan_filter = 'vector_doc_id != ""'
     _model_space_fields = ("metadata",)
 
     def _model_space_from_row(
@@ -89,6 +104,174 @@ class ContractMilvusV15VectorRepository(ContractMilvusVectorRepository):
             "embedding_model_version": flat.get("embedding_model_version"),
             "embedding_dim": flat.get("embedding_dim"),
         }
+
+    def query_by_expert_id(
+        self,
+        expert_id: int,
+        *,
+        output_fields: Sequence[str] | None = None,
+    ) -> list[dict[str, object]]:
+        """按 ``expert_id`` 查询该专家的全部向量记录（V15 迁移期兼容路径）。
+
+        与 base 的区别：
+            - V15 的 ``expert_id`` 位于 flat metadata JSON，因此过滤表达式为
+              ``metadata["expert_id"] == N``（JSON path filter，不把 expert_id
+              提升成一级字段，也不新增 scalar projection）；
+            - 默认只返回 ``vector_doc_id``（``list_vectors_by_expert`` 的唯一
+              消费字段），不拉取 embedding / chunk_text / 整包 metadata。
+            - 禁止把 ``expert_id`` / ``content_hash`` / ``metadata_hash`` 作为
+              一级 output field 请求（V15 不存在这些字段，fail-closed）。
+
+        公共 API 语义不变：返回行始终包含 ``vector_doc_id``。
+        """
+
+        if isinstance(expert_id, bool) or not isinstance(expert_id, int):
+            raise ValueError(  # noqa: TRY004
+                "expert_id 必须是整数"
+            )
+        if expert_id < 1:
+            raise ValueError("expert_id 必须是正整数")
+
+        fields = list(
+            output_fields
+            if output_fields is not None
+            else ["vector_doc_id"]
+        )
+        if not fields or any(
+            not isinstance(field, str) or not field.strip() for field in fields
+        ):
+            raise ValueError("output_fields 必须是非空字符串序列")
+        for forbidden in _V15_FORBIDDEN_TOP_LEVEL_FIELDS:
+            if forbidden in fields:
+                raise ValueError(
+                    f"V15 不存在一级字段 {forbidden!r}，请通过 'metadata' 读取"
+                )
+
+        iterator = self._get_client().query_iterator(
+            collection_name=self.settings.collection_name,
+            batch_size=1000,
+            limit=-1,
+            filter=f'metadata["expert_id"] == {int(expert_id)}',
+            output_fields=fields,
+            consistency_level="Strong",
+            **self._timeout_kwargs(),
+        )
+        rows: list[dict[str, object]] = []
+        try:
+            while True:
+                batch = iterator.next()
+                if not isinstance(batch, list) or not all(
+                    isinstance(row, Mapping) for row in batch
+                ):
+                    raise TypeError("Milvus expert_id iterator 返回了非法 Entity 批次")
+                if not batch:
+                    break
+                rows.extend(dict(row) for row in batch)
+        finally:
+            iterator.close()
+        return rows
+
+    def list_all_vector_states(
+        self,
+        *,
+        output_fields: Sequence[str] | None = None,
+    ) -> list[dict[str, object]]:
+        """列出当前 Collection 中全部向量的最小状态（V15 版本）。
+
+        公共返回语义与 base 保持一致：
+            每行包含 ``vector_doc_id`` / ``content_hash`` / ``metadata_hash``
+            （供 Full Reconciliation 差异判断与 stale 计算）。
+
+        但 V15 物理读取为 ``["vector_doc_id", "metadata"]``，再从 metadata JSON
+        提取两个 hash——这是纯 4 字段设计明确接受的 tradeoff（V15 不再有一级
+        hash scalar），不为了优化而重新增加 hash scalar。
+
+        fail-closed：
+            - 显式请求不存在的 V15 一级字段（expert_id/content_hash/
+              metadata_hash）→ ``ValueError``；
+            - metadata 缺 ``content_hash`` / ``metadata_hash``、hash 类型错误 →
+              ``RuntimeError``；
+            - 全量结果出现重复 ``vector_doc_id`` → ``RuntimeError``（不静默去重）；
+            - iterator 返回非法批次 → ``TypeError``。
+        """
+
+        fields = list(
+            output_fields
+            if output_fields is not None
+            else ["vector_doc_id", "metadata"]
+        )
+        if not fields or any(
+            not isinstance(field, str) or not field.strip() for field in fields
+        ):
+            raise ValueError("output_fields 必须是非空字符串序列")
+        for forbidden in _V15_FORBIDDEN_TOP_LEVEL_FIELDS:
+            if forbidden in fields:
+                raise ValueError(
+                    f"V15 不存在一级字段 {forbidden!r}，请通过 'metadata' 读取"
+                )
+
+        iterator = self._get_client().query_iterator(
+            collection_name=self.settings.collection_name,
+            batch_size=1000,
+            limit=-1,
+            filter=self._full_scan_filter,
+            output_fields=fields,
+            consistency_level="Strong",
+            **self._timeout_kwargs(),
+        )
+        rows: list[dict[str, object]] = []
+        seen_ids: set[str] = set()
+        check_duplicates = "vector_doc_id" in fields
+        try:
+            while True:
+                batch = iterator.next()
+                if not isinstance(batch, list) or not all(
+                    isinstance(row, Mapping) for row in batch
+                ):
+                    raise TypeError("Milvus 全量状态 iterator 返回了非法 Entity 批次")
+                if not batch:
+                    break
+                for row in batch:
+                    projected = dict(row)
+                    if "metadata" in fields:
+                        projected = self._extract_light_state(projected)
+                    rows.append(projected)
+                    if check_duplicates:
+                        vector_doc_id = projected.get("vector_doc_id")
+                        if isinstance(vector_doc_id, str):
+                            if vector_doc_id in seen_ids:
+                                raise RuntimeError(
+                                    "Milvus 全量状态扫描返回了重复 vector_doc_id: "
+                                    f"{vector_doc_id!r}"
+                                )
+                            seen_ids.add(vector_doc_id)
+        finally:
+            iterator.close()
+        return rows
+
+    def _extract_light_state(
+        self,
+        projected: dict[str, object],
+    ) -> dict[str, object]:
+        """从 V15 行的 flat metadata 提取轻量状态模型（fail-closed）。
+
+        读取 ``metadata["content_hash"]`` / ``metadata["metadata_hash"]``，
+        从返回行中移除原始 metadata key，替换为两个 hash —— 保持公共返回语义
+        （vector_doc_id / content_hash / metadata_hash）。
+        """
+
+        flat = projected.pop("metadata")
+        if not isinstance(flat, Mapping):
+            raise TypeError("Milvus V15 全量状态行缺少合法 metadata JSON 对象")
+        content_hash = flat.get("content_hash")
+        metadata_hash = flat.get("metadata_hash")
+        if not isinstance(content_hash, str) or not content_hash:
+            raise RuntimeError("Milvus V15 全量状态 metadata 缺少合法 content_hash")
+        if not isinstance(metadata_hash, str) or not metadata_hash:
+            raise RuntimeError("Milvus V15 全量状态 metadata 缺少合法 metadata_hash")
+        projected["content_hash"] = content_hash
+        projected["metadata_hash"] = metadata_hash
+        return projected
 
     def search(
         self,

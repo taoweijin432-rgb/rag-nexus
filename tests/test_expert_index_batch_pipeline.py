@@ -343,7 +343,7 @@ def test_build_single_expert_passes_strict_contract_snapshot_to_vector_sync() ->
     assert expert_id == 25
     assert len(records) == 1
     assert isinstance(records[0], ExpertChunkEmbeddingInput)
-    assert records[0].contract_version == "4.0.0"
+    assert records[0].contract_version == "4.1.0"
     assert records[0].vector_doc_id.startswith("expert:25:profile_summary:")
 
 

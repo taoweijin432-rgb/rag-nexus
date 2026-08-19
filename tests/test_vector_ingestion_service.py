@@ -28,6 +28,7 @@ from rag_vector_store import (
     VectorQueryResult,
 )
 from rag_vector_store.chunking.contract_pipeline import ContractEmbeddingWorker
+from rag_vector_store.milvus import MilvusV15RowMapper
 from rag_vector_store.model_space import build_model_space_id
 
 FIXTURE_PATH = (
@@ -434,6 +435,177 @@ def test_get_vectors_dedupes_and_orders() -> None:
     ]
 
 
+def _v15_repo_with(chunks: list[EmbeddedContractPreparedChunk]) -> FakeMilvusRepository:
+    """以 V15 物理 row 形态存储：hash 仅存在于 metadata JSON，顶层严格 4 字段。"""
+
+    repo = FakeMilvusRepository()
+    mapper = MilvusV15RowMapper()
+    for c in chunks:
+        repo.rows[c.vector_doc_id] = mapper.to_row(c)
+    return repo
+
+
+def test_get_vectors_v15_projects_hash_from_metadata_to_top() -> None:
+    """V15 物理 row hash 位于 metadata JSON；get_vectors 逻辑返回顶层应含哈希。"""
+
+    repo = _v15_repo_with(embedded_chunks())
+    service = VectorIngestionService(
+        ingestion_service=ContractBatchIngestionService(
+            ContractEmbeddingWorker(FakeEmbeddingModel()), repo
+        ),
+        repository=repo,  # type: ignore[arg-type]
+    )
+    chunk = embedded_chunks()[0]
+
+    result = service.get_vectors([chunk.vector_doc_id])
+
+    assert len(result.records) == 1
+    record = result.records[0]
+    # 物理顶层仍不含哈希（投影只作用于逻辑返回，不改物理 row）
+    assert "content_hash" not in repo.rows[chunk.vector_doc_id]
+    assert "metadata_hash" not in repo.rows[chunk.vector_doc_id]
+    # 逻辑返回顶层已投影哈希，且与 metadata 中存储的值一致
+    flat = repo.rows[chunk.vector_doc_id]["metadata"]
+    assert record["content_hash"] == flat["content_hash"]
+    assert record["metadata_hash"] == flat["metadata_hash"]
+    assert record["content_hash"] == chunk.content_hash
+    assert record["metadata_hash"] == chunk.metadata_hash
+    # 仍不暴露 embedding
+    assert "embedding" not in record
+    # 只投影两个哈希，不平铺其它 metadata 字段
+    for other in ("expert_id", "chunk_type", "is_active"):
+        assert other not in record
+
+
+def test_get_vectors_v15_supports_existing_rows_idempotent_read() -> None:
+    """V15 get_vectors 逻辑返回可被 ExpertVectorSynchronizer._existing_rows 读取。"""
+
+    from expert_index.vector_sync import ExpertVectorSynchronizer
+
+    chunks = embedded_chunks()
+    repo = _v15_repo_with(chunks)
+    service = VectorIngestionService(
+        ingestion_service=ContractBatchIngestionService(
+            ContractEmbeddingWorker(FakeEmbeddingModel()), repo
+        ),
+        repository=repo,  # type: ignore[arg-type]
+    )
+    ids = sorted(c.vector_doc_id for c in chunks)
+
+    result = service.get_vectors(ids)
+
+    # 上游增量幂等判断不再因顶层缺哈希而抛错
+    existing_by_id = ExpertVectorSynchronizer._existing_rows(result.records)
+    assert set(existing_by_id) == set(ids)
+    for vector_doc_id, item in existing_by_id.items():
+        original = next(c for c in chunks if c.vector_doc_id == vector_doc_id)
+        assert item["content_hash"] == original.content_hash
+        assert item["metadata_hash"] == original.metadata_hash
+
+
+def test_get_vectors_v14_keeps_top_level_hash_unchanged() -> None:
+    """V14 物理 row 哈希已位于顶层；投影不应改变其形态或哈希值。"""
+
+    chunks = embedded_chunks()
+    repo = FakeMilvusRepository()
+    for c in chunks:
+        repo.rows[c.vector_doc_id] = MilvusRowMapper().to_row(c)
+    service = VectorIngestionService(
+        ingestion_service=ContractBatchIngestionService(
+            ContractEmbeddingWorker(FakeEmbeddingModel()), repo
+        ),
+        repository=repo,  # type: ignore[arg-type]
+    )
+    chunk = chunks[0]
+
+    result = service.get_vectors([chunk.vector_doc_id])
+
+    record = result.records[0]
+    assert record["content_hash"] == chunk.content_hash
+    assert record["metadata_hash"] == chunk.metadata_hash
+    # V14 物理 row 顶层本就有哈希，逻辑返回形态与物理一致
+    assert "content_hash" in repo.rows[chunk.vector_doc_id]
+    assert "metadata_hash" in repo.rows[chunk.vector_doc_id]
+
+
+def test_get_vectors_v15_missing_content_hash_fails_closed() -> None:
+    """metadata JSON 缺 content_hash 时，顶层无哈希，上游 _existing_rows fail-closed。"""
+
+    from expert_index.vector_sync import ExpertVectorSynchronizer, VectorSyncError
+
+    chunks = embedded_chunks()
+    repo = _v15_repo_with(chunks)
+    # 破坏第一个 chunk 物理 row 的 metadata，移除 content_hash
+    first_id = chunks[0].vector_doc_id
+    repo.rows[first_id]["metadata"] = {
+        k: v for k, v in dict(repo.rows[first_id]["metadata"]).items()
+        if k != "content_hash"
+    }
+    service = VectorIngestionService(
+        ingestion_service=ContractBatchIngestionService(
+            ContractEmbeddingWorker(FakeEmbeddingModel()), repo
+        ),
+        repository=repo,  # type: ignore[arg-type]
+    )
+
+    result = service.get_vectors([first_id])
+
+    # 投影不补造哈希：逻辑返回顶层仍缺 content_hash
+    assert "content_hash" not in result.records[0]
+    with pytest.raises(VectorSyncError):
+        ExpertVectorSynchronizer._existing_rows(result.records)
+
+
+def test_get_vectors_v15_missing_metadata_hash_fails_closed() -> None:
+    """metadata JSON 缺 metadata_hash 时，顶层无哈希，上游 _existing_rows fail-closed。"""
+
+    from expert_index.vector_sync import ExpertVectorSynchronizer, VectorSyncError
+
+    chunks = embedded_chunks()
+    repo = _v15_repo_with(chunks)
+    first_id = chunks[0].vector_doc_id
+    repo.rows[first_id]["metadata"] = {
+        k: v for k, v in dict(repo.rows[first_id]["metadata"]).items()
+        if k != "metadata_hash"
+    }
+    service = VectorIngestionService(
+        ingestion_service=ContractBatchIngestionService(
+            ContractEmbeddingWorker(FakeEmbeddingModel()), repo
+        ),
+        repository=repo,  # type: ignore[arg-type]
+    )
+
+    result = service.get_vectors([first_id])
+
+    assert "metadata_hash" not in result.records[0]
+    with pytest.raises(VectorSyncError):
+        ExpertVectorSynchronizer._existing_rows(result.records)
+
+
+def test_get_vectors_v15_does_not_mutate_physical_row() -> None:
+    """投影只作用于逻辑返回；原始 V15 repository row 顶层仍严格无哈希。"""
+
+    chunks = embedded_chunks()
+    repo = _v15_repo_with(chunks)
+    service = VectorIngestionService(
+        ingestion_service=ContractBatchIngestionService(
+            ContractEmbeddingWorker(FakeEmbeddingModel()), repo
+        ),
+        repository=repo,  # type: ignore[arg-type]
+    )
+    chunk = chunks[0]
+    physical_before = dict(repo.rows[chunk.vector_doc_id])
+    metadata_before = dict(physical_before["metadata"])
+
+    service.get_vectors([chunk.vector_doc_id])
+
+    physical_after = repo.rows[chunk.vector_doc_id]
+    assert set(physical_after.keys()) == set(physical_before.keys())
+    assert "content_hash" not in physical_after
+    assert "metadata_hash" not in physical_after
+    assert dict(physical_after["metadata"]) == metadata_before
+
+
 # ---------------------------------------------------------------------------
 # update_metadata
 # ---------------------------------------------------------------------------
@@ -573,6 +745,152 @@ def test_update_metadata_converts_contract_error() -> None:
     # 非 Contract 输入（不是 ExpertChunkEmbeddingInput）
     with pytest.raises(VectorContractError):
         service.update_metadata(["not-a-chunk"])  # type: ignore[list-item]
+
+
+# ---------------------------------------------------------------------------
+# update_metadata：metadata-only 安全边界（Task6-1A）
+# ---------------------------------------------------------------------------
+def test_update_metadata_content_hash_change_fails_closed() -> None:
+    """输入的 content_hash 与 existing 不一致 → 必须抛 VectorContractError。
+
+    输入 chunk 本身是合法 Contract（content_hash == sha256(chunk_text)）；
+    existing 实体的 content_hash 被异常篡改，导致两者不一致。
+    """
+
+    old_chunk = embedded_chunks()[0]
+    repo = _repo_with_one(old_chunk)
+    # 篕改 existing row 的 content_hash，模拟 existing 实体状态异常
+    tampered_row = dict(repo.rows[old_chunk.vector_doc_id])
+    tampered_row["content_hash"] = "b" * 64
+    repo.rows[old_chunk.vector_doc_id] = tampered_row
+    service = make_service(repo)
+
+    with pytest.raises(VectorContractError) as exc_info:
+        service.update_metadata([input_records()[0]])
+
+    assert "content_hash 不一致" in str(exc_info.value)
+    assert "metadata-only" in str(exc_info.value)
+    assert "upsert_chunks" in str(exc_info.value)
+    # 未复用旧向量写入、未调用 Embedding
+    assert repo.upsert_calls == []
+
+
+def test_update_metadata_chunk_text_change_fails_closed() -> None:
+    """输入的 chunk_text 与 existing 不一致 → 必须抛 VectorContractError。
+
+    输入 chunk 本身是合法 Contract；existing 实体的 chunk_text 被异常篡改。
+    """
+
+    old_chunk = embedded_chunks()[0]
+    repo = _repo_with_one(old_chunk)
+    # 篕改 existing row 的 chunk_text，模拟 existing 实体状态异常
+    tampered_row = dict(repo.rows[old_chunk.vector_doc_id])
+    tampered_row["chunk_text"] = old_chunk.chunk_text + " 篕改"
+    repo.rows[old_chunk.vector_doc_id] = tampered_row
+    service = make_service(repo)
+
+    with pytest.raises(VectorContractError) as exc_info:
+        service.update_metadata([input_records()[0]])
+
+    assert "chunk_text 不一致" in str(exc_info.value)
+    assert "metadata-only" in str(exc_info.value)
+    assert "upsert_chunks" in str(exc_info.value)
+    assert repo.upsert_calls == []
+
+
+def test_update_metadata_vector_doc_id_mismatch_fails_closed() -> None:
+    """existing 实体的 vector_doc_id 与输入不一致 → gate 返回明确错误。
+
+    正常路径下 get_by_vector_doc_id 按 key 查询返回的 row 必含同一 vector_doc_id，
+    且 ``EmbeddedContractPreparedChunk`` 的 model_validator 会校验 vector_doc_id
+    公式；因此本 gate 是纯防御性深度检查，直接单元测试 gate 本身（用两个不同
+    的合法 chunk 构造 validated/old 不一致的场景）。
+    """
+
+    validated = input_records()[0]  # expert:900001:profile_summary:900001:0
+    # 用另一个 chunk（不同 vector_doc_id）作为 existing
+    mismatched_old = embedded_chunks()[1]
+
+    error = VectorIngestionService._metadata_only_inconsistency_error(
+        validated, mismatched_old
+    )
+
+    assert error is not None
+    assert "vector_doc_id 不一致" in error
+    assert "metadata-only" in error
+    assert "upsert_chunks" in error
+    assert "正文/主键变化" in error
+
+
+
+def test_update_metadata_metadata_only_change_succeeds() -> None:
+    """正常 metadata-only 更新（metadata_hash 变化、正文/主键不变）→ 成功。"""
+
+    old_chunk = embedded_chunks()[0]
+    repo = _repo_with_one(old_chunk)
+    service = make_service(repo)
+    chunk = input_records()[0]
+    new_metadata_hash = "1" * 64
+    new_chunk = chunk.model_copy(update={"metadata_hash": new_metadata_hash})
+
+    result = service.update_metadata([new_chunk])
+
+    assert result.results[0].status == "metadata_updated"
+    assert result.metadata_updated_count == 1
+    assert result.failed_count == 0
+    assert len(repo.upsert_calls) == 1
+    written = repo.upsert_calls[0][0]
+    # 正文 / 主键 / content_hash 保持与 existing 一致
+    assert written.vector_doc_id == old_chunk.vector_doc_id
+    assert written.chunk_text == old_chunk.chunk_text
+    assert written.content_hash == old_chunk.content_hash
+    # 新 metadata_hash 生效
+    assert written.metadata_hash == new_metadata_hash
+
+
+def test_update_metadata_metadata_only_reuses_existing_embedding() -> None:
+    """正常 metadata-only 更新 → 复用 existing embedding / 模型字段。"""
+
+    old_chunk = embedded_chunks()[0]
+    repo = _repo_with_one(old_chunk)
+    service = make_service(repo)
+    chunk = input_records()[0]
+    new_chunk = chunk.model_copy(update={"metadata_hash": "1" * 64})
+
+    service.update_metadata([new_chunk])
+
+    written = repo.upsert_calls[0][0]
+    assert written.embedding == old_chunk.embedding
+    assert written.embedding_dim == old_chunk.embedding_dim
+    assert written.embedding_model_alias == old_chunk.embedding_model_alias
+    assert written.embedding_model_version == old_chunk.embedding_model_version
+    assert written.embedded_at == old_chunk.embedded_at
+
+
+def test_update_metadata_metadata_only_does_not_call_embedding() -> None:
+    """正常 metadata-only 更新 → Embedding 调用次数为 0。"""
+
+    old_chunk = embedded_chunks()[0]
+    repo = _repo_with_one(old_chunk)
+    embed_calls: list[int] = []
+
+    class TrackingWorker(ContractEmbeddingWorker):
+        def embed(self, chunks: Any) -> Any:
+            embed_calls.append(1)
+            return super().embed(chunks)
+
+    service = VectorIngestionService(
+        ingestion_service=ContractBatchIngestionService(
+            TrackingWorker(FakeEmbeddingModel()), repo
+        ),
+        repository=repo,  # type: ignore[arg-type]
+    )
+    chunk = input_records()[0]
+    new_chunk = chunk.model_copy(update={"metadata_hash": "1" * 64})
+
+    service.update_metadata([new_chunk])
+
+    assert embed_calls == []
 
 
 # ---------------------------------------------------------------------------
@@ -872,7 +1190,7 @@ def test_update_metadata_from_row_validation_error_is_milvus_error() -> None:
         "metadata_ext": {"security": {}},
         "source_ext": {},
         "versions_ext": {},
-        "contract_version": "4.0.0",
+        "contract_version": "4.1.0",
     }
     repo.rows[chunk.vector_doc_id] = bad_row
 

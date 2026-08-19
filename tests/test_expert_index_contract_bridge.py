@@ -57,7 +57,7 @@ def test_chunk_record_maps_to_strict_contract_v400() -> None:
     )
 
     assert isinstance(contract, ExpertChunkEmbeddingInput)
-    assert contract.contract_version == "4.0.0"
+    assert contract.contract_version == "4.1.0"
     assert contract.vector_doc_id == chunk.vector_doc_id
     assert contract.chunk_text == chunk.chunk_text
     assert contract.content_hash == chunk.content_hash

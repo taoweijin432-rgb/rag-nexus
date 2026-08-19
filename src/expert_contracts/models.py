@@ -1,8 +1,12 @@
-"""专家 Chunk 向量化输入契约 v4.0.0 的共享强类型定义。
+"""专家 Chunk 向量化输入契约 v4.1.0 的共享强类型定义。
 
 本模块只表达 Contract 的字段、枚举和校验规则，不读取数据库、不读取文件，
 也不依赖任何业务 Builder 或向量存储实现。上游生成的 ``vector_doc_id`` 只存在
 Contract 顶层并按正式公式生成；``metadata`` 不再保留 ``vector_doc_id`` 副本。
+
+4.1.0 变更：``metadata`` 从三类字段统一 superset 改为按 ``chunk_type`` 的
+per-type 模型（``ProfileSummaryMetadata`` / ``EmploymentMetadata`` /
+``ProjectMetadata``），不适用于当前类型的字段不再输出占位。
 """
 
 from __future__ import annotations
@@ -15,7 +19,7 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
-EXPERT_CHUNK_CONTRACT_VERSION = "4.0.0"
+EXPERT_CHUNK_CONTRACT_VERSION = "4.1.0"
 
 _VECTOR_DOC_ID_MAX_BYTES = 2048
 
@@ -49,17 +53,21 @@ _CODE_PATTERN = r"^[a-z][a-z0-9_]*$"
 
 __all__ = [
     "EXPERT_CHUNK_CONTRACT_VERSION",
+    "EXPERT_CHUNK_METADATA_BY_TYPE",
     "ChunkSubtype",
     "ChunkType",
     "ContractPreparedChunk",
     "EmbeddedContractPreparedChunk",
+    "EmploymentMetadata",
     "ExpertChunkEmbeddingInput",
-    "ExpertChunkMetadata",
     "ExpertChunkSource",
     "ExpertChunkVersions",
     "OriginType",
+    "ProfileSummaryMetadata",
+    "ProjectMetadata",
     "VerificationStatus",
     "WeightTier",
+    "metadata_model_for_chunk_type",
 ]
 
 
@@ -69,36 +77,24 @@ class _ContractModel(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
 
 
-class ExpertChunkMetadata(_ContractModel):
-    """契约中的业务 Metadata（三类 Chunk 有效字段并集）。
+class _ChunkMetadataBase(_ContractModel):
+    """三类 Chunk 公共的 Metadata 字段。
 
-    该模型不再携带 ``vector_doc_id``；向量主键只存在于 Contract 顶层。
-    不适用当前 ``chunk_type`` 的字段由上游填充为 ``None``/空数组。
+    只包含对三种 ``chunk_type`` 都有意义、且都参与的字段；类型专属字段由
+    ``ProfileSummaryMetadata`` / ``EmploymentMetadata`` / ``ProjectMetadata``
+    各自声明。不适用于当前 ``chunk_type`` 的字段不得出现在该类型的 Metadata 中
+    （不输出、不填 ``None``/``[]`` 占位）。
     """
 
     company_name_raw: str | None = Field(..., max_length=512)
     company_name_norm: str | None = Field(..., max_length=512)
-    role_name_raw: str | None = Field(..., max_length=256)
-    role_code: str | None = Field(..., max_length=128)
-    role_level: str | None = Field(..., max_length=64)
-    job_status_norm: str | None = Field(..., max_length=32)
-    abroad_flag_norm: bool | None = Field(...)
-    work_years: Decimal | None = Field(...)
-    project_name: str | None = Field(default=None, max_length=512)
-    start_month: str | None = Field(..., pattern=_MONTH_PATTERN)
-    end_month: str | None = Field(..., pattern=_MONTH_PATTERN)
-    is_current: bool | None = Field(...)
     industry_codes: list[str] = Field(...)
-    function_codes: list[str] = Field(...)
     topic_codes: list[str] = Field(...)
-    school_names_raw: list[str] = Field(...)
-    major_names_raw: list[str] = Field(...)
-    eligible_for_recommendation: bool | None = Field(...)
     origin_type: OriginType = Field(...)
     verification_status: VerificationStatus = Field(...)
     weight_tier: WeightTier = Field(...)
 
-    @field_validator("industry_codes", "function_codes", "topic_codes")
+    @field_validator("industry_codes", "topic_codes")
     @classmethod
     def validate_code_arrays(cls, value: list[str]) -> list[str]:
         """校验标签代码是合法的小写代码，并且已经去重、排序。
@@ -107,9 +103,40 @@ class ExpertChunkMetadata(_ContractModel):
         """
 
         if any(not re.fullmatch(_CODE_PATTERN, item) for item in value):
-            raise ValueError("industry/function/topic_codes 必须是小写 snake_case 代码")
+            raise ValueError("industry/topic_codes 必须是小写 snake_case 代码")
         if value != sorted(set(value)):
-            raise ValueError("industry/function/topic_codes 必须去重并按字典序升序排列")
+            raise ValueError("industry/topic_codes 必须去重并按字典序升序排列")
+        return value
+
+
+class ProfileSummaryMetadata(_ChunkMetadataBase):
+    """profile_summary 的专属业务 Metadata。
+
+    只声明 profile 有意义的字段：岗位、工作年限、海外标记、职能/学校/专业数组
+    与推荐资格；不包含 employment/project 的 ``project_name``/``start_month``/
+    ``end_month``/``is_current``。
+    """
+
+    role_name_raw: str | None = Field(..., max_length=256)
+    role_code: str | None = Field(..., max_length=128)
+    role_level: str | None = Field(..., max_length=64)
+    job_status_norm: str | None = Field(..., max_length=32)
+    abroad_flag_norm: bool | None = Field(...)
+    work_years: Decimal | None = Field(...)
+    function_codes: list[str] = Field(...)
+    school_names_raw: list[str] = Field(...)
+    major_names_raw: list[str] = Field(...)
+    eligible_for_recommendation: bool | None = Field(...)
+
+    @field_validator("function_codes")
+    @classmethod
+    def validate_function_codes(cls, value: list[str]) -> list[str]:
+        """职能代码同样要求小写 snake_case、去重、升序。"""
+
+        if any(not re.fullmatch(_CODE_PATTERN, item) for item in value):
+            raise ValueError("function_codes 必须是小写 snake_case 代码")
+        if value != sorted(set(value)):
+            raise ValueError("function_codes 必须去重并按字典序升序排列")
         return value
 
     @field_validator("work_years", mode="before")
@@ -136,6 +163,54 @@ class ExpertChunkMetadata(_ContractModel):
             return Decimal(value)
         except (ValueError, ArithmeticError) as exc:
             raise ValueError("work_years 必须是 DECIMAL(5,2) 数值或 NULL") from exc
+
+
+class EmploymentMetadata(_ChunkMetadataBase):
+    """employment 的专属业务 Metadata。
+
+    岗位字段（profile 也有）、任职起止月与是否当前任职；不包含 profile 的
+    ``job_status_norm``/``abroad_flag_norm``/``work_years``/``school_names_raw``/
+    ``major_names_raw``/``eligible_for_recommendation``，也不包含 project 的
+    ``project_name``。
+    """
+
+    role_name_raw: str | None = Field(..., max_length=256)
+    role_code: str | None = Field(..., max_length=128)
+    role_level: str | None = Field(..., max_length=64)
+    start_month: str | None = Field(..., pattern=_MONTH_PATTERN)
+    end_month: str | None = Field(..., pattern=_MONTH_PATTERN)
+    is_current: bool | None = Field(...)
+
+
+class ProjectMetadata(_ChunkMetadataBase):
+    """project 的专属业务 Metadata。
+
+    项目名称与起止月；不包含岗位字段（``role_name_raw``/``role_code``/
+    ``role_level``）、``is_current``、教育数组与推荐资格。
+    """
+
+    project_name: str | None = Field(default=None, max_length=512)
+    start_month: str | None = Field(..., pattern=_MONTH_PATTERN)
+    end_month: str | None = Field(..., pattern=_MONTH_PATTERN)
+
+
+# 三类 Metadata 的联合类型与按 chunk_type 的注册表。
+ChunkMetadata = ProfileSummaryMetadata | EmploymentMetadata | ProjectMetadata
+
+EXPERT_CHUNK_METADATA_BY_TYPE: dict[str, type[ChunkMetadata]] = {
+    "profile_summary": ProfileSummaryMetadata,
+    "employment": EmploymentMetadata,
+    "project": ProjectMetadata,
+}
+
+
+def metadata_model_for_chunk_type(chunk_type: str) -> type[ChunkMetadata]:
+    """返回指定 ``chunk_type`` 对应的 Metadata 模型类（fail-closed）。"""
+
+    try:
+        return EXPERT_CHUNK_METADATA_BY_TYPE[chunk_type]
+    except (KeyError, TypeError) as exc:
+        raise ValueError(f"未知 chunk_type: {chunk_type!r}") from exc
 
 
 class ExpertChunkSource(_ContractModel):
@@ -166,7 +241,7 @@ class ExpertChunkVersions(_ContractModel):
 
 
 class ExpertChunkEmbeddingInput(_ContractModel):
-    """一条待向量化的正式内存输入记录（Contract 4.0.0）。
+    """一条待向量化的正式内存输入记录（Contract 4.1.0）。
 
     在主链路中的位置：
         - 产生：由上游 Builder（expert_index 侧）生成，或由
@@ -189,11 +264,11 @@ class ExpertChunkEmbeddingInput(_ContractModel):
         title="Expert Chunk Embedding Input",
         json_schema_extra={
             "$id": "https://internal.example/schemas/"
-            "expert_chunk_embedding_input-4.0.0.json"
+            "expert_chunk_embedding_input-4.1.0.json"
         },
     )
 
-    contract_version: Literal["4.0.0"]
+    contract_version: Literal["4.1.0"]
     vector_doc_id: str = Field(..., min_length=1, max_length=_VECTOR_DOC_ID_MAX_BYTES)
     expert_id: int = Field(..., ge=1)
     serial_number: str | None = Field(..., max_length=64)
@@ -205,7 +280,7 @@ class ExpertChunkEmbeddingInput(_ContractModel):
     char_count: int = Field(..., ge=1, le=1000)
     content_hash: str = Field(..., pattern=_SHA256_PATTERN)
     metadata_hash: str = Field(..., pattern=_SHA256_PATTERN)
-    metadata: ExpertChunkMetadata
+    metadata: ChunkMetadata
     source: ExpertChunkSource
     versions: ExpertChunkVersions
     is_active: bool
@@ -238,6 +313,16 @@ class ExpertChunkEmbeddingInput(_ContractModel):
         if self.contract_version != EXPERT_CHUNK_CONTRACT_VERSION:
             raise ValueError(
                 f"contract_version 必须是 {EXPERT_CHUNK_CONTRACT_VERSION}"
+            )
+        # Metadata 类型必须与 chunk_type 匹配：不输出其他类型的字段占位。
+        expected_metadata_type = metadata_model_for_chunk_type(self.chunk_type)
+        if not isinstance(self.metadata, expected_metadata_type):
+            # pydantic model_validator 抛 ValueError 会被封装为 ValidationError，
+            # 符合契约 fail-closed 语义；此处 isinstance 检查是业务语义校验，
+            # 不是 Python 类型错误，保留 ValueError（TRY004 误报，显式抑制）。
+            raise ValueError(  # noqa: TRY004
+                f"{self.chunk_type} 的 metadata 必须是 "
+                f"{expected_metadata_type.__name__}"
             )
         expected_vector_doc_id = (
             f"expert:{self.expert_id}:{self.chunk_type}:"

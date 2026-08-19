@@ -15,12 +15,13 @@
 from __future__ import annotations
 
 import functools
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from typing import Any
 
 from pymilvus.exceptions import MilvusException
 
 from expert_contracts.models import (
+    ContractPreparedChunk,
     EmbeddedContractPreparedChunk,
     ExpertChunkEmbeddingInput,
 )
@@ -137,6 +138,46 @@ def _dedupe(vector_doc_ids: Sequence[str]) -> list[str]:
     return cleaned
 
 
+# 增量幂等读取需要投影到逻辑返回顶层的两个哈希字段名。V14 把它们存为物理
+# 一级字段，V15 把它们移进 ``metadata`` JSON；本常量只服务于 get_vectors 的
+# 逻辑投影，不代表物理 Schema 字段。
+_HASH_PROJECTION_FIELDS = ("content_hash", "metadata_hash")
+
+
+def _project_hash_fields(row: Mapping[str, object]) -> dict[str, object]:
+    """把上游幂等判断需要的哈希投影到逻辑返回 record 顶层。
+
+    语义：
+        - 不修改原始物理 row（先 ``dict(row)`` 复制）；
+        - 顶层已有合法哈希时保持不变（V14 物理 row 即此形态）；
+        - 顶层缺失时，从 ``metadata`` JSON 中提取 ``content_hash`` /
+          ``metadata_hash`` 到逻辑返回顶层（V15 物理 row 哈希位于 metadata）；
+        - 只投影本模块明确声明需要的哈希字段，不平铺其它 metadata 字段；
+        - 顶层与 ``metadata`` 均缺失时不补造哈希，交由调用方 fail-closed。
+
+    Args:
+        row: Repository ``get_by_vector_doc_id`` 返回的物理 row。
+
+    Returns:
+        逻辑返回 record（可能含投影后的顶层哈希）。
+    """
+
+    record = dict(row)
+    metadata = record.get("metadata")
+    if not isinstance(metadata, Mapping):
+        # metadata 不是对象时无法从其提取哈希；保持物理 row 形态，
+        # 由下游 fail-closed。
+        return record
+    for field in _HASH_PROJECTION_FIELDS:
+        top_value = record.get(field)
+        if isinstance(top_value, str) and top_value:
+            continue
+        flat_value = metadata.get(field)
+        if isinstance(flat_value, str) and flat_value:
+            record[field] = flat_value
+    return record
+
+
 class VectorIngestionService:
     """统一编排 Chunk 向量化、写入、更新、删除与查询的 Facade。
 
@@ -242,6 +283,14 @@ class VectorIngestionService:
         """按 vector_doc_id 集合批量查询 Milvus 记录（不含 embedding）。
 
         保留输入去重顺序；``records`` 为命中的记录，``missing`` 为未命中主键。
+
+        hash 投影契约：上游 ``ExpertVectorSynchronizer`` 增量幂等判断只读取
+        逻辑 record 顶层的 ``content_hash`` / ``metadata_hash``（V14 把这两个
+        哈希存为物理一级字段，V15 把它们移进了 ``metadata`` JSON）。这里在
+        Service 边界做统一的逻辑投影——顶层已有合法哈希时保持不变，否则从
+        ``metadata`` JSON 中提取这两个字段到逻辑返回顶层。这是纯内存投影，
+        不修改 Milvus 物理 Schema，不增加一级字段，不平铺其它 metadata 字段；
+        顶层与 ``metadata`` 都缺失时不在本层补造哈希，交由调用方 fail-closed。
         """
 
         cleaned = _dedupe(vector_doc_ids)
@@ -256,7 +305,7 @@ class VectorIngestionService:
             if row is None:
                 missing.append(vid)
             else:
-                records.append(dict(row))
+                records.append(_project_hash_fields(row))
         return VectorQueryResult(records=records, missing=missing)
 
     # ------------------------------------------------------------------
@@ -272,10 +321,13 @@ class VectorIngestionService:
         流程（逐条）：
             1. Contract 校验；
             2. ``get_by_vector_doc_id`` 读取旧 Entity；
-            3. 安全门：旧 Entity 存在 / model_space 一致 / embedding_dim 一致；
-            4. 通过 → ``MilvusRowMapper.from_row`` 复用旧向量 + 新 metadata upsert；
-            5. 任一安全门失败 → 该条 ``status=failed``、``recommendation="call_upsert"``，
-               不调用 Embedding、不静默降级。
+            3. metadata-only 一致性门：本次输入的 ``vector_doc_id`` /
+               ``content_hash`` / ``chunk_text`` 必须与 existing 实体完全一致，
+               否则属于调用方误用（正文/主键已变化），立即抛 ``VectorContractError``；
+            4. 安全门：旧 Entity 存在 / model_space 一致 / embedding_dim 一致；
+            5. 通过 → ``MilvusRowMapper.from_row`` 复用旧向量 + 新 metadata upsert；
+            6. model_space/dim 安全门失败 → 该条 ``status=failed``、
+               ``recommendation="call_upsert"``，不调用 Embedding、不静默降级。
         """
 
         items: list[VectorItemResult] = []
@@ -303,6 +355,18 @@ class VectorIngestionService:
 
             old_chunk = _guard_call(self.row_mapper.from_row, old_row)
 
+            # metadata-only 安全门：本次输入必须与 existing 实体的
+            # vector_doc_id / content_hash / chunk_text 完全一致，否则属于调用方
+            # 误用（正文/主键已变化，不应走 update_metadata）。任一不一致立即
+            # fail-closed 抛 VectorContractError，不静默降级、不自动修正 hash、
+            # 不重新生成 vector_doc_id、不调用 Embedding。
+            metadata_only_error = self._metadata_only_inconsistency_error(
+                validated,
+                old_chunk,
+            )
+            if metadata_only_error is not None:
+                raise VectorContractError(metadata_only_error)
+
             gate_error = self._metadata_gate_error(old_chunk)
             if gate_error is not None:
                 items.append(_failed_item(vector_doc_id, gate_error))
@@ -324,6 +388,38 @@ class VectorIngestionService:
                 )
             )
         return VectorIngestionResult(results=items)
+
+    @staticmethod
+    def _metadata_only_inconsistency_error(
+        validated: ContractPreparedChunk,
+        old_chunk: EmbeddedContractPreparedChunk,
+    ) -> str | None:
+        """校验本次输入是否为 metadata-only 更新，返回失败原因（None 表示通过）。
+
+        ``update_metadata`` 复用旧向量，禁止任何正文 / 主键变化；任一不一致
+        属于调用方误用，应改走 ``upsert_chunks`` 重新 Embedding。
+        """
+
+        if validated.vector_doc_id != old_chunk.vector_doc_id:
+            return (
+                f"update_metadata 只允许 metadata-only 更新；vector_doc_id 不一致 "
+                f"(input={validated.vector_doc_id!r}, "
+                f"existing={old_chunk.vector_doc_id!r})；"
+                "正文/主键变化必须走 upsert_chunks 并重新 Embedding"
+            )
+        if validated.content_hash != old_chunk.content_hash:
+            return (
+                "update_metadata 只允许 metadata-only 更新；content_hash 不一致 "
+                f"(input={validated.content_hash[:12]!r}, "
+                f"existing={old_chunk.content_hash[:12]!r})；"
+                "正文变化必须走 upsert_chunks 并重新 Embedding"
+            )
+        if validated.chunk_text != old_chunk.chunk_text:
+            return (
+                "update_metadata 只允许 metadata-only 更新；chunk_text 不一致；"
+                "正文变化必须走 upsert_chunks 并重新 Embedding"
+            )
+        return None
 
     def _metadata_gate_error(
         self,

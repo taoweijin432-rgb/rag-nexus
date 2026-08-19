@@ -24,7 +24,7 @@ def expert_chunk_mapping() -> dict[str, object]:
     text = "[专家能力概述]\n上游生成的共享 Contract 测试记录。"
     return {
         # vector_doc_id 只存在顶层，且满足正式公式。
-        "contract_version": "4.0.0",
+        "contract_version": "4.1.0",
         "vector_doc_id": "expert:900001:profile_summary:900001:0",
         "expert_id": 900001,
         "serial_number": "DEV900001",
@@ -45,10 +45,6 @@ def expert_chunk_mapping() -> dict[str, object]:
             "job_status_norm": "active",
             "abroad_flag_norm": False,
             "work_years": "9.50",
-            "project_name": None,
-            "start_month": None,
-            "end_month": None,
-            "is_current": None,
             "industry_codes": ["artificial_intelligence"],
             "function_codes": ["product_management"],
             "topic_codes": ["knowledge_retrieval"],
@@ -69,7 +65,7 @@ def expert_chunk_mapping() -> dict[str, object]:
         },
         "versions": {
             "chunk_policy_version": "1.3",
-            "metadata_schema_version": "3.0",
+            "metadata_schema_version": "4.0",
         },
         "is_active": True,
         "updated_at": "2026-08-12T10:05:00+08:00",
@@ -85,7 +81,7 @@ def test_adapter_maps_json_mapping_to_contract_v400() -> None:
     contract = ExpertChunkMappingAdapter().from_mapping(mapping)
 
     assert isinstance(contract, ExpertChunkEmbeddingInput)
-    assert contract.contract_version == EXPERT_CHUNK_CONTRACT_VERSION == "4.0.0"
+    assert contract.contract_version == EXPERT_CHUNK_CONTRACT_VERSION == "4.1.0"
     # vector_doc_id 只存在顶层，metadata 不再携带副本。
     assert contract.vector_doc_id == "expert:900001:profile_summary:900001:0"
     assert not hasattr(contract.metadata, "vector_doc_id")

@@ -59,7 +59,7 @@ def fixture_payload(chunk_type: str = "profile_summary") -> dict[str, object]:
 
 
 def test_contract_version_is_400() -> None:
-    assert EXPERT_CHUNK_CONTRACT_VERSION == "4.0.0"
+    assert EXPERT_CHUNK_CONTRACT_VERSION == "4.1.0"
 
 
 def test_three_contract_fixture_types_pass() -> None:
@@ -71,14 +71,14 @@ def test_three_contract_fixture_types_pass() -> None:
         "employment",
         "project",
     ]
-    assert {record.contract_version for record in records} == {"4.0.0"}
+    assert {record.contract_version for record in records} == {"4.1.0"}
 
 
 def test_generated_json_schema_is_strict_contract_v400() -> None:
     schema = ExpertChunkEmbeddingInput.model_json_schema()
 
     assert schema["additionalProperties"] is False
-    assert schema["properties"]["contract_version"]["const"] == "4.0.0"
+    assert schema["properties"]["contract_version"]["const"] == "4.1.0"
     assert "vector_doc_id" in schema["properties"]
     assert "chunk_id" not in schema["properties"]
     assert set(schema["required"]) >= {
@@ -90,13 +90,31 @@ def test_generated_json_schema_is_strict_contract_v400() -> None:
         "serial_number",
     }
 
-    metadata_schema = schema["$defs"]["ExpertChunkMetadata"]
+    # per-type Metadata：三个独立模型，不再有统一 superset 模型。
+    for model_name in (
+        "ProfileSummaryMetadata",
+        "EmploymentMetadata",
+        "ProjectMetadata",
+    ):
+        assert model_name in schema["$defs"], model_name
+    metadata_schema = schema["$defs"]["ProfileSummaryMetadata"]
     assert "vector_doc_id" not in metadata_schema["required"]
     assert "vector_doc_id" not in metadata_schema["properties"]
     assert "project_role" not in metadata_schema["properties"]
     assert "company_normalization_status" not in metadata_schema["properties"]
-    assert set(_ADDED_METADATA - {"metadata_hash"}) <= set(metadata_schema["properties"])
+    assert set(_ADDED_METADATA - {"metadata_hash"}) <= set(
+        metadata_schema["properties"]
+    )
     assert "work_years" in metadata_schema["properties"]
+    # Employment/Project 模型不得包含 profile 专属字段。
+    employment_schema = schema["$defs"]["EmploymentMetadata"]
+    assert "work_years" not in employment_schema["properties"]
+    assert "school_names_raw" not in employment_schema["properties"]
+    assert "eligible_for_recommendation" not in employment_schema["properties"]
+    project_schema = schema["$defs"]["ProjectMetadata"]
+    assert "role_name_raw" not in project_schema["properties"]
+    assert "is_current" not in project_schema["properties"]
+    assert "eligible_for_recommendation" not in project_schema["properties"]
 
     source_schema = schema["$defs"]["ExpertChunkSource"]
     assert "source_record_id" not in source_schema["properties"]
@@ -211,16 +229,73 @@ def test_profile_only_fields_are_present() -> None:
     assert profile.metadata.function_codes == ["product_management"]
 
 
-def test_non_profile_eligible_for_recommendation_is_null_and_arrays_empty() -> None:
+def test_non_profile_fields_are_absent_not_null() -> None:
+    """per-type 后：employment/project 的 metadata 不包含 profile 专属字段。"""
     employment = fixture_records()[1]
+    employment_dump = employment.metadata.model_dump()
+    for field in (
+        "eligible_for_recommendation",
+        "job_status_norm",
+        "abroad_flag_norm",
+        "work_years",
+        "function_codes",
+        "school_names_raw",
+        "major_names_raw",
+    ):
+        assert field not in employment_dump, field
+        assert not hasattr(employment.metadata, field), field
 
-    assert employment.metadata.eligible_for_recommendation is None
-    assert employment.metadata.job_status_norm is None
-    assert employment.metadata.abroad_flag_norm is None
-    assert employment.metadata.work_years is None
-    assert employment.metadata.function_codes == []
-    assert employment.metadata.school_names_raw == []
-    assert employment.metadata.major_names_raw == []
+    project = fixture_records()[2]
+    project_dump = project.metadata.model_dump()
+    for field in (
+        "role_name_raw",
+        "role_code",
+        "role_level",
+        "is_current",
+        "eligible_for_recommendation",
+        "school_names_raw",
+        "major_names_raw",
+    ):
+        assert field not in project_dump, field
+        assert not hasattr(project.metadata, field), field
+
+    profile = fixture_records()[0]
+    profile_dump = profile.metadata.model_dump()
+    for field in ("project_name", "start_month", "end_month", "is_current"):
+        assert field not in profile_dump, field
+        assert not hasattr(profile.metadata, field), field
+
+
+def test_metadata_type_must_match_chunk_type_fail_closed() -> None:
+    """chunk_type 与 Metadata 类型不匹配必须被拒绝（fail-closed）。"""
+    employment = fixture_records()[1]
+    project = fixture_records()[2]
+
+    # employment + ProfileSummaryMetadata（把 metadata 换成 profile 字段集）
+    bad_employment = employment.model_copy(
+        update={"metadata": fixture_records()[0].metadata}
+    )
+    with pytest.raises(ValueError, match="metadata 必须是 EmploymentMetadata"):
+        ExpertChunkEmbeddingInput.model_validate(
+            bad_employment.model_dump(mode="json")
+        )
+
+    # project + EmploymentMetadata
+    bad_project = project.model_copy(
+        update={"metadata": employment.metadata}
+    )
+    with pytest.raises(ValueError, match="metadata 必须是 ProjectMetadata"):
+        ExpertChunkEmbeddingInput.model_validate(
+            bad_project.model_dump(mode="json")
+        )
+
+    # profile_summary + ProjectMetadata
+    profile = fixture_records()[0]
+    bad_profile = profile.model_copy(update={"metadata": project.metadata})
+    with pytest.raises(ValueError, match="metadata 必须是 ProfileSummaryMetadata"):
+        ExpertChunkEmbeddingInput.model_validate(
+            bad_profile.model_dump(mode="json")
+        )
 
 
 def test_metadata_hash_is_sha256_and_versions_are_13_30() -> None:
@@ -228,7 +303,7 @@ def test_metadata_hash_is_sha256_and_versions_are_13_30() -> None:
         assert len(record.metadata_hash) == 64
         assert set(record.metadata_hash) <= set("0123456789abcdef")
         assert record.versions.chunk_policy_version == "1.3"
-        assert record.versions.metadata_schema_version == "3.0"
+        assert record.versions.metadata_schema_version == "4.0"
 
 
 def test_hash_is_computed_from_chunk_text_in_fixture() -> None:

@@ -1,10 +1,11 @@
 """V15 精简物理 Schema 对应的 Milvus Entity 与行映射。
 
-本模块是 Contract 输出到 V15 物理存储之间唯一的字段映射边界：7 个一级字段
-（``vector_doc_id`` / ``expert_id`` / ``content_hash`` / ``metadata_hash`` /
-``chunk_text`` / ``embedding`` / ``metadata``），其余 Contract 信息全部合并进
-单个 flat ``metadata`` JSON。它不创建 Collection、不调用 Milvus Client，
-也不决定 Task State。
+本模块是 Contract 输出到 V15 物理存储之间唯一的字段映射边界：4 个一级字段
+（``vector_doc_id`` / ``chunk_text`` / ``embedding`` / ``metadata``），其余
+Contract 信息（含 ``expert_id`` / ``content_hash`` / ``metadata_hash`` /
+业务 metadata / source / versions / 嵌入字段等）全部合并进单个 flat
+``metadata`` JSON。它不创建 Collection、不调用 Milvus Client，也不决定
+Task State。
 
 与 v14 的关系：
     - v14 的 ``MilvusExpertChunkEntity`` / ``MilvusRowMapper``（``milvus/contract.py``）
@@ -14,14 +15,16 @@
 flat ``metadata`` 设计约束：
     - 单层 flat JSON，不使用 ``contract`` / ``metadata`` / ``source`` /
       ``versions`` 等 namespace 键；
-    - 一级字段（``vector_doc_id`` / ``expert_id`` / ``content_hash`` /
-      ``metadata_hash`` / ``chunk_text`` / ``embedding``）不得重复出现在
-      ``metadata`` 中；
+    - 一级字段（``vector_doc_id`` / ``chunk_text`` / ``embedding``）不得重复
+      出现在 ``metadata`` 中；
+    - ``expert_id`` / ``content_hash`` / ``metadata_hash`` 等从一级字段迁移进
+      metadata 后，其计算语义完全不变（只透传，不重算、不改变 hash payload）；
+    - Metadata 为 Contract 4.1.0 的 per-type 模型：Mapper 只机械投影当前
+      ``chunk_type`` 声明字段，不包含任何 ``if chunk_type`` 分支或字段删除名单；
     - 合并时发现真实 key 冲突一律 fail-closed（抛 ValueError），不静默覆盖；
     - ``null`` / ``[]`` 原样保留；``work_years``（Decimal）沿用当前
       ``model_dump(mode="json")`` 序列化为字符串（保留两位小数精度）；
-      datetime 保持当前 ISO 8601 字符串语义；
-    - ``content_hash`` / ``metadata_hash`` 语义完全不变（只透传，不重算）。
+      datetime 保持当前 ISO 8601 字符串语义。
 
 ``from_row`` 必须满足 ``update_metadata`` 的现有依赖：能还原完整的
 ``EmbeddedContractPreparedChunk``（含 embedding 原样保留、模型空间字段、
@@ -39,9 +42,9 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from expert_contracts.models import (
     EmbeddedContractPreparedChunk,
-    ExpertChunkMetadata,
     ExpertChunkSource,
     ExpertChunkVersions,
+    metadata_model_for_chunk_type,
 )
 
 from .schemas.contract_v15 import (
@@ -59,23 +62,24 @@ __all__ = [
 ]
 
 # 一级物理字段：这些 key 禁止出现在 flat metadata JSON 中。
-_V15_PHYSICAL_KEYS = frozenset(
-    {"vector_doc_id", "expert_id", "content_hash", "metadata_hash", "chunk_text", "embedding"}
-)
+# V15 纯 4 字段：expert_id / content_hash / metadata_hash 不再是物理字段，
+# 因此允许（并要求）出现在 metadata 中。
+_V15_PHYSICAL_KEYS = frozenset({"vector_doc_id", "chunk_text", "embedding"})
 # 禁止的 namespace 键：flat metadata 不允许 contract/metadata/source/versions 分组。
 _V15_NAMESPACE_KEYS = frozenset({"contract", "metadata", "source", "versions"})
 
 
 class MilvusV15Entity(BaseModel):
-    """V15 精简 Schema 在 Milvus 中的完整 Entity 数据模型（7 个一级字段）。
+    """V15 精简 Schema 在 Milvus 中的完整 Entity 数据模型（4 个一级字段）。
 
     谁使用：
         ``MilvusV15RowMapper`` 的输出模型；后续 V15 Repository 通过 Mapper
         把 ``EmbeddedContractPreparedChunk`` 映射为行后再交给 PyMilvus。
 
     内容：
-        7 个物理字段；``metadata`` 为单层 flat JSON，承载其余全部 Contract
-        信息。构造时会拒绝非有限向量。
+        4 个物理字段；``metadata`` 为单层 flat JSON，承载其余全部 Contract
+        信息（含 expert_id / content_hash / metadata_hash）。构造时会拒绝
+        非有限向量。
 
     身份：
         只有 ``vector_doc_id``（唯一 PK），不存在 ``chunk_id`` 或其他业务主键。
@@ -84,9 +88,6 @@ class MilvusV15Entity(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
 
     vector_doc_id: str
-    expert_id: int
-    content_hash: str
-    metadata_hash: str
     chunk_text: str
     embedding: list[float] = Field(min_length=1)
     metadata: dict[str, object]
@@ -102,7 +103,7 @@ class MilvusV15Entity(BaseModel):
 
 
 class MilvusV15RowMapper:
-    """将 ``EmbeddedContractPreparedChunk`` 无损映射为 V15 行（7 字段 + flat JSON）。
+    """将 ``EmbeddedContractPreparedChunk`` 无损映射为 V15 行（4 字段 + flat JSON）。
 
     这是 V15 主链路中唯一的“业务 Contract → Milvus 物理存储模型”映射边界：
 
@@ -114,10 +115,11 @@ class MilvusV15RowMapper:
         后续 V15 Repository（写入前、落 SDK 前调用）；当前阶段仅提供映射能力。
 
     映射规则：
-        - 7 个一级字段：``vector_doc_id`` / ``expert_id`` / ``content_hash`` /
-          ``metadata_hash`` / ``chunk_text`` / ``embedding`` / ``metadata``；
-        - ``metadata`` 为单层 flat JSON：顶层 Contract 的非物理字段
-          （``contract_version`` / ``serial_number`` / ``chunk_type`` /
+        - 4 个一级字段：``vector_doc_id`` / ``chunk_text`` / ``embedding`` /
+          ``metadata``；
+        - ``metadata`` 为单层 flat JSON：顶层 Contract 的其余字段
+          （``expert_id`` / ``content_hash`` / ``metadata_hash`` /
+          ``contract_version`` / ``serial_number`` / ``chunk_type`` /
           ``chunk_subtype`` / ``chunk_index`` / ``chunk_total`` / ``char_count`` /
           ``is_active`` / ``updated_at`` / ``embedded_at``）与 Embedding 输出字段
           （``embedding_dim`` / ``embedding_model_alias`` /
@@ -140,13 +142,15 @@ class MilvusV15RowMapper:
         self,
         chunk: EmbeddedContractPreparedChunk,
     ) -> MilvusV15Entity:
-        """创建包含 7 个物理字段和 flat metadata JSON 的 V15 Entity。"""
+        """创建包含 4 个物理字段和 flat metadata JSON 的 V15 Entity。"""
 
         if not isinstance(chunk, EmbeddedContractPreparedChunk):
             raise TypeError("MilvusV15RowMapper 只接受 EmbeddedContractPreparedChunk")
 
         # 顶层 Contract 的非物理字段（model_dump(mode="json") 已稳定序列化
         # Decimal / datetime），与 metadata/source/versions 分开平铺。
+        # V15 纯 4 字段：expert_id / content_hash / metadata_hash 不再是物理
+        # 字段，因此进入 top_level_flat（最终合并进 metadata），不重算 hash。
         top_level = chunk.model_dump(mode="json")
         top_level_flat = {
             key: value
@@ -168,9 +172,6 @@ class MilvusV15RowMapper:
 
         entity = MilvusV15Entity(
             vector_doc_id=chunk.vector_doc_id,
-            expert_id=chunk.expert_id,
-            content_hash=chunk.content_hash,
-            metadata_hash=chunk.metadata_hash,
             chunk_text=chunk.chunk_text,
             embedding=list(chunk.embedding),
             metadata=flat,
@@ -216,10 +217,16 @@ class MilvusV15RowMapper:
         if not isinstance(flat, Mapping):
             raise TypeError("Milvus V15 行缺少合法 metadata JSON 对象")
 
+        # V15 纯 4 字段：expert_id / content_hash / metadata_hash 从 flat
+        # metadata 读取（不再是一级字段），vector_doc_id / chunk_text /
+        # embedding 仍是一级字段。
+        # per-type 后按行中 chunk_type 挑选对应 Metadata 模型（机械查找，
+        # 不包含 if chunk_type 分支），只投影该类型声明字段。
+        metadata_model = metadata_model_for_chunk_type(flat.get("chunk_type"))
         payload = {
             "contract_version": flat.get("contract_version"),
             "vector_doc_id": row.get("vector_doc_id"),
-            "expert_id": row.get("expert_id"),
+            "expert_id": flat.get("expert_id"),
             "serial_number": flat.get("serial_number"),
             "chunk_type": flat.get("chunk_type"),
             "chunk_subtype": flat.get("chunk_subtype"),
@@ -227,9 +234,9 @@ class MilvusV15RowMapper:
             "chunk_total": flat.get("chunk_total"),
             "chunk_text": row.get("chunk_text"),
             "char_count": flat.get("char_count"),
-            "content_hash": row.get("content_hash"),
-            "metadata_hash": row.get("metadata_hash"),
-            "metadata": _pick_flat_fields(flat, ExpertChunkMetadata),
+            "content_hash": flat.get("content_hash"),
+            "metadata_hash": flat.get("metadata_hash"),
+            "metadata": _pick_flat_fields(flat, metadata_model),
             "source": _pick_flat_fields(flat, ExpertChunkSource),
             "versions": _pick_flat_fields(flat, ExpertChunkVersions),
             "is_active": flat.get("is_active"),
@@ -277,7 +284,8 @@ def _merge_flat_metadata(
 
     规则：
         - 任意两个来源出现相同 key → ``ValueError``（不允许重复 key 后覆盖）；
-        - key 属于一级物理字段（``vector_doc_id`` 等）→ ``ValueError``；
+        - key 属于一级物理字段（``vector_doc_id`` / ``chunk_text`` /
+          ``embedding``）→ ``ValueError``；
         - key 属于 namespace 键（``contract`` / ``metadata`` / ``source`` /
           ``versions``）→ ``ValueError``；
         - ``null`` / ``[]`` / Decimal 字符串 / ISO 8601 字符串原样保留。
