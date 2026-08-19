@@ -391,9 +391,9 @@ def normalize_aggregate(
 
     使用位置
     --------
-    ``pipeline.py::_process_expert`` 在 Source 读取之后调用本函数，随后把返回结果交给
-    ``ChunkFactory.build_all``。因此这里决定 Chunk 使用什么标准化事实，但不负责文本
-    模板、长度切分或 MySQL 写入。
+    ``pipeline.py::_process_active_expert`` 在 Source 读取之后调用本函数，随后把返回
+    结果交给 ``ChunkFactory.build_all``。因此这里决定 Chunk 使用什么标准化事实，
+    但不负责文本模板、长度切分或 MySQL 写入。
     """
 
     profile = aggregate.profile

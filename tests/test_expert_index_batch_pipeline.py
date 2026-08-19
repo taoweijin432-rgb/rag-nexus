@@ -232,13 +232,13 @@ def _partial_retry_checkpoint() -> FullBatchCheckpoint:
     )
 
 
-def test_build_one_reuses_expert_core_and_keeps_existing_result() -> None:
+def test_build_single_expert_reuses_core_and_keeps_existing_result() -> None:
     """重构后单专家入口仍创建 single 批次并返回原有数量结构。"""
 
     source = FakeSource([ExpertCandidate(id=24, deleted_at=None)])
     repository = FakeRepository()
 
-    result = _pipeline(source, repository).build_one(
+    result = _pipeline(source, repository).build_single_expert(
         24,
         data_version="20260814_01",
         batch_no="single_pipeline_refactor_test",
@@ -257,14 +257,14 @@ def test_build_one_reuses_expert_core_and_keeps_existing_result() -> None:
     assert repository.finish_calls[-1][1]["status"] == "success"
 
 
-def test_build_one_passes_strict_contract_snapshot_to_vector_sync() -> None:
+def test_build_single_expert_passes_strict_contract_snapshot_to_vector_sync() -> None:
     """内存标准化生成的 Chunk 应通过 Contract 直接交给下游。"""
 
     source = FakeSource([ExpertCandidate(id=25, deleted_at=None)])
     repository = FakeRepository()
     vector_sync = FakeVectorSync()
 
-    result = _pipeline(source, repository, vector_sync).build_one(
+    result = _pipeline(source, repository, vector_sync).build_single_expert(
         25,
         data_version="20260818_01",
         batch_no="single_vector_sync_test",
@@ -280,7 +280,7 @@ def test_build_one_passes_strict_contract_snapshot_to_vector_sync() -> None:
     assert records[0].vector_doc_id.startswith("expert:25:profile_summary:")
 
 
-def test_build_many_paginates_and_continues_after_one_expert_fails() -> None:
+def test_build_expert_batch_paginates_and_continues_after_one_expert_fails() -> None:
     """一位 active 专家失败后继续处理下一位，并把全量批次汇总为 partial。"""
 
     source = FakeSource(
@@ -293,7 +293,7 @@ def test_build_many_paginates_and_continues_after_one_expert_fails() -> None:
     )
     repository = FakeRepository()
 
-    result = _pipeline(source, repository).build_many(
+    result = _pipeline(source, repository).build_expert_batch(
         data_version="20260814_02",
         page_size=2,
         batch_no="full_pipeline_partial_test",
@@ -323,7 +323,7 @@ def test_build_many_paginates_and_continues_after_one_expert_fails() -> None:
     ]
 
 
-def test_build_many_limits_scope_to_first_n_candidates() -> None:
+def test_build_expert_batch_limits_scope_to_first_n_candidates() -> None:
     """max_experts 应在分页前收缩固定上界，并只处理前 N 位候选。"""
 
     source = FakeSource(
@@ -335,7 +335,7 @@ def test_build_many_limits_scope_to_first_n_candidates() -> None:
     )
     repository = FakeRepository()
 
-    result = _pipeline(source, repository).build_many(
+    result = _pipeline(source, repository).build_expert_batch(
         data_version="20260818_02",
         page_size=1,
         max_experts=2,
@@ -353,7 +353,7 @@ def test_build_many_limits_scope_to_first_n_candidates() -> None:
     assert repository.start_calls[0][2]["upper_bound_id"] == 20
 
 
-def test_resume_many_continues_after_last_complete_page_with_original_scope() -> None:
+def test_resume_expert_batch_continues_after_last_complete_page_with_original_scope() -> None:
     """续跑应复用原批次范围和计数，只读取可靠游标之后的候选。"""
 
     source = FakeSource(
@@ -381,7 +381,7 @@ def test_resume_many_continues_after_last_complete_page_with_original_scope() ->
         chunk_count=2,
     )
 
-    result = _pipeline(source, repository).resume_many(701, page_size=1)
+    result = _pipeline(source, repository).resume_expert_batch(701, page_size=1)
 
     assert result.batch_id == 701
     assert result.batch_no == "original_interrupted_batch"
@@ -400,7 +400,7 @@ def test_resume_many_continues_after_last_complete_page_with_original_scope() ->
     assert source.loaded_ids == [30, 40]
 
 
-def test_retry_partial_only_reprocesses_failed_items_and_finishes_success() -> None:
+def test_retry_failed_batch_experts_only_reprocesses_failures_and_finishes_success() -> None:
     """失败专家全部修复后，应按明细重汇总并把原 partial 批次改为 success。"""
 
     source = FakeSource(
@@ -426,7 +426,10 @@ def test_retry_partial_only_reprocesses_failed_items_and_finishes_success() -> N
         chunk_count=3,
     )
 
-    result = _pipeline(source, repository).retry_partial(701, page_size=1)
+    result = _pipeline(source, repository).retry_failed_batch_experts(
+        701,
+        page_size=1,
+    )
 
     assert result.batch_id == 701
     assert result.batch_no == "partial_retry_batch"
@@ -447,7 +450,7 @@ def test_retry_partial_only_reprocesses_failed_items_and_finishes_success() -> N
     assert repository.finish_calls[-1][1]["error_summary"] is None
 
 
-def test_retry_partial_attempts_each_failed_item_once_and_remains_partial() -> None:
+def test_retry_failed_batch_experts_attempts_each_item_once_and_remains_partial() -> None:
     """专家再次失败时本次只尝试一次，并根据明细汇总保持 partial。"""
 
     source = FakeSource(
@@ -487,7 +490,10 @@ def test_retry_partial_attempts_each_failed_item_once_and_remains_partial() -> N
         chunk_count=1,
     )
 
-    result = _pipeline(source, repository).retry_partial(701, page_size=50)
+    result = _pipeline(source, repository).retry_failed_batch_experts(
+        701,
+        page_size=50,
+    )
 
     assert result.status == "partial"
     assert result.failed_count == 1
@@ -503,7 +509,7 @@ def test_retry_partial_attempts_each_failed_item_once_and_remains_partial() -> N
     ]
 
 
-def test_build_many_deactivates_deleted_candidate_without_loading_source() -> None:
+def test_build_expert_batch_deactivates_deleted_candidate_without_loading_source() -> None:
     """deleted 专家不读取正文，完成历史停用后记为 deactivated。"""
 
     deleted_at = datetime(2026, 8, 14, 12, 30, tzinfo=ZoneInfo("Asia/Shanghai"))
@@ -511,7 +517,7 @@ def test_build_many_deactivates_deleted_candidate_without_loading_source() -> No
     repository = FakeRepository()
     vector_sync = FakeVectorSync()
 
-    result = _pipeline(source, repository, vector_sync).build_many(
+    result = _pipeline(source, repository, vector_sync).build_expert_batch(
         data_version="20260814_03",
         batch_no="full_deleted_pending_test",
     )
@@ -527,7 +533,7 @@ def test_build_many_deactivates_deleted_candidate_without_loading_source() -> No
     assert finished[0][1][2]["result_code"] == "expert_deleted"
 
 
-def test_build_many_rejects_no_content_and_continues_next_expert() -> None:
+def test_build_expert_batch_rejects_no_content_and_continues_next_expert() -> None:
     """无内容专家用空快照停用旧 Chunk 并记为 rejected，不算程序失败。"""
 
     source = FakeSource(
@@ -540,7 +546,7 @@ def test_build_many_rejects_no_content_and_continues_next_expert() -> None:
     repository = FakeRepository()
     vector_sync = FakeVectorSync()
 
-    result = _pipeline(source, repository, vector_sync).build_many(
+    result = _pipeline(source, repository, vector_sync).build_expert_batch(
         data_version="20260814_04",
         page_size=1,
         batch_no="full_empty_pending_test",
@@ -562,7 +568,7 @@ def test_build_many_rejects_no_content_and_continues_next_expert() -> None:
     assert statuses == ["rejected", "success"]
 
 
-def test_build_many_marks_batch_failed_when_candidate_page_is_invalid() -> None:
+def test_build_expert_batch_marks_batch_failed_when_candidate_page_is_invalid() -> None:
     """候选页倒序属于批次级契约错误，不能靠跳过单个专家继续运行。"""
 
     source = FakeSource(
@@ -574,7 +580,7 @@ def test_build_many_marks_batch_failed_when_candidate_page_is_invalid() -> None:
     repository = FakeRepository()
 
     with pytest.raises(ValueError, match="严格升序"):
-        _pipeline(source, repository).build_many(
+        _pipeline(source, repository).build_expert_batch(
             data_version="20260814_05",
             batch_no="full_invalid_page_test",
         )
@@ -595,7 +601,7 @@ def test_failed_page_keeps_last_complete_page_counts_for_safe_resume() -> None:
     repository.fail_finish_item_ids = {20}
 
     with pytest.raises(RuntimeError, match="批次明细写入失败"):
-        _pipeline(source, repository).build_many(
+        _pipeline(source, repository).build_expert_batch(
             data_version="20260818_05",
             page_size=2,
             batch_no="failed_mid_page_batch",
@@ -612,14 +618,16 @@ def test_failed_page_keeps_last_complete_page_counts_for_safe_resume() -> None:
 
 
 @pytest.mark.parametrize("page_size", [0, 1001])
-def test_build_many_rejects_invalid_page_size_before_source_access(page_size: int) -> None:
+def test_build_expert_batch_rejects_invalid_page_size_before_source_access(
+    page_size: int,
+) -> None:
     """无效页大小必须在固定上界查询和批次创建之前失败。"""
 
     source = FakeSource([ExpertCandidate(id=1, deleted_at=None)])
     repository = FakeRepository()
 
     with pytest.raises(ValueError, match="page_size"):
-        _pipeline(source, repository).build_many(
+        _pipeline(source, repository).build_expert_batch(
             data_version="20260814_06",
             page_size=page_size,
         )
@@ -629,7 +637,7 @@ def test_build_many_rejects_invalid_page_size_before_source_access(page_size: in
 
 
 @pytest.mark.parametrize("max_experts", [0, -1, True, 1.5])
-def test_build_many_rejects_invalid_max_experts_before_source_access(
+def test_build_expert_batch_rejects_invalid_max_experts_before_source_access(
     max_experts: object,
 ) -> None:
     """无效范围限制必须在查询上界和创建批次前失败。"""
@@ -638,7 +646,7 @@ def test_build_many_rejects_invalid_max_experts_before_source_access(
     repository = FakeRepository()
 
     with pytest.raises(ValueError, match="max_experts"):
-        _pipeline(source, repository).build_many(
+        _pipeline(source, repository).build_expert_batch(
             data_version="20260818_03",
             max_experts=max_experts,  # type: ignore[arg-type]
         )

@@ -47,7 +47,7 @@ class BuildResult:
     """
 
     batch_id: int  # expert_index_batch.id，用于回查本次运行。
-    batch_no: str  # 单专家业务批次号；调用方不传时由 _single_batch_no 自动生成。
+    batch_no: str  # 单专家业务批次号；调用方不传时自动生成。
     expert_id: int  # 本次重建的 experts.id。
     extracted_count: int  # 1 条主档加工作、项目、教育来源记录数。
     stage_count: int  # 不再持久化 Stage，因此新任务恒为 0。
@@ -84,8 +84,8 @@ class BatchBuildResult:
 class _ExpertProgress:
     """记录一位专家在当前调用中已完成阶段的数量。
 
-    ``_process_expert`` 在来源读取和 Chunk 构建完成后更新对应字段，使外层在成功或
-    异常时都能记录已经实际发生的数量。该对象只存在于内存。
+    ``_process_active_expert`` 在来源读取和 Chunk 构建完成后更新对应字段，使外层在
+    成功或异常时都能记录已经实际发生的数量。该对象只存在于内存。
     """
 
     expert_id: int
@@ -97,7 +97,7 @@ class ExpertIndexPipeline:
     """提供单专家构建、新建批量任务、断点续跑和失败重试入口。
 
     默认从配置创建 MySQL Source 和 Repository，也支持注入同接口实现。所有入口共享
-    ``_process_expert``，确保单专家与批量任务采用相同的标准化、校验和同步规则。
+    ``_process_active_expert``，确保单专家与批量任务采用相同的标准化、校验和同步规则。
     """
 
     def __init__(
@@ -114,7 +114,7 @@ class ExpertIndexPipeline:
         self.vector_sync = vector_sync
         self.factory = ChunkFactory(settings)
 
-    def build_one(
+    def build_single_expert(
         self,
         expert_id: int,
         *,
@@ -132,13 +132,13 @@ class ExpertIndexPipeline:
         if expert_id <= 0:
             raise ValueError("expert_id 必须大于 0")
         with self.repository.build_lock("single"):
-            return self._build_one_locked(
+            return self._build_single_expert_locked(
                 expert_id,
                 data_version=data_version,
                 batch_no=batch_no,
             )
 
-    def _build_one_locked(
+    def _build_single_expert_locked(
         self,
         expert_id: int,
         *,
@@ -149,14 +149,14 @@ class ExpertIndexPipeline:
 
         成功时把处理数量写入批次主表并返回 ``BuildResult``；异常时把已完成数量和安全
         错误摘要写入 failed 批次，再原样抛出异常。领域处理统一委托给
-        ``_process_expert``。
+        ``_process_active_expert``。
         """
 
-        actual_batch_no = batch_no or _single_batch_no(expert_id)
+        actual_batch_no = batch_no or _generate_single_batch_number(expert_id)
         batch_id = self.repository.start_batch(actual_batch_no, "single")
         progress = _ExpertProgress(expert_id=expert_id)
         try:
-            outcome = self._process_expert(
+            outcome = self._process_active_expert(
                 expert_id,
                 data_version=data_version,
                 batch_id=batch_id,
@@ -194,7 +194,7 @@ class ExpertIndexPipeline:
             )
             raise
 
-    def build_many(
+    def build_expert_batch(
         self,
         *,
         data_version: str,
@@ -221,14 +221,14 @@ class ExpertIndexPipeline:
         ):
             raise ValueError("max_experts 必须是正整数或 None")
         with self.repository.build_lock("full"):
-            return self._build_many_locked(
+            return self._build_expert_batch_locked(
                 data_version=data_version,
                 page_size=page_size,
                 max_experts=max_experts,
                 batch_no=batch_no,
             )
 
-    def resume_many(
+    def resume_expert_batch(
         self,
         batch_id: int,
         *,
@@ -248,7 +248,7 @@ class ExpertIndexPipeline:
             )
         with self.repository.build_lock("full"):
             checkpoint = self.repository.resume_batch(batch_id)
-            return self._build_many_locked(
+            return self._build_expert_batch_locked(
                 data_version=checkpoint.data_version,
                 page_size=page_size,
                 max_experts=None,
@@ -256,7 +256,7 @@ class ExpertIndexPipeline:
                 checkpoint=checkpoint,
             )
 
-    def retry_partial(
+    def retry_failed_batch_experts(
         self,
         batch_id: int,
         *,
@@ -281,9 +281,12 @@ class ExpertIndexPipeline:
             )
         with self.repository.build_lock("full"):
             checkpoint = self.repository.load_partial_batch_for_retry(batch_id)
-            return self._retry_partial_locked(checkpoint, page_size=page_size)
+            return self._retry_failed_batch_experts_locked(
+                checkpoint,
+                page_size=page_size,
+            )
 
-    def _retry_partial_locked(
+    def _retry_failed_batch_experts_locked(
         self,
         checkpoint: FullBatchCheckpoint,
         *,
@@ -311,11 +314,11 @@ class ExpertIndexPipeline:
                 try:
                     candidate = self.source.load_expert_candidate(expert_id)
                     if candidate.is_deleted:
-                        self._sync_expert_vectors(expert_id, [])
+                        self._sync_expert_vector_snapshot(expert_id, [])
                         terminal_status = "deactivated"
                         result_code = "expert_deleted"
                     else:
-                        terminal_status = self._process_expert(
+                        terminal_status = self._process_active_expert(
                             expert_id,
                             data_version=checkpoint.data_version,
                             batch_id=checkpoint.batch_id,
@@ -354,7 +357,10 @@ class ExpertIndexPipeline:
             if summary.failed_count or unfinished_count
             else "success"
         )
-        error_summary = _batch_error_summary(summary.failed_count, error_summaries)
+        error_summary = _build_batch_error_summary(
+            summary.failed_count,
+            error_summaries,
+        )
         if error_summary is None and unfinished_count:
             error_summary = {"unfinished_item_count": unfinished_count}
 
@@ -388,7 +394,7 @@ class ExpertIndexPipeline:
             chunk_count=summary.chunk_count,
         )
 
-    def _build_many_locked(
+    def _build_expert_batch_locked(
         self,
         *,
         data_version: str,
@@ -404,7 +410,7 @@ class ExpertIndexPipeline:
         1. 新任务从 Source 固定 ``upper_bound_id`` 并创建批次；续跑任务恢复原检查点；
         2. 从新任务的 0 或续跑批次的可靠 ``cursor_id`` 开始 Keyset Pagination；
         3. 每页先登记 pending，再按 running→终态记录每位候选；
-        4. active 专家复用 ``_process_expert``，逻辑删除和无内容分别进入
+        4. active 专家复用 ``_process_active_expert``，逻辑删除和无内容分别进入
            deactivated/rejected，意外异常才计入 failed；
         5. 每页全部明细可靠落库后，才持久化游标和累计计数；
         6. 逻辑删除、无内容或陈旧来源导致 Chunk 停用时同步重算 metadata_hash；
@@ -420,7 +426,7 @@ class ExpertIndexPipeline:
             upper_bound_id = self.source.get_full_scan_upper_bound(
                 max_experts=max_experts,
             )
-            actual_batch_no = batch_no or _full_batch_no()
+            actual_batch_no = batch_no or _generate_full_batch_number()
             batch_id = self.repository.start_batch(
                 actual_batch_no,
                 "full",
@@ -494,7 +500,7 @@ class ExpertIndexPipeline:
                         "chunk_count": chunk_count,
                     }
                     break
-                _validate_candidate_page(
+                _validate_expert_candidate_page(
                     candidates,
                     after_id=cursor_id,
                     upper_bound_id=upper_bound_id,
@@ -515,11 +521,11 @@ class ExpertIndexPipeline:
                     try:
                         if candidate.is_deleted:
                             # 删除候选不读取正文，直接用空快照删除下游历史向量。
-                            self._sync_expert_vectors(candidate.id, [])
+                            self._sync_expert_vector_snapshot(candidate.id, [])
                             terminal_status = "deactivated"
                             result_code = "expert_deleted"
                         else:
-                            terminal_status = self._process_expert(
+                            terminal_status = self._process_active_expert(
                                 candidate.id,
                                 data_version=data_version,
                                 batch_id=batch_id,
@@ -624,7 +630,10 @@ class ExpertIndexPipeline:
             success_count=success_count,
             failed_count=failed_count,
             deactivated_count=deactivated_count,
-            error_summary=_batch_error_summary(failed_count, error_summaries),
+            error_summary=_build_batch_error_summary(
+                failed_count,
+                error_summaries,
+            ),
         )
 
         return BatchBuildResult(
@@ -643,7 +652,7 @@ class ExpertIndexPipeline:
             chunk_count=chunk_count,
         )
 
-    def _process_expert(
+    def _process_active_expert(
         self,
         expert_id: int,
         *,
@@ -680,16 +689,16 @@ class ExpertIndexPipeline:
         chunks = self.factory.build_all(profile, employments, projects)
         if not chunks:
             # 无可生成内容属于 rejected 业务结果，用空快照清除旧向量。
-            self._sync_expert_vectors(expert_id, [])
+            self._sync_expert_vector_snapshot(expert_id, [])
             return "rejected"
 
         validate_chunks(chunks)
         # 校验完成后记录 Chunk 数量；向量同步失败时外层会把本专家标记为 failed。
         progress.chunk_count = len(chunks)
-        self._sync_expert_vectors(expert_id, chunks)
+        self._sync_expert_vector_snapshot(expert_id, chunks)
         return "success"
 
-    def _sync_expert_vectors(
+    def _sync_expert_vector_snapshot(
         self,
         expert_id: int,
         chunks: list[ChunkRecord],
@@ -715,7 +724,7 @@ def _validate_data_version(data_version: str) -> None:
         raise ValueError("data_version 不能为空")
 
 
-def _validate_candidate_page(
+def _validate_expert_candidate_page(
     candidates: list[ExpertCandidate],
     *,
     after_id: int,
@@ -734,7 +743,7 @@ def _validate_candidate_page(
         raise ValueError("Source 候选页超出当前全量游标范围")
 
 
-def _batch_error_summary(
+def _build_batch_error_summary(
     failed_count: int,
     errors: list[dict[str, object]],
 ) -> dict[str, object] | None:
@@ -749,21 +758,15 @@ def _batch_error_summary(
     }
 
 
-def _single_batch_no(expert_id: int) -> str:
+def _generate_single_batch_number(expert_id: int) -> str:
     """生成单专家业务批次号，不创建或修改任何专家数据。"""
 
     timestamp = datetime.now().astimezone().strftime("%Y%m%d%H%M%S%f")
     return f"single_{expert_id}_{timestamp}"
 
 
-def _full_batch_no() -> str:
+def _generate_full_batch_number() -> str:
     """为未指定批次号的全量任务生成带时间戳的唯一业务编号。"""
 
     timestamp = datetime.now().astimezone().strftime("%Y%m%d%H%M%S%f")
     return f"full_{timestamp}"
-
-
-def _batch_no(expert_id: int) -> str:
-    """生成与 :func:`_single_batch_no` 相同的单专家批次号。"""
-
-    return _single_batch_no(expert_id)
