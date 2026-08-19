@@ -75,8 +75,8 @@ class VectorSyncSummary:
 class BuildResult:
     """单专家任务完成后返回的批次标识和处理数量。
 
-    该结果不包含源数据或 Chunk 正文。批次处理数量写入批次主表；``vector_sync``
-    仅汇总当前命令收到的下游返回值，不做数据库持久化。
+    该结果不包含源数据或 Chunk 正文。``vector_sync`` 是当前命令的同步摘要，且相同
+    数量会累计写入批次主表。
     """
 
     batch_id: int  # expert_index_batch.id，用于回查本次运行。
@@ -94,7 +94,7 @@ class BatchBuildResult:
     """批量任务完成后返回的扫描范围、最终游标和累计数量。
 
     该对象由新批次、续跑和失败重试入口共同返回，只包含任务状态和计数，不包含专家
-    原始字段。``vector_sync`` 只统计当前命令，不包含续跑前已经完成的专家。
+    原始字段。返回的 ``vector_sync`` 只统计当前命令；批次主表保存跨续跑的累计值。
 
     ``rejected_count`` 表示存在但无可生成内容的专家数；``deactivated_count`` 表示
     主档已逻辑删除且历史 Chunk 已完成停用的专家数。两者都不是程序失败。
@@ -192,6 +192,7 @@ class ExpertIndexPipeline:
         actual_batch_no = batch_no or _generate_single_batch_number(expert_id)
         batch_id = self.repository.start_batch(actual_batch_no, "single")
         progress = _ExpertProgress(expert_id=expert_id)
+        vector_sync = VectorSyncSummary()
         try:
             outcome = self._process_active_expert(
                 expert_id,
@@ -200,6 +201,7 @@ class ExpertIndexPipeline:
                 progress=progress,
             )
             assert progress.vector_sync is not None
+            vector_sync = vector_sync.add(progress.vector_sync)
             # 当前只生成完整 Chunk；返回结构中的 partial 数量固定为 0。
             partial_count = 0
             self.repository.finish_batch(
@@ -209,6 +211,7 @@ class ExpertIndexPipeline:
                 stage_count=0,
                 chunk_count=progress.chunk_count,
                 rejected_count=1 if outcome == "rejected" else 0,
+                **_vector_sync_persistence_fields(vector_sync),
             )
             return BuildResult(
                 batch_id=batch_id,
@@ -218,7 +221,7 @@ class ExpertIndexPipeline:
                 stage_count=0,
                 chunk_count=progress.chunk_count,
                 partial_chunk_count=partial_count,
-                vector_sync=VectorSyncSummary().add(progress.vector_sync),
+                vector_sync=vector_sync,
             )
         except Exception as exc:
             # 批次错误摘要只记录异常类型和截断消息，不保存专家正文或 Chunk Text。
@@ -230,6 +233,7 @@ class ExpertIndexPipeline:
                 chunk_count=progress.chunk_count,
                 rejected_count=1,
                 error_summary={"error_type": type(exc).__name__, "message": str(exc)[:400]},
+                **_vector_sync_persistence_fields(vector_sync),
             )
             raise
 
@@ -335,7 +339,9 @@ class ExpertIndexPipeline:
 
         after_expert_id = 0
         error_summaries: list[dict[str, object]] = []
+        # 返回值只描述本次重试；持久化值从原批次累计统计继续增加。
         vector_sync = VectorSyncSummary()
+        persisted_vector_sync = _checkpoint_vector_sync(checkpoint)
         while True:
             expert_ids = self.repository.load_retryable_batch_item_ids(
                 checkpoint.batch_id,
@@ -386,6 +392,9 @@ class ExpertIndexPipeline:
                 )
                 if progress.vector_sync is not None:
                     vector_sync = vector_sync.add(progress.vector_sync)
+                    persisted_vector_sync = persisted_vector_sync.add(
+                        progress.vector_sync
+                    )
                 if terminal_status == "failed" and (
                     len(error_summaries) < MAX_BATCH_ERROR_SUMMARIES
                 ):
@@ -422,6 +431,7 @@ class ExpertIndexPipeline:
             failed_count=summary.failed_count,
             deactivated_count=summary.deactivated_count,
             error_summary=error_summary,
+            **_vector_sync_persistence_fields(persisted_vector_sync),
         )
         return BatchBuildResult(
             batch_id=checkpoint.batch_id,
@@ -500,6 +510,12 @@ class ExpertIndexPipeline:
         error_summaries: list[dict[str, object]] = []
         # 续跑也只汇总当前命令新完成的同步，不混入检查点之前的历史处理。
         vector_sync = VectorSyncSummary()
+        persisted_vector_sync = (
+            VectorSyncSummary()
+            if checkpoint is None
+            else _checkpoint_vector_sync(checkpoint)
+        )
+        reliable_persisted_vector_sync = persisted_vector_sync
         # 该快照只在完整页进度成功落库后更新。批次级错误使用它收口，确保游标与累计
         # 数量属于同一个页边界，续跑时不会重复累计中断页。
         reliable_progress = {
@@ -535,6 +551,7 @@ class ExpertIndexPipeline:
                         extracted_count=extracted_count,
                         stage_count=stage_count,
                         chunk_count=chunk_count,
+                        **_vector_sync_persistence_fields(persisted_vector_sync),
                     )
                     reliable_progress = {
                         "cursor_id": cursor_id,
@@ -547,6 +564,7 @@ class ExpertIndexPipeline:
                         "stage_count": stage_count,
                         "chunk_count": chunk_count,
                     }
+                    reliable_persisted_vector_sync = persisted_vector_sync
                     break
                 _validate_expert_candidate_page(
                     candidates,
@@ -604,6 +622,9 @@ class ExpertIndexPipeline:
                     )
                     if progress.vector_sync is not None:
                         vector_sync = vector_sync.add(progress.vector_sync)
+                        persisted_vector_sync = persisted_vector_sync.add(
+                            progress.vector_sync
+                        )
 
                     if terminal_status == "success":
                         success_count += 1
@@ -638,6 +659,7 @@ class ExpertIndexPipeline:
                     extracted_count=extracted_count,
                     stage_count=stage_count,
                     chunk_count=chunk_count,
+                    **_vector_sync_persistence_fields(persisted_vector_sync),
                 )
                 reliable_progress = {
                     "cursor_id": cursor_id,
@@ -650,6 +672,7 @@ class ExpertIndexPipeline:
                     "stage_count": stage_count,
                     "chunk_count": chunk_count,
                 }
+                reliable_persisted_vector_sync = persisted_vector_sync
 
         except Exception as exc:
             # 批次级错误无法安全跳过。使用最后完整页快照结束批次，使中断页可以重跑。
@@ -666,6 +689,9 @@ class ExpertIndexPipeline:
                 failed_count=reliable_progress["failed_count"],
                 deactivated_count=reliable_progress["deactivated_count"],
                 error_summary={"error_type": type(exc).__name__},
+                **_vector_sync_persistence_fields(
+                    reliable_persisted_vector_sync
+                ),
             )
             raise
 
@@ -687,6 +713,7 @@ class ExpertIndexPipeline:
                 failed_count,
                 error_summaries,
             ),
+            **_vector_sync_persistence_fields(persisted_vector_sync),
         )
 
         return BatchBuildResult(
@@ -769,6 +796,38 @@ class ExpertIndexPipeline:
             timezone_name=self.settings.timezone,
         )
         return self.vector_sync.sync_expert(expert_id, contracts)
+
+
+def _checkpoint_vector_sync(
+    checkpoint: FullBatchCheckpoint,
+) -> VectorSyncSummary:
+    """把批次检查点中的持久化计数恢复为同步摘要。"""
+
+    return VectorSyncSummary(
+        expert_count=checkpoint.vector_sync_expert_count,
+        current_count=checkpoint.vector_current_count,
+        eligible_count=checkpoint.vector_eligible_count,
+        embedded_count=checkpoint.vector_embedded_count,
+        metadata_updated_count=checkpoint.vector_metadata_updated_count,
+        unchanged_count=checkpoint.vector_unchanged_count,
+        deleted_count=checkpoint.vector_deleted_count,
+        delete_not_found_count=checkpoint.vector_delete_not_found_count,
+    )
+
+
+def _vector_sync_persistence_fields(summary: VectorSyncSummary) -> dict[str, int]:
+    """把内存摘要映射为批次主表对应的数量参数。"""
+
+    return {
+        "vector_sync_expert_count": summary.expert_count,
+        "vector_current_count": summary.current_count,
+        "vector_eligible_count": summary.eligible_count,
+        "vector_embedded_count": summary.embedded_count,
+        "vector_metadata_updated_count": summary.metadata_updated_count,
+        "vector_unchanged_count": summary.unchanged_count,
+        "vector_deleted_count": summary.deleted_count,
+        "vector_delete_not_found_count": summary.delete_not_found_count,
+    }
 
 
 def _validate_data_version(data_version: str) -> None:

@@ -1,7 +1,7 @@
 """全量加工批次状态表的静态 DDL 契约测试。
 
 本文件只读取版本库中的 SQL 文本，不连接或修改 MySQL。它用于第一阶段审查：确保
-新建库使用的 001 和现有库使用的 005 都准备了相同的批次跟踪能力，并确保新环境
+新建库使用 001，现有库依次使用增量迁移补齐批次跟踪和同步统计字段，并确保新环境
 不再创建已停用的 Stage/Chunk 持久化表。
 """
 
@@ -12,6 +12,18 @@ from pathlib import Path
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 INITIAL_SCHEMA = PROJECT_ROOT / "sql" / "001_create_expert_index_tables.sql"
 BATCH_MIGRATION = PROJECT_ROOT / "sql" / "005_add_full_batch_tracking.sql"
+VECTOR_STATS_MIGRATION = PROJECT_ROOT / "sql" / "006_add_vector_sync_stats.sql"
+
+VECTOR_STAT_FIELDS = {
+    "vector_sync_expert_count",
+    "vector_current_count",
+    "vector_eligible_count",
+    "vector_embedded_count",
+    "vector_metadata_updated_count",
+    "vector_unchanged_count",
+    "vector_deleted_count",
+    "vector_delete_not_found_count",
+}
 
 
 def _read(path: Path) -> str:
@@ -49,6 +61,9 @@ def test_initial_schema_contains_full_batch_summary_fields() -> None:
     }
 
     for field in required_fields:
+        assert field in batch
+
+    for field in VECTOR_STAT_FIELDS:
         assert field in batch
 
 
@@ -108,3 +123,16 @@ def test_existing_database_migration_is_additive_and_complete() -> None:
     # 第一阶段迁移必须保持纯新增，防止审查前意外破坏已有单专家数据。
     assert "DROP TABLE" not in migration.upper()
     assert "DROP COLUMN" not in migration.upper()
+
+
+def test_vector_stats_migration_adds_only_batch_summary_fields() -> None:
+    """现有库迁移应只为批次主表增加带默认值的同步统计字段。"""
+
+    migration = _read(VECTOR_STATS_MIGRATION)
+
+    assert "ALTER TABLE expert_index_batch" in migration
+    for field in VECTOR_STAT_FIELDS:
+        assert f"ADD COLUMN {field}" in migration
+    assert migration.count("NOT NULL DEFAULT 0") == len(VECTOR_STAT_FIELDS)
+    assert "expert_index_batch_item" not in migration
+    assert "DROP " not in migration.upper()

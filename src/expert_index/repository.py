@@ -5,7 +5,7 @@
 1. 执行受版本控制的建表或迁移 SQL；
 2. 用 MySQL 命名锁协调 single/full 任务，并管理批次主表；
 3. 记录每位候选专家的 pending、running 和最终状态；
-4. 持久化全量任务的处理范围、页游标与累计计数。
+4. 持久化全量任务的处理范围、页游标与向量同步累计计数。
 
 本层不读取业务源表，不清洗文本，不持久化 Stage 或 Chunk，也不调用向量服务。
 标准化结果和 Chunk 通过内存 Contract 交给下游，只有可恢复的任务状态写入索引库。
@@ -60,6 +60,14 @@ class FullBatchCheckpoint:
     extracted_count: int
     stage_count: int
     chunk_count: int
+    vector_sync_expert_count: int = 0  # 已可靠完成向量同步的累计专家数。
+    vector_current_count: int = 0  # 累计提交给下游的当前 Chunk 数。
+    vector_eligible_count: int = 0  # 累计应保留向量的 Chunk 数。
+    vector_embedded_count: int = 0  # 累计实际重新向量化的 Chunk 数。
+    vector_metadata_updated_count: int = 0  # 累计只更新 Metadata 的 Chunk 数。
+    vector_unchanged_count: int = 0  # 累计无需写入的 Chunk 数。
+    vector_deleted_count: int = 0  # 累计成功删除的旧向量数。
+    vector_delete_not_found_count: int = 0  # 累计删除时未找到的向量数。
 
 
 @dataclass(frozen=True)
@@ -227,11 +235,19 @@ class MySQLIndexRepository:
         success_count: int | None = None,
         failed_count: int | None = None,
         deactivated_count: int | None = None,
+        vector_sync_expert_count: int = 0,
+        vector_current_count: int = 0,
+        vector_eligible_count: int = 0,
+        vector_embedded_count: int = 0,
+        vector_metadata_updated_count: int = 0,
+        vector_unchanged_count: int = 0,
+        vector_deleted_count: int = 0,
+        vector_delete_not_found_count: int = 0,
         error_summary: dict[str, Any] | None = None,
     ) -> None:
         """写回批次最终状态、各阶段计数和结束时间。
 
-        本方法只更新批次主表，不写 Stage 或 Chunk。``single`` 写入处理数量和错误摘要；
+        本方法只更新批次主表，不写 Stage 或 Chunk。``single`` 写入处理数量和同步统计；
         ``full`` 还必须完整提供最终游标及专家分类计数。两种模式都会设置结束时间。
 
         ``error_summary`` 会序列化为 JSON，只应包含异常类型、机器码或简短安全说明，
@@ -260,15 +276,24 @@ class MySQLIndexRepository:
                         SET status=%s, cursor_id=%s, candidate_count=%s,
                             success_count=%s, failed_count=%s, deactivated_count=%s,
                             extracted_count=%s, stage_count=%s, chunk_count=%s,
-                            rejected_count=%s, error_summary=%s,
+                            rejected_count=%s, vector_sync_expert_count=%s,
+                            vector_current_count=%s, vector_eligible_count=%s,
+                            vector_embedded_count=%s,
+                            vector_metadata_updated_count=%s,
+                            vector_unchanged_count=%s, vector_deleted_count=%s,
+                            vector_delete_not_found_count=%s, error_summary=%s,
                             finished_at=CURRENT_TIMESTAMP(6)
                         WHERE id=%s
                         """,
                         (
                             status, cursor_id, candidate_count, success_count,
                             failed_count, deactivated_count, extracted_count,
-                            stage_count, chunk_count, rejected_count, error_json,
-                            batch_id,
+                            stage_count, chunk_count, rejected_count,
+                            vector_sync_expert_count, vector_current_count,
+                            vector_eligible_count, vector_embedded_count,
+                            vector_metadata_updated_count, vector_unchanged_count,
+                            vector_deleted_count, vector_delete_not_found_count,
+                            error_json, batch_id,
                         ),
                     )
                 else:
@@ -276,13 +301,22 @@ class MySQLIndexRepository:
                         """
                         UPDATE expert_index_batch
                         SET status=%s, extracted_count=%s, stage_count=%s,
-                            chunk_count=%s, rejected_count=%s, error_summary=%s,
+                            chunk_count=%s, rejected_count=%s,
+                            vector_sync_expert_count=%s, vector_current_count=%s,
+                            vector_eligible_count=%s, vector_embedded_count=%s,
+                            vector_metadata_updated_count=%s,
+                            vector_unchanged_count=%s, vector_deleted_count=%s,
+                            vector_delete_not_found_count=%s, error_summary=%s,
                             finished_at=CURRENT_TIMESTAMP(6)
                         WHERE id=%s
                         """,
                         (
                             status, extracted_count, stage_count, chunk_count,
-                            rejected_count, error_json, batch_id,
+                            rejected_count, vector_sync_expert_count,
+                            vector_current_count, vector_eligible_count,
+                            vector_embedded_count, vector_metadata_updated_count,
+                            vector_unchanged_count, vector_deleted_count,
+                            vector_delete_not_found_count, error_json, batch_id,
                         ),
                     )
             connection.commit()
@@ -310,7 +344,11 @@ class MySQLIndexRepository:
                            cursor_id, upper_bound_id, candidate_count,
                            success_count, failed_count, rejected_count,
                            deactivated_count, extracted_count, stage_count,
-                           chunk_count
+                           chunk_count, vector_sync_expert_count,
+                           vector_current_count, vector_eligible_count,
+                           vector_embedded_count, vector_metadata_updated_count,
+                           vector_unchanged_count, vector_deleted_count,
+                           vector_delete_not_found_count
                     FROM expert_index_batch
                     WHERE id=%s
                     FOR UPDATE
@@ -351,6 +389,14 @@ class MySQLIndexRepository:
                     "extracted_count",
                     "stage_count",
                     "chunk_count",
+                    "vector_sync_expert_count",
+                    "vector_current_count",
+                    "vector_eligible_count",
+                    "vector_embedded_count",
+                    "vector_metadata_updated_count",
+                    "vector_unchanged_count",
+                    "vector_deleted_count",
+                    "vector_delete_not_found_count",
                 )
                 counts = {name: int(row.get(name) or 0) for name in count_names}
                 if any(value < 0 for value in counts.values()):
@@ -400,7 +446,11 @@ class MySQLIndexRepository:
                            cursor_id, upper_bound_id, candidate_count,
                            success_count, failed_count, rejected_count,
                            deactivated_count, extracted_count, stage_count,
-                           chunk_count
+                           chunk_count, vector_sync_expert_count,
+                           vector_current_count, vector_eligible_count,
+                           vector_embedded_count, vector_metadata_updated_count,
+                           vector_unchanged_count, vector_deleted_count,
+                           vector_delete_not_found_count
                     FROM expert_index_batch
                     WHERE id=%s
                     """,
@@ -437,6 +487,14 @@ class MySQLIndexRepository:
                 "extracted_count",
                 "stage_count",
                 "chunk_count",
+                "vector_sync_expert_count",
+                "vector_current_count",
+                "vector_eligible_count",
+                "vector_embedded_count",
+                "vector_metadata_updated_count",
+                "vector_unchanged_count",
+                "vector_deleted_count",
+                "vector_delete_not_found_count",
             )
             counts = {name: int(row.get(name) or 0) for name in count_names}
             if any(value < 0 for value in counts.values()):
@@ -651,6 +709,14 @@ class MySQLIndexRepository:
         extracted_count: int,
         stage_count: int,
         chunk_count: int,
+        vector_sync_expert_count: int = 0,
+        vector_current_count: int = 0,
+        vector_eligible_count: int = 0,
+        vector_embedded_count: int = 0,
+        vector_metadata_updated_count: int = 0,
+        vector_unchanged_count: int = 0,
+        vector_deleted_count: int = 0,
+        vector_delete_not_found_count: int = 0,
     ) -> None:
         """在一整页专家到达终态后，持久化全量游标与累计计数。
 
@@ -667,13 +733,22 @@ class MySQLIndexRepository:
                     UPDATE expert_index_batch
                     SET cursor_id=%s, candidate_count=%s, success_count=%s,
                         failed_count=%s, rejected_count=%s, deactivated_count=%s,
-                        extracted_count=%s, stage_count=%s, chunk_count=%s
+                        extracted_count=%s, stage_count=%s, chunk_count=%s,
+                        vector_sync_expert_count=%s, vector_current_count=%s,
+                        vector_eligible_count=%s, vector_embedded_count=%s,
+                        vector_metadata_updated_count=%s,
+                        vector_unchanged_count=%s, vector_deleted_count=%s,
+                        vector_delete_not_found_count=%s
                     WHERE id=%s AND status='running'
                     """,
                     (
                         cursor_id, candidate_count, success_count, failed_count,
                         rejected_count, deactivated_count, extracted_count,
-                        stage_count, chunk_count, batch_id,
+                        stage_count, chunk_count, vector_sync_expert_count,
+                        vector_current_count, vector_eligible_count,
+                        vector_embedded_count, vector_metadata_updated_count,
+                        vector_unchanged_count, vector_deleted_count,
+                        vector_delete_not_found_count, batch_id,
                     ),
                 )
             connection.commit()

@@ -249,6 +249,10 @@ def _partial_retry_checkpoint() -> FullBatchCheckpoint:
         extracted_count=1,
         stage_count=0,
         chunk_count=1,
+        vector_sync_expert_count=1,
+        vector_current_count=1,
+        vector_eligible_count=1,
+        vector_embedded_count=1,
     )
 
 
@@ -316,6 +320,8 @@ def test_build_single_expert_reuses_core_and_keeps_existing_result() -> None:
         ("single_pipeline_refactor_test", "single", {})
     ]
     assert repository.finish_calls[-1][1]["status"] == "success"
+    assert repository.finish_calls[-1][1]["vector_sync_expert_count"] == 1
+    assert repository.finish_calls[-1][1]["vector_embedded_count"] == 1
 
 
 def test_build_single_expert_passes_strict_contract_snapshot_to_vector_sync() -> None:
@@ -379,6 +385,8 @@ def test_build_expert_batch_paginates_and_continues_after_one_expert_fails() -> 
         "upper_bound_id": 30,
     }
     assert [call["cursor_id"] for call in repository.progress_calls] == [20, 30]
+    assert repository.progress_calls[-1]["vector_sync_expert_count"] == 2
+    assert repository.progress_calls[-1]["vector_embedded_count"] == 2
     finish = repository.finish_calls[-1][1]
     assert finish["status"] == "partial"
     assert finish["error_summary"]["failed_expert_count"] == 1
@@ -443,6 +451,10 @@ def test_resume_expert_batch_continues_after_last_complete_page_with_original_sc
         extracted_count=2,
         stage_count=0,
         chunk_count=2,
+        vector_sync_expert_count=2,
+        vector_current_count=2,
+        vector_eligible_count=2,
+        vector_embedded_count=2,
     )
 
     result = _pipeline(source, repository).resume_expert_batch(701, page_size=1)
@@ -465,6 +477,8 @@ def test_resume_expert_batch_continues_after_last_complete_page_with_original_sc
     assert source.upper_bound_calls == 0
     assert source.page_calls == [(20, 40, 1), (30, 40, 1)]
     assert source.loaded_ids == [30, 40]
+    assert repository.progress_calls[-1]["vector_sync_expert_count"] == 4
+    assert repository.progress_calls[-1]["vector_current_count"] == 4
 
 
 def test_retry_failed_batch_experts_only_reprocesses_failures_and_finishes_success() -> None:
@@ -517,6 +531,8 @@ def test_retry_failed_batch_experts_only_reprocesses_failures_and_finishes_succe
     ]
     assert repository.finish_calls[-1][1]["status"] == "success"
     assert repository.finish_calls[-1][1]["error_summary"] is None
+    assert repository.finish_calls[-1][1]["vector_sync_expert_count"] == 3
+    assert repository.finish_calls[-1][1]["vector_embedded_count"] == 3
 
 
 def test_retry_failed_batch_experts_attempts_each_item_once_and_remains_partial() -> None:
@@ -686,6 +702,8 @@ def test_failed_page_keeps_last_complete_page_counts_for_safe_resume() -> None:
     assert failed_finish["extracted_count"] == 0
     assert failed_finish["stage_count"] == 0
     assert failed_finish["chunk_count"] == 0
+    assert failed_finish["vector_sync_expert_count"] == 0
+    assert failed_finish["vector_embedded_count"] == 0
 
 
 @pytest.mark.parametrize("page_size", [0, 1001])

@@ -137,6 +137,14 @@ def test_resume_batch_reuses_checkpoint_and_reactivates_original_row(
             "extracted_count": 2,
             "stage_count": 2,
             "chunk_count": 1,
+            "vector_sync_expert_count": 2,
+            "vector_current_count": 3,
+            "vector_eligible_count": 2,
+            "vector_embedded_count": 1,
+            "vector_metadata_updated_count": 1,
+            "vector_unchanged_count": 0,
+            "vector_deleted_count": 1,
+            "vector_delete_not_found_count": 0,
         }
     )
     connection = RecordingConnection(cursor)
@@ -151,6 +159,10 @@ def test_resume_batch_reuses_checkpoint_and_reactivates_original_row(
     assert checkpoint.candidate_count == 2
     assert checkpoint.success_count == 1
     assert checkpoint.rejected_count == 1
+    assert checkpoint.vector_sync_expert_count == 2
+    assert checkpoint.vector_current_count == 3
+    assert checkpoint.vector_metadata_updated_count == 1
+    assert checkpoint.vector_deleted_count == 1
     assert "FOR UPDATE" in cursor.executed[0][0]
     assert cursor.executed[0][1] == (801,)
     assert "SET status='running', error_summary=NULL, finished_at=NULL" in cursor.executed[1][0]
@@ -208,6 +220,14 @@ def test_partial_batch_retry_context_requires_completed_full_scan(
             "extracted_count": 3,
             "stage_count": 3,
             "chunk_count": 3,
+            "vector_sync_expert_count": 3,
+            "vector_current_count": 3,
+            "vector_eligible_count": 3,
+            "vector_embedded_count": 2,
+            "vector_metadata_updated_count": 1,
+            "vector_unchanged_count": 0,
+            "vector_deleted_count": 0,
+            "vector_delete_not_found_count": 0,
         }
     )
     connection = RecordingConnection(cursor)
@@ -218,6 +238,8 @@ def test_partial_batch_retry_context_requires_completed_full_scan(
     assert checkpoint.batch_no == "partial_retry_batch"
     assert checkpoint.data_version == "20260818_06"
     assert checkpoint.cursor_id == checkpoint.upper_bound_id == 40
+    assert checkpoint.vector_sync_expert_count == 3
+    assert checkpoint.vector_metadata_updated_count == 1
     assert len(cursor.executed) == 1
     assert "FROM expert_index_batch WHERE id=%s" in cursor.executed[0][0]
     assert all("UPDATE" not in sql for sql, _params in cursor.executed)
@@ -341,6 +363,14 @@ def test_batch_item_lifecycle_and_page_progress_use_safe_columns(
         extracted_count=7,
         stage_count=3,
         chunk_count=5,
+        vector_sync_expert_count=1,
+        vector_current_count=5,
+        vector_eligible_count=4,
+        vector_embedded_count=3,
+        vector_metadata_updated_count=1,
+        vector_unchanged_count=0,
+        vector_deleted_count=1,
+        vector_delete_not_found_count=0,
     )
 
     assert len(cursors[0].executed) == 2
@@ -351,6 +381,8 @@ def test_batch_item_lifecycle_and_page_progress_use_safe_columns(
         "success", 4, 3, 5, None, None, 801, 10
     )
     assert "WHERE id=%s AND status='running'" in cursors[3].executed[0][0]
+    assert "vector_sync_expert_count=%s" in cursors[3].executed[0][0]
+    assert cursors[3].executed[0][1][-9:] == (1, 5, 4, 3, 1, 0, 1, 0, 801)
     assert all(connection.commit_count == 1 for connection in connections)
 
 
@@ -375,17 +407,55 @@ def test_full_batch_finish_persists_final_cursor_and_all_expert_counts(
         extracted_count=24,
         stage_count=18,
         chunk_count=30,
+        vector_sync_expert_count=9,
+        vector_current_count=30,
+        vector_eligible_count=27,
+        vector_embedded_count=20,
+        vector_metadata_updated_count=3,
+        vector_unchanged_count=4,
+        vector_deleted_count=2,
+        vector_delete_not_found_count=1,
         error_summary={"failed_expert_count": 1},
     )
 
     sql, params = cursor.executed[0]
     assert "cursor_id=%s, candidate_count=%s" in sql
     assert "deactivated_count=%s" in sql
+    assert "vector_metadata_updated_count=%s" in sql
     assert params == (
         "partial", 999, 10, 6, 1, 1, 24, 18, 30, 2,
-        '{"failed_expert_count":1}', 801,
+        9, 30, 27, 20, 3, 4, 2, 1, '{"failed_expert_count":1}', 801,
     )
     assert connection.commit_count == 1
+
+
+def test_single_batch_finish_persists_vector_sync_counts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """single 批次收口也应写入本次下游同步结果。"""
+
+    cursor = RecordingCursor()
+    connection = RecordingConnection(cursor)
+    _patch_connection(monkeypatch, connection)
+
+    _repository().finish_batch(
+        801,
+        status="success",
+        extracted_count=4,
+        chunk_count=3,
+        vector_sync_expert_count=1,
+        vector_current_count=3,
+        vector_eligible_count=3,
+        vector_embedded_count=2,
+        vector_metadata_updated_count=1,
+    )
+
+    sql, params = cursor.executed[0]
+    assert "cursor_id" not in sql
+    assert "vector_sync_expert_count=%s" in sql
+    assert params == (
+        "success", 4, 0, 3, 0, 1, 3, 3, 2, 1, 0, 0, 0, None, 801,
+    )
 
 
 def test_batch_item_rejects_message_like_result_code_before_connect(

@@ -29,6 +29,23 @@ CREATE TABLE IF NOT EXISTS expert_index_batch (
     stage_count INT UNSIGNED NOT NULL DEFAULT 0 COMMENT '旧 Stage 批次兼容计数，新任务恒为 0',
     chunk_count INT UNSIGNED NOT NULL DEFAULT 0,
     rejected_count INT UNSIGNED NOT NULL DEFAULT 0,
+    -- 以下字段累计下游已可靠返回的同步结果，用于断点续跑和批次历史查询。
+    vector_sync_expert_count INT UNSIGNED NOT NULL DEFAULT 0
+        COMMENT '已完成向量同步并返回可靠结果的专家数',
+    vector_current_count INT UNSIGNED NOT NULL DEFAULT 0
+        COMMENT '上游提交的当前 Chunk 总数',
+    vector_eligible_count INT UNSIGNED NOT NULL DEFAULT 0
+        COMMENT '满足保留条件的 Chunk 总数',
+    vector_embedded_count INT UNSIGNED NOT NULL DEFAULT 0
+        COMMENT '实际重新向量化的 Chunk 总数',
+    vector_metadata_updated_count INT UNSIGNED NOT NULL DEFAULT 0
+        COMMENT '只更新 Metadata 的 Chunk 总数',
+    vector_unchanged_count INT UNSIGNED NOT NULL DEFAULT 0
+        COMMENT '无需写入的未变化 Chunk 总数',
+    vector_deleted_count INT UNSIGNED NOT NULL DEFAULT 0
+        COMMENT '成功删除的旧向量总数',
+    vector_delete_not_found_count INT UNSIGNED NOT NULL DEFAULT 0
+        COMMENT '请求删除但下游未找到的向量总数',
     error_summary JSON NULL,
     started_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
     finished_at DATETIME(6) NULL,
