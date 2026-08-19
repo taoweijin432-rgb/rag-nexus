@@ -33,17 +33,50 @@ from .ports import ExpertVectorSyncPort
 from .repository import FullBatchCheckpoint, MySQLIndexRepository
 from .source import MAX_FULL_SCAN_PAGE_SIZE, MySQLSourceAdapter
 from .validators import validate_chunks
+from .vector_sync import ExpertVectorSyncResult
 
 # 批次主表只保存有限数量的失败样本；每位专家的完整机器终态由批次明细表记录。
 MAX_BATCH_ERROR_SUMMARIES = 20
 
 
 @dataclass(frozen=True)
+class VectorSyncSummary:
+    """汇总当前命令中已完整返回的专家向量同步结果。"""
+
+    expert_count: int = 0  # 已完成向量同步并返回可靠结果的专家数。
+    current_count: int = 0  # 上游本次提交的当前 Chunk 总数。
+    eligible_count: int = 0  # 满足激活和审核条件、应保留向量的 Chunk 总数。
+    embedded_count: int = 0  # 正文新增或变化并实际重新向量化的 Chunk 总数。
+    metadata_updated_count: int = 0  # 未重新向量化、只更新 Metadata 的 Chunk 总数。
+    unchanged_count: int = 0  # 正文和 Metadata 均未变化、无需写入的 Chunk 总数。
+    deleted_count: int = 0  # 当前快照已不存在并成功删除的旧向量总数。
+    delete_not_found_count: int = 0  # 请求删除但下游未找到的向量总数。
+
+    def add(self, result: ExpertVectorSyncResult) -> VectorSyncSummary:
+        """返回累加一位专家同步结果后的新汇总，不修改已有对象。"""
+
+        return VectorSyncSummary(
+            expert_count=self.expert_count + 1,
+            current_count=self.current_count + result.current_count,
+            eligible_count=self.eligible_count + result.eligible_count,
+            embedded_count=self.embedded_count + result.embedded_count,
+            metadata_updated_count=(
+                self.metadata_updated_count + result.metadata_updated_count
+            ),
+            unchanged_count=self.unchanged_count + result.unchanged_count,
+            deleted_count=self.deleted_count + result.deleted_count,
+            delete_not_found_count=(
+                self.delete_not_found_count + result.delete_not_found_count
+            ),
+        )
+
+
+@dataclass(frozen=True)
 class BuildResult:
     """单专家任务完成后返回的批次标识和处理数量。
 
-    该结果不包含源数据或 Chunk 正文；相同统计同时写入批次主表，便于按 ``batch_id``
-    回查执行结果。
+    该结果不包含源数据或 Chunk 正文。批次处理数量写入批次主表；``vector_sync``
+    仅汇总当前命令收到的下游返回值，不做数据库持久化。
     """
 
     batch_id: int  # expert_index_batch.id，用于回查本次运行。
@@ -53,13 +86,15 @@ class BuildResult:
     stage_count: int  # 不再持久化 Stage，因此新任务恒为 0。
     chunk_count: int  # 成功同步到下游的最终 Chunk 行数。
     partial_chunk_count: int  # 当前流程不生成 partial Chunk，因此恒为 0。
+    vector_sync: VectorSyncSummary  # 本次单专家命令的向量同步数量摘要。
 
 
 @dataclass(frozen=True)
 class BatchBuildResult:
     """批量任务完成后返回的扫描范围、最终游标和累计数量。
 
-    该对象由新批次和续跑入口共同返回，只包含任务状态和计数，不包含专家原始字段。
+    该对象由新批次、续跑和失败重试入口共同返回，只包含任务状态和计数，不包含专家
+    原始字段。``vector_sync`` 只统计当前命令，不包含续跑前已经完成的专家。
 
     ``rejected_count`` 表示存在但无可生成内容的专家数；``deactivated_count`` 表示
     主档已逻辑删除且历史 Chunk 已完成停用的专家数。两者都不是程序失败。
@@ -78,6 +113,7 @@ class BatchBuildResult:
     extracted_count: int  # 所有已推进专家读取到的四表来源记录总数。
     stage_count: int  # 纯内存构建新增量为 0；续跑旧批次时保留其历史值。
     chunk_count: int  # 已生成的 Chunk 总数；同步失败专家可能已产生 Chunk。
+    vector_sync: VectorSyncSummary  # 只统计本次命令实际处理并完成同步的专家。
 
 
 @dataclass
@@ -91,6 +127,7 @@ class _ExpertProgress:
     expert_id: int
     extracted_count: int = 0
     chunk_count: int = 0
+    vector_sync: ExpertVectorSyncResult | None = None  # 同步成功返回后才设置。
 
 
 class ExpertIndexPipeline:
@@ -162,6 +199,7 @@ class ExpertIndexPipeline:
                 batch_id=batch_id,
                 progress=progress,
             )
+            assert progress.vector_sync is not None
             # 当前只生成完整 Chunk；返回结构中的 partial 数量固定为 0。
             partial_count = 0
             self.repository.finish_batch(
@@ -180,6 +218,7 @@ class ExpertIndexPipeline:
                 stage_count=0,
                 chunk_count=progress.chunk_count,
                 partial_chunk_count=partial_count,
+                vector_sync=VectorSyncSummary().add(progress.vector_sync),
             )
         except Exception as exc:
             # 批次错误摘要只记录异常类型和截断消息，不保存专家正文或 Chunk Text。
@@ -296,6 +335,7 @@ class ExpertIndexPipeline:
 
         after_expert_id = 0
         error_summaries: list[dict[str, object]] = []
+        vector_sync = VectorSyncSummary()
         while True:
             expert_ids = self.repository.load_retryable_batch_item_ids(
                 checkpoint.batch_id,
@@ -314,7 +354,10 @@ class ExpertIndexPipeline:
                 try:
                     candidate = self.source.load_expert_candidate(expert_id)
                     if candidate.is_deleted:
-                        self._sync_expert_vector_snapshot(expert_id, [])
+                        progress.vector_sync = self._sync_expert_vector_snapshot(
+                            expert_id,
+                            [],
+                        )
                         terminal_status = "deactivated"
                         result_code = "expert_deleted"
                     else:
@@ -341,6 +384,8 @@ class ExpertIndexPipeline:
                     result_code=result_code,
                     error_type=error_type,
                 )
+                if progress.vector_sync is not None:
+                    vector_sync = vector_sync.add(progress.vector_sync)
                 if terminal_status == "failed" and (
                     len(error_summaries) < MAX_BATCH_ERROR_SUMMARIES
                 ):
@@ -392,6 +437,7 @@ class ExpertIndexPipeline:
             extracted_count=summary.extracted_count,
             stage_count=summary.stage_count,
             chunk_count=summary.chunk_count,
+            vector_sync=vector_sync,
         )
 
     def _build_expert_batch_locked(
@@ -452,6 +498,8 @@ class ExpertIndexPipeline:
             stage_count = checkpoint.stage_count
             chunk_count = checkpoint.chunk_count
         error_summaries: list[dict[str, object]] = []
+        # 续跑也只汇总当前命令新完成的同步，不混入检查点之前的历史处理。
+        vector_sync = VectorSyncSummary()
         # 该快照只在完整页进度成功落库后更新。批次级错误使用它收口，确保游标与累计
         # 数量属于同一个页边界，续跑时不会重复累计中断页。
         reliable_progress = {
@@ -521,7 +569,10 @@ class ExpertIndexPipeline:
                     try:
                         if candidate.is_deleted:
                             # 删除候选不读取正文，直接用空快照删除下游历史向量。
-                            self._sync_expert_vector_snapshot(candidate.id, [])
+                            progress.vector_sync = self._sync_expert_vector_snapshot(
+                                candidate.id,
+                                [],
+                            )
                             terminal_status = "deactivated"
                             result_code = "expert_deleted"
                         else:
@@ -551,6 +602,8 @@ class ExpertIndexPipeline:
                         result_code=result_code,
                         error_type=error_type,
                     )
+                    if progress.vector_sync is not None:
+                        vector_sync = vector_sync.add(progress.vector_sync)
 
                     if terminal_status == "success":
                         success_count += 1
@@ -650,6 +703,7 @@ class ExpertIndexPipeline:
             extracted_count=extracted_count,
             stage_count=stage_count,
             chunk_count=chunk_count,
+            vector_sync=vector_sync,
         )
 
     def _process_active_expert(
@@ -689,20 +743,20 @@ class ExpertIndexPipeline:
         chunks = self.factory.build_all(profile, employments, projects)
         if not chunks:
             # 无可生成内容属于 rejected 业务结果，用空快照清除旧向量。
-            self._sync_expert_vector_snapshot(expert_id, [])
+            progress.vector_sync = self._sync_expert_vector_snapshot(expert_id, [])
             return "rejected"
 
         validate_chunks(chunks)
         # 校验完成后记录 Chunk 数量；向量同步失败时外层会把本专家标记为 failed。
         progress.chunk_count = len(chunks)
-        self._sync_expert_vector_snapshot(expert_id, chunks)
+        progress.vector_sync = self._sync_expert_vector_snapshot(expert_id, chunks)
         return "success"
 
     def _sync_expert_vector_snapshot(
         self,
         expert_id: int,
         chunks: list[ChunkRecord],
-    ) -> None:
+    ) -> ExpertVectorSyncResult:
         """把 Chunk 转为公共 Contract，并同步一位专家的完整向量快照。
 
         ``chunks`` 为空时也会调用下游，用于删除该专家已存在但本次不再产出的向量。
@@ -714,7 +768,7 @@ class ExpertIndexPipeline:
             updated_at=updated_at,
             timezone_name=self.settings.timezone,
         )
-        self.vector_sync.sync_expert(expert_id, contracts)
+        return self.vector_sync.sync_expert(expert_id, contracts)
 
 
 def _validate_data_version(data_version: str) -> None:

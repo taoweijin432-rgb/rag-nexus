@@ -7,7 +7,7 @@ Fake。Pipeline 因而不依赖 Milvus Repository、Embedding Worker 等下游�
 from __future__ import annotations
 
 from collections.abc import Sequence
-from typing import Protocol
+from typing import TYPE_CHECKING, Protocol
 
 from expert_contracts import ExpertChunkEmbeddingInput
 from rag_vector_store import (
@@ -16,6 +16,9 @@ from rag_vector_store import (
     VectorIngestionResult,
     VectorQueryResult,
 )
+
+if TYPE_CHECKING:
+    from .vector_sync import ExpertVectorSyncResult
 
 
 class VectorStorePort(Protocol):
@@ -51,7 +54,7 @@ class ExpertVectorSyncPort(Protocol):
         self,
         expert_id: int,
         records: Sequence[ExpertChunkEmbeddingInput],
-    ) -> object: ...
+    ) -> ExpertVectorSyncResult: ...
 
 
 __all__ = ["ExpertVectorSyncPort", "VectorStorePort"]

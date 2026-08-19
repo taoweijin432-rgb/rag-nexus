@@ -7,7 +7,7 @@ Repository 定向测试覆盖。
 
 from __future__ import annotations
 
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
 from datetime import datetime
 from typing import Any
@@ -19,8 +19,9 @@ from expert_contracts import ExpertChunkEmbeddingInput
 from expert_index.cli import build_parser
 from expert_index.config import DatabaseConfig, Settings
 from expert_index.models import ExpertAggregate, ExpertCandidate, ExpertSource
-from expert_index.pipeline import ExpertIndexPipeline
+from expert_index.pipeline import ExpertIndexPipeline, VectorSyncSummary
 from expert_index.repository import BatchItemSummary, FullBatchCheckpoint
+from expert_index.vector_sync import ExpertVectorSyncResult
 
 
 def _settings() -> Settings:
@@ -185,16 +186,35 @@ class FakeRepository:
 class FakeVectorSync:
     """记录 Pipeline 交付的正式 Contract 快照。"""
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        *,
+        results_by_expert: dict[int, ExpertVectorSyncResult] | None = None,
+    ) -> None:
         self.calls: list[tuple[int, list[ExpertChunkEmbeddingInput]]] = []
+        self.results_by_expert = results_by_expert or {}
 
     def sync_expert(
         self,
         expert_id: int,
-        records: list[ExpertChunkEmbeddingInput],
-    ) -> object:
-        self.calls.append((expert_id, list(records)))
-        return object()
+        records: Sequence[ExpertChunkEmbeddingInput],
+    ) -> ExpertVectorSyncResult:
+        current_records = list(records)
+        self.calls.append((expert_id, current_records))
+        if expert_id in self.results_by_expert:
+            return self.results_by_expert[expert_id]
+        # 默认把收到的当前快照视为全部完成首次向量化。
+        current_count = len(current_records)
+        return ExpertVectorSyncResult(
+            expert_id=expert_id,
+            current_count=current_count,
+            eligible_count=current_count,
+            embedded_count=current_count,
+            metadata_updated_count=0,
+            unchanged_count=0,
+            deleted_count=0,
+            delete_not_found_count=0,
+        )
 
 
 def _pipeline(
@@ -232,6 +252,44 @@ def _partial_retry_checkpoint() -> FullBatchCheckpoint:
     )
 
 
+def test_vector_sync_summary_accumulates_all_downstream_counters() -> None:
+    """同步摘要应逐项累加下游返回值，并记录已完成专家数。"""
+
+    first = ExpertVectorSyncResult(
+        expert_id=10,
+        current_count=3,
+        eligible_count=2,
+        embedded_count=1,
+        metadata_updated_count=1,
+        unchanged_count=0,
+        deleted_count=1,
+        delete_not_found_count=0,
+    )
+    second = ExpertVectorSyncResult(
+        expert_id=20,
+        current_count=4,
+        eligible_count=3,
+        embedded_count=1,
+        metadata_updated_count=0,
+        unchanged_count=2,
+        deleted_count=0,
+        delete_not_found_count=1,
+    )
+
+    summary = VectorSyncSummary().add(first).add(second)
+
+    assert summary == VectorSyncSummary(
+        expert_count=2,
+        current_count=7,
+        eligible_count=5,
+        embedded_count=2,
+        metadata_updated_count=1,
+        unchanged_count=2,
+        deleted_count=1,
+        delete_not_found_count=1,
+    )
+
+
 def test_build_single_expert_reuses_core_and_keeps_existing_result() -> None:
     """重构后单专家入口仍创建 single 批次并返回原有数量结构。"""
 
@@ -250,6 +308,9 @@ def test_build_single_expert_reuses_core_and_keeps_existing_result() -> None:
     assert result.stage_count == 0
     assert result.chunk_count == 1
     assert result.partial_chunk_count == 0
+    assert result.vector_sync.expert_count == 1
+    assert result.vector_sync.current_count == 1
+    assert result.vector_sync.embedded_count == 1
     assert repository.lock_modes == ["single"]
     assert repository.start_calls == [
         ("single_pipeline_refactor_test", "single", {})
@@ -308,6 +369,9 @@ def test_build_expert_batch_paginates_and_continues_after_one_expert_fails() -> 
     assert result.extracted_count == 2
     assert result.stage_count == 0
     assert result.chunk_count == 2
+    assert result.vector_sync.expert_count == 2
+    assert result.vector_sync.current_count == 2
+    assert result.vector_sync.embedded_count == 2
     assert source.page_calls == [(0, 30, 2), (20, 30, 2)]
     assert source.loaded_ids == [10, 20, 30]
     assert repository.start_calls[0][2] == {
@@ -392,6 +456,9 @@ def test_resume_expert_batch_continues_after_last_complete_page_with_original_sc
     assert result.extracted_count == 4
     assert result.stage_count == 0
     assert result.chunk_count == 4
+    # 检查点前两位专家不计入本次命令的内存同步摘要。
+    assert result.vector_sync.expert_count == 2
+    assert result.vector_sync.current_count == 2
     assert repository.lock_modes == ["full"]
     assert repository.resume_calls == [701]
     assert repository.start_calls == []
@@ -437,6 +504,8 @@ def test_retry_failed_batch_experts_only_reprocesses_failures_and_finishes_succe
     assert result.candidate_count == 3
     assert result.success_count == 3
     assert result.failed_count == 0
+    assert result.vector_sync.expert_count == 2
+    assert result.vector_sync.embedded_count == 2
     assert source.upper_bound_calls == 0
     assert source.page_calls == []
     assert source.candidate_calls == [20, 30]
@@ -525,6 +594,8 @@ def test_build_expert_batch_deactivates_deleted_candidate_without_loading_source
     assert result.status == "success"
     assert result.failed_count == 0
     assert result.deactivated_count == 1
+    assert result.vector_sync.expert_count == 1
+    assert result.vector_sync.current_count == 0
     assert source.loaded_ids == []
     assert result.stage_count == 0
     assert vector_sync.calls == [(40, [])]
