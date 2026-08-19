@@ -30,6 +30,7 @@ from .indexes import (
     vector_index_spec,
 )
 from .repository import ContractMilvusVectorRepository
+from .repository_v15 import ContractMilvusV15VectorRepository
 
 __all__ = [
     "CONTRACT_SCALAR_INDEX_FIELDS",
@@ -38,6 +39,7 @@ __all__ = [
     "V15_CONTRACT_VECTOR_DIMENSION",
     "V15_VECTOR_DOC_ID_MAX_BYTES",
     "CollectionCompatibilityResult",
+    "ContractMilvusV15VectorRepository",
     "ContractMilvusVectorRepository",
     "IndexSpec",
     "MilvusExpertChunkEntity",

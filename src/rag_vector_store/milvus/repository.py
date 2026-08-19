@@ -65,7 +65,25 @@ class ContractMilvusVectorRepository:
         应用自行管理 PyMilvus client 生命周期的场景。所有正式写入都先确定向量
         维度，再通过 Schema/Index Compatibility Gate；已存在但不兼容的 Collection
         会阻断，不自动 drop、alter 或 recreate。
+
+    持久化 profile：
+        V14（本类默认）使用 25 字段 Schema、``MilvusRowMapper`` 与
+        ``index_specs``；V15 由 ``ContractMilvusV15VectorRepository`` 子类整体
+        替换下面声明的 profile 属性，禁止在方法内部按版本分支。
     """
+
+    # ---- 持久化 profile（默认 V14；V15 子类整体替换，禁止方法内按版本分支）----
+    _schema_field_specs = staticmethod(contract_milvus_field_specs)
+    _schema_builder = staticmethod(build_contract_schema)
+    _index_specs_fn = staticmethod(index_specs)
+    _row_mapper_cls = MilvusRowMapper
+    # 全量扫描/模型空间一致性检查使用的 filter 表达式与输出字段。
+    _full_scan_filter = "embedding_dim >= 0"
+    _model_space_fields = (
+        "embedding_model_alias",
+        "embedding_model_version",
+        "embedding_dim",
+    )
 
     def __init__(
         self,
@@ -85,7 +103,7 @@ class ContractMilvusVectorRepository:
         self._initialized = False
         self._owns_client = client is None
         self._allow_collection_creation = allow_collection_creation
-        self._contract_row_mapper = MilvusRowMapper()
+        self._contract_row_mapper = self._row_mapper_cls()
         self._lock = Lock()
 
         if vector_dimension is not None:
@@ -104,7 +122,7 @@ class ContractMilvusVectorRepository:
         """返回正式契约 Milvus Schema 摘要，不连接或修改 Milvus。"""
 
         dimension = self._resolve_vector_dimension(vector_dimension)
-        return [spec.summary() for spec in contract_milvus_field_specs(dimension)]
+        return [spec.summary() for spec in self._schema_field_specs(dimension)]
 
     def compare_contract_schema(
         self,
@@ -116,7 +134,7 @@ class ContractMilvusVectorRepository:
         dimension = self._resolve_vector_dimension(vector_dimension)
         return compare_schema_specs(
             description,
-            contract_milvus_field_specs(dimension),
+            self._schema_field_specs(dimension),
         ).as_dict()
 
     def expected_index_summary(self) -> dict[str, object]:
@@ -131,7 +149,7 @@ class ContractMilvusVectorRepository:
 
         return [
             spec.summary(include_name=True)
-            for spec in index_specs(self.settings)
+            for spec in self._index_specs_fn(self.settings)
         ]
 
     def compare_contract_indexes(self, client: Any | None = None) -> dict[str, object]:
@@ -162,7 +180,7 @@ class ContractMilvusVectorRepository:
         return compare_contract_indexes_definition(
             index_names,
             descriptions,
-            index_specs(self.settings),
+            self._index_specs_fn(self.settings),
         ).as_dict()
 
     def assert_destructive_maintenance_allowed(
@@ -426,7 +444,7 @@ class ContractMilvusVectorRepository:
 
         dimension = self._resolve_vector_dimension(None)
         output_fields = [
-            spec.name for spec in contract_milvus_field_specs(dimension)
+            spec.name for spec in self._schema_field_specs(dimension)
         ]
         if not include_embedding:
             output_fields.remove("embedding")
@@ -549,7 +567,7 @@ class ContractMilvusVectorRepository:
             collection_name=self.settings.collection_name,
             batch_size=1000,
             limit=-1,
-            filter="embedding_dim >= 0",
+            filter=self._full_scan_filter,
             output_fields=fields,
             consistency_level="Strong",
             **self._timeout_kwargs(),
@@ -733,12 +751,8 @@ class ContractMilvusVectorRepository:
             collection_name=self.settings.collection_name,
             batch_size=1000,
             limit=-1,
-            filter="embedding_dim >= 0",
-            output_fields=[
-                "embedding_model_alias",
-                "embedding_model_version",
-                "embedding_dim",
-            ],
+            filter=self._full_scan_filter,
+            output_fields=list(self._model_space_fields),
             consistency_level="Strong",
             **self._timeout_kwargs(),
         )
@@ -752,7 +766,7 @@ class ContractMilvusVectorRepository:
                 if not rows:
                     break
                 difference = compare_model_space(
-                    rows,
+                    [self._model_space_from_row(row) for row in rows],
                     embedding_model_alias=record.embedding_model_alias,
                     embedding_model_version=record.embedding_model_version,
                     embedding_dimension=record.embedding_dim,
@@ -765,20 +779,32 @@ class ContractMilvusVectorRepository:
         finally:
             iterator.close()
 
-    def _build_schema(self, vector_dimension: int | None) -> Any:
-        """构造正式 Contract Schema，不修改任何已有 Collection。"""
+    def _model_space_from_row(
+        self,
+        row: Mapping[str, Any],
+    ) -> dict[str, object]:
+        """从单行 Entity 提取模型空间字段（默认 V14 一级字段投影）。"""
 
-        return build_contract_schema(self.settings, vector_dimension)
+        return {
+            "embedding_model_alias": row.get("embedding_model_alias"),
+            "embedding_model_version": row.get("embedding_model_version"),
+            "embedding_dim": row.get("embedding_dim"),
+        }
+
+    def _build_schema(self, vector_dimension: int | None) -> Any:
+        """构造 profile 指定的 Contract Schema，不修改任何已有 Collection。"""
+
+        return self._schema_builder(self.settings, vector_dimension)
 
     def _build_contract_schema(self, vector_dimension: int | None) -> Any:
-        """保留内部构建入口，实际使用正式 Contract Schema。"""
+        """保留内部构建入口，实际使用 profile 指定的 Contract Schema。"""
 
-        return build_contract_schema(self.settings, vector_dimension)
+        return self._schema_builder(self.settings, vector_dimension)
 
     def _build_index_params(self, client: Any) -> Any:
         return build_index_params(
             client,
-            index_specs(self.settings),
+            self._index_specs_fn(self.settings),
         )
 
     def _validate_existing_collection(self, description: Mapping[str, Any]) -> None:
