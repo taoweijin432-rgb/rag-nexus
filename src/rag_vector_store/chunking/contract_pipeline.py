@@ -42,27 +42,8 @@ _CHUNK_SUBTYPES = {
 _FORBIDDEN_TEXT_PATTERN = re.compile(
     "[\\x00\\u200b-\\u200f\\u202a-\\u202e\\u2066-\\u2069\\ufeff]"
 )
-_PII_PATTERNS = (
-    ("邮箱", re.compile(r"(?i)\b[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}\b")),
-    ("手机号", re.compile(r"(?<!\d)1[3-9]\d{9}(?!\d)")),
-    ("身份证号", re.compile(r"(?<!\d)\d{17}[0-9Xx](?!\d)")),
-    ("银行卡号", re.compile(r"(?<!\d)\d{13,19}(?!\d)")),
-    ("原始 URL", re.compile(r"(?i)\bhttps?://[^\s]+")),
-    (
-        "IP 地址",
-        re.compile(
-            r"(?<!\d)(?:25[0-5]|2[0-4]\d|1?\d?\d)"
-            r"(?:\.(?:25[0-5]|2[0-4]\d|1?\d?\d)){3}(?!\d)"
-        ),
-    ),
-    (
-        "微信号",
-        re.compile(
-            r"(?:微信|wechat|wx)\s*[:：]\s*[A-Za-z][-_A-Za-z0-9]{5,19}",
-            re.IGNORECASE,
-        ),
-    ),
-)
+# PII 检查已下沉到上游 expert_index/normalize.py 的 clean_text，
+# Contract 层不再重复校验 PII（避免误判标准编号等业务数字，且职责归上游清洗）。
 
 
 class ContractValidationError(ValueError):
@@ -238,11 +219,8 @@ class ContractValidator:
         # role_name_raw / project_name 均为 NULLABLE，文档未规定 employment/project
         # 必须因所属 chunk_type 强制这些字段非空。因此这里不校验旧 v2 的必填规则。
 
-        # PII 检查在 Embedding 前执行，避免敏感信息进入外部模型；错误只返回
-        # 安全摘要，不把命中的原文写入日志或异常。
-        for pii_name, pattern in _PII_PATTERNS:
-            if pattern.search(text):
-                errors.append(f"chunk_text 疑似包含{pii_name}")
+        # PII 校验已下沉到上游 expert_index/normalize.py 的 clean_text，
+        # Contract 层不再重复校验 PII（避免误判标准编号等业务数字，如 IEC 标准号）。
 
         if errors:
             raise ContractValidationError("；".join(errors))
