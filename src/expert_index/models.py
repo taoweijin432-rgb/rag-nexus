@@ -21,6 +21,9 @@ CHECKPOINT_SOURCE_TABLES = frozenset(
     }
 )
 
+# 来源表在单个批次中的扫描状态；只描述扫描生命周期，不表示安全 Checkpoint 已推进。
+BATCH_SOURCE_SCAN_STATUSES = frozenset({"pending", "running", "success", "failed"})
+
 
 @dataclass(frozen=True, order=True)
 class SourceScanCursor:
@@ -43,6 +46,58 @@ class SourceScanCursor:
             or self.record_id < 0
         ):
             raise ValueError("record_id 必须是非负整数")
+
+
+@dataclass(frozen=True)
+class BatchSourceScan:
+    """一个批次对一张来源表的固定扫描范围和临时进度。
+
+    ``current_cursor`` 只用于批次中断恢复；即使到达 ``upper_bound``，也必须等待
+    下游任务全部完成后，才能单独推进该来源表的安全 Checkpoint。
+    """
+
+    batch_id: int  # 所属构建批次 ID，对应 expert_index_batch.id。
+    source_table: str  # 当前批次独立扫描的物理来源表。
+    start_cursor: SourceScanCursor  # 批次启动时读取的安全 Checkpoint。
+    current_cursor: SourceScanCursor  # 当前临时扫描位置，不代表数据已安全处理。
+    upper_bound: SourceScanCursor  # 批次启动时固定的来源表扫描上界。
+    checkpoint_lock_version: int  # 启动时的 Checkpoint 版本，供最终并发校验。
+    status: str = "pending"  # 扫描状态：pending/running/success/failed。
+    started_at: datetime | None = None  # 实际开始扫描该来源表的时间。
+    finished_at: datetime | None = None  # 来源表扫描到达终态的时间。
+
+    def __post_init__(self) -> None:
+        """保证批次标识、扫描范围和数据库状态能够可靠持久化。"""
+
+        if (
+            isinstance(self.batch_id, bool)
+            or not isinstance(self.batch_id, int)
+            or self.batch_id < 1
+        ):
+            raise ValueError("batch_id 必须是正整数")
+        if self.source_table not in CHECKPOINT_SOURCE_TABLES:
+            raise ValueError(f"不支持的 Checkpoint 来源表: {self.source_table}")
+        for field_name, cursor in (
+            ("start_cursor", self.start_cursor),
+            ("current_cursor", self.current_cursor),
+            ("upper_bound", self.upper_bound),
+        ):
+            if not isinstance(cursor, SourceScanCursor):
+                raise TypeError(f"{field_name} 必须是 SourceScanCursor")
+        if not self.start_cursor <= self.current_cursor <= self.upper_bound:
+            raise ValueError("扫描游标必须满足 start_cursor <= current_cursor <= upper_bound")
+        if (
+            isinstance(self.checkpoint_lock_version, bool)
+            or not isinstance(self.checkpoint_lock_version, int)
+            or self.checkpoint_lock_version < 0
+        ):
+            raise ValueError("checkpoint_lock_version 必须是非负整数")
+        if self.status not in BATCH_SOURCE_SCAN_STATUSES:
+            raise ValueError(f"不支持的批次来源扫描状态: {self.status}")
+        if self.started_at is not None and not isinstance(self.started_at, datetime):
+            raise TypeError("started_at 必须是 datetime 或 None")
+        if self.finished_at is not None and not isinstance(self.finished_at, datetime):
+            raise TypeError("finished_at 必须是 datetime 或 None")
 
 
 @dataclass(frozen=True)
