@@ -12,7 +12,7 @@ from typing import Any, Self
 import pytest
 
 from expert_index.config import DatabaseConfig
-from expert_index.models import SourceCheckpoint
+from expert_index.models import BatchSourceScan, SourceCheckpoint, SourceScanCursor
 from expert_index.repository import (
     BatchNotResumableError,
     BatchNotRetryableError,
@@ -210,6 +210,139 @@ def test_initialize_source_checkpoint_rejects_nonzero_lock_version(
 
     with pytest.raises(ValueError, match="lock_version 必须为 0"):
         _repository().initialize_source_checkpoint(checkpoint)
+
+
+def test_create_batch_source_scan_inserts_fixed_range(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """创建方法应完整保存来源表扫描范围，且不能覆盖已有记录。"""
+
+    start_time = datetime(2026, 8, 13, 22, 0, tzinfo=timezone.utc)
+    upper_bound_time = datetime(2026, 8, 20, 10, 0, tzinfo=timezone.utc)
+    cursor = RecordingCursor()
+    connection = RecordingConnection(cursor)
+    _patch_connection(monkeypatch, connection)
+
+    _repository().create_batch_source_scan(
+        BatchSourceScan(
+            batch_id=903,
+            source_table="experts_education_experience",
+            start_cursor=SourceScanCursor(start_time, 100),
+            current_cursor=SourceScanCursor(start_time, 100),
+            upper_bound=SourceScanCursor(upper_bound_time, 300),
+            checkpoint_lock_version=4,
+        )
+    )
+
+    sql, params = cursor.executed[0]
+    assert "INSERT INTO expert_index_batch_source" in sql
+    assert "ON DUPLICATE KEY UPDATE" not in sql
+    assert params == (
+        903,
+        "experts_education_experience",
+        start_time,
+        100,
+        start_time,
+        100,
+        upper_bound_time,
+        300,
+        4,
+        "pending",
+        None,
+        None,
+    )
+    assert connection.commit_count == 1
+    assert connection.rollback_count == 0
+    assert connection.closed is True
+
+
+def test_create_batch_source_scan_rejects_already_started_state(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """创建入口不能被用来写入已经推进的临时游标。"""
+
+    def unexpected_connect(**_kwargs: object) -> None:
+        raise AssertionError("已推进的扫描状态不应连接数据库")
+
+    monkeypatch.setattr("expert_index.repository.pymysql.connect", unexpected_connect)
+    start_time = datetime(2026, 8, 13, 22, 0, tzinfo=timezone.utc)
+
+    with pytest.raises(ValueError, match="current_cursor 必须等于 start_cursor"):
+        _repository().create_batch_source_scan(
+            BatchSourceScan(
+                batch_id=903,
+                source_table="experts",
+                start_cursor=SourceScanCursor(start_time, 0),
+                current_cursor=SourceScanCursor(start_time, 1),
+                upper_bound=SourceScanCursor(start_time, 10),
+                checkpoint_lock_version=0,
+                status="running",
+            )
+        )
+
+
+def test_get_batch_source_scan_returns_persisted_state(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """查询方法应把数据库行还原为带三个复合游标的领域模型。"""
+
+    start_time = datetime(2026, 8, 13, 22, 0, tzinfo=timezone.utc)
+    cursor_time = datetime(2026, 8, 20, 9, 0, tzinfo=timezone.utc)
+    upper_bound_time = datetime(2026, 8, 20, 10, 0, tzinfo=timezone.utc)
+    started_at = datetime(2026, 8, 20, 10, 1, tzinfo=timezone.utc)
+    cursor = RecordingCursor(
+        one={
+            "batch_id": 903,
+            "source_table": "experts_education_experience",
+            "start_updated_at": start_time,
+            "start_id": 100,
+            "cursor_updated_at": cursor_time,
+            "cursor_id": 200,
+            "upper_bound_updated_at": upper_bound_time,
+            "upper_bound_id": 300,
+            "checkpoint_lock_version": 4,
+            "status": "running",
+            "started_at": started_at,
+            "finished_at": None,
+        }
+    )
+    connection = RecordingConnection(cursor)
+    _patch_connection(monkeypatch, connection)
+
+    scan = _repository().get_batch_source_scan(
+        903,
+        "experts_education_experience",
+    )
+
+    assert scan == BatchSourceScan(
+        batch_id=903,
+        source_table="experts_education_experience",
+        start_cursor=SourceScanCursor(start_time, 100),
+        current_cursor=SourceScanCursor(cursor_time, 200),
+        upper_bound=SourceScanCursor(upper_bound_time, 300),
+        checkpoint_lock_version=4,
+        status="running",
+        started_at=started_at,
+    )
+    sql, params = cursor.executed[0]
+    assert "FROM expert_index_batch_source" in sql
+    assert params == (903, "experts_education_experience")
+    assert connection.commit_count == 0
+    assert connection.closed is True
+
+
+def test_get_batch_source_scan_returns_none_when_not_initialized(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """批次尚未创建来源表扫描范围时应返回 None，且不产生写操作。"""
+
+    cursor = RecordingCursor(one=None)
+    connection = RecordingConnection(cursor)
+    _patch_connection(monkeypatch, connection)
+
+    assert _repository().get_batch_source_scan(903, "experts") is None
+    assert connection.commit_count == 0
+    assert connection.closed is True
 
 
 def test_full_batch_start_persists_version_cursor_and_upper_bound(

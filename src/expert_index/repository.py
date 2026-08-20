@@ -23,7 +23,12 @@ from typing import Any
 import pymysql
 
 from .config import DatabaseConfig
-from .models import CHECKPOINT_SOURCE_TABLES, SourceCheckpoint
+from .models import (
+    CHECKPOINT_SOURCE_TABLES,
+    BatchSourceScan,
+    SourceCheckpoint,
+    SourceScanCursor,
+)
 
 # single/full 共用一个由 MySQL 连接持有的全局锁，防止构建任务并发改写派生数据。
 BUILD_LOCK_PREFIX = "expert_index_build_v1"
@@ -179,6 +184,117 @@ class MySQLIndexRepository:
         except Exception:
             connection.rollback()
             raise
+        finally:
+            connection.close()
+
+    def create_batch_source_scan(self, scan: BatchSourceScan) -> None:
+        """创建一个批次对一张来源表的固定扫描范围。
+
+        使用普通 ``INSERT`` 保证同一批次和来源表只能创建一次；重复记录由数据库唯一键
+        拒绝，不覆盖已经存在的临时进度。该方法只保存初始状态，不推进扫描游标或正式
+        Checkpoint。
+        """
+
+        if not isinstance(scan, BatchSourceScan):
+            raise TypeError("scan 必须是 BatchSourceScan")
+        if scan.current_cursor != scan.start_cursor:
+            raise ValueError("新建批次来源记录的 current_cursor 必须等于 start_cursor")
+        if scan.status != "pending" or scan.started_at is not None or scan.finished_at is not None:
+            raise ValueError("新建批次来源记录必须处于未开始的 pending 状态")
+
+        connection = pymysql.connect(**self.config.as_kwargs())
+        try:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    INSERT INTO expert_index_batch_source(
+                        batch_id, source_table,
+                        start_updated_at, start_id,
+                        cursor_updated_at, cursor_id,
+                        upper_bound_updated_at, upper_bound_id,
+                        checkpoint_lock_version, status,
+                        started_at, finished_at
+                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    """,
+                    (
+                        scan.batch_id,
+                        scan.source_table,
+                        scan.start_cursor.updated_at,
+                        scan.start_cursor.record_id,
+                        scan.current_cursor.updated_at,
+                        scan.current_cursor.record_id,
+                        scan.upper_bound.updated_at,
+                        scan.upper_bound.record_id,
+                        scan.checkpoint_lock_version,
+                        scan.status,
+                        scan.started_at,
+                        scan.finished_at,
+                    ),
+                )
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+
+    def get_batch_source_scan(
+        self,
+        batch_id: int,
+        source_table: str,
+    ) -> BatchSourceScan | None:
+        """读取一个批次对指定来源表保存的扫描范围和临时进度。
+
+        返回 ``None`` 表示该批次尚未初始化此来源表。读取不会创建记录、锁定行、推进
+        临时游标或修改正式 Checkpoint。
+        """
+
+        if isinstance(batch_id, bool) or not isinstance(batch_id, int) or batch_id < 1:
+            raise ValueError("batch_id 必须是正整数")
+        if not isinstance(source_table, str) or source_table not in CHECKPOINT_SOURCE_TABLES:
+            raise ValueError(f"不支持的 Checkpoint 来源表: {source_table}")
+
+        connection = pymysql.connect(**self.config.as_kwargs(autocommit=True))
+        try:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    SELECT batch_id, source_table,
+                           start_updated_at, start_id,
+                           cursor_updated_at, cursor_id,
+                           upper_bound_updated_at, upper_bound_id,
+                           checkpoint_lock_version, status,
+                           started_at, finished_at
+                    FROM expert_index_batch_source
+                    WHERE batch_id=%s AND source_table=%s
+                    """,
+                    (batch_id, source_table),
+                )
+                row = cursor.fetchone()
+            if row is None:
+                return None
+            if int(row["batch_id"]) != batch_id or row.get("source_table") != source_table:
+                raise RuntimeError("批次来源扫描查询结果与请求条件不一致")
+            return BatchSourceScan(
+                batch_id=batch_id,
+                source_table=source_table,
+                start_cursor=SourceScanCursor(
+                    updated_at=row["start_updated_at"],
+                    record_id=int(row["start_id"]),
+                ),
+                current_cursor=SourceScanCursor(
+                    updated_at=row["cursor_updated_at"],
+                    record_id=int(row["cursor_id"]),
+                ),
+                upper_bound=SourceScanCursor(
+                    updated_at=row["upper_bound_updated_at"],
+                    record_id=int(row["upper_bound_id"]),
+                ),
+                checkpoint_lock_version=int(row["checkpoint_lock_version"]),
+                status=row["status"],
+                started_at=row.get("started_at"),
+                finished_at=row.get("finished_at"),
+            )
         finally:
             connection.close()
 
