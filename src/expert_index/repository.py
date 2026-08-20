@@ -23,6 +23,7 @@ from typing import Any
 import pymysql
 
 from .config import DatabaseConfig
+from .models import CHECKPOINT_SOURCE_TABLES, SourceCheckpoint
 
 # single/full 共用一个由 MySQL 连接持有的全局锁，防止构建任务并发改写派生数据。
 BUILD_LOCK_PREFIX = "expert_index_build_v1"
@@ -96,6 +97,52 @@ class MySQLIndexRepository:
     def __init__(self, config: DatabaseConfig) -> None:
         # 仅保存索引库连接配置，实际连接由各公开操作按需创建并关闭。
         self.config = config
+
+    def get_source_checkpoint(
+        self,
+        source_table: str,
+    ) -> SourceCheckpoint | None:
+        """读取一张物理来源表最后安全提交的 Checkpoint。
+
+        返回 ``None`` 表示该来源表尚未初始化同步位置。该方法只读取已提交状态，
+        不创建默认游标、不锁定记录，也不推进 Checkpoint，避免读取动作意外改变
+        后续增量扫描范围。
+        """
+
+        if not isinstance(source_table, str) or source_table not in CHECKPOINT_SOURCE_TABLES:
+            raise ValueError(f"不支持的 Checkpoint 来源表: {source_table}")
+
+        connection = pymysql.connect(**self.config.as_kwargs(autocommit=True))
+        try:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    SELECT source_table, last_updated_at, last_id,
+                           last_batch_id, last_success_time, lock_version
+                    FROM expert_index_source_checkpoint
+                    WHERE source_table=%s
+                    """,
+                    (source_table,),
+                )
+                row = cursor.fetchone()
+            if row is None:
+                return None
+            if row.get("source_table") != source_table:
+                raise RuntimeError("Checkpoint 查询结果与请求来源表不一致")
+            return SourceCheckpoint(
+                source_table=source_table,
+                last_updated_at=row["last_updated_at"],
+                last_id=int(row["last_id"]),
+                last_batch_id=(
+                    int(row["last_batch_id"])
+                    if row.get("last_batch_id") is not None
+                    else None
+                ),
+                last_success_time=row.get("last_success_time"),
+                lock_version=int(row["lock_version"]),
+            )
+        finally:
+            connection.close()
 
     @contextmanager
     def build_lock(self, run_mode: str) -> Iterator[None]:

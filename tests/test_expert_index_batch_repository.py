@@ -1,4 +1,4 @@
-"""Repository 全量批次记录、互斥锁和生命周期事务测试。
+"""Repository Checkpoint、全量批次记录、互斥锁和生命周期事务测试。
 
 测试使用 Recording Connection/Cursor，不连接或修改真实 MySQL。它只验证 SQL 结构、
 参数顺序、事务收口和安全终态校验；Chunk 内容生成仍由领域测试负责。
@@ -6,11 +6,13 @@
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from typing import Any, Self
 
 import pytest
 
 from expert_index.config import DatabaseConfig
+from expert_index.models import SourceCheckpoint
 from expert_index.repository import (
     BatchNotResumableError,
     BatchNotRetryableError,
@@ -88,6 +90,70 @@ def _patch_connection(
         "expert_index.repository.pymysql.connect",
         lambda **_kwargs: connection,
     )
+
+
+def test_get_source_checkpoint_returns_committed_state(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Repository 应把已提交行完整转换为只读 Checkpoint 模型。"""
+
+    checkpoint_time = datetime(2026, 8, 20, 9, 30, tzinfo=timezone.utc)
+    success_time = datetime(2026, 8, 20, 9, 35, tzinfo=timezone.utc)
+    cursor = RecordingCursor(
+        one={
+            "source_table": "experts_work_experience",
+            "last_updated_at": checkpoint_time,
+            "last_id": 2801,
+            "last_batch_id": 901,
+            "last_success_time": success_time,
+            "lock_version": 3,
+        }
+    )
+    connection = RecordingConnection(cursor)
+    _patch_connection(monkeypatch, connection)
+
+    checkpoint = _repository().get_source_checkpoint("experts_work_experience")
+
+    assert checkpoint == SourceCheckpoint(
+        source_table="experts_work_experience",
+        last_updated_at=checkpoint_time,
+        last_id=2801,
+        last_batch_id=901,
+        last_success_time=success_time,
+        lock_version=3,
+    )
+    assert "FROM expert_index_source_checkpoint" in cursor.executed[0][0]
+    assert cursor.executed[0][1] == ("experts_work_experience",)
+    assert connection.commit_count == 0
+    assert connection.closed is True
+
+
+def test_get_source_checkpoint_returns_none_when_not_initialized(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """表中没有对应行时返回 None，不在读取方法中擅自创建起始位置。"""
+
+    cursor = RecordingCursor(one=None)
+    connection = RecordingConnection(cursor)
+    _patch_connection(monkeypatch, connection)
+
+    assert _repository().get_source_checkpoint("experts") is None
+    assert connection.commit_count == 0
+    assert connection.closed is True
+
+
+def test_get_source_checkpoint_rejects_unknown_table_before_connecting(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """非法表名必须在连接数据库前失败，避免动态表名扩大读取范围。"""
+
+    def unexpected_connect(**_kwargs: object) -> None:
+        raise AssertionError("非法来源表不应连接数据库")
+
+    monkeypatch.setattr("expert_index.repository.pymysql.connect", unexpected_connect)
+
+    with pytest.raises(ValueError, match="不支持的 Checkpoint 来源表"):
+        _repository().get_source_checkpoint("expert_work_experience")
 
 
 def test_full_batch_start_persists_version_cursor_and_upper_bound(
