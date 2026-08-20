@@ -61,7 +61,14 @@ from .milvus.contract import (
     MilvusRowMapper,
     contract_milvus_field_specs,
 )
+from .milvus.contract_v15 import (
+    V15_CONTRACT_VECTOR_DIMENSION,
+    V15_VECTOR_DOC_ID_MAX_BYTES,
+    MilvusV15Entity,
+    MilvusV15RowMapper,
+)
 from .milvus.repository import ContractMilvusVectorRepository
+from .milvus.repository_v15 import ContractMilvusV15VectorRepository
 from .model_space import (
     FORMAL_EMBEDDING_DIMENSION,
     FORMAL_EMBEDDING_MODEL,
@@ -90,6 +97,8 @@ __all__ = [
     "FORMAL_EMBEDDING_MODEL_SPACE_ID",
     "FORMAL_EMBEDDING_MODEL_VERSION",
     "FORMAL_EMBEDDING_PROVIDER",
+    "V15_CONTRACT_VECTOR_DIMENSION",
+    "V15_VECTOR_DOC_ID_MAX_BYTES",
     "CompanyCloudEmbeddingError",
     "CompanyCloudEmbeddingModel",
     "CompanyCloudEmbeddingSettings",
@@ -100,6 +109,7 @@ __all__ = [
     "ContractIngestionError",
     "ContractIngestionResult",
     "ContractIngestionService",
+    "ContractMilvusV15VectorRepository",
     "ContractMilvusVectorRepository",
     "ContractPreparedChunk",
     "ContractRepository",
@@ -119,6 +129,8 @@ __all__ = [
     "MilvusFieldSpec",
     "MilvusRowMapper",
     "MilvusSettings",
+    "MilvusV15Entity",
+    "MilvusV15RowMapper",
     "MutationResult",
     "ProfileSummaryMetadata",
     "ProjectMetadata",

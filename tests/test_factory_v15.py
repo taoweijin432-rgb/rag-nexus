@@ -1,11 +1,11 @@
 """Factory 对 V15 Repository 选择能力的接通测试（Fake/Mock，不联网）。
 
 覆盖 Task5-3 要求：
-    1. 默认 factory → V14 repository；
+    1. 默认 factory → V15 repository；
     2. schema_profile="v15" → V15 repository；
     3. ingestion V15 能正确组装（含 V15 row_mapper 跟随）；
     4. reconciliation V15 的 repository 与 ingestion.repository 是同一个对象（is）；
-    5. V14 默认行为不变；
+    5. V14 作为显式回滚路径仍可用；
     6. 非法 profile → fail-closed；
     7. 显式 repository 注入与 profile 冲突 → fail-closed；
     8. V15 update_metadata 使用 V15 mapper/repository 路径；
@@ -210,33 +210,45 @@ def _v15_description(repository: ContractMilvusV15VectorRepository) -> dict[str,
 
 
 # ---------------------------------------------------------------------------
-# 1/5. 默认 V14 行为不变
+# 1/5. 默认 V15 行为：factory 默认 schema_profile="v15"，V14 为显式回滚路径
 # ---------------------------------------------------------------------------
 
 
-def test_factory_default_uses_v14_repository() -> None:
+def test_factory_default_uses_v15_repository() -> None:
     ingestion = create_vector_ingestion_service(
         milvus_settings=_settings(),
         embedding_worker=_worker(),
     )
     assert isinstance(ingestion, VectorIngestionService)
-    assert isinstance(ingestion.repository, ContractMilvusVectorRepository)
-    assert not isinstance(ingestion.repository, ContractMilvusV15VectorRepository)
-    assert isinstance(ingestion.row_mapper, MilvusRowMapper)
-    assert not isinstance(ingestion.row_mapper, MilvusV15RowMapper)
+    assert isinstance(ingestion.repository, ContractMilvusV15VectorRepository)
+    assert isinstance(ingestion.row_mapper, MilvusV15RowMapper)
+    assert not isinstance(ingestion.row_mapper, MilvusRowMapper)
 
 
-def test_reconciliation_default_uses_v14_repository() -> None:
+def test_reconciliation_default_uses_v15_repository() -> None:
     service = create_full_vector_reconciliation_service(
         milvus_settings=_settings(),
         embedding_worker=_worker(),
     )
     assert isinstance(service, FullVectorReconciliationService)
-    assert isinstance(service.repository, ContractMilvusVectorRepository)
-    assert not isinstance(service.repository, ContractMilvusV15VectorRepository)
-    assert isinstance(service.ingestion.row_mapper, MilvusRowMapper)
+    assert isinstance(service.repository, ContractMilvusV15VectorRepository)
+    assert isinstance(service.ingestion.row_mapper, MilvusV15RowMapper)
     # 同一 repository 对象
     assert service.repository is service.ingestion.repository
+
+
+def test_factory_explicit_v14_profile_still_available() -> None:
+    """V14 作为兼容回滚路径仍然可用（显式 schema_profile="v14"）。"""
+
+    ingestion = create_vector_ingestion_service(
+        milvus_settings=_settings(),
+        embedding_worker=_worker(),
+        schema_profile="v14",
+    )
+    assert isinstance(ingestion.repository, ContractMilvusVectorRepository)
+    assert not isinstance(ingestion.repository, ContractMilvusV15VectorRepository)
+    assert isinstance(ingestion.row_mapper, MilvusRowMapper)
+    assert not isinstance(ingestion.row_mapper, MilvusV15RowMapper)
 
 
 # ---------------------------------------------------------------------------

@@ -5,10 +5,11 @@ ContractBatchIngestionService / Validator / RowMapper），只调用
 ``create_vector_ingestion_service()`` 即可从环境变量组装完整服务。
 
 持久化 profile：
-    ``schema_profile`` 控制 Repository 的物理 Schema profile（默认 ``v14``）：
-        - ``v14``：``ContractMilvusVectorRepository``（25 字段 + ``MilvusRowMapper``）；
+    ``schema_profile`` 控制 Repository 的物理 Schema profile（默认 ``v15``）：
         - ``v15``：``ContractMilvusV15VectorRepository``（4 字段 +
-          ``MilvusV15RowMapper``）。
+          ``MilvusV15RowMapper``）；
+        - ``v14``：``ContractMilvusVectorRepository``（25 字段 +
+          ``MilvusRowMapper``），保留为兼容���滚路径。
     profile 只影响持久化结构，不改变 ``collection_name``（仍由
     ``MilvusSettings`` 决定），也不影响公共 API 语义。
 """
@@ -183,7 +184,7 @@ def create_vector_ingestion_service(
     row_mapper: MilvusRowMapper | MilvusV15RowMapper | None = None,
     expected_dimension: int = EXPECTED_EMBEDDING_DIMENSION,
     formal_model_space_id: str = FORMAL_EMBEDDING_MODEL_SPACE_ID,
-    schema_profile: SchemaProfile = "v14",
+    schema_profile: SchemaProfile = "v15",
 ) -> VectorIngestionService:
     """从环境配置组装完整的 ``VectorIngestionService``。
 
@@ -194,11 +195,12 @@ def create_vector_ingestion_service(
         ``VectorIngestionService``。
 
     Args:
-        schema_profile: 持久化 profile，``v14``（默认，现有行为不变）或 ``v15``。
+        schema_profile: 持久化 profile，``v15``（默认）或 ``v14``。
             ``v15`` 时使用 ``ContractMilvusV15VectorRepository``，且未显式传入
             ``row_mapper`` 时自动跟随为 ``MilvusV15RowMapper``。
+            ``v14`` 保留为兼容回滚路径（旧 25 字段 Collection）。
             该参数只控制持久化结构，不改变 ``collection_name``。
-        repository: 显式注入的 Repository；注入时优先使用，不按 profile 替换，
+        repository: 显式注入的 Repository；注入时优先使用，不按 profile 替换,
             但若与 ``schema_profile`` 明显冲突则 fail-closed。
         row_mapper: 显式注入的 RowMapper；注入时优先使用，不按 profile 替换，
             但必须与 ``schema_profile`` 和 ``repository`` 的持久化 profile 一致，

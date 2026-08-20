@@ -19,9 +19,9 @@
     ``create_vector_ingestion_service(repository=...)``，因此 ingestion 内部
     与 reconciliation 仍共享同一 repository 对象，一致性不受影响。
 
-    ``schema_profile``（v14/v15）控制 Repository 的持久化 profile，透传给
+    ``schema_profile``（v15/v14）控制 Repository 的持久化 profile，透传给
     ``create_vector_ingestion_service()``；reconciliation 与 ingestion 因此
-    共享同一个 V15（或 V14）Repository 实例。
+    共享同一个 V15（或 V14）Repository 实例。默认 ``v15``。
 """
 
 from __future__ import annotations
@@ -61,7 +61,7 @@ def create_full_vector_reconciliation_service(
     expected_dimension: int = EXPECTED_EMBEDDING_DIMENSION,
     formal_model_space_id: str = FORMAL_EMBEDDING_MODEL_SPACE_ID,
     delete_batch_size: int = _DELETE_BATCH_SIZE,
-    schema_profile: SchemaProfile = "v14",
+    schema_profile: SchemaProfile = "v15",
 ) -> FullVectorReconciliationService:
     """从环境配置（或注入组件）组装完整的 ``FullVectorReconciliationService``。
 
@@ -73,9 +73,10 @@ def create_full_vector_reconciliation_service(
         组装 ``FullVectorReconciliationService``。
 
     Args:
-        schema_profile: 持久化 profile，``v14``（默认，现有行为不变）或 ``v15``。
+        schema_profile: 持久化 profile，``v15``（默认）或 ``v14``。
             ``v15`` 时 reconciliation 与 ingestion 共享同一个
             ``ContractMilvusV15VectorRepository`` 实例。
+            ``v14`` 保留为兼容回滚路径（旧 25 字段 Collection）。
 
     允许通过关键字注入部分或全部依赖用于测试 / 自定义组装，未注入项自动从环境读取；
     每个参数语义与 ``create_vector_ingestion_service()`` 一致。

@@ -105,12 +105,12 @@ def test_milvus_destructive_maintenance_collections_default_and_parse() -> None:
     settings = MilvusSettings.from_env(
         {
             "MILVUS_ALLOWED_DESTRUCTIVE_COLLECTIONS": (
-                "expert_candidates_v14_contract_dev, stray ,  "
+                "expert_candidates_v15_contract_dev, stray ,  "
             ),
         }
     )
     assert settings.destructive_maintenance_collections == (
-        "expert_candidates_v14_contract_dev",
+        "expert_candidates_v15_contract_dev",
         "stray",
     )
     assert settings.collection_name in settings.destructive_maintenance_collections
