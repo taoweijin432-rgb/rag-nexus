@@ -13,6 +13,7 @@ from zoneinfo import ZoneInfo
 import pytest
 
 from expert_index.config import DatabaseConfig
+from expert_index.models import CHECKPOINT_SOURCE_TABLES, SourceScanCursor
 from expert_index.source import MAX_FULL_SCAN_PAGE_SIZE, MySQLSourceAdapter
 
 
@@ -85,6 +86,59 @@ def _patch_connection(
 
     monkeypatch.setattr("expert_index.source.pymysql.connect", connect)
     return calls
+
+
+@pytest.mark.parametrize("source_table", sorted(CHECKPOINT_SOURCE_TABLES))
+def test_source_scan_upper_bound_uses_updated_at_and_id(
+    monkeypatch: pytest.MonkeyPatch,
+    source_table: str,
+) -> None:
+    """每张来源表都应按复合游标倒序读取当前固定上界。"""
+
+    updated_at = datetime(2026, 8, 20, 11, 30, tzinfo=ZoneInfo("Asia/Shanghai"))
+    cursor = FakeCursor(one={"updated_at": updated_at, "id": 981})
+    connection = FakeConnection(cursor)
+    connect_calls = _patch_connection(monkeypatch, connection)
+
+    result = _adapter().get_source_scan_upper_bound(source_table)
+
+    assert result == SourceScanCursor(updated_at=updated_at, record_id=981)
+    sql, params = cursor.executed[0]
+    assert sql == (
+        f"SELECT updated_at, id FROM {source_table} "
+        "ORDER BY updated_at DESC, id DESC LIMIT 1"
+    )
+    assert params is None
+    assert "deleted_at" not in sql
+    assert connect_calls[0]["autocommit"] is True
+    assert connection.closed is True
+
+
+def test_source_scan_upper_bound_returns_none_for_empty_table(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """空来源表没有真实上界，不能伪造时间或 ID。"""
+
+    cursor = FakeCursor(one=None)
+    connection = FakeConnection(cursor)
+    _patch_connection(monkeypatch, connection)
+
+    assert _adapter().get_source_scan_upper_bound("experts") is None
+    assert connection.closed is True
+
+
+def test_source_scan_upper_bound_rejects_unknown_table_before_connect(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """非法表名必须在连接前失败，不能进入动态 SQL。"""
+
+    def unexpected_connect(**_kwargs: Any) -> None:
+        raise AssertionError("非法来源表不应连接 MySQL")
+
+    monkeypatch.setattr("expert_index.source.pymysql.connect", unexpected_connect)
+
+    with pytest.raises(ValueError, match="不支持的 Checkpoint 来源表"):
+        _adapter().get_source_scan_upper_bound("expert_work_experience")
 
 
 def test_full_scan_upper_bound_uses_all_expert_rows(

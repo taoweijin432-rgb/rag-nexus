@@ -13,17 +13,29 @@ import pymysql
 
 from .config import DatabaseConfig
 from .models import (
+    CHECKPOINT_SOURCE_TABLES,
     EducationSource,
     EmploymentSource,
     ExpertAggregate,
     ExpertCandidate,
     ExpertSource,
     ProjectSource,
+    SourceScanCursor,
 )
 
 # 第一版把分页大小限制在 1000 以内，防止调用方误传过大 limit，一次读取过多候选。
 # 默认页大小将在后续 CLI/Pipeline 阶段决定；Source 这里只约束数据库访问安全上限。
 MAX_FULL_SCAN_PAGE_SIZE = 1000
+
+# MySQL 不能用参数占位符绑定表名，因此这里只允许从固定白名单选择完整 SQL。
+# 查询不排除 deleted_at：逻辑删除同样属于必须进入增量处理的来源变化。
+_SOURCE_SCAN_UPPER_BOUND_SQL = {
+    source_table: (
+        f"SELECT updated_at, id FROM {source_table} "
+        "ORDER BY updated_at DESC, id DESC LIMIT 1"
+    )
+    for source_table in CHECKPOINT_SOURCE_TABLES
+}
 
 
 class ExpertNotFoundError(LookupError):
@@ -35,6 +47,33 @@ class MySQLSourceAdapter:
 
     def __init__(self, config: DatabaseConfig) -> None:
         self.config = config
+
+    def get_source_scan_upper_bound(
+        self,
+        source_table: str,
+    ) -> SourceScanCursor | None:
+        """读取一张来源表启动增量批次时的固定扫描上界。
+
+        返回最大 ``(updated_at, id)``；空表返回 ``None``。该方法只固定本批次将来允许
+        扫描到的位置，不读取业务正文、不更新 Checkpoint，也不实现增量分页。
+        """
+
+        if not isinstance(source_table, str) or source_table not in CHECKPOINT_SOURCE_TABLES:
+            raise ValueError(f"不支持的 Checkpoint 来源表: {source_table}")
+
+        connection = pymysql.connect(**self.config.as_kwargs(autocommit=True))
+        try:
+            with connection.cursor() as cursor:
+                cursor.execute(_SOURCE_SCAN_UPPER_BOUND_SQL[source_table])
+                row = cursor.fetchone()
+            if row is None:
+                return None
+            return SourceScanCursor(
+                updated_at=row["updated_at"],
+                record_id=int(row["id"]),
+            )
+        finally:
+            connection.close()
 
     def get_full_scan_upper_bound(
         self,

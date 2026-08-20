@@ -6,9 +6,22 @@ from datetime import datetime, timezone
 
 import pytest
 
-from expert_index.models import CHECKPOINT_SOURCE_TABLES, SourceCheckpoint
+from expert_index.models import (
+    CHECKPOINT_SOURCE_TABLES,
+    SourceCheckpoint,
+    SourceScanCursor,
+)
 
 CHECKPOINT_TIME = datetime(2026, 8, 13, 22, 0, tzinfo=timezone.utc)
+
+
+def test_source_scan_cursor_orders_by_time_then_record_id() -> None:
+    """复合游标顺序必须与增量 SQL 的 updated_at、id 排序一致。"""
+
+    earlier = SourceScanCursor(updated_at=CHECKPOINT_TIME, record_id=1)
+    later = SourceScanCursor(updated_at=CHECKPOINT_TIME, record_id=2)
+
+    assert earlier < later
 
 
 def test_source_checkpoint_accepts_each_supported_source_table() -> None:

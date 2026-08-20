@@ -22,6 +22,26 @@ CHECKPOINT_SOURCE_TABLES = frozenset(
 )
 
 
+@dataclass(frozen=True, order=True)
+class SourceScanCursor:
+    """来源表增量扫描使用的 ``(updated_at, id)`` 复合位置。"""
+
+    updated_at: datetime  # 来源记录更新时间，是复合排序的第一部分。
+    record_id: int  # 来源记录主键，是相同更新时间下的稳定排序依据。
+
+    def __post_init__(self) -> None:
+        """保证游标对应一条真实来源记录，而不是未初始化的默认位置。"""
+
+        if not isinstance(self.updated_at, datetime):
+            raise TypeError("updated_at 必须是 datetime")
+        if (
+            isinstance(self.record_id, bool)
+            or not isinstance(self.record_id, int)
+            or self.record_id < 1
+        ):
+            raise ValueError("record_id 必须是正整数")
+
+
 @dataclass(frozen=True)
 class SourceCheckpoint:
     """一张物理来源表最后安全提交的增量扫描位置。
