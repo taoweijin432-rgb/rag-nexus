@@ -1,4 +1,4 @@
-"""Source、Stage 与最终 Chunk 的显式领域模型。
+"""Checkpoint、Source、Stage 与最终 Chunk 的显式领域模型。
 
 Source 模型严格使用 MySQL 源表列名，审查时可以直接与 SELECT 字段逐一对照；
 Stage 模型使用清洗和标准化后的业务语义名；ChunkRecord 是内存中的下游输入快照。
@@ -9,6 +9,65 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime
+
+# Checkpoint 只允许跟踪当前进入专家索引链路的四张物理来源表，避免拼写错误创建出
+# 永远不会被扫描的孤立游标。新增来源表时必须显式更新本集合和对应数据库约束。
+CHECKPOINT_SOURCE_TABLES = frozenset(
+    {
+        "experts",
+        "experts_work_experience",
+        "experts_project_experience",
+        "experts_education_experience",
+    }
+)
+
+
+@dataclass(frozen=True)
+class SourceCheckpoint:
+    """一张物理来源表最后安全提交的增量扫描位置。
+
+    ``last_updated_at`` 和 ``last_id`` 必须共同使用：来源表时间只有秒级精度，
+    ``last_id`` 负责区分同一秒内的多条记录。该模型只表达已经提交的数据库状态，
+    不表示批次正在处理的临时位置，也不负责读取或推进 Checkpoint。
+    """
+
+    source_table: str  # 被独立跟踪的物理来源表名。
+    last_updated_at: datetime  # 最后安全提交的来源记录 updated_at。
+    last_id: int  # last_updated_at 相同时最后安全提交的来源记录 ID。
+    last_batch_id: int | None = None  # 最后成功推进该位置的构建批次 ID。
+    last_success_time: datetime | None = None  # 最近一次安全提交的系统时间。
+    lock_version: int = 0  # 乐观锁版本，防止旧批次覆盖新位置。
+
+    def __post_init__(self) -> None:
+        """拒绝无法形成可靠复合游标或无法映射到 Checkpoint 表的状态。"""
+
+        if self.source_table not in CHECKPOINT_SOURCE_TABLES:
+            raise ValueError(f"不支持的 Checkpoint 来源表: {self.source_table}")
+        if not isinstance(self.last_updated_at, datetime):
+            raise TypeError("last_updated_at 必须是 datetime")
+        if (
+            isinstance(self.last_id, bool)
+            or not isinstance(self.last_id, int)
+            or self.last_id < 0
+        ):
+            raise ValueError("last_id 必须是非负整数")
+        if self.last_batch_id is not None and (
+            isinstance(self.last_batch_id, bool)
+            or not isinstance(self.last_batch_id, int)
+            or self.last_batch_id < 1
+        ):
+            raise ValueError("last_batch_id 必须是正整数或 None")
+        if self.last_success_time is not None and not isinstance(
+            self.last_success_time,
+            datetime,
+        ):
+            raise TypeError("last_success_time 必须是 datetime 或 None")
+        if (
+            isinstance(self.lock_version, bool)
+            or not isinstance(self.lock_version, int)
+            or self.lock_version < 0
+        ):
+            raise ValueError("lock_version 必须是非负整数")
 
 
 @dataclass(frozen=True)
