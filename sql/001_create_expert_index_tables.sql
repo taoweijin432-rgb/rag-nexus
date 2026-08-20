@@ -81,6 +81,55 @@ CREATE TABLE IF NOT EXISTS expert_index_source_checkpoint (
     )
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
+-- 一个构建批次对一张来源表的固定增量扫描范围和临时扫描进度。
+--
+-- start_* 是批次启动时读取的安全 Checkpoint，upper_bound_* 是同一时刻固定的来源表
+-- 上界，cursor_* 只表示该批次已经扫描到的临时位置。cursor_* 不能替代安全 Checkpoint；
+-- 后续仍须等待该范围内全部任务完成，才能把 expert_index_source_checkpoint 推进到上界。
+-- checkpoint_lock_version 保存启动时版本，供最终提交时检测是否有其他批次抢先推进。
+CREATE TABLE IF NOT EXISTS expert_index_batch_source (
+    id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+    batch_id BIGINT UNSIGNED NOT NULL COMMENT '逻辑关联 expert_index_batch.id',
+    source_table VARCHAR(128) NOT NULL COMMENT '本行负责扫描的物理来源表',
+    start_updated_at DATETIME(6) NOT NULL COMMENT '批次启动时的安全 Checkpoint 时间',
+    start_id BIGINT UNSIGNED NOT NULL COMMENT '批次启动时的安全 Checkpoint 来源主键',
+    cursor_updated_at DATETIME(6) NOT NULL COMMENT '当前已扫描到的临时时间游标',
+    cursor_id BIGINT UNSIGNED NOT NULL COMMENT '当前已扫描到的临时来源主键游标',
+    upper_bound_updated_at DATETIME(6) NOT NULL COMMENT '批次启动时固定的扫描上界时间',
+    upper_bound_id BIGINT UNSIGNED NOT NULL COMMENT '批次启动时固定的扫描上界来源主键',
+    checkpoint_lock_version BIGINT UNSIGNED NOT NULL
+        COMMENT '批次启动时读取的 Checkpoint 乐观锁版本',
+    status VARCHAR(16) NOT NULL DEFAULT 'pending'
+        COMMENT 'pending/running/success/failed',
+    started_at DATETIME(6) NULL COMMENT '开始扫描该来源表的时间',
+    finished_at DATETIME(6) NULL COMMENT '该来源表批次到达终态的时间',
+    created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+    updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6)
+        ON UPDATE CURRENT_TIMESTAMP(6),
+    PRIMARY KEY (id),
+    UNIQUE KEY uk_expert_batch_source (batch_id, source_table),
+    KEY idx_expert_batch_source_status (batch_id, status),
+    CONSTRAINT chk_expert_batch_source_table CHECK (
+        source_table IN (
+            'experts',
+            'experts_work_experience',
+            'experts_project_experience',
+            'experts_education_experience'
+        )
+    ),
+    CONSTRAINT chk_expert_batch_source_status CHECK (
+        status IN ('pending', 'running', 'success', 'failed')
+    ),
+    CONSTRAINT chk_expert_batch_source_start_cursor CHECK (
+        start_updated_at < cursor_updated_at
+        OR (start_updated_at = cursor_updated_at AND start_id <= cursor_id)
+    ),
+    CONSTRAINT chk_expert_batch_source_cursor_upper CHECK (
+        cursor_updated_at < upper_bound_updated_at
+        OR (cursor_updated_at = upper_bound_updated_at AND cursor_id <= upper_bound_id)
+    )
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
 -- 全量批次的专家级执行明细。
 --
 -- Pipeline 每发现一位候选专家，会为同一 (batch_id, expert_id) 创建或更新一行：
