@@ -14,7 +14,11 @@ import pytest
 
 from expert_index.config import DatabaseConfig
 from expert_index.models import CHECKPOINT_SOURCE_TABLES, SourceScanCursor
-from expert_index.source import MAX_FULL_SCAN_PAGE_SIZE, MySQLSourceAdapter
+from expert_index.source import (
+    MAX_FULL_SCAN_PAGE_SIZE,
+    MAX_SOURCE_SCAN_PAGE_SIZE,
+    MySQLSourceAdapter,
+)
 
 
 class FakeCursor:
@@ -139,6 +143,134 @@ def test_source_scan_upper_bound_rejects_unknown_table_before_connect(
 
     with pytest.raises(ValueError, match="不支持的 Checkpoint 来源表"):
         _adapter().get_source_scan_upper_bound("expert_work_experience")
+
+
+@pytest.mark.parametrize("source_table", sorted(CHECKPOINT_SOURCE_TABLES))
+def test_source_change_candidates_use_fixed_composite_range(
+    monkeypatch: pytest.MonkeyPatch,
+    source_table: str,
+) -> None:
+    """四张表都应在起点开区间、固定上界闭区间内按复合游标分页。"""
+
+    start_time = datetime(2026, 8, 20, 11, 0, tzinfo=ZoneInfo("Asia/Shanghai"))
+    end_time = datetime(2026, 8, 20, 12, 0, tzinfo=ZoneInfo("Asia/Shanghai"))
+    deleted_at = datetime(2026, 8, 20, 11, 30, tzinfo=ZoneInfo("Asia/Shanghai"))
+    cursor = FakeCursor(
+        rows=[
+            {
+                "id": 102,
+                "expert_id": 71,
+                "updated_at": start_time,
+                "deleted_at": None,
+            },
+            {
+                "id": 120,
+                "expert_id": 72,
+                "updated_at": end_time,
+                "deleted_at": deleted_at,
+            },
+        ]
+    )
+    connection = FakeConnection(cursor)
+    connect_calls = _patch_connection(monkeypatch, connection)
+
+    candidates = _adapter().load_source_change_candidates(
+        source_table,
+        after_cursor=SourceScanCursor(updated_at=start_time, record_id=100),
+        upper_bound=SourceScanCursor(updated_at=end_time, record_id=120),
+        limit=50,
+    )
+
+    assert [item.record_id for item in candidates] == [102, 120]
+    assert [item.expert_id for item in candidates] == [71, 72]
+    assert candidates[0].cursor == SourceScanCursor(
+        updated_at=start_time,
+        record_id=102,
+    )
+    assert candidates[1].is_deleted is True
+    sql, params = cursor.executed[0]
+    expected_expert_field = "id AS expert_id" if source_table == "experts" else "expert_id"
+    assert f"SELECT id, {expected_expert_field}, updated_at, deleted_at" in sql
+    assert "updated_at > %s OR (updated_at = %s AND id > %s)" in sql
+    assert "updated_at < %s OR (updated_at = %s AND id <= %s)" in sql
+    assert "ORDER BY updated_at ASC, id ASC" in sql
+    assert "deleted_at IS NULL" not in sql
+    assert params == (start_time, start_time, 100, end_time, end_time, 120, 50)
+    assert connect_calls[0]["autocommit"] is True
+    assert connection.closed is True
+
+
+def test_source_change_candidates_keep_missing_expert_id(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """经历表无法关联专家的脏记录必须保留，后续才能进入隔离流程。"""
+
+    updated_at = datetime(2026, 8, 20, 11, 0, tzinfo=ZoneInfo("Asia/Shanghai"))
+    cursor = FakeCursor(
+        rows=[
+            {
+                "id": 102,
+                "expert_id": None,
+                "updated_at": updated_at,
+                "deleted_at": None,
+            }
+        ]
+    )
+    connection = FakeConnection(cursor)
+    _patch_connection(monkeypatch, connection)
+
+    candidates = _adapter().load_source_change_candidates(
+        "experts_work_experience",
+        after_cursor=SourceScanCursor(updated_at=updated_at, record_id=0),
+        upper_bound=SourceScanCursor(updated_at=updated_at, record_id=102),
+        limit=10,
+    )
+
+    assert candidates[0].expert_id is None
+
+
+@pytest.mark.parametrize("limit", [0, True, MAX_SOURCE_SCAN_PAGE_SIZE + 1])
+def test_source_change_candidates_reject_invalid_limit_before_connect(
+    monkeypatch: pytest.MonkeyPatch,
+    limit: object,
+) -> None:
+    """非法页大小不能触发源库连接。"""
+
+    def unexpected_connect(**_kwargs: Any) -> None:
+        raise AssertionError("参数校验失败时不应连接 MySQL")
+
+    monkeypatch.setattr("expert_index.source.pymysql.connect", unexpected_connect)
+    updated_at = datetime(2026, 8, 20, 11, 0, tzinfo=ZoneInfo("Asia/Shanghai"))
+
+    with pytest.raises(ValueError, match="limit"):
+        _adapter().load_source_change_candidates(
+            "experts",
+            after_cursor=SourceScanCursor(updated_at=updated_at, record_id=0),
+            upper_bound=SourceScanCursor(updated_at=updated_at, record_id=1),
+            limit=limit,  # type: ignore[arg-type]
+        )
+
+
+def test_source_change_candidates_skip_empty_range_without_connect(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """起点已经到达上界时直接返回空页，不执行无意义查询。"""
+
+    def unexpected_connect(**_kwargs: Any) -> None:
+        raise AssertionError("空范围不应连接 MySQL")
+
+    monkeypatch.setattr("expert_index.source.pymysql.connect", unexpected_connect)
+    cursor = SourceScanCursor(
+        updated_at=datetime(2026, 8, 20, 11, 0, tzinfo=ZoneInfo("Asia/Shanghai")),
+        record_id=10,
+    )
+
+    assert _adapter().load_source_change_candidates(
+        "experts",
+        after_cursor=cursor,
+        upper_bound=cursor,
+        limit=10,
+    ) == []
 
 
 def test_full_scan_upper_bound_uses_all_expert_rows(

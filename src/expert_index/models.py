@@ -24,22 +24,70 @@ CHECKPOINT_SOURCE_TABLES = frozenset(
 
 @dataclass(frozen=True, order=True)
 class SourceScanCursor:
-    """来源表增量扫描使用的 ``(updated_at, id)`` 复合位置。"""
+    """来源表增量扫描使用的 ``(updated_at, id)`` 复合位置。
+
+    ``record_id=0`` 只用于首次扫描的起点；来源表真实记录仍从正整数 ID 开始。
+    """
 
     updated_at: datetime  # 来源记录更新时间，是复合排序的第一部分。
     record_id: int  # 来源记录主键，是相同更新时间下的稳定排序依据。
 
     def __post_init__(self) -> None:
-        """保证游标对应一条真实来源记录，而不是未初始化的默认位置。"""
+        """保证游标能够安全参与复合范围比较。"""
 
         if not isinstance(self.updated_at, datetime):
             raise TypeError("updated_at 必须是 datetime")
         if (
             isinstance(self.record_id, bool)
             or not isinstance(self.record_id, int)
+            or self.record_id < 0
+        ):
+            raise ValueError("record_id 必须是非负整数")
+
+
+@dataclass(frozen=True)
+class SourceChangeCandidate:
+    """增量扫描发现的一条最小来源变化，不包含任何业务正文。"""
+
+    source_table: str  # 发生变化的物理来源表。
+    record_id: int  # 来源表主键，用于形成下一页游标。
+    expert_id: int | None  # 受影响专家；经历表脏数据可能暂时无法关联。
+    updated_at: datetime  # 来源更新时间，与 record_id 共同确定顺序。
+    deleted_at: datetime | None  # 非空表示需要触发旧 Chunk 清理。
+
+    def __post_init__(self) -> None:
+        """拒绝无法定位来源记录或无法参与增量排序的候选。"""
+
+        if self.source_table not in CHECKPOINT_SOURCE_TABLES:
+            raise ValueError(f"不支持的 Checkpoint 来源表: {self.source_table}")
+        if (
+            isinstance(self.record_id, bool)
+            or not isinstance(self.record_id, int)
             or self.record_id < 1
         ):
             raise ValueError("record_id 必须是正整数")
+        if self.expert_id is not None and (
+            isinstance(self.expert_id, bool)
+            or not isinstance(self.expert_id, int)
+            or self.expert_id < 1
+        ):
+            raise ValueError("expert_id 必须是正整数或 None")
+        if not isinstance(self.updated_at, datetime):
+            raise TypeError("updated_at 必须是 datetime")
+        if self.deleted_at is not None and not isinstance(self.deleted_at, datetime):
+            raise TypeError("deleted_at 必须是 datetime 或 None")
+
+    @property
+    def cursor(self) -> SourceScanCursor:
+        """返回当前来源记录对应的复合位置，供下一页继续扫描。"""
+
+        return SourceScanCursor(updated_at=self.updated_at, record_id=self.record_id)
+
+    @property
+    def is_deleted(self) -> bool:
+        """返回该来源记录是否已经逻辑删除。"""
+
+        return self.deleted_at is not None
 
 
 @dataclass(frozen=True)

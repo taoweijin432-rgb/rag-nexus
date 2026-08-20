@@ -20,12 +20,15 @@ from .models import (
     ExpertCandidate,
     ExpertSource,
     ProjectSource,
+    SourceChangeCandidate,
     SourceScanCursor,
 )
 
 # 第一版把分页大小限制在 1000 以内，防止调用方误传过大 limit，一次读取过多候选。
 # 默认页大小将在后续 CLI/Pipeline 阶段决定；Source 这里只约束数据库访问安全上限。
 MAX_FULL_SCAN_PAGE_SIZE = 1000
+# 增量扫描同样限制单页规模，避免一次把大量来源变化加载进内存。
+MAX_SOURCE_SCAN_PAGE_SIZE = 1000
 
 # MySQL 不能用参数占位符绑定表名，因此这里只允许从固定白名单选择完整 SQL。
 # 查询不排除 deleted_at：逻辑删除同样属于必须进入增量处理的来源变化。
@@ -34,6 +37,21 @@ _SOURCE_SCAN_UPPER_BOUND_SQL = {
         f"SELECT updated_at, id FROM {source_table} "
         "ORDER BY updated_at DESC, id DESC LIMIT 1"
     )
+    for source_table in CHECKPOINT_SOURCE_TABLES
+}
+
+# experts 使用自身主键作为 expert_id；三张经历表读取实际关联字段。所有查询只返回
+# 调度所需的 ID、时间和删除标记，不提前读取公司、经历描述等业务内容。
+_SOURCE_CHANGE_PAGE_SQL = {
+    source_table: f"""
+        SELECT id, {"id AS expert_id" if source_table == "experts" else "expert_id"},
+               updated_at, deleted_at
+        FROM {source_table}
+        WHERE (updated_at > %s OR (updated_at = %s AND id > %s))
+          AND (updated_at < %s OR (updated_at = %s AND id <= %s))
+        ORDER BY updated_at ASC, id ASC
+        LIMIT %s
+    """
     for source_table in CHECKPOINT_SOURCE_TABLES
 }
 
@@ -72,6 +90,75 @@ class MySQLSourceAdapter:
                 updated_at=row["updated_at"],
                 record_id=int(row["id"]),
             )
+        finally:
+            connection.close()
+
+    def load_source_change_candidates(
+        self,
+        source_table: str,
+        *,
+        after_cursor: SourceScanCursor,
+        upper_bound: SourceScanCursor,
+        limit: int,
+    ) -> list[SourceChangeCandidate]:
+        """在固定复合游标范围内读取一页最小来源变化。
+
+        查询范围为 ``after_cursor < (updated_at, id) <= upper_bound``，结果按相同字段
+        升序排列。逻辑删除记录不会被过滤；无法关联专家的经历记录保留 ``expert_id=None``，
+        留给后续任务层隔离处理。本方法不读取正文，也不推进任何 Checkpoint。
+        """
+
+        if not isinstance(source_table, str) or source_table not in CHECKPOINT_SOURCE_TABLES:
+            raise ValueError(f"不支持的 Checkpoint 来源表: {source_table}")
+        if not isinstance(after_cursor, SourceScanCursor):
+            raise TypeError("after_cursor 必须是 SourceScanCursor")
+        if not isinstance(upper_bound, SourceScanCursor):
+            raise TypeError("upper_bound 必须是 SourceScanCursor")
+        if (
+            isinstance(limit, bool)
+            or not isinstance(limit, int)
+            or not 1 <= limit <= MAX_SOURCE_SCAN_PAGE_SIZE
+        ):
+            raise ValueError(
+                f"limit 必须位于 1 到 {MAX_SOURCE_SCAN_PAGE_SIZE} 之间"
+            )
+        try:
+            range_is_empty = after_cursor >= upper_bound
+        except TypeError as exc:
+            raise ValueError("扫描起点和上界必须使用一致的时间类型") from exc
+        if range_is_empty:
+            return []
+
+        connection = pymysql.connect(**self.config.as_kwargs(autocommit=True))
+        try:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    _SOURCE_CHANGE_PAGE_SQL[source_table],
+                    (
+                        after_cursor.updated_at,
+                        after_cursor.updated_at,
+                        after_cursor.record_id,
+                        upper_bound.updated_at,
+                        upper_bound.updated_at,
+                        upper_bound.record_id,
+                        limit,
+                    ),
+                )
+                rows = cursor.fetchall()
+            return [
+                SourceChangeCandidate(
+                    source_table=source_table,
+                    record_id=int(row["id"]),
+                    expert_id=(
+                        int(row["expert_id"])
+                        if row.get("expert_id") is not None
+                        else None
+                    ),
+                    updated_at=row["updated_at"],
+                    deleted_at=row.get("deleted_at"),
+                )
+                for row in rows
+            ]
         finally:
             connection.close()
 

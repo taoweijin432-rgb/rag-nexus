@@ -8,6 +8,7 @@ import pytest
 
 from expert_index.models import (
     CHECKPOINT_SOURCE_TABLES,
+    SourceChangeCandidate,
     SourceCheckpoint,
     SourceScanCursor,
 )
@@ -22,6 +23,32 @@ def test_source_scan_cursor_orders_by_time_then_record_id() -> None:
     later = SourceScanCursor(updated_at=CHECKPOINT_TIME, record_id=2)
 
     assert earlier < later
+
+
+def test_source_scan_cursor_accepts_initial_zero_record_id() -> None:
+    """首次增量扫描可以从指定时间的 ID 0 起点开始。"""
+
+    cursor = SourceScanCursor(updated_at=CHECKPOINT_TIME, record_id=0)
+
+    assert cursor.record_id == 0
+
+
+def test_source_change_candidate_exposes_cursor_and_delete_state() -> None:
+    """最小变化候选应能提供下一页位置和逻辑删除状态。"""
+
+    candidate = SourceChangeCandidate(
+        source_table="experts_project_experience",
+        record_id=9,
+        expert_id=None,
+        updated_at=CHECKPOINT_TIME,
+        deleted_at=CHECKPOINT_TIME,
+    )
+
+    assert candidate.cursor == SourceScanCursor(
+        updated_at=CHECKPOINT_TIME,
+        record_id=9,
+    )
+    assert candidate.is_deleted is True
 
 
 def test_source_checkpoint_accepts_each_supported_source_table() -> None:
