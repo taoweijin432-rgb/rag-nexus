@@ -884,3 +884,71 @@ def test_v15_search_not_connected_yet() -> None:
     repository = make_v15_repository()
     with pytest.raises(NotImplementedError, match="检索通路尚未接通"):
         repository.search([0.1] * 1024)
+
+
+# ---------------------------------------------------------------------------
+# 模型空间校验缓存：V15 Repository 复用 base 缓存逻辑（同 model space 只扫描一次）
+# ---------------------------------------------------------------------------
+
+
+def test_v15_model_space_cache_skips_scan_on_second_upsert() -> None:
+    """V15 Repository 与 V14 共享同一缓存实现，第二次 upsert 跳过全表扫描。"""
+
+    chunks = embedded_contract_chunks()
+    client = FakeV15MilvusClient(exists=True)
+    repository = make_v15_repository(client)
+    client.description = v15_description(repository)
+
+    repository.upsert_batch(chunks)
+    scans_before = sum(
+        1 for c in client.query_iterator_calls
+        if c.get("filter") == 'vector_doc_id != ""'
+    )
+    assert repository._validated_model_space is not None
+    assert repository._validated_model_space["embedding_model_alias"] == (
+        "alibaba-bailian:text-embedding-v4"
+    )
+
+    # 第二次：同 V15 Repository、同 model space，应命中缓存跳过扫描。
+    repository.upsert_batch(chunks)
+    scans_after = sum(
+        1 for c in client.query_iterator_calls
+        if c.get("filter") == 'vector_doc_id != ""'
+    )
+    assert scans_before == 1
+    assert scans_after == 1, "V15 第二次 upsert 不应再触发模型空间全表扫描"
+    assert len(client.upsert_calls) == 2
+
+
+def test_v15_model_space_cache_isolated_from_v14() -> None:
+    """V14 与 V15 是不同 Repository 类/实例，缓存各自独立，互不串跳。
+
+    V14 Repository 行为不变由 test_contract_milvus_repository.py 的完整套件
+    覆盖；这里用两个不同 model space 的 V15 实例验证实例级缓存隔离。
+    """
+
+    chunks = embedded_contract_chunks()
+    other_chunks = [
+        c.model_copy(update={"embedding_model_alias": "other-model"})
+        for c in chunks
+    ]
+
+    client_a = FakeV15MilvusClient(exists=True)
+    repo_a = make_v15_repository(client_a)
+    client_a.description = v15_description(repo_a)
+
+    client_b = FakeV15MilvusClient(exists=True)
+    repo_b = make_v15_repository(client_b)
+    client_b.description = v15_description(repo_b)
+
+    repo_a.upsert_batch(chunks)
+    repo_b.upsert_batch(other_chunks)
+
+    # 两个实例各自独立缓存了不同的 model space。
+    assert repo_a._validated_model_space is not None
+    assert repo_b._validated_model_space is not None
+    assert repo_a._validated_model_space["embedding_model_alias"] == (
+        "alibaba-bailian:text-embedding-v4"
+    )
+    assert repo_b._validated_model_space["embedding_model_alias"] == "other-model"
+    assert repo_a._validated_model_space != repo_b._validated_model_space

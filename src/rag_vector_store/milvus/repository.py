@@ -105,6 +105,11 @@ class ContractMilvusVectorRepository:
         self._allow_collection_creation = allow_collection_creation
         self._contract_row_mapper = self._row_mapper_cls()
         self._lock = Lock()
+        # 模型空间一致性缓存：同一 Repository 生命周期内，同一个
+        # (embedding_model_alias, embedding_model_version, embedding_dim) 只校验
+        # 一次既有 Collection 数据；后续相同 model space 的 upsert 直接复用，跳过
+        # 全表扫描。model space 变化时缓存失效并重新校验，保持 fail-closed。
+        self._validated_model_space: dict[str, object] | None = None
 
         if vector_dimension is not None:
             self._set_vector_dimension(vector_dimension)
@@ -745,7 +750,23 @@ class ContractMilvusVectorRepository:
         self,
         record: EmbeddedContractPreparedChunk,
     ) -> None:
-        """在 upsert 前分批遍历已有 Entity，确认 Collection 模型空间一致。"""
+        """在 upsert 前分批遍历已有 Entity，确认 Collection 模型空间一致。
+
+        缓存：同一 Repository 生命周期内，同一 model space
+        (embedding_model_alias / embedding_model_version / embedding_dim) 只校验
+        一次既有 Collection 数据；后续相同 model space 的 upsert 直接跳过全表
+        扫描。model space 任一字段变化都会使缓存失效并重新校验，保持 fail-closed。
+        扫描中发现不一致或 iterator 异常时不写缓存，下次同名 model space 仍会
+        重新扫描。
+        """
+
+        requested = {
+            "embedding_model_alias": record.embedding_model_alias,
+            "embedding_model_version": record.embedding_model_version,
+            "embedding_dim": record.embedding_dim,
+        }
+        if self._validated_model_space == requested:
+            return
 
         iterator = self._get_client().query_iterator(
             collection_name=self.settings.collection_name,
@@ -778,6 +799,8 @@ class ContractMilvusVectorRepository:
                     )
         finally:
             iterator.close()
+        # 扫描全部通过后才写入缓存，使后续相同 model space 跳过扫描。
+        self._validated_model_space = requested
 
     def _model_space_from_row(
         self,

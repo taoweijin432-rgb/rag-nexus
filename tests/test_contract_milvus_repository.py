@@ -1257,3 +1257,122 @@ def test_destructive_maintenance_gate_does_not_affect_ordinary_crud() -> None:
 
     assert result.affected_count == 3
     assert client.upsert_calls
+
+
+# ---------------------------------------------------------------------------
+# 模型空间校验缓存：同一 Repository 生命周期内同一 model space 只扫描一次
+# ---------------------------------------------------------------------------
+
+
+def test_model_space_cache_first_upsert_scans_collection() -> None:
+    """首次 upsert 缓存为空，必须执行全表扫描。"""
+
+    client = FakeContractMilvusClient(exists=True)
+    repository = ContractMilvusVectorRepository(
+        contract_settings(),
+        vector_dimension=1024,
+        client=client,
+    )
+    client.description = repository._build_schema(1024).to_dict()
+
+    repository.upsert_batch(embedded_contract_chunks())
+
+    # 首次扫描：_validate_existing_model_space 触发一次 query_iterator。
+    model_space_scans = [
+        call for call in client.query_iterator_calls
+        if call.get("filter") == "embedding_dim >= 0"
+    ]
+    assert len(model_space_scans) == 1
+    assert repository._validated_model_space is not None
+    assert repository._validated_model_space["embedding_model_alias"] == (
+        "alibaba-bailian:text-embedding-v4"
+    )
+
+
+def test_model_space_cache_second_upsert_skips_scan() -> None:
+    """同 Repository 同 model space 第二次 upsert 直接复用缓存，跳过全表扫描。"""
+
+    client = FakeContractMilvusClient(exists=True)
+    repository = ContractMilvusVectorRepository(
+        contract_settings(),
+        vector_dimension=1024,
+        client=client,
+    )
+    client.description = repository._build_schema(1024).to_dict()
+
+    repository.upsert_batch(embedded_contract_chunks())
+    scans_before = sum(
+        1 for c in client.query_iterator_calls if c.get("filter") == "embedding_dim >= 0"
+    )
+
+    # 第二次：同 Repository、同 model space，应命中缓存跳过扫描。
+    repository.upsert_batch(embedded_contract_chunks())
+
+    scans_after = sum(
+        1 for c in client.query_iterator_calls if c.get("filter") == "embedding_dim >= 0"
+    )
+    assert scans_before == 1
+    assert scans_after == 1, "第二次 upsert 不应再触发模型空间全表扫描"
+    assert len(client.upsert_calls) == 2
+
+
+def test_model_space_cache_changed_model_space_revalidates() -> None:
+    """model space 变化（alias/version/dim 任一）必须使缓存失效并重新校验。"""
+
+    client = FakeContractMilvusClient(exists=True)
+    repository = ContractMilvusVectorRepository(
+        contract_settings(),
+        vector_dimension=1024,
+        client=client,
+    )
+    client.description = repository._build_schema(1024).to_dict()
+
+    # 第一次：text-embedding-v4 / v1 / 1024，空 Collection 视图，缓存校验通过。
+    repository.upsert_batch(embedded_contract_chunks())
+    scans_after_first = sum(
+        1 for c in client.query_iterator_calls if c.get("filter") == "embedding_dim >= 0"
+    )
+    assert scans_after_first == 1
+
+    # 第二次：alias 改为 other-model，缓存失效重新校验。
+    # 让模型空间扫描返回空批次（模拟一个仍无既有 other-model 数据的 Collection
+    # 视图），避免读到第一次写入的 v4 行造成不匹配。
+    client.model_space_batches = [[]]
+    other_chunks = [
+        c.model_copy(update={"embedding_model_alias": "other-model"})
+        for c in embedded_contract_chunks()
+    ]
+    repository.upsert_batch(other_chunks)
+
+    scans_after_second = sum(
+        1 for c in client.query_iterator_calls if c.get("filter") == "embedding_dim >= 0"
+    )
+    assert scans_after_second == 2, "model space 变化必须重新扫描校验"
+    assert repository._validated_model_space["embedding_model_alias"] == "other-model"
+
+
+def test_model_space_cache_mismatch_still_fails_closed_and_not_cached() -> None:
+    """扫描中发现不一致仍 fail-closed，且不写入缓存（下次同名仍会重新扫描）。"""
+
+    client = FakeContractMilvusClient(exists=True)
+    repository = ContractMilvusVectorRepository(
+        contract_settings(),
+        vector_dimension=1024,
+        client=client,
+    )
+    client.description = repository._build_schema(1024).to_dict()
+    # 既有数据是 other-vendor / v2，与当前请求 text-embedding-v4 / v1 不一致。
+    client.model_space_batches = [
+        [{
+            "embedding_model_alias": "other-vendor",
+            "embedding_model_version": "v2",
+            "embedding_dim": 1024,
+        }]
+    ]
+
+    with pytest.raises(ValueError, match="已有 Entity 与当前 Embedding model-space"):
+        repository.upsert_batch(embedded_contract_chunks())
+
+    # 校验失败不写缓存，避免后续相同 model space 被错误跳过。
+    assert repository._validated_model_space is None
+    assert client.upsert_calls == []
