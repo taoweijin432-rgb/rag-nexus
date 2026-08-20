@@ -1,8 +1,8 @@
-"""全量加工批次状态表的静态 DDL 契约测试。
+"""加工批次与来源 Checkpoint 状态表的静态 DDL 契约测试。
 
 本文件只读取版本库中的 SQL 文本，不连接或修改 MySQL。它用于第一阶段审查：确保
-新建库使用 001，现有库依次使用增量迁移补齐批次跟踪和同步统计字段，并确保新环境
-不再创建已停用的 Stage/Chunk 持久化表。
+新建库使用 001，现有库依次使用增量迁移补齐批次跟踪、同步统计和来源 Checkpoint，
+并确保新环境不再创建已停用的 Stage/Chunk 持久化表。
 """
 
 from __future__ import annotations
@@ -13,6 +13,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 INITIAL_SCHEMA = PROJECT_ROOT / "sql" / "001_create_expert_index_tables.sql"
 BATCH_MIGRATION = PROJECT_ROOT / "sql" / "005_add_full_batch_tracking.sql"
 VECTOR_STATS_MIGRATION = PROJECT_ROOT / "sql" / "006_add_vector_sync_stats.sql"
+SOURCE_CHECKPOINT_MIGRATION = PROJECT_ROOT / "sql" / "007_add_source_checkpoint.sql"
 
 VECTOR_STAT_FIELDS = {
     "vector_sync_expert_count",
@@ -88,12 +89,39 @@ def test_initial_schema_contains_expert_level_batch_items() -> None:
     assert "error_message VARCHAR(512) NULL" in item
 
 
+def test_initial_schema_contains_source_checkpoint() -> None:
+    """新建库应为四张物理来源表保存独立的复合安全游标。"""
+
+    checkpoint = _create_table_block(
+        _read(INITIAL_SCHEMA),
+        "expert_index_source_checkpoint",
+    )
+
+    for field in (
+        "source_table",
+        "last_updated_at",
+        "last_id",
+        "last_batch_id",
+        "last_success_time",
+        "lock_version",
+    ):
+        assert field in checkpoint
+    assert "PRIMARY KEY (source_table)" in checkpoint
+    for source_table in (
+        "experts",
+        "experts_work_experience",
+        "experts_project_experience",
+        "experts_education_experience",
+    ):
+        assert f"'{source_table}'" in checkpoint
+
+
 def test_initial_schema_only_creates_batch_state_tables() -> None:
-    """新环境只创建批次状态表，Stage 与 Chunk 都通过内存链路处理。"""
+    """新环境只创建批次和 Checkpoint 状态表，Stage/Chunk 继续走内存链路。"""
 
     schema = _read(INITIAL_SCHEMA)
 
-    assert schema.count("CREATE TABLE IF NOT EXISTS") == 2
+    assert schema.count("CREATE TABLE IF NOT EXISTS") == 3
     for removed_table in (
         "expert_index_stage",
         "expert_index_employment_stage",
@@ -135,4 +163,27 @@ def test_vector_stats_migration_adds_only_batch_summary_fields() -> None:
         assert f"ADD COLUMN {field}" in migration
     assert migration.count("NOT NULL DEFAULT 0") == len(VECTOR_STAT_FIELDS)
     assert "expert_index_batch_item" not in migration
+    assert "DROP " not in migration.upper()
+
+
+def test_source_checkpoint_migration_only_creates_checkpoint_table() -> None:
+    """现有库迁移只新增来源 Checkpoint，不初始化游标或修改来源表。"""
+
+    migration = _read(SOURCE_CHECKPOINT_MIGRATION)
+    checkpoint = _create_table_block(
+        migration,
+        "expert_index_source_checkpoint",
+    )
+
+    for field in (
+        "source_table",
+        "last_updated_at",
+        "last_id",
+        "last_batch_id",
+        "last_success_time",
+        "lock_version",
+    ):
+        assert field in checkpoint
+    assert "INSERT INTO" not in migration.upper()
+    assert "ALTER TABLE" not in migration.upper()
     assert "DROP " not in migration.upper()
