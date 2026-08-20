@@ -156,6 +156,62 @@ def test_get_source_checkpoint_rejects_unknown_table_before_connecting(
         _repository().get_source_checkpoint("expert_work_experience")
 
 
+def test_initialize_source_checkpoint_inserts_explicit_safe_position(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """初始化应原样写入调用方确认的位置，并以版本 0 开始。"""
+
+    checkpoint_time = datetime(2026, 8, 13, 22, 0, tzinfo=timezone.utc)
+    success_time = datetime(2026, 8, 20, 10, 0, tzinfo=timezone.utc)
+    cursor = RecordingCursor()
+    connection = RecordingConnection(cursor)
+    _patch_connection(monkeypatch, connection)
+
+    _repository().initialize_source_checkpoint(
+        SourceCheckpoint(
+            source_table="experts_project_experience",
+            last_updated_at=checkpoint_time,
+            last_id=1800,
+            last_batch_id=902,
+            last_success_time=success_time,
+        )
+    )
+
+    sql, params = cursor.executed[0]
+    assert "INSERT INTO expert_index_source_checkpoint" in sql
+    assert "ON DUPLICATE KEY UPDATE" not in sql
+    assert params == (
+        "experts_project_experience",
+        checkpoint_time,
+        1800,
+        902,
+        success_time,
+    )
+    assert connection.commit_count == 1
+    assert connection.rollback_count == 0
+    assert connection.closed is True
+
+
+def test_initialize_source_checkpoint_rejects_nonzero_lock_version(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """初始化入口不能伪装成已有 Checkpoint 的更新操作。"""
+
+    def unexpected_connect(**_kwargs: object) -> None:
+        raise AssertionError("非法初始版本不应连接数据库")
+
+    monkeypatch.setattr("expert_index.repository.pymysql.connect", unexpected_connect)
+    checkpoint = SourceCheckpoint(
+        source_table="experts",
+        last_updated_at=datetime(2026, 8, 13, 22, 0, tzinfo=timezone.utc),
+        last_id=0,
+        lock_version=1,
+    )
+
+    with pytest.raises(ValueError, match="lock_version 必须为 0"):
+        _repository().initialize_source_checkpoint(checkpoint)
+
+
 def test_full_batch_start_persists_version_cursor_and_upper_bound(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

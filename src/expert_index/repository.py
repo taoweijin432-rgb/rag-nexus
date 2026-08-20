@@ -144,6 +144,44 @@ class MySQLIndexRepository:
         finally:
             connection.close()
 
+    def initialize_source_checkpoint(self, checkpoint: SourceCheckpoint) -> None:
+        """首次持久化调用方已经确认安全的来源表同步起点。
+
+        该方法使用普通 ``INSERT``，不会通过 Upsert 覆盖已有位置；同一来源表已经存在
+        Checkpoint 时由数据库唯一键直接拒绝。初始乐观锁版本必须为 0，后续位置推进
+        将由独立的提交方法负责，避免初始化入口被误用为更新入口。
+        """
+
+        if not isinstance(checkpoint, SourceCheckpoint):
+            raise TypeError("checkpoint 必须是 SourceCheckpoint")
+        if checkpoint.lock_version != 0:
+            raise ValueError("初始化 Checkpoint 的 lock_version 必须为 0")
+
+        connection = pymysql.connect(**self.config.as_kwargs())
+        try:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    INSERT INTO expert_index_source_checkpoint(
+                        source_table, last_updated_at, last_id,
+                        last_batch_id, last_success_time, lock_version
+                    ) VALUES (%s, %s, %s, %s, %s, 0)
+                    """,
+                    (
+                        checkpoint.source_table,
+                        checkpoint.last_updated_at,
+                        checkpoint.last_id,
+                        checkpoint.last_batch_id,
+                        checkpoint.last_success_time,
+                    ),
+                )
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+
     @contextmanager
     def build_lock(self, run_mode: str) -> Iterator[None]:
         """在一次 single/full 加工的完整生命周期内持有 MySQL 命名锁。
