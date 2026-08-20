@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import threading
+import time
 from collections.abc import Callable
 from urllib.error import HTTPError, URLError
 
@@ -127,6 +129,7 @@ def test_company_cloud_embedding_splits_large_input_and_preserves_order() -> Non
             api_url="https://embedding.example.test/v1/embeddings",
             api_key="unit-test-key",
             expected_dimension=1,
+            concurrency=1,
         ),
         opener=opener,
     )
@@ -163,6 +166,7 @@ def test_company_cloud_embedding_fails_whole_call_when_a_slice_fails() -> None:
             api_url="https://embedding.example.test/v1/embeddings",
             api_key="unit-test-key",
             expected_dimension=1,
+            concurrency=1,
         ),
         opener=opener,
     )
@@ -277,3 +281,111 @@ def test_company_cloud_embedding_does_not_expose_api_key_in_settings_repr() -> N
     configured = settings()
 
     assert "unit-test-key" not in repr(configured)
+
+
+def test_company_cloud_embedding_concurrency_runs_batches_in_parallel_and_preserves_order() -> None:
+    """并发路径下多个微批同时执行，但返回向量仍与输入顺序一一对应。"""
+
+    seen_threads: set[int] = set()
+    max_concurrent = 0
+    current = 0
+    lock = threading.Lock()
+
+    def opener(request: object, **kwargs: object) -> FakeResponse:
+        nonlocal current, max_concurrent
+        with lock:
+            current += 1
+            max_concurrent = max(max_concurrent, current)
+            seen_threads.add(threading.get_ident())
+        payload = json.loads(request.data.decode("utf-8"))
+        # 模拟网络延迟以增大并发重叠窗口。
+        time.sleep(0.05)
+        with lock:
+            current -= 1
+        return FakeResponse(
+            {
+                "data": [
+                    {"index": i, "embedding": [float(text.rsplit("-", 1)[1])]}
+                    for i, text in enumerate(payload["input"])
+                ]
+            }
+        )
+
+    model = CompanyCloudEmbeddingModel(
+        CompanyCloudEmbeddingSettings(
+            api_url="https://embedding.example.test/v1/embeddings",
+            api_key="unit-test-key",
+            expected_dimension=1,
+            concurrency=4,
+        ),
+        opener=opener,
+    )
+
+    # 35 条输入 → 4 个微批（10+10+10+5），并发度 4。
+    embeddings = model.embed([f"chunk-{index}" for index in range(35)])
+
+    assert embeddings == [[float(index)] for index in range(35)]
+    # 并发路径应使用多个线程执行微批。
+    assert len(seen_threads) > 1
+    assert max_concurrent > 1
+
+
+def test_company_cloud_embedding_concurrency_fails_closed_on_any_slice_failure() -> None:
+    """并发路径下任一微批失败，整批抛出，不会返回部分向量。"""
+
+    def opener(request: object, **kwargs: object) -> FakeResponse:
+        payload = json.loads(request.data.decode("utf-8"))
+        # 第二个微批（index 10-19）模拟网络失败。
+        if payload["input"][0].startswith("chunk-1"):
+            raise URLError("temporary network failure")
+        return FakeResponse(
+            {
+                "data": [
+                    {"index": i, "embedding": [0.1]}
+                    for i, _ in enumerate(payload["input"])
+                ]
+            }
+        )
+
+    model = CompanyCloudEmbeddingModel(
+        CompanyCloudEmbeddingSettings(
+            api_url="https://embedding.example.test/v1/embeddings",
+            api_key="unit-test-key",
+            expected_dimension=1,
+            concurrency=4,
+        ),
+        opener=opener,
+    )
+
+    with pytest.raises(CompanyCloudEmbeddingError, match="连接或请求超时"):
+        model.embed([f"chunk-{index}" for index in range(25)])
+
+
+def test_company_cloud_embedding_concurrency_defaults_to_four() -> None:
+    configured = CompanyCloudEmbeddingSettings(
+        api_url="https://embedding.example.test/v1/embeddings",
+        api_key="unit-test-key",
+    )
+
+    assert configured.concurrency == 4
+
+
+def test_company_cloud_embedding_concurrency_reads_configuration_from_environment() -> None:
+    model = CompanyCloudEmbeddingModel.from_env(
+        {
+            "EMBEDDING_API_URL": "https://embedding.example.test/v1/embeddings",
+            "EMBEDDING_API_KEY": "unit-test-key",
+            "EMBEDDING_CONCURRENCY": "8",
+        }
+    )
+
+    assert model.settings.concurrency == 8
+
+
+def test_company_cloud_embedding_concurrency_rejects_negative() -> None:
+    with pytest.raises(ValueError, match="EMBEDDING_CONCURRENCY"):
+        CompanyCloudEmbeddingSettings(
+            api_url="https://embedding.example.test/v1/embeddings",
+            api_key="unit-test-key",
+            concurrency=-1,
+        )

@@ -20,16 +20,19 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from zoneinfo import ZoneInfo
+
+from expert_contracts import ExpertChunkEmbeddingInput
 
 from .chunk_builder import ChunkFactory
 from .config import Settings
 from .contract_bridge import chunk_records_to_contracts
 from .models import ChunkRecord, ExpertCandidate
 from .normalize import normalize_aggregate
-from .ports import ExpertVectorSyncPort
+from .ports import ExpertBatchSyncInput, ExpertVectorSyncPort
 from .repository import FullBatchCheckpoint, MySQLIndexRepository
 from .source import MAX_FULL_SCAN_PAGE_SIZE, MySQLSourceAdapter
 from .validators import validate_chunks
@@ -577,6 +580,20 @@ class ExpertIndexPipeline:
                     [candidate.id for candidate in candidates],
                 )
 
+                # 阶段 1：逐专家读、生成、校验（CPU，不触发 Embedding），
+                # 收集需要同步的专家及其 Contract 快照，领域异常隔离为 failed。
+                # failed 专家不进入批量同步；deleted/rejected 用空快照进入，
+                # 以删除该专家已存在但本次不再产出的向量。
+                batch_inputs: list[ExpertBatchSyncInput] = []
+                pending: list[
+                    tuple[
+                        ExpertCandidate,
+                        _ExpertProgress,
+                        str,
+                        str | None,
+                        str | None,
+                    ]
+                ] = []
                 for candidate in candidates:
                     candidate_count += 1
                     progress = _ExpertProgress(expert_id=candidate.id)
@@ -586,29 +603,45 @@ class ExpertIndexPipeline:
                     error_type: str | None = None
                     try:
                         if candidate.is_deleted:
-                            # 删除候选不读取正文，直接用空快照删除下游历史向量。
-                            progress.vector_sync = self._sync_expert_vector_snapshot(
-                                candidate.id,
-                                [],
-                            )
+                            # 删除候选不读取正文，用空快照删除下游历史向量。
                             terminal_status = "deactivated"
                             result_code = "expert_deleted"
+                            contracts = self._contracts_for_expert([])
                         else:
-                            terminal_status = self._process_active_expert(
-                                candidate.id,
-                                data_version=data_version,
-                                batch_id=batch_id,
-                                progress=progress,
+                            terminal_status, contracts = (
+                                self._build_expert_contracts_for_batch(
+                                    candidate.id,
+                                    data_version=data_version,
+                                    batch_id=batch_id,
+                                    progress=progress,
+                                )
                             )
                             if terminal_status == "rejected":
                                 result_code = "no_chunkable_content"
+                        batch_inputs.append(
+                            ExpertBatchSyncInput(
+                                expert_id=candidate.id,
+                                records=contracts,
+                            )
+                        )
                     # 只隔离单专家领域处理异常。批次明细或页游标写入失败会继续向外抛出，
                     # 终止整个批次，避免在审计状态未落库时跳过候选。
                     except Exception as exc:  # noqa: BLE001
                         terminal_status = "failed"
                         result_code = "expert_processing_failed"
                         error_type = type(exc).__name__
+                    pending.append(
+                        (candidate, progress, terminal_status, result_code, error_type)
+                    )
 
+                # 阶段 2：跨专家批量同步，合并 Embedding 与 Milvus 写入。
+                # 任一专家同步失败会 fail-closed 中断整页，由外层 catch 收口为 failed。
+                sync_results = self._sync_experts_batch(batch_inputs)
+
+                # 落库阶段：逐专家回填同步结果、持久化终态、累计批次数量。
+                for candidate, progress, terminal_status, result_code, error_type in pending:
+                    if terminal_status != "failed":
+                        progress.vector_sync = sync_results.get(candidate.id)
                     # 先持久化专家终态，再把该专家计入批次累计数量。
                     self.repository.finish_batch_item(
                         batch_id,
@@ -796,6 +829,71 @@ class ExpertIndexPipeline:
             timezone_name=self.settings.timezone,
         )
         return self.vector_sync.sync_expert(expert_id, contracts)
+
+    def _build_expert_contracts_for_batch(
+        self,
+        expert_id: int,
+        *,
+        data_version: str,
+        batch_id: int,
+        progress: _ExpertProgress,
+    ) -> tuple[str, list[ExpertChunkEmbeddingInput]]:
+        """执行一位 active 专家的读、生成与校验，但不触发向量同步。
+
+        返回 ``(业务终态, contracts)``：有 Chunk 返回 ("success", contracts)，
+        无可生成内容返回 ("rejected", [])。异常原样向外抛，由批量循环隔离为
+        failed。``progress`` 记录已完成的阶段数量。本方法与 :meth:`_process_active_expert`
+        共用读、生成、校验逻辑，但不调用下游，以便批量循环合并 Embedding。
+        """
+
+        aggregate = self.source.load_expert(expert_id)
+        progress.extracted_count = (
+            1
+            + len(aggregate.employments)
+            + len(aggregate.projects)
+            + len(aggregate.educations)
+        )
+
+        profile, employments, projects = normalize_aggregate(
+            aggregate,
+            data_version=data_version,
+            build_batch_id=batch_id,
+        )
+        chunks = self.factory.build_all(profile, employments, projects)
+        if not chunks:
+            # 无可生成内容属于 rejected 业务结果，返回空快照用于清除旧向量。
+            return "rejected", self._contracts_for_expert([])
+
+        validate_chunks(chunks)
+        progress.chunk_count = len(chunks)
+        return "success", self._contracts_for_expert(chunks)
+
+    def _contracts_for_expert(
+        self,
+        chunks: list[ChunkRecord],
+    ) -> list[ExpertChunkEmbeddingInput]:
+        """把 Chunk 转为公共 Contract，向量同步前的纯内存转换。"""
+
+        updated_at = datetime.now(ZoneInfo(self.settings.timezone))
+        return chunk_records_to_contracts(
+            chunks,
+            updated_at=updated_at,
+            timezone_name=self.settings.timezone,
+        )
+
+    def _sync_experts_batch(
+        self,
+        inputs: Sequence[ExpertBatchSyncInput],
+    ) -> dict[int, ExpertVectorSyncResult]:
+        """批量同步多位专家，合并 Embedding 与 Milvus 写入。
+
+        空输入返回空 dict。返回值按 expert_id 索引，供批量循环回填 per-expert 结果。
+        """
+
+        if not inputs:
+            return {}
+        results = self.vector_sync.sync_expert_batch(inputs)
+        return {r.expert_id: r for r in results}
 
 
 def _checkpoint_vector_sync(

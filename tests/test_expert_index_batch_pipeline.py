@@ -20,6 +20,7 @@ from expert_index.cli import build_parser
 from expert_index.config import DatabaseConfig, Settings
 from expert_index.models import ExpertAggregate, ExpertCandidate, ExpertSource
 from expert_index.pipeline import ExpertIndexPipeline, VectorSyncSummary
+from expert_index.ports import ExpertBatchSyncInput
 from expert_index.repository import BatchItemSummary, FullBatchCheckpoint
 from expert_index.vector_sync import ExpertVectorSyncResult
 
@@ -192,6 +193,7 @@ class FakeVectorSync:
         results_by_expert: dict[int, ExpertVectorSyncResult] | None = None,
     ) -> None:
         self.calls: list[tuple[int, list[ExpertChunkEmbeddingInput]]] = []
+        self.batch_calls: list[list[ExpertBatchSyncInput]] = []
         self.results_by_expert = results_by_expert or {}
 
     def sync_expert(
@@ -215,6 +217,15 @@ class FakeVectorSync:
             deleted_count=0,
             delete_not_found_count=0,
         )
+
+    def sync_expert_batch(
+        self,
+        experts: Sequence[ExpertBatchSyncInput],
+    ) -> list[ExpertVectorSyncResult]:
+        """记录批量调用并逐专家复用 sync_expert 的结果构造逻辑。"""
+
+        self.batch_calls.append(list(experts))
+        return [self.sync_expert(e.expert_id, e.records) for e in experts]
 
 
 def _pipeline(

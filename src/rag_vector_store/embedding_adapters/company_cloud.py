@@ -25,6 +25,7 @@ import json
 import math
 import os
 from collections.abc import Callable, Mapping, Sequence
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from numbers import Real
 from typing import Any
@@ -71,6 +72,9 @@ class CompanyCloudEmbeddingSettings:
     model_version: str | None = FORMAL_EMBEDDING_MODEL_VERSION
     expected_dimension: int | None = FORMAL_EMBEDDING_DIMENSION
     timeout: float = 60.0
+    # Embedding 微批并发度：同一次 embed 内的多个厂商微批并发请求，提升吞吐。
+    # 0/1 表示串行（保持旧行为），>1 表示最多同时发起该数量的 HTTP 微批。
+    concurrency: int = 4
 
     def __post_init__(self) -> None:
         """校验配置，避免把无效配置带到网络请求阶段。"""
@@ -95,6 +99,10 @@ class CompanyCloudEmbeddingSettings:
             raise ValueError("EMBEDDING_DIMENSION 必须是正整数")
         if isinstance(self.timeout, bool) or self.timeout <= 0:
             raise ValueError("EMBEDDING_TIMEOUT 必须是正数")
+        if isinstance(self.concurrency, bool) or not isinstance(self.concurrency, int):
+            raise ValueError("EMBEDDING_CONCURRENCY 必须是整数")  # noqa: TRY004
+        if self.concurrency < 0:
+            raise ValueError("EMBEDDING_CONCURRENCY 不能为负数")
 
     @classmethod
     def from_env(
@@ -106,6 +114,7 @@ class CompanyCloudEmbeddingSettings:
         env = os.environ if environ is None else environ
         timeout_text = _optional(env, "EMBEDDING_TIMEOUT")
         dimension_text = _optional(env, "EMBEDDING_DIMENSION")
+        concurrency_text = _optional(env, "EMBEDDING_CONCURRENCY")
         return cls(
             api_url=_required(env, "EMBEDDING_API_URL"),
             api_key=_required(env, "EMBEDDING_API_KEY"),
@@ -125,6 +134,9 @@ class CompanyCloudEmbeddingSettings:
                 else _parse_dimension(dimension_text)
             ),
             timeout=60.0 if timeout_text is None else _parse_timeout(timeout_text),
+            concurrency=(
+                4 if concurrency_text is None else _parse_concurrency(concurrency_text)
+            ),
         )
 
 
@@ -214,6 +226,9 @@ class CompanyCloudEmbeddingModel(EmbeddingModel):
 
         每次百炼请求最多携带十条文本。API 若返回 ``index``，解析器会在片内
         复原顺序；所有片都成功后才返回合并结果，避免调用方拿到部分向量。
+
+        当 ``concurrency`` 配置大于 1 时，多个微批会并发发起 HTTP 请求以提升
+        吞吐，但结果仍按输入顺序合并，任一微批失败则整体抛出（fail-closed）。
         """
 
         input_texts = list(texts)
@@ -222,10 +237,44 @@ class CompanyCloudEmbeddingModel(EmbeddingModel):
             # 空输入直接返回空列表：正式 Worker 不会在无 eligible 时调用本方法。
             return []
 
-        embeddings: list[list[float]] = []
-        for start in range(0, len(input_texts), DEFAULT_EMBEDDING_BATCH_SIZE):
-            batch = input_texts[start : start + DEFAULT_EMBEDDING_BATCH_SIZE]
-            embeddings.extend(self._embed_batch(batch))
+        # 切分为固定大小的微批，记录每批在整体输入中的起始位置以便保序合并。
+        slices: list[tuple[int, list[str]]] = [
+            (start, input_texts[start : start + DEFAULT_EMBEDDING_BATCH_SIZE])
+            for start in range(
+                0, len(input_texts), DEFAULT_EMBEDDING_BATCH_SIZE
+            )
+        ]
+        if self.settings.concurrency <= 1 or len(slices) <= 1:
+            # 串行路径（并发度 0/1 或只有一批）保持原有顺序与失败语义。
+            embeddings: list[list[float]] = []
+            for _, batch in slices:
+                embeddings.extend(self._embed_batch(batch))
+            return embeddings
+
+        # 并发路径：每个微批在独立线程执行，结果按起始位置写入预分配列表。
+        result: list[list[list[float]] | None] = [None] * len(slices)
+        max_workers = min(self.settings.concurrency, len(slices))
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            future_to_index = {
+                executor.submit(self._embed_batch, batch): slice_index
+                for slice_index, (_, batch) in enumerate(slices)
+            }
+            first_error: BaseException | None = None
+            for future, slice_index in future_to_index.items():
+                try:
+                    result[slice_index] = list(future.result())
+                except BaseException as exc:  # noqa: BLE001
+                    # 任一微批失败即取消其余任务并记录首个错误，保证 fail-closed。
+                    if first_error is None:
+                        first_error = exc
+                    for pending in future_to_index:
+                        pending.cancel()
+        if first_error is not None:
+            raise first_error
+        embeddings = []
+        for chunk in result:
+            assert chunk is not None  # 全部成功才有此分支
+            embeddings.extend(chunk)
         return embeddings
 
     def _embed_batch(self, input_texts: Sequence[str]) -> list[list[float]]:
@@ -421,6 +470,18 @@ def _parse_timeout(value: str) -> float:
     if timeout <= 0:
         raise ValueError("EMBEDDING_TIMEOUT 必须是正数")
     return timeout
+
+
+def _parse_concurrency(value: str) -> int:
+    """解析 Embedding 微批并发度，拒绝负数与非整数。"""
+
+    try:
+        concurrency = int(value)
+    except ValueError as exc:
+        raise ValueError("EMBEDDING_CONCURRENCY 必须是整数") from exc
+    if concurrency < 0:
+        raise ValueError("EMBEDDING_CONCURRENCY 不能为负数")
+    return concurrency
 
 
 def _parse_dimension(value: str) -> int:

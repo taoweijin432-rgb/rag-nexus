@@ -2,10 +2,14 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
 
+import pytest
+
 from expert_contracts import ExpertChunkEmbeddingInput, adapt_expert_chunk_mapping
+from expert_index.ports import ExpertBatchSyncInput
 from expert_index.vector_sync import ExpertVectorSynchronizer
 from rag_vector_store import (
     VectorDeletionResult,
@@ -204,3 +208,93 @@ def test_sync_expert_falls_back_to_upsert_and_deletes_rejected_record() -> None:
         metadata_changed.vector_doc_id
     ]
     assert store.delete_calls == [[rejected.vector_doc_id]]
+
+
+def _other_expert_record(
+    record: ExpertChunkEmbeddingInput, expert_id: int
+) -> ExpertChunkEmbeddingInput:
+    """构造公式仍合法的另一专家 Contract，供批量同步测试使用。"""
+
+    payload = record.model_dump()
+    payload["expert_id"] = expert_id
+    source = dict(payload["source"])
+    source["source_field_id"] = str(expert_id)
+    payload["source"] = source
+    payload["vector_doc_id"] = (
+        f"expert:{expert_id}:{record.chunk_type}:{expert_id}:{record.chunk_index}"
+    )
+    new_record = ExpertChunkEmbeddingInput.model_validate(payload)
+    # 重算 content_hash 以保持与 chunk_text 一致（Contract 校验要求）。
+    new_payload = new_record.model_dump()
+    new_payload["content_hash"] = hashlib.sha256(
+        new_record.chunk_text.encode("utf-8")
+    ).hexdigest()
+    return ExpertChunkEmbeddingInput.model_validate(new_payload)
+
+
+def test_sync_expert_batch_merges_upsert_across_experts_into_one_call() -> None:
+    """跨专家批量同步应把多专家的 to_upsert 合并为一次 upsert_chunks 调用。"""
+
+    content_changed = _records()[2]
+    other = _other_expert_record(_records()[0], 900002)
+    store = FakeVectorStore({})
+
+    results = ExpertVectorSynchronizer(store).sync_expert_batch(
+        [
+            ExpertBatchSyncInput(expert_id=900001, records=[content_changed]),
+            ExpertBatchSyncInput(expert_id=900002, records=[other]),
+        ]
+    )
+
+    # 关键：两次 per-expert sync 会触发两次 upsert；批量合并后只有一次 upsert_chunks。
+    assert len(store.upsert_calls) == 1
+    assert {item.vector_doc_id for item in store.upsert_calls[0]} == {
+        content_changed.vector_doc_id,
+        other.vector_doc_id,
+    }
+    by_expert = {r.expert_id: r for r in results}
+    assert by_expert[900001].embedded_count == 1
+    assert by_expert[900002].embedded_count == 1
+
+
+def test_sync_expert_batch_matches_single_sync_expert_result() -> None:
+    """单专家批量结果与 sync_expert 等价，验证语义一致性。"""
+
+    unchanged, metadata_changed, content_changed = _records()
+    new_record = _copy_with_source_id(content_changed, "162")
+    records = [unchanged, metadata_changed, content_changed, new_record]
+    stale_id = "expert:900001:employment:99999:0"
+    rows = {
+        unchanged.vector_doc_id: _row(unchanged),
+        metadata_changed.vector_doc_id: _row(metadata_changed, metadata_hash="0" * 64),
+        content_changed.vector_doc_id: _row(content_changed, content_hash="1" * 64),
+        stale_id: {
+            "vector_doc_id": stale_id,
+            "expert_id": 900001,
+            "content_hash": "2" * 64,
+            "metadata_hash": "3" * 64,
+        },
+    }
+
+    batch_result = ExpertVectorSynchronizer(FakeVectorStore(dict(rows))).sync_expert_batch(
+        [ExpertBatchSyncInput(expert_id=900001, records=records)]
+    )[0]
+    single_result = ExpertVectorSynchronizer(FakeVectorStore(dict(rows))).sync_expert(
+        900001, records
+    )
+
+    assert batch_result == single_result
+
+
+def test_sync_expert_batch_returns_empty_list_for_empty_input() -> None:
+    store = FakeVectorStore({})
+    results = ExpertVectorSynchronizer(store).sync_expert_batch([])
+    assert results == []
+    assert store.upsert_calls == []
+
+
+def test_sync_expert_batch_rejects_non_batch_input() -> None:
+    store = FakeVectorStore({})
+    synchronizer = ExpertVectorSynchronizer(store)
+    with pytest.raises(TypeError):
+        synchronizer.sync_expert_batch([(900001, [])])  # type: ignore[list-item]

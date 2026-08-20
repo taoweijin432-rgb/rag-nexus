@@ -8,12 +8,12 @@ Milvus Repository。
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from expert_contracts import ExpertChunkEmbeddingInput
 from rag_vector_store import VectorIngestionResult, VectorItemResult
 
-from .ports import VectorStorePort
+from .ports import ExpertBatchSyncInput, VectorStorePort
 
 
 class VectorSyncError(RuntimeError):
@@ -34,6 +34,19 @@ class ExpertVectorSyncResult:
     delete_not_found_count: int
 
 
+@dataclass(frozen=True)
+class _ExpertDiff:
+    """一位专家的差分计算结果，不含任何写入执行。"""
+
+    expert_id: int
+    current_count: int
+    eligible_count: int
+    to_upsert: list[ExpertChunkEmbeddingInput] = field(default_factory=list)
+    to_update: list[ExpertChunkEmbeddingInput] = field(default_factory=list)
+    unchanged_count: int = 0
+    stale_ids: list[str] = field(default_factory=list)
+
+
 class ExpertVectorSynchronizer:
     """把一位专家的完整 Contract 快照同步到下游向量服务。"""
 
@@ -46,6 +59,106 @@ class ExpertVectorSynchronizer:
         records: Sequence[ExpertChunkEmbeddingInput],
     ) -> ExpertVectorSyncResult:
         """计算完整差分并按 upsert → metadata → delete 顺序执行。"""
+
+        diff = self._compute_expert_diff(expert_id, records)
+
+        embedded_count = self._upsert(diff.to_upsert)
+        metadata_updated_count, fallback = self._update_metadata(diff.to_update)
+        embedded_count += self._upsert(fallback)
+
+        deletion = self.store.delete_vectors(diff.stale_ids)
+        if deletion.requested_count != len(diff.stale_ids):
+            raise VectorSyncError("delete_vectors 返回的 requested_count 与请求不一致")
+
+        return ExpertVectorSyncResult(
+            expert_id=diff.expert_id,
+            current_count=diff.current_count,
+            eligible_count=diff.eligible_count,
+            embedded_count=embedded_count,
+            metadata_updated_count=metadata_updated_count,
+            unchanged_count=diff.unchanged_count,
+            deleted_count=deletion.deleted_count,
+            delete_not_found_count=deletion.not_found_count,
+        )
+
+    def sync_expert_batch(
+        self,
+        experts: Sequence[ExpertBatchSyncInput],
+    ) -> list[ExpertVectorSyncResult]:
+        """跨专家批量同步，合并 Embedding 与 Milvus 写入。
+
+        与 :meth:`sync_expert` 语义等价，但把多位专家的 ``to_upsert`` 合并为一次
+        ``store.upsert_chunks``（一次 Embedding 批 + 一次 Milvus upsert），减少
+        per-expert 小批量的调用开销。各专家的 list/get/diff 仍按专家维度独立执行，
+        保证幂等与陈旧删除语义不变。
+
+        执行顺序：
+        1. 逐专家计算差分（list → get → diff，不触发 Embedding）；
+        2. 合并全部专家的 ``to_upsert`` 一次写入（一次 Embedding + 一次 Milvus）；
+        3. 逐专家执行 metadata-only 更新（安全门失败的记录回退到 upsert）；
+        4. 合并全部回退记录再一次写入（一次 Embedding + 一次 Milvus）；
+        5. 逐专家删除陈旧向量，汇总各专家结果。
+
+        任何一步失败都 fail-closed，整批抛出，不会返回部分专家结果。
+        """
+
+        if not all(isinstance(e, ExpertBatchSyncInput) for e in experts):
+            raise TypeError("experts 只接受 ExpertBatchSyncInput")
+        diffs = [self._compute_expert_diff(e.expert_id, e.records) for e in experts]
+
+        # 阶段 1：跨专家合并首次 upsert（一次 Embedding + 一次 Milvus 写入）
+        first_upsert: list[ExpertChunkEmbeddingInput] = []
+        for diff in diffs:
+            first_upsert.extend(diff.to_upsert)
+        first_embedded_vids = self._upsert_tracking(first_upsert)
+
+        # 阶段 2：逐专家 metadata-only 更新，收集安全门回退记录
+        per_expert_metadata: dict[int, int] = {}
+        fallback_upsert: list[ExpertChunkEmbeddingInput] = []
+        for diff in diffs:
+            updated, fallback = self._update_metadata(diff.to_update)
+            per_expert_metadata[diff.expert_id] = updated
+            fallback_upsert.extend(fallback)
+
+        # 阶段 3：合并全部回退记录再一次 Embedding + 写入
+        fallback_embedded_vids = self._upsert_tracking(fallback_upsert)
+
+        # 阶段 4：逐专家删除陈旧向量并汇总结果
+        results: list[ExpertVectorSyncResult] = []
+        for diff in diffs:
+            deletion = self.store.delete_vectors(diff.stale_ids)
+            if deletion.requested_count != len(diff.stale_ids):
+                raise VectorSyncError(
+                    "delete_vectors 返回的 requested_count 与请求不一致"
+                )
+            embedded_count = (
+                sum(1 for r in diff.to_upsert if r.vector_doc_id in first_embedded_vids)
+                + sum(
+                    1
+                    for r in diff.to_update
+                    if r.vector_doc_id in fallback_embedded_vids
+                )
+            )
+            results.append(
+                ExpertVectorSyncResult(
+                    expert_id=diff.expert_id,
+                    current_count=diff.current_count,
+                    eligible_count=diff.eligible_count,
+                    embedded_count=embedded_count,
+                    metadata_updated_count=per_expert_metadata.get(diff.expert_id, 0),
+                    unchanged_count=diff.unchanged_count,
+                    deleted_count=deletion.deleted_count,
+                    delete_not_found_count=deletion.not_found_count,
+                )
+            )
+        return results
+
+    def _compute_expert_diff(
+        self,
+        expert_id: int,
+        records: Sequence[ExpertChunkEmbeddingInput],
+    ) -> _ExpertDiff:
+        """计算一位专家的差分，不触发任何 Embedding 或写入。"""
 
         if isinstance(expert_id, bool) or not isinstance(expert_id, int) or expert_id < 1:
             raise ValueError("expert_id 必须是正整数")
@@ -85,25 +198,27 @@ class ExpertVectorSynchronizer:
             else:
                 unchanged_count += 1
 
-        embedded_count = self._upsert(to_upsert)
-        metadata_updated_count, fallback = self._update_metadata(to_update)
-        embedded_count += self._upsert(fallback)
-
         stale_ids = sorted(existing_ids - set(eligible_by_id))
-        deletion = self.store.delete_vectors(stale_ids)
-        if deletion.requested_count != len(stale_ids):
-            raise VectorSyncError("delete_vectors 返回的 requested_count 与请求不一致")
-
-        return ExpertVectorSyncResult(
+        return _ExpertDiff(
             expert_id=expert_id,
             current_count=len(items),
             eligible_count=len(eligible_by_id),
-            embedded_count=embedded_count,
-            metadata_updated_count=metadata_updated_count,
+            to_upsert=to_upsert,
+            to_update=to_update,
             unchanged_count=unchanged_count,
-            deleted_count=deletion.deleted_count,
-            delete_not_found_count=deletion.not_found_count,
+            stale_ids=stale_ids,
         )
+
+    def _upsert_tracking(
+        self,
+        records: Sequence[ExpertChunkEmbeddingInput],
+    ) -> set[str]:
+        """批量 upsert 并返回成功嵌入的 vector_doc_id 集合，用于跨专家计数。"""
+
+        if not records:
+            return set()
+        self._upsert(records)
+        return {item.vector_doc_id for item in records}
 
     @staticmethod
     def _existing_rows(
