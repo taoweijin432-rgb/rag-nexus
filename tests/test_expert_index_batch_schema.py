@@ -1,8 +1,8 @@
-"""加工批次、来源扫描范围与 Checkpoint 状态表的静态 DDL 契约测试。
+"""加工批次、来源扫描、CDC 事件与 Checkpoint 状态表的静态 DDL 契约测试。
 
 本文件只读取版本库中的 SQL 文本，不连接或修改 MySQL。它用于第一阶段审查：确保
 新建库使用 001，现有库依次使用增量迁移补齐批次跟踪、同步统计、来源扫描范围和
-Checkpoint，并确保新环境不再创建已停用的 Stage/Chunk 持久化表。
+Checkpoint 和 CDC 事件表，并确保新环境不再创建已停用的 Stage/Chunk 持久化表。
 """
 
 from __future__ import annotations
@@ -15,6 +15,7 @@ BATCH_MIGRATION = PROJECT_ROOT / "sql" / "005_add_full_batch_tracking.sql"
 VECTOR_STATS_MIGRATION = PROJECT_ROOT / "sql" / "006_add_vector_sync_stats.sql"
 SOURCE_CHECKPOINT_MIGRATION = PROJECT_ROOT / "sql" / "007_add_source_checkpoint.sql"
 SOURCE_BATCH_MIGRATION = PROJECT_ROOT / "sql" / "008_add_source_batch_tracking.sql"
+CDC_EVENT_MIGRATION = PROJECT_ROOT / "sql" / "009_add_cdc_event_tracking.sql"
 
 VECTOR_STAT_FIELDS = {
     "vector_sync_expert_count",
@@ -142,12 +143,43 @@ def test_initial_schema_contains_source_batch_scan_range() -> None:
     assert "KEY idx_expert_batch_source_status (batch_id, status)" in source_batch
 
 
+def test_initial_schema_contains_minimal_cdc_event_tracking() -> None:
+    """新建库应持久化 CDC 位点和任务状态，但不保存来源行或 Chunk 正文。"""
+
+    event = _create_table_block(_read(INITIAL_SCHEMA), "expert_index_cdc_event")
+
+    for field in (
+        "destination",
+        "binlog_file",
+        "binlog_position",
+        "row_index",
+        "event_time",
+        "source_schema",
+        "source_table",
+        "operation_type",
+        "source_record_id",
+        "expert_id",
+        "status",
+        "attempt_count",
+        "processed_at",
+    ):
+        assert field in event
+    assert "UNIQUE KEY uk_expert_cdc_event_position" in event
+    assert "KEY idx_expert_cdc_event_queue (status, id)" in event
+    for operation_type in ("insert", "update", "delete"):
+        assert f"'{operation_type}'" in event
+    for status in ("pending", "running", "retry", "success", "dead_letter"):
+        assert f"'{status}'" in event
+    for forbidden_field in ("before_columns", "after_columns", "raw_payload", "chunk_text"):
+        assert forbidden_field not in event.lower()
+
+
 def test_initial_schema_only_creates_batch_state_tables() -> None:
     """新环境只创建批次和 Checkpoint 状态表，Stage/Chunk 继续走内存链路。"""
 
     schema = _read(INITIAL_SCHEMA)
 
-    assert schema.count("CREATE TABLE IF NOT EXISTS") == 4
+    assert schema.count("CREATE TABLE IF NOT EXISTS") == 5
     for removed_table in (
         "expert_index_stage",
         "expert_index_employment_stage",
@@ -235,6 +267,20 @@ def test_source_batch_migration_only_creates_scan_range_table() -> None:
     ):
         assert field in source_batch
     assert "expert_index_source_checkpoint" in migration
+    assert "INSERT INTO" not in migration.upper()
+    assert "ALTER TABLE" not in migration.upper()
+    assert "DROP " not in migration.upper()
+
+
+def test_cdc_event_migration_only_creates_minimal_event_table() -> None:
+    """现有库迁移只新增 CDC 任务表，不消费事件或推进任何 Checkpoint。"""
+
+    migration = _read(CDC_EVENT_MIGRATION)
+    event = _create_table_block(migration, "expert_index_cdc_event")
+
+    assert "UNIQUE KEY uk_expert_cdc_event_position" in event
+    assert "destination, binlog_file, binlog_position, row_index" in event
+    assert "KEY idx_expert_cdc_event_queue (status, id)" in event
     assert "INSERT INTO" not in migration.upper()
     assert "ALTER TABLE" not in migration.upper()
     assert "DROP " not in migration.upper()
