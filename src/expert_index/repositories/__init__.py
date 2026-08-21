@@ -9,6 +9,7 @@ from .batch import (
 from .batch_item import BatchItemSummary, MySQLBatchItemRepository
 from .build_lock import ConcurrentBuildError, MySQLBuildLockRepository
 from .source_state import MySQLSourceStateRepository
+from .sync_task import MySQLSourceSyncTaskRepository
 
 __all__ = [
     "BatchItemSummary",
@@ -20,4 +21,5 @@ __all__ = [
     "MySQLBatchRepository",
     "MySQLBuildLockRepository",
     "MySQLSourceStateRepository",
+    "MySQLSourceSyncTaskRepository",
 ]
