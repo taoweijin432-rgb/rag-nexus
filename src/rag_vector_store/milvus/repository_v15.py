@@ -48,15 +48,25 @@ Embedding、Task State；不创建真实 Collection（是否创建由调用方�
 
 from __future__ import annotations
 
+import json
 from collections.abc import Mapping, Sequence
 from typing import Any
 
+from expert_contracts.models import EmbeddedContractPreparedChunk
+
+from .compatibility import compare_model_space
 from .contract_v15 import MilvusV15RowMapper
 from .indexes import index_specs_v15
 from .repository import ContractMilvusVectorRepository
 from .schemas.contract_v15 import build_v15_schema, v15_milvus_field_specs
 
 __all__ = ["ContractMilvusV15VectorRepository"]
+
+# 限量采样行数：V15 Collection 规模增长后，upsert 前的既有 model-space
+# 一致性检查不再全表扫描，改为采样前若干行校验。当前正式数据向量空间一致，
+# 采样校验既避免隧道链路下的全表扫描超时，又保留 fail-closed 的方向性
+# （采样到不一致即拒绝）。
+_MODEL_SPACE_SAMPLE_LIMIT = 50
 
 # V15 不存在的一级字段（已进入 flat metadata JSON）：禁止作为一级 output field。
 _V15_FORBIDDEN_TOP_LEVEL_FIELDS = ("expert_id", "content_hash", "metadata_hash")
@@ -104,6 +114,63 @@ class ContractMilvusV15VectorRepository(ContractMilvusVectorRepository):
             "embedding_model_version": flat.get("embedding_model_version"),
             "embedding_dim": flat.get("embedding_dim"),
         }
+
+    def _validate_existing_model_space(
+        self,
+        record: EmbeddedContractPreparedChunk,
+    ) -> None:
+        """在 upsert 前采样校验既有 Entity 的模型空间一致性（V15 版本）。
+
+        与 base Repository 的区别：V15 不再对整个 Collection 做全表
+        ``query_iterator(limit=-1)`` 扫描——该扫描会随 Collection 行数线性
+        增长，在 SSH 隧道 + 远端 Milvus 链路下达到数十秒级超时，导致 upsert
+        在写入前卡死（已写入约 7 万行时复现）。改为限量采样前
+        ``_MODEL_SPACE_SAMPLE_LIMIT`` 行校验 model-space 一致性。
+
+        语义变化（已与业务确认）：
+            - 由“验证全部历史行”放宽为“限量采样验证”；
+            - 当前正式数据向量空间一致，采样校验足以阻止异空间混写；
+            - 采样到任一不一致行仍 fail-closed，拒绝本次 upsert。
+
+        缓存语义与 base 一致：同一 Repository 生命周期内、同一 model space
+        采样通过后才写缓存；采样中发现不一致或查询异常时不写缓存，下次
+        同名 model space 仍会重新采样。model space 任一字段变化会使缓存失效。
+        """
+
+        requested = {
+            "embedding_model_alias": record.embedding_model_alias,
+            "embedding_model_version": record.embedding_model_version,
+            "embedding_dim": record.embedding_dim,
+        }
+        if self._validated_model_space == requested:
+            return
+
+        rows = self._get_client().query(
+            collection_name=self.settings.collection_name,
+            filter=self._full_scan_filter,
+            output_fields=list(self._model_space_fields),
+            limit=_MODEL_SPACE_SAMPLE_LIMIT,
+            consistency_level="Strong",
+            **self._timeout_kwargs(),
+        )
+        if not isinstance(rows, list) or not all(
+            isinstance(row, Mapping) for row in rows
+        ):
+            raise TypeError("Milvus model-space 采样查询返回了非法 Entity 批次")
+        if rows:
+            difference = compare_model_space(
+                [self._model_space_from_row(row) for row in rows],
+                embedding_model_alias=record.embedding_model_alias,
+                embedding_model_version=record.embedding_model_version,
+                embedding_dimension=record.embedding_dim,
+            )
+            if not difference.compatible:
+                raise ValueError(
+                    "Milvus Collection 已有 Entity 与当前 Embedding model-space 不一致: "
+                    f"{json.dumps(difference.as_dict(), ensure_ascii=False, sort_keys=True)}"
+                )
+        # 采样校验通过后才写入缓存，使后续相同 model space 跳过采样查询。
+        self._validated_model_space = requested
 
     def query_by_expert_id(
         self,

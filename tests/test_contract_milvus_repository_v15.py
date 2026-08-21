@@ -214,6 +214,18 @@ class FakeV15MilvusClient:
 
     def query(self, **kwargs: Any) -> list[dict[str, Any]]:
         self.query_calls.append(kwargs)
+        # model-space 采样校验：业务代码用 output_fields=["metadata"] +
+        # filter='vector_doc_id != ""' + limit=N 采样既有 Entity。
+        # 优先返回测试显式配置的 model_space_batches[0]，保持与旧
+        # query_iterator 测试数据准备方式兼容。
+        output_fields = kwargs.get("output_fields")
+        if (
+            output_fields == ["metadata"]
+            and self.model_space_batches
+        ):
+            sampled = self.model_space_batches[0]
+            if isinstance(sampled, list):
+                return sampled
         ids = kwargs.get("ids")
         if ids is None:
             rows = list(self.rows.values())
@@ -223,7 +235,6 @@ class FakeV15MilvusClient:
                 for vector_doc_id in ids
                 if vector_doc_id in self.rows
             ]
-        output_fields = kwargs.get("output_fields")
         if output_fields:
             rows = [
                 {field: row.get(field) for field in output_fields if field in row}
@@ -497,8 +508,8 @@ def test_v15_upsert_model_space_check_reads_flat_metadata() -> None:
 
     repository.upsert_batch(chunks)  # 模型空间一致，不应抛异常
 
-    scan_call = client.query_iterator_calls[0]
-    # 全量扫描 filter 基于一级 PK vector_doc_id（不引用任何不存在的 V15 scalar）。
+    scan_call = client.query_calls[0]
+    # 限量采样校验 filter 基于一级 PK vector_doc_id（不引用任何不存在的 V15 scalar）。
     assert scan_call["filter"] == 'vector_doc_id != ""'
     # model-space validation 仍从 metadata JSON 读取模型空间字段。
     assert scan_call["output_fields"] == ["metadata"]
@@ -901,7 +912,7 @@ def test_v15_model_space_cache_skips_scan_on_second_upsert() -> None:
 
     repository.upsert_batch(chunks)
     scans_before = sum(
-        1 for c in client.query_iterator_calls
+        1 for c in client.query_calls
         if c.get("filter") == 'vector_doc_id != ""'
     )
     assert repository._validated_model_space is not None
@@ -909,14 +920,14 @@ def test_v15_model_space_cache_skips_scan_on_second_upsert() -> None:
         "alibaba-bailian:text-embedding-v4"
     )
 
-    # 第二次：同 V15 Repository、同 model space，应命中缓存跳过扫描。
+    # 第二次：同 V15 Repository、同 model space，应命中缓存跳过采样查询。
     repository.upsert_batch(chunks)
     scans_after = sum(
-        1 for c in client.query_iterator_calls
+        1 for c in client.query_calls
         if c.get("filter") == 'vector_doc_id != ""'
     )
     assert scans_before == 1
-    assert scans_after == 1, "V15 第二次 upsert 不应再触发模型空间全表扫描"
+    assert scans_after == 1, "V15 第二次 upsert 不应再触发模型空间采样查询"
     assert len(client.upsert_calls) == 2
 
 
