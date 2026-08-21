@@ -1,8 +1,8 @@
-"""加工批次、来源扫描、CDC 事件与 Checkpoint 状态表的静态 DDL 契约测试。
+"""加工批次、来源扫描、同步任务、CDC 事件与 Checkpoint 表的静态 DDL 契约测试。
 
 本文件只读取版本库中的 SQL 文本，不连接或修改 MySQL。它用于第一阶段审查：确保
 新建库使用 001，现有库依次使用增量迁移补齐批次跟踪、同步统计、来源扫描范围和
-Checkpoint 和 CDC 事件表，并确保新环境不再创建已停用的 Stage/Chunk 持久化表。
+Checkpoint、CDC 事件和同步任务表，并确保新环境不再创建已停用的 Stage/Chunk 表。
 """
 
 from __future__ import annotations
@@ -16,6 +16,7 @@ VECTOR_STATS_MIGRATION = PROJECT_ROOT / "sql" / "006_add_vector_sync_stats.sql"
 SOURCE_CHECKPOINT_MIGRATION = PROJECT_ROOT / "sql" / "007_add_source_checkpoint.sql"
 SOURCE_BATCH_MIGRATION = PROJECT_ROOT / "sql" / "008_add_source_batch_tracking.sql"
 CDC_EVENT_MIGRATION = PROJECT_ROOT / "sql" / "009_add_cdc_event_tracking.sql"
+SYNC_TASK_MIGRATION = PROJECT_ROOT / "sql" / "010_add_incremental_sync_task.sql"
 
 VECTOR_STAT_FIELDS = {
     "vector_sync_expert_count",
@@ -174,12 +175,63 @@ def test_initial_schema_contains_minimal_cdc_event_tracking() -> None:
         assert forbidden_field not in event.lower()
 
 
+def test_initial_schema_contains_source_record_sync_tasks() -> None:
+    """新建库应按来源记录保存标准增量任务字段、状态和幂等键。"""
+
+    task = _create_table_block(_read(INITIAL_SCHEMA), "expert_index_sync_task")
+
+    for field in (
+        "batch_id",
+        "source_table",
+        "source_record_id",
+        "expert_id",
+        "operation_type",
+        "sync_status",
+        "retry_count",
+        "error_stage",
+        "error_type",
+        "error_message",
+        "result_code",
+        "created_at",
+        "started_at",
+        "completed_at",
+    ):
+        assert field in task
+    assert "UNIQUE KEY uk_expert_sync_task_source" in task
+    assert "batch_id, source_table, source_record_id" in task
+    assert "KEY idx_expert_sync_task_queue (sync_status, id)" in task
+    for operation_type in ("insert", "update", "delete"):
+        assert f"'{operation_type}'" in task
+    for status in ("pending", "processing", "success", "failed", "retrying", "dead"):
+        assert f"'{status}'" in task
+    for error_stage in (
+        "source",
+        "parse",
+        "pii",
+        "chunk_builder",
+        "generation",
+        "validation",
+        "embedding",
+        "milvus",
+        "checkpoint",
+    ):
+        assert f"'{error_stage}'" in task
+    for forbidden_field in (
+        "raw_payload",
+        "source_row",
+        "chunk_text",
+        "metadata json",
+        "embedding float_vector",
+    ):
+        assert forbidden_field not in task.lower()
+
+
 def test_initial_schema_only_creates_batch_state_tables() -> None:
     """新环境只创建批次和 Checkpoint 状态表，Stage/Chunk 继续走内存链路。"""
 
     schema = _read(INITIAL_SCHEMA)
 
-    assert schema.count("CREATE TABLE IF NOT EXISTS") == 5
+    assert schema.count("CREATE TABLE IF NOT EXISTS") == 6
     for removed_table in (
         "expert_index_stage",
         "expert_index_employment_stage",
@@ -281,6 +333,20 @@ def test_cdc_event_migration_only_creates_minimal_event_table() -> None:
     assert "UNIQUE KEY uk_expert_cdc_event_position" in event
     assert "destination, binlog_file, binlog_position, row_index" in event
     assert "KEY idx_expert_cdc_event_queue (status, id)" in event
+    assert "INSERT INTO" not in migration.upper()
+    assert "ALTER TABLE" not in migration.upper()
+    assert "DROP " not in migration.upper()
+
+
+def test_sync_task_migration_only_creates_task_state_table() -> None:
+    """现有库迁移只新增任务结构，不执行任务或推进 Checkpoint。"""
+
+    migration = _read(SYNC_TASK_MIGRATION)
+    task = _create_table_block(migration, "expert_index_sync_task")
+
+    assert "UNIQUE KEY uk_expert_sync_task_source" in task
+    assert "KEY idx_expert_sync_task_queue (sync_status, id)" in task
+    assert "retry_count SMALLINT UNSIGNED NOT NULL DEFAULT 0" in task
     assert "INSERT INTO" not in migration.upper()
     assert "ALTER TABLE" not in migration.upper()
     assert "DROP " not in migration.upper()

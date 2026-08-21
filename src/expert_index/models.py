@@ -1,4 +1,4 @@
-"""Checkpoint、Source、Stage 与最终 Chunk 的显式领域模型。
+"""Checkpoint、同步任务、Source、Stage 与最终 Chunk 的显式领域模型。
 
 Source 模型严格使用 MySQL 源表列名，审查时可以直接与 SELECT 字段逐一对照；
 Stage 模型使用清洗和标准化后的业务语义名；ChunkRecord 是内存中的下游输入快照。
@@ -23,6 +23,107 @@ CHECKPOINT_SOURCE_TABLES = frozenset(
 
 # 来源表在单个批次中的扫描状态；只描述扫描生命周期，不表示安全 Checkpoint 已推进。
 BATCH_SOURCE_SCAN_STATUSES = frozenset({"pending", "running", "success", "failed"})
+
+# 来源同步任务的完整生命周期。failed 表示本次执行失败但尚未进入重试，dead 表示
+# 已超过最大重试次数；是否推进 Checkpoint 由后续任务编排根据这些状态统一判断。
+SOURCE_SYNC_TASK_STATUSES = frozenset(
+    {"pending", "processing", "success", "failed", "retrying", "dead"}
+)
+
+# insert/update/delete 同时覆盖 updated_at 扫描与 CDC 事件，避免两条入口使用不同术语。
+SOURCE_SYNC_OPERATION_TYPES = frozenset({"insert", "update", "delete"})
+
+# 失败阶段只用于安全定位处理环节，不保存来源正文、Chunk Text 或其他业务数据。
+SOURCE_SYNC_ERROR_STAGES = frozenset(
+    {
+        "source",
+        "parse",
+        "pii",
+        "chunk_builder",
+        "generation",
+        "validation",
+        "embedding",
+        "milvus",
+        "checkpoint",
+    }
+)
+
+
+@dataclass(frozen=True)
+class SourceSyncTask:
+    """一条来源记录在增量链路中的持久化处理任务。
+
+    同一批次内以 ``source_table + source_record_id`` 定位唯一业务对象。该模型只保存
+    调度状态和安全错误摘要，不包含来源行、Chunk Text、Metadata 或 Embedding。
+    """
+
+    task_id: int  # expert_index_sync_task.id。
+    batch_id: int  # 所属增量批次 ID，对应 expert_index_batch.id。
+    source_table: str  # 发生变化的四张物理来源表之一。
+    source_record_id: int  # 来源表主键，用于重新读取当前完整业务记录。
+    expert_id: int | None  # 受影响专家；暂时无法映射时允许为空并等待处置。
+    operation_type: str  # 来源变化类型：insert/update/delete。
+    sync_status: str  # 处理状态：pending/processing/success/failed/retrying/dead。
+    retry_count: int  # 已执行的自动重试次数，不包含首次处理。
+    created_at: datetime  # 任务首次持久化时间。
+    error_stage: str | None = None  # 最近失败所在的标准处理阶段。
+    error_type: str | None = None  # 安全异常类型，不保存来源内容。
+    error_message: str | None = None  # 截断后的安全错误摘要，最长 512 字符。
+    result_code: str | None = None  # 机器结果码，如 no_chunkable_content。
+    started_at: datetime | None = None  # 最近一次开始处理的时间。
+    completed_at: datetime | None = None  # success 或 dead 的最终完成时间。
+
+    def __post_init__(self) -> None:
+        """保证任务字段能够安全映射到数据库约束和后续状态机。"""
+
+        for field_name, value in (
+            ("task_id", self.task_id),
+            ("batch_id", self.batch_id),
+            ("source_record_id", self.source_record_id),
+        ):
+            if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+                raise ValueError(f"{field_name} 必须是正整数")
+        if self.expert_id is not None and (
+            isinstance(self.expert_id, bool)
+            or not isinstance(self.expert_id, int)
+            or self.expert_id < 1
+        ):
+            raise ValueError("expert_id 必须是正整数或 None")
+        if self.source_table not in CHECKPOINT_SOURCE_TABLES:
+            raise ValueError(f"不支持的同步任务来源表: {self.source_table}")
+        if self.operation_type not in SOURCE_SYNC_OPERATION_TYPES:
+            raise ValueError(f"不支持的同步任务操作类型: {self.operation_type}")
+        if self.sync_status not in SOURCE_SYNC_TASK_STATUSES:
+            raise ValueError(f"不支持的同步任务状态: {self.sync_status}")
+        if (
+            isinstance(self.retry_count, bool)
+            or not isinstance(self.retry_count, int)
+            or self.retry_count < 0
+        ):
+            raise ValueError("retry_count 必须是非负整数")
+        if self.error_stage is not None and self.error_stage not in SOURCE_SYNC_ERROR_STAGES:
+            raise ValueError(f"不支持的同步任务失败阶段: {self.error_stage}")
+        for field_name, value, max_length in (
+            ("error_type", self.error_type, 128),
+            ("error_message", self.error_message, 512),
+            ("result_code", self.result_code, 64),
+        ):
+            if value is not None and (
+                not isinstance(value, str)
+                or not value.strip()
+                or len(value) > max_length
+            ):
+                raise ValueError(
+                    f"{field_name} 必须是长度不超过 {max_length} 的非空字符串或 None"
+                )
+        if not isinstance(self.created_at, datetime):
+            raise TypeError("created_at 必须是 datetime")
+        for field_name, value in (
+            ("started_at", self.started_at),
+            ("completed_at", self.completed_at),
+        ):
+            if value is not None and not isinstance(value, datetime):
+                raise TypeError(f"{field_name} 必须是 datetime 或 None")
 
 
 @dataclass(frozen=True, order=True)
