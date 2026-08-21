@@ -189,6 +189,8 @@ def test_create_batch_inserts_created_row() -> None:
 
     assert batch_id == 42
     assert connection.closed is True
+    # 写操作必须显式提交：连接工厂不保证 autocommit。
+    assert connection.commit_count == 1
     sql, params = cursor.executed[0]
     assert sql.startswith("INSERT INTO v15_vectorization_batch")
     assert "status" in sql and "'created'" in sql
@@ -202,6 +204,7 @@ def test_create_batch_records_upstream_batch_id() -> None:
     batch_id = repo.create_batch(total_count=3, upstream_batch_id=8)
 
     assert batch_id == 43
+    assert _connection.commit_count == 1
     sql, params = cursor.executed[0]
     assert "upstream_batch_id" in sql
     assert params == (3, 8)
@@ -760,3 +763,107 @@ def test_hash_format_and_source_table_are_validated() -> None:
         _upsert_input(content_hash="not-a-hash")
     with pytest.raises(ValueError, match="source_table"):
         _upsert_input(source_table="not_a_source_table")
+
+
+# ----------------------------------------------------------------------
+# 版本字段（chunk_type / source_event_id / source_updated_at）
+# ----------------------------------------------------------------------
+
+
+def test_version_fields_roundtrip_through_insert_and_read() -> None:
+    """版本字段落库与读取：INSERT 参数与行解析双向覆盖。"""
+
+    cursor = (
+        ScriptedCursor()
+        .expect(one={"status": "created"})
+        .expect(lastrowid=201)
+    )
+    repo, _connection = _repository(cursor)
+    event_time = datetime(2026, 8, 22, 9, 30, tzinfo=timezone.utc)
+
+    repo.create_work_items(
+        batch_id=3,
+        items=[
+            _upsert_input(
+                chunk_type="employment",
+                source_event_id=9025,
+                source_updated_at=event_time,
+            )
+        ],
+    )
+
+    insert_sql, params = cursor.executed[1]
+    assert "chunk_type" in insert_sql
+    assert "source_event_id" in insert_sql
+    assert "source_updated_at" in insert_sql
+    assert params is not None
+    # 新列追加在参数列表末尾，不影响既有位置语义。
+    assert params[16] == "employment"
+    assert params[17] == 9025
+    assert params[18] == event_time
+
+    # 读取路径：行解析还原三个字段。
+    read_cursor = ScriptedCursor().expect(
+        one={
+            "work_item_id": 201,
+            "batch_id": 3,
+            "operation": "upsert",
+            "vector_doc_id": "expert:10000:profile_summary",
+            "chunk_text": "专家简介文本",
+            "metadata_json": '{"contract_version": "4.0.0"}',
+            "content_hash": "a" * 64,
+            "metadata_hash": None,
+            "chunk_policy_version": "v4",
+            "embedding_model_alias": "alibaba-bailian:text-embedding-v4",
+            "embedding_model_version": "v1",
+            "is_active": 1,
+            "expert_id": 10000,
+            "chunk_type": "employment",
+            "source_table": "experts",
+            "source_field_id": "10000",
+            "source_event_id": 9025,
+            "source_updated_at": event_time,
+            "stale_vector_doc_ids": None,
+            "status": "created",
+            "attempts": 0,
+            "error_type": None,
+            "error_message": None,
+            "lease_until": None,
+            "processed_at": None,
+            "created_at": datetime(2026, 8, 22, tzinfo=timezone.utc),
+            "updated_at": datetime(2026, 8, 22, tzinfo=timezone.utc),
+        }
+    )
+    repo2, _connection2 = _repository(read_cursor)
+
+    item = repo2.get_work_item(201)
+
+    assert item.chunk_type == "employment"
+    assert item.source_event_id == 9025
+    assert item.source_updated_at == event_time
+
+
+def test_version_fields_default_to_none() -> None:
+    """未提供版本字段时落库为 NULL，读取还原为 None。"""
+
+    cursor = (
+        ScriptedCursor()
+        .expect(one={"status": "created"})
+        .expect(lastrowid=202)
+    )
+    repo, _connection = _repository(cursor)
+
+    repo.create_work_items(batch_id=3, items=[_upsert_input()])
+
+    _sql, params = cursor.executed[1]
+    assert params is not None
+    assert params[16] is None
+    assert params[17] is None
+    assert params[18] is None
+
+
+def test_unknown_chunk_type_is_rejected_by_model() -> None:
+    """chunk_type 必须是 Contract 三值之一（fail-closed）。"""
+
+    with pytest.raises(ValueError, match="chunk_type"):
+        _upsert_input(chunk_type="summary")

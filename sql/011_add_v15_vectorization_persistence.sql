@@ -22,6 +22,11 @@
 --   v15_vectorization_batch.upstream_batch_id 只读引用上游触发批次
 --   （如 expert_index_batch.batch_id）；保留本地自增 batch_id，
 --   不建立跨模块外键。
+--
+-- 事件顺序（旧事件保护）：
+--   source_event_id 记录上游 CDC 的单调递增事件 id，是新旧事件比较的
+--   主依据；source_updated_at 只作辅助时间字段。禁止用 CDC 位点字符串
+--   （binlog file:position）做字典序比较。
 
 CREATE TABLE IF NOT EXISTS v15_vectorization_batch (
     batch_id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
@@ -62,8 +67,11 @@ CREATE TABLE IF NOT EXISTS v15_vectorization_work_item (
     embedding_model_version VARCHAR(64) NULL COMMENT '模型空间校验依据之一',
     is_active TINYINT(1) NOT NULL DEFAULT 1 COMMENT '本项应用后的向量生命周期标记；disable 为 0',
     expert_id BIGINT UNSIGNED NULL COMMENT '所属专家 id；disable 项可空',
+    chunk_type VARCHAR(64) NULL COMMENT 'Contract chunk_type；disable 项可空',
     source_table VARCHAR(256) NULL COMMENT '四张专家来源表之一；disable 项可空',
     source_field_id VARCHAR(128) NULL COMMENT '来源字段定位 id；来源定位统一使用本字段命名',
+    source_event_id BIGINT UNSIGNED NULL COMMENT '上游 CDC 单调递增事件 id；新旧事件比较的主依据',
+    source_updated_at DATETIME(6) NULL COMMENT '来源事件时间；仅作辅助排序，不做字典序比较',
     stale_vector_doc_ids JSON NULL COMMENT '本次操作需失效的旧 vector_doc_id 数组',
     status VARCHAR(16) NOT NULL DEFAULT 'created'
         COMMENT 'created/running/committed/failed/rejected',
@@ -81,12 +89,18 @@ CREATE TABLE IF NOT EXISTS v15_vectorization_work_item (
     KEY idx_v15_work_item_batch (batch_id, status),
     KEY idx_v15_work_item_vector (vector_doc_id_hash),
     KEY idx_v15_work_item_source (source_table, source_field_id),
+    KEY idx_v15_work_item_chunk (chunk_type, status),
     KEY idx_v15_work_item_expert (expert_id),
     CONSTRAINT chk_v15_work_item_operation CHECK (
         operation IN ('upsert', 'metadata_update', 'disable')
     ),
     CONSTRAINT chk_v15_work_item_status CHECK (
         status IN ('created', 'running', 'committed', 'failed', 'rejected')
+    ),
+    CONSTRAINT chk_v15_work_item_chunk_type CHECK (
+        chunk_type IS NULL OR chunk_type IN (
+            'profile_summary', 'employment', 'project'
+        )
     ),
     CONSTRAINT chk_v15_work_item_source_table CHECK (
         source_table IS NULL OR source_table IN (

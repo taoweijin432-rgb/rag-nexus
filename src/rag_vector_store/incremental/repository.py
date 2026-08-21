@@ -50,8 +50,9 @@ _ERROR_MESSAGE_MAX = 512
 _ITEM_COLUMNS = (
     "work_item_id, batch_id, operation, vector_doc_id, chunk_text, metadata_json, "
     "content_hash, metadata_hash, chunk_policy_version, embedding_model_alias, "
-    "embedding_model_version, is_active, expert_id, source_table, source_field_id, "
-    "stale_vector_doc_ids, status, attempts, error_type, error_message, "
+    "embedding_model_version, is_active, expert_id, chunk_type, source_table, "
+    "source_field_id, source_event_id, source_updated_at, stale_vector_doc_ids, "
+    "status, attempts, error_type, error_message, "
     "lease_until, processed_at, created_at, updated_at"
 )
 
@@ -144,7 +145,9 @@ class MySQLV15VectorizationRepository:
             raise ValueError("total_count 不能为负数")
         connection = self._connector()
         try:
-            with connection.cursor() as cursor:
+            # 显式事务提交：连接工厂不保证 autocommit，裸 INSERT 会随
+            # 短连接关闭而回滚。
+            with _transaction(connection), connection.cursor() as cursor:
                 cursor.execute(
                     f"INSERT INTO {_BATCH_TABLE} "
                     "(status, total_count, upstream_batch_id) VALUES ('created', %s, %s)",
@@ -326,9 +329,10 @@ class MySQLV15VectorizationRepository:
                 "batch_id, operation, vector_doc_id, vector_doc_id_hash, chunk_text, "
                 "metadata_json, content_hash, metadata_hash, chunk_policy_version, "
                 "embedding_model_alias, embedding_model_version, is_active, expert_id, "
-                "source_table, source_field_id, stale_vector_doc_ids, status"
+                "source_table, source_field_id, stale_vector_doc_ids, status, "
+                "chunk_type, source_event_id, source_updated_at"
                 ") VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, "
-                "'created')",
+                "'created', %s, %s, %s)",
                 (
                     batch_id,
                     item.operation,
@@ -348,6 +352,9 @@ class MySQLV15VectorizationRepository:
                     _json_param(list(item.stale_vector_doc_ids))
                     if item.stale_vector_doc_ids
                     else None,
+                    item.chunk_type,
+                    item.source_event_id,
+                    item.source_updated_at,
                 ),
             )
         except IntegrityError as exc:
@@ -710,8 +717,15 @@ def _work_item_from_row(row: dict[str, Any]) -> V15VectorizationWorkItem:
         expert_id=(
             int(row["expert_id"]) if row.get("expert_id") is not None else None
         ),
+        chunk_type=row.get("chunk_type"),
         source_table=row.get("source_table"),
         source_field_id=row.get("source_field_id"),
+        source_event_id=(
+            int(row["source_event_id"])
+            if row.get("source_event_id") is not None
+            else None
+        ),
+        source_updated_at=row.get("source_updated_at"),
         stale_vector_doc_ids=stale,
         status=row["status"],
         attempts=int(row.get("attempts", 0)),

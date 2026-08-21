@@ -35,6 +35,10 @@ ALLOWED_SOURCE_TABLES: tuple[str, ...] = (
     "experts_education_experience",
 )
 
+# 与 Contract 的 ``ChunkType`` 对齐的三值枚举；独立声明以保持本模块
+# 不依赖 expert_contracts 内部符号。
+V15ChunkType = Literal["profile_summary", "employment", "project"]
+
 V15WorkItemOperation = Literal["upsert", "metadata_update", "disable"]
 V15WorkItemStatus = Literal[
     "created",
@@ -89,8 +93,15 @@ class V15WorkItemInput(BaseModel):
     embedding_model_version: str | None = Field(default=None, max_length=64)
     is_active: bool = True
     expert_id: int | None = Field(default=None, ge=0)
+    chunk_type: V15ChunkType | None = None
     source_table: str | None = Field(default=None, max_length=256)
     source_field_id: str | None = Field(default=None, max_length=128)
+    source_event_id: int | None = Field(
+        default=None,
+        ge=0,
+        description="上游 CDC 单调递增事件 id；新旧事件比较的主依据",
+    )
+    source_updated_at: datetime | None = None
     stale_vector_doc_ids: tuple[str, ...] = ()
 
     @field_validator("vector_doc_id")
@@ -190,8 +201,11 @@ class V15VectorizationWorkItem(BaseModel):
     embedding_model_version: str | None = None
     is_active: bool = True
     expert_id: int | None = None
+    chunk_type: V15ChunkType | None = None
     source_table: str | None = None
     source_field_id: str | None = None
+    source_event_id: int | None = None
+    source_updated_at: datetime | None = None
     stale_vector_doc_ids: tuple[str, ...] = ()
     status: V15WorkItemStatus
     attempts: int = 0

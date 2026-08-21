@@ -361,7 +361,9 @@ def test_delete_vectors_empty_is_safe() -> None:
     assert repo.delete_calls == []
 
 
-def test_delete_vectors_dedupes() -> None:
+def test_delete_vectors_dedupes_via_disable() -> None:
+    """delete_vectors 去重且逐条只读一次（逻辑下线路径）。"""
+
     repo = FakeMilvusRepository()
     service = VectorIngestionService(
         ingestion_service=ContractBatchIngestionService(
@@ -376,18 +378,18 @@ def test_delete_vectors_dedupes() -> None:
 
     assert result.requested_count == 1
     assert result.deleted_count == 1
-    assert repo.delete_calls == [[chunk.vector_doc_id]]
+    # 不触发物理删除；去重后只读取一次。
+    assert repo.delete_calls == []
+    assert repo.get_calls == [chunk.vector_doc_id]
+    assert chunk.vector_doc_id in repo.rows
 
 
-def test_delete_vectors_converts_repo_error() -> None:
+def test_disable_upsert_error_converts_to_milvus_error() -> None:
+    """逻辑下线回写失败时按 Milvus 层故障路由公共异常。"""
+
     repo = FakeMilvusRepository()
-    repo.delete_error = RuntimeError("galaxy down")
-    service = VectorIngestionService(
-        ingestion_service=ContractBatchIngestionService(
-            ContractEmbeddingWorker(FakeEmbeddingModel()), repo
-        ),
-        repository=repo,  # type: ignore[arg-type]
-    )
+    repo.upsert_error = RuntimeError("galaxy down")
+    service = make_service(repo)
     chunk = embedded_chunks()[0]
     repo.rows[chunk.vector_doc_id] = MilvusV15RowMapper().to_row(chunk)
 
@@ -640,9 +642,9 @@ def test_update_metadata_does_not_call_embedding() -> None:
     embed_calls: list[int] = []
 
     class TrackingWorker(ContractEmbeddingWorker):
-        def embed(self, chunks: Any) -> Any:
+        def embed(self, records: Any) -> Any:
             embed_calls.append(1)
-            return super().embed(chunks)
+            return super().embed(records)
 
     service = VectorIngestionService(
         ingestion_service=ContractBatchIngestionService(
@@ -863,9 +865,9 @@ def test_update_metadata_metadata_only_does_not_call_embedding() -> None:
     embed_calls: list[int] = []
 
     class TrackingWorker(ContractEmbeddingWorker):
-        def embed(self, chunks: Any) -> Any:
+        def embed(self, records: Any) -> Any:
             embed_calls.append(1)
-            return super().embed(chunks)
+            return super().embed(records)
 
     service = VectorIngestionService(
         ingestion_service=ContractBatchIngestionService(
@@ -957,17 +959,148 @@ def test_upsert_chunks_runtime_error_from_repo_converted() -> None:
         service.upsert_chunks(input_records())
 
 
-def test_delete_vectors_type_error_from_repo_converted() -> None:
+def test_delete_vectors_get_type_error_converted() -> None:
+    """逻辑下线读取旧实体失败时按 Milvus 层故障路由公共异常。"""
+
     repo = FakeMilvusRepository()
-    repo.delete_error = TypeError("Milvus query returned invalid entity structure")
-    service = VectorIngestionService(
-        ingestion_service=ContractBatchIngestionService(
-            ContractEmbeddingWorker(FakeEmbeddingModel()), repo
-        ),
-        repository=repo,  # type: ignore[arg-type]
-    )
+    repo.get_error = TypeError("Milvus query returned invalid entity structure")
+    service = make_service(repo)
     with pytest.raises(VectorMilvusError):
         service.delete_vectors(["expert:900001:profile_summary:900001:0"])
+
+
+def test_delete_vectors_get_value_error_is_milvus_error() -> None:
+    """逻辑下线读取旧实体的 ValueError 同样路由为 Milvus 层故障。"""
+
+    repo = FakeMilvusRepository()
+    repo.get_error = ValueError("Milvus delete 失败")
+    service = make_service(repo)
+    with pytest.raises(VectorMilvusError):
+        service.delete_vectors(["expert:900001:profile_summary:900001:0"])
+
+
+# ---------------------------------------------------------------------------
+# disable_vectors（统一逻辑下线）
+# ---------------------------------------------------------------------------
+def test_disable_vectors_marks_inactive_and_preserves_payload() -> None:
+    """disable 成功：实体保留，仅 is_active 变化，向量/文本/历史 metadata 不变。"""
+
+    repo = FakeMilvusRepository()
+    service = make_service(repo)
+    chunk = embedded_chunks()[0]
+    original_row = MilvusV15RowMapper().to_row(chunk)
+    repo.rows[chunk.vector_doc_id] = dict(original_row)
+
+    result = service.disable_vectors([chunk.vector_doc_id])
+
+    assert isinstance(result, VectorDeletionResult)
+    assert result.requested_count == 1
+    assert result.deleted_count == 1
+    assert result.not_found_count == 0
+    # 实体仍在，无物理删除调用。
+    assert repo.delete_calls == []
+    new_row = repo.rows[chunk.vector_doc_id]
+    assert new_row is not None
+    restored = MilvusV15RowMapper().from_row(new_row)
+    assert restored.is_active is False
+    # 向量、正文与全部历史内容保持不变。
+    assert restored.embedding == chunk.embedding
+    assert restored.chunk_text == chunk.chunk_text
+    assert restored.content_hash == chunk.content_hash
+    assert restored.metadata_hash == chunk.metadata_hash
+    assert restored.metadata == chunk.metadata
+    assert restored.embedding_model_alias == chunk.embedding_model_alias
+    assert restored.embedding_dim == chunk.embedding_dim
+
+
+def test_disable_vectors_is_idempotent_on_replay() -> None:
+    """重复 disable 幂等：已下线实体不再触发写入。"""
+
+    repo = FakeMilvusRepository()
+    service = make_service(repo)
+    chunk = embedded_chunks()[0]
+    repo.rows[chunk.vector_doc_id] = MilvusV15RowMapper().to_row(chunk)
+
+    first = service.disable_vectors([chunk.vector_doc_id])
+    upserts_after_first = len(repo.upsert_calls)
+    second = service.disable_vectors([chunk.vector_doc_id])
+
+    assert first.deleted_count == 1
+    assert second.deleted_count == 1
+    assert second.not_found_count == 0
+    # 重放零写入。
+    assert len(repo.upsert_calls) == upserts_after_first
+
+
+def test_disable_vectors_missing_ids_counted_not_found() -> None:
+    """不存在的 id 计入 not_found，不报错（幂等语义）。"""
+
+    repo = FakeMilvusRepository()
+    service = make_service(repo)
+
+    result = service.disable_vectors(
+        ["expert:999:profile_summary:999:0", "expert:998:employment:998:0"]
+    )
+
+    assert result.requested_count == 2
+    assert result.deleted_count == 0
+    assert result.not_found_count == 2
+    assert repo.upsert_calls == []
+
+
+def test_disabled_chunk_can_be_reupserted_active() -> None:
+    """已 disable 的同 vector_doc_id 重新 upsert 后恢复 active。
+
+    覆盖"disabled 数据不阻止同 vector_doc_id 重新出现"：upsert 以主键
+    覆盖写回，is_active 随新输入恢复为 true。
+    """
+
+    repo = FakeMilvusRepository()
+    service = make_service(repo)
+    chunks = embedded_chunks()
+    inputs = input_records()
+    target_input = inputs[0]
+    target_id = chunks[0].vector_doc_id
+    repo.rows[target_id] = MilvusV15RowMapper().to_row(chunks[0])
+
+    disabled = service.disable_vectors([target_id])
+    assert disabled.deleted_count == 1
+    assert (
+        MilvusV15RowMapper().from_row(repo.rows[target_id]).is_active is False
+    )
+
+    reupsert = service.upsert_chunks([target_input])
+
+    assert reupsert.embedded_count == 1
+    restored = MilvusV15RowMapper().from_row(repo.rows[target_id])
+    assert restored.is_active is True
+    assert restored.content_hash == chunks[0].content_hash
+
+
+def test_list_vectors_by_expert_includes_disabled_without_blocking_upsert() -> None:
+    """list 默认结果包含 disabled id，但不阻止同一 Chunk 重新 upsert。"""
+
+    repo = FakeMilvusRepository()
+    service = make_service(repo)
+    chunks = embedded_chunks()
+    inputs = input_records()
+    for c in chunks:
+        repo.rows[c.vector_doc_id] = MilvusV15RowMapper().to_row(c)
+    target_id = chunks[0].vector_doc_id
+    expert_id = chunks[0].expert_id
+
+    service.disable_vectors([target_id])
+
+    listed = service.list_vectors_by_expert(expert_id)
+    # disabled 实体仍被列出（保留在 Collection 内），供 diff 与审计。
+    assert target_id in listed.vector_doc_ids
+
+    # 列出并不阻止恢复：重新 upsert 成功。
+    reupsert = service.upsert_chunks([inputs[0]])
+    assert reupsert.embedded_count == 1
+    assert (
+        MilvusV15RowMapper().from_row(repo.rows[target_id]).is_active is True
+    )
 
 
 def test_get_vectors_type_error_from_repo_converted() -> None:
@@ -1123,19 +1256,6 @@ def test_get_vectors_repository_value_error_is_milvus_error() -> None:
     )
     with pytest.raises(VectorMilvusError):
         service.get_vectors(["expert:900001:profile_summary:900001:0"])
-
-
-def test_delete_vectors_repository_value_error_is_milvus_error() -> None:
-    repo = FakeMilvusRepository()
-    repo.delete_error = ValueError("Milvus delete 失败")
-    service = VectorIngestionService(
-        ingestion_service=ContractBatchIngestionService(
-            ContractEmbeddingWorker(FakeEmbeddingModel()), repo
-        ),
-        repository=repo,  # type: ignore[arg-type]
-    )
-    with pytest.raises(VectorMilvusError):
-        service.delete_vectors(["expert:900001:profile_summary:900001:0"])
 
 
 def test_list_vectors_by_expert_bad_expert_id_is_contract_error() -> None:

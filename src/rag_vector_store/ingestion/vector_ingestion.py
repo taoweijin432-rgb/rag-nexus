@@ -2,7 +2,9 @@
 
 职责：
     - ``upsert_chunks``：正式 Chunk 向量化并写入 Milvus（复用 ContractBatchIngestionService）。
-    - ``delete_vectors``：按 vector_doc_id 删除 Milvus 向量。
+    - ``disable_vectors``：按 vector_doc_id 逻辑下线向量（保留实体与向量，仅置 is_active=false）。
+    - ``delete_vectors``：在线删除入口；自 T2-1 起统一委派给 ``disable_vectors``，
+      不再触发物理删除（保持原签名与返回类型，上游 Port 无感知）。
     - ``get_vectors``：批量查询 Milvus 记录（不含 embedding）。
     - ``update_metadata``：metadata-only 更新，复用旧向量，不调用 Embedding。
     - ``list_vectors_by_expert``：按专家列出轻量 vector_doc_id。
@@ -244,36 +246,70 @@ class VectorIngestionService:
         return VectorIngestionResult(results=items)
 
     # ------------------------------------------------------------------
-    # 2. delete_vectors
+    # 2. disable_vectors / delete_vectors（统一逻辑下线）
     # ------------------------------------------------------------------
+    @_guard_errors
+    def disable_vectors(
+        self,
+        vector_doc_ids: Sequence[str],
+    ) -> VectorDeletionResult:
+        """按 vector_doc_id 集合逻辑下线 Milvus 向量（无物理删除）。
+
+        逐条流程：
+            1. ``get_by_vector_doc_id(include_embedding=True)`` 读取现有完整实体；
+            2. 实体不存在 → 计入 ``not_found_count``（幂等，不报错）；
+            3. 已处于 is_active=false → 幂等重放，跳过写入、计入下线数；
+            4. 否则保留 vector_doc_id / chunk_text / embedding 与全部历史
+               metadata，仅置 ``is_active=false`` 后以同一主键 upsert 回写。
+
+        全程禁止调用 ``repository.delete_by_vector_doc_ids``；旧实体携带的
+        model_space 信息随行保留，若与 Collection 现行空间不一致由底层
+        upsert 校验 fail-closed。
+
+        返回的 ``deleted_count`` 语义为"处理后处于下线状态的数量"。
+        """
+
+        cleaned = _dedupe(vector_doc_ids)
+        disabled_count = 0
+        not_found_count = 0
+        for vector_doc_id in cleaned:
+            old_row = _guard_call(
+                self.repository.get_by_vector_doc_id,
+                vector_doc_id,
+                include_embedding=True,
+            )
+            if old_row is None:
+                not_found_count += 1
+                continue
+            old_chunk = _guard_call(self.row_mapper.from_row, old_row)
+            if not old_chunk.is_active:
+                # 幂等重放：目标已处于下线状态，不重复写 Milvus。
+                disabled_count += 1
+                continue
+            new_chunk = old_chunk.model_copy(update={"is_active": False})
+            _guard_call(self.repository.upsert_batch, [new_chunk])
+            disabled_count += 1
+        return VectorDeletionResult(
+            requested_count=len(cleaned),
+            deleted_count=disabled_count,
+            not_found_count=not_found_count,
+        )
+
     @_guard_errors
     def delete_vectors(
         self,
         vector_doc_ids: Sequence[str],
     ) -> VectorDeletionResult:
-        """按 vector_doc_id 集合删除 Milvus 向量。
+        """按 vector_doc_id 集合下线 Milvus 向量（在线删除入口）。
 
-        空输入安全返回；保留去重顺序；删除幂等。
-        单次 ``delete_by_vector_doc_ids`` 删除，按实际 ``deleted_count`` 推导
-        ``not_found_count``（= requested_count - deleted_count）。
-        pymilvus delete 只返回删除条数，不返回具体主键；因此公共结果只报告
-        可靠的数量（requested / deleted / not_found_count），不伪造具体未命中 ID。
+        自 T2-1 起在线删除语义统一为逻辑下线：本方法只委派
+        ``disable_vectors``（保留实体与向量，仅置 is_active=false），
+        不再调用 ``repository.delete_by_vector_doc_ids`` 物理删除。
+        签名与返回类型不变，上游 ``VectorStorePort`` 调用方无感知；
+        空输入安全返回，去重保序，重复执行幂等。
         """
 
-        cleaned = _dedupe(vector_doc_ids)
-        if not cleaned:
-            return VectorDeletionResult(
-                requested_count=0,
-                deleted_count=0,
-            )
-
-        mutation = _guard_call(self.repository.delete_by_vector_doc_ids, cleaned)
-        deleted_count = mutation.affected_count
-        return VectorDeletionResult(
-            requested_count=len(cleaned),
-            deleted_count=deleted_count,
-            not_found_count=len(cleaned) - deleted_count,
-        )
+        return self.disable_vectors(vector_doc_ids)
 
     # ------------------------------------------------------------------
     # 3. get_vectors
