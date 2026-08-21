@@ -38,8 +38,8 @@ from ..chunking.contract_pipeline import (
     EmbeddingEligibilityError,
 )
 from ..embedding_adapters.company_cloud import CompanyCloudEmbeddingError
-from ..milvus.contract import MilvusRowMapper
-from ..milvus.repository import ContractMilvusVectorRepository
+from ..milvus.contract_v15 import MilvusV15RowMapper
+from ..milvus.repository import ContractMilvusRepositoryBase
 from ..model_space import (
     FORMAL_EMBEDDING_MODEL_SPACE_ID,
     build_model_space_id,
@@ -138,9 +138,9 @@ def _dedupe(vector_doc_ids: Sequence[str]) -> list[str]:
     return cleaned
 
 
-# 增量幂等读取需要投影到逻辑返回顶层的两个哈希字段名。V14 把它们存为物理
-# 一级字段，V15 把它们移进 ``metadata`` JSON；本常量只服务于 get_vectors 的
-# 逻辑投影，不代表物理 Schema 字段。
+# 增量幂等读取需要投影到逻辑返回顶层的两个哈希字段名。V15 把它们存进
+# ``metadata`` JSON；本常量只服务于 get_vectors 的逻辑投影，不代表物理
+# Schema 字段。
 _HASH_PROJECTION_FIELDS = ("content_hash", "metadata_hash")
 
 
@@ -149,7 +149,8 @@ def _project_hash_fields(row: Mapping[str, object]) -> dict[str, object]:
 
     语义：
         - 不修改原始物理 row（先 ``dict(row)`` 复制）；
-        - 顶层已有合法哈希时保持不变（V14 物理 row 即此形态）；
+        - 顶层已有合法哈希时保持不变（兼容历史 V14 物理 row 形态，已是死分支
+          但无害，避免误处理旧回放数据）；
         - 顶层缺失时，从 ``metadata`` JSON 中提取 ``content_hash`` /
           ``metadata_hash`` 到逻辑返回顶层（V15 物理 row 哈希位于 metadata）；
         - 只投影本模块明确声明需要的哈希字段，不平铺其它 metadata 字段；
@@ -193,9 +194,9 @@ class VectorIngestionService:
         *,
         ingestion_service: ContractBatchIngestionService | None = None,
         embedding_worker: ContractEmbeddingWorker | None = None,
-        repository: ContractMilvusVectorRepository,
+        repository: ContractMilvusRepositoryBase,
         validator: ContractValidator | None = None,
-        row_mapper: MilvusRowMapper | None = None,
+        row_mapper: MilvusV15RowMapper | None = None,
         expected_dimension: int = EXPECTED_EMBEDDING_DIMENSION,
         formal_model_space_id: str = FORMAL_EMBEDDING_MODEL_SPACE_ID,
     ) -> None:
@@ -211,7 +212,9 @@ class VectorIngestionService:
         self.ingestion = ingestion_service
         self.repository = repository
         self.validator = validator or ContractValidator()
-        self.row_mapper = row_mapper if row_mapper is not None else MilvusRowMapper()
+        # 默认 Mapper 固定为 V15，禁止静默回退到已退役的 V14 Mapper；
+        # 正式组装应通过 factory 注入与 repository profile 一致的 Mapper。
+        self.row_mapper = row_mapper if row_mapper is not None else MilvusV15RowMapper()
         self.expected_dimension = expected_dimension
         self.formal_model_space_id = formal_model_space_id
 
@@ -285,8 +288,8 @@ class VectorIngestionService:
         保留输入去重顺序；``records`` 为命中的记录，``missing`` 为未命中主键。
 
         hash 投影契约：上游 ``ExpertVectorSynchronizer`` 增量幂等判断只读取
-        逻辑 record 顶层的 ``content_hash`` / ``metadata_hash``（V14 把这两个
-        哈希存为物理一级字段，V15 把它们移进了 ``metadata`` JSON）。这里在
+        逻辑 record 顶层的 ``content_hash`` / ``metadata_hash``（V15 把这两个
+        哈希存进 ``metadata`` JSON）。这里在
         Service 边界做统一的逻辑投影——顶层已有合法哈希时保持不变，否则从
         ``metadata`` JSON 中提取这两个字段到逻辑返回顶层。这是纯内存投影，
         不修改 Milvus 物理 Schema，不增加一级字段，不平铺其它 metadata 字段；
@@ -325,7 +328,7 @@ class VectorIngestionService:
                ``content_hash`` / ``chunk_text`` 必须与 existing 实体完全一致，
                否则属于调用方误用（正文/主键已变化），立即抛 ``VectorContractError``；
             4. 安全门：旧 Entity 存在 / model_space 一致 / embedding_dim 一致；
-            5. 通过 → ``MilvusRowMapper.from_row`` 复用旧向量 + 新 metadata upsert；
+            5. 通过 → ``MilvusV15RowMapper.from_row`` 复用旧向量 + 新 metadata upsert；
             6. model_space/dim 安全门失败 → 该条 ``status=failed``、
                ``recommendation="call_upsert"``，不调用 Embedding、不静默降级。
         """

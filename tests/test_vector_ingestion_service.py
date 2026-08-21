@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -17,7 +17,7 @@ from rag_vector_store import (
     ContractIngestionResult,
     ContractValidationError,
     EmbeddedContractPreparedChunk,
-    MilvusRowMapper,
+    MilvusV15RowMapper,
     MutationResult,
     VectorContractError,
     VectorDeletionResult,
@@ -28,7 +28,6 @@ from rag_vector_store import (
     VectorQueryResult,
 )
 from rag_vector_store.chunking.contract_pipeline import ContractEmbeddingWorker
-from rag_vector_store.milvus import MilvusV15RowMapper
 from rag_vector_store.model_space import build_model_space_id
 
 FIXTURE_PATH = (
@@ -47,6 +46,17 @@ class FakeEmbeddingModel:
 
     def embed(self, texts: Sequence[str]) -> list[list[float]]:
         return [[0.1] * 1024 for _ in texts]
+
+
+def _row_expert_id(row: dict[str, Any]) -> Any:
+    """从 fake row 提取 expert_id，兼容 V15（位于 metadata JSON）。"""
+
+    if "expert_id" in row:
+        return row["expert_id"]
+    metadata = row.get("metadata")
+    if isinstance(metadata, Mapping):
+        return metadata.get("expert_id")
+    return None
 
 
 class FakeMilvusRepository:
@@ -100,7 +110,7 @@ class FakeMilvusRepository:
         if self.upsert_error is not None:
             raise self.upsert_error
         for record in records:
-            self.rows[record.vector_doc_id] = MilvusRowMapper().to_row(record)
+            self.rows[record.vector_doc_id] = MilvusV15RowMapper().to_row(record)
         return MutationResult(
             affected_count=len(records),
             primary_keys=[r.vector_doc_id for r in records],
@@ -118,7 +128,7 @@ class FakeMilvusRepository:
         fields = (
             list(output_fields)
             if output_fields is not None
-            else ["vector_doc_id", "expert_id", "content_hash", "metadata_hash"]
+            else ["vector_doc_id"]
         )
         return [
             {
@@ -127,7 +137,7 @@ class FakeMilvusRepository:
                 if field in row
             }
             for row in self.rows.values()
-            if row.get("expert_id") == expert_id
+            if _row_expert_id(row) == expert_id
         ]
 
 
@@ -278,7 +288,7 @@ def test_delete_vectors_success() -> None:
     )
     chunks = embedded_chunks()
     for c in chunks:
-        repo.rows[c.vector_doc_id] = MilvusRowMapper().to_row(c)
+        repo.rows[c.vector_doc_id] = MilvusV15RowMapper().to_row(c)
     ids = [c.vector_doc_id for c in chunks]
 
     result = service.delete_vectors(ids)
@@ -299,7 +309,7 @@ def test_delete_vectors_missing() -> None:
     )
     chunks = embedded_chunks()
     for c in chunks:
-        repo.rows[c.vector_doc_id] = MilvusRowMapper().to_row(c)
+        repo.rows[c.vector_doc_id] = MilvusV15RowMapper().to_row(c)
     present = chunks[0].vector_doc_id
     missing = "expert:999:profile_summary:999:0"
 
@@ -323,7 +333,7 @@ def test_delete_vectors_not_found_count_only_reports_count() -> None:
     )
     chunks = embedded_chunks()
     for c in chunks:
-        repo.rows[c.vector_doc_id] = MilvusRowMapper().to_row(c)
+        repo.rows[c.vector_doc_id] = MilvusV15RowMapper().to_row(c)
     missing = "expert:999:profile_summary:999:0"
     present = chunks[0].vector_doc_id
 
@@ -360,7 +370,7 @@ def test_delete_vectors_dedupes() -> None:
         repository=repo,  # type: ignore[arg-type]
     )
     chunk = embedded_chunks()[0]
-    repo.rows[chunk.vector_doc_id] = MilvusRowMapper().to_row(chunk)
+    repo.rows[chunk.vector_doc_id] = MilvusV15RowMapper().to_row(chunk)
 
     result = service.delete_vectors([chunk.vector_doc_id, chunk.vector_doc_id])
 
@@ -379,7 +389,7 @@ def test_delete_vectors_converts_repo_error() -> None:
         repository=repo,  # type: ignore[arg-type]
     )
     chunk = embedded_chunks()[0]
-    repo.rows[chunk.vector_doc_id] = MilvusRowMapper().to_row(chunk)
+    repo.rows[chunk.vector_doc_id] = MilvusV15RowMapper().to_row(chunk)
 
     with pytest.raises(VectorMilvusError):
         service.delete_vectors([chunk.vector_doc_id])
@@ -398,7 +408,7 @@ def test_get_vectors_existing_and_missing() -> None:
     )
     chunks = embedded_chunks()
     for c in chunks:
-        repo.rows[c.vector_doc_id] = MilvusRowMapper().to_row(c)
+        repo.rows[c.vector_doc_id] = MilvusV15RowMapper().to_row(c)
     missing = "expert:999:profile_summary:999:0"
     ids = [chunks[0].vector_doc_id, missing, chunks[1].vector_doc_id]
 
@@ -424,7 +434,7 @@ def test_get_vectors_dedupes_and_orders() -> None:
     )
     chunks = embedded_chunks()
     for c in chunks:
-        repo.rows[c.vector_doc_id] = MilvusRowMapper().to_row(c)
+        repo.rows[c.vector_doc_id] = MilvusV15RowMapper().to_row(c)
     ids = [chunks[1].vector_doc_id, chunks[0].vector_doc_id, chunks[1].vector_doc_id]
 
     result = service.get_vectors(ids)
@@ -501,31 +511,6 @@ def test_get_vectors_v15_supports_existing_rows_idempotent_read() -> None:
         original = next(c for c in chunks if c.vector_doc_id == vector_doc_id)
         assert item["content_hash"] == original.content_hash
         assert item["metadata_hash"] == original.metadata_hash
-
-
-def test_get_vectors_v14_keeps_top_level_hash_unchanged() -> None:
-    """V14 物理 row 哈希已位于顶层；投影不应改变其形态或哈希值。"""
-
-    chunks = embedded_chunks()
-    repo = FakeMilvusRepository()
-    for c in chunks:
-        repo.rows[c.vector_doc_id] = MilvusRowMapper().to_row(c)
-    service = VectorIngestionService(
-        ingestion_service=ContractBatchIngestionService(
-            ContractEmbeddingWorker(FakeEmbeddingModel()), repo
-        ),
-        repository=repo,  # type: ignore[arg-type]
-    )
-    chunk = chunks[0]
-
-    result = service.get_vectors([chunk.vector_doc_id])
-
-    record = result.records[0]
-    assert record["content_hash"] == chunk.content_hash
-    assert record["metadata_hash"] == chunk.metadata_hash
-    # V14 物理 row 顶层本就有哈希，逻辑返回形态与物理一致
-    assert "content_hash" in repo.rows[chunk.vector_doc_id]
-    assert "metadata_hash" in repo.rows[chunk.vector_doc_id]
 
 
 def test_get_vectors_v15_missing_content_hash_fails_closed() -> None:
@@ -611,7 +596,7 @@ def test_get_vectors_v15_does_not_mutate_physical_row() -> None:
 # ---------------------------------------------------------------------------
 def _repo_with_one(chunk: EmbeddedContractPreparedChunk) -> FakeMilvusRepository:
     repo = FakeMilvusRepository()
-    repo.rows[chunk.vector_doc_id] = MilvusRowMapper().to_row(chunk)
+    repo.rows[chunk.vector_doc_id] = MilvusV15RowMapper().to_row(chunk)
     return repo
 
 
@@ -759,9 +744,12 @@ def test_update_metadata_content_hash_change_fails_closed() -> None:
 
     old_chunk = embedded_chunks()[0]
     repo = _repo_with_one(old_chunk)
-    # 篕改 existing row 的 content_hash，模拟 existing 实体状态异常
+    # 篕改 existing row 的 content_hash（V15 中位于 metadata JSON），模拟 existing
+    # 实体状态异常
     tampered_row = dict(repo.rows[old_chunk.vector_doc_id])
-    tampered_row["content_hash"] = "b" * 64
+    tampered_metadata = dict(tampered_row["metadata"])
+    tampered_metadata["content_hash"] = "b" * 64
+    tampered_row["metadata"] = tampered_metadata
     repo.rows[old_chunk.vector_doc_id] = tampered_row
     service = make_service(repo)
 
@@ -906,7 +894,7 @@ def test_list_vectors_by_expert() -> None:
     )
     chunks = embedded_chunks()
     for c in chunks:
-        repo.rows[c.vector_doc_id] = MilvusRowMapper().to_row(c)
+        repo.rows[c.vector_doc_id] = MilvusV15RowMapper().to_row(c)
 
     result = service.list_vectors_by_expert(900001)
 
@@ -1010,8 +998,8 @@ def test_list_vectors_by_expert_type_error_converted() -> None:
 
 def _repo_with_corrupted_row(chunk: EmbeddedContractPreparedChunk) -> FakeMilvusRepository:
     repo = FakeMilvusRepository()
-    row = MilvusRowMapper().to_row(chunk)
-    row.pop("metadata_ext")  # 破坏反向映射所需字段
+    row = MilvusV15RowMapper().to_row(chunk)
+    row.pop("metadata")  # 破坏反向映射所需的 flat metadata JSON
     repo.rows[chunk.vector_doc_id] = row
     return repo
 
@@ -1183,13 +1171,10 @@ def test_update_metadata_from_row_validation_error_is_milvus_error() -> None:
     VectorMilvusError，不泄漏原始异常。"""
 
     repo = FakeMilvusRepository()
-    # 构造一个 from_row 会抛异常的非法行（缺必需标量字段）
+    # 构造一个 from_row 会抛异常的非法行（缺 flat metadata JSON）
     chunk = embedded_chunks()[0]
     bad_row = {
         "vector_doc_id": chunk.vector_doc_id,
-        "metadata_ext": {"security": {}},
-        "source_ext": {},
-        "versions_ext": {},
         "contract_version": "4.1.0",
     }
     repo.rows[chunk.vector_doc_id] = bad_row

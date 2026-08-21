@@ -5,7 +5,7 @@
     2. schema_profile="v15" → V15 repository；
     3. ingestion V15 能正确组装（含 V15 row_mapper 跟随）；
     4. reconciliation V15 的 repository 与 ingestion.repository 是同一个对象（is）；
-    5. V14 作为显式回滚路径仍可用；
+    5. V14 作为显式 schema_profile 时 fail-closed（已退役）；
     6. 非法 profile → fail-closed；
     7. 显式 repository 注入与 profile 冲突 → fail-closed；
     8. V15 update_metadata 使用 V15 mapper/repository 路径；
@@ -32,9 +32,7 @@ from rag_vector_store import (
 )
 from rag_vector_store.chunking.contract_ingestion import ContractBatchIngestionService
 from rag_vector_store.milvus import ContractMilvusV15VectorRepository
-from rag_vector_store.milvus.contract import MilvusRowMapper
 from rag_vector_store.milvus.contract_v15 import MilvusV15RowMapper
-from rag_vector_store.milvus.repository import ContractMilvusVectorRepository
 
 FIXTURE_PATH = (
     Path(__file__).resolve().parents[1]
@@ -62,7 +60,7 @@ def _worker() -> ContractEmbeddingWorker:
 
 
 def _settings(
-    collection_name: str = "expert_candidates_v14_contract_dev",
+    collection_name: str = "expert_candidates_v15_contract_dev",
 ) -> MilvusSettings:
     return MilvusSettings(
         collection_name=collection_name,
@@ -222,7 +220,6 @@ def test_factory_default_uses_v15_repository() -> None:
     assert isinstance(ingestion, VectorIngestionService)
     assert isinstance(ingestion.repository, ContractMilvusV15VectorRepository)
     assert isinstance(ingestion.row_mapper, MilvusV15RowMapper)
-    assert not isinstance(ingestion.row_mapper, MilvusRowMapper)
 
 
 def test_reconciliation_default_uses_v15_repository() -> None:
@@ -237,18 +234,21 @@ def test_reconciliation_default_uses_v15_repository() -> None:
     assert service.repository is service.ingestion.repository
 
 
-def test_factory_explicit_v14_profile_still_available() -> None:
-    """V14 作为兼容回滚路径仍然可用（显式 schema_profile="v14"）。"""
+def test_factory_explicit_v14_profile_fail_closed() -> None:
+    """V14 旧链路已退役：显式 schema_profile="v14" 必须 fail-closed。"""
 
-    ingestion = create_vector_ingestion_service(
-        milvus_settings=_settings(),
-        embedding_worker=_worker(),
-        schema_profile="v14",
-    )
-    assert isinstance(ingestion.repository, ContractMilvusVectorRepository)
-    assert not isinstance(ingestion.repository, ContractMilvusV15VectorRepository)
-    assert isinstance(ingestion.row_mapper, MilvusRowMapper)
-    assert not isinstance(ingestion.row_mapper, MilvusV15RowMapper)
+    with pytest.raises(ValueError, match="V14"):
+        create_vector_ingestion_service(
+            milvus_settings=_settings(),
+            embedding_worker=_worker(),
+            schema_profile="v14",
+        )
+    with pytest.raises(ValueError, match="V14"):
+        create_full_vector_reconciliation_service(
+            milvus_settings=_settings(),
+            embedding_worker=_worker(),
+            schema_profile="v14",
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -265,7 +265,6 @@ def test_factory_v15_uses_v15_repository_and_mapper() -> None:
     assert isinstance(ingestion.repository, ContractMilvusV15VectorRepository)
     # row_mapper 未显式传入时跟随 repository → V15 mapper
     assert isinstance(ingestion.row_mapper, MilvusV15RowMapper)
-    assert not isinstance(ingestion.row_mapper, MilvusRowMapper)
 
 
 def test_ingestion_v15_assembles_chain() -> None:
@@ -298,15 +297,6 @@ def test_factory_v15_explicit_row_mapper_wins() -> None:
         schema_profile="v15",
     )
     assert ingestion.row_mapper is explicit
-
-    explicit_v14 = MilvusRowMapper()
-    ingestion_v14 = create_vector_ingestion_service(
-        milvus_settings=_settings(),
-        embedding_worker=_worker(),
-        row_mapper=explicit_v14,
-        schema_profile="v14",
-    )
-    assert ingestion_v14.row_mapper is explicit_v14
 
 
 # ---------------------------------------------------------------------------
@@ -351,31 +341,17 @@ def test_factory_invalid_profile_fail_closed() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_explicit_v14_repository_with_v15_profile_fail_closed() -> None:
-    v14_repo = ContractMilvusVectorRepository(_settings(), 1024)
-    with pytest.raises(ValueError, match="冲突"):
-        create_vector_ingestion_service(
-            repository=v14_repo,
-            embedding_worker=_worker(),
-            schema_profile="v15",
-        )
-    with pytest.raises(ValueError, match="冲突"):
-        create_full_vector_reconciliation_service(
-            repository=v14_repo,
-            embedding_worker=_worker(),
-            schema_profile="v15",
-        )
-
-
 def test_explicit_v15_repository_with_v14_profile_fail_closed() -> None:
+    """schema_profile='v14' 先于 repository 校验 fail-closed（V14 已退役）。"""
+
     v15_repo = ContractMilvusV15VectorRepository(_settings(), 1024)
-    with pytest.raises(ValueError, match="冲突"):
+    with pytest.raises(ValueError, match="V14"):
         create_vector_ingestion_service(
             repository=v15_repo,
             embedding_worker=_worker(),
             schema_profile="v14",
         )
-    with pytest.raises(ValueError, match="冲突"):
+    with pytest.raises(ValueError, match="V14"):
         create_full_vector_reconciliation_service(
             repository=v15_repo,
             embedding_worker=_worker(),
@@ -384,15 +360,7 @@ def test_explicit_v15_repository_with_v14_profile_fail_closed() -> None:
 
 
 def test_explicit_repository_is_used_without_replacement() -> None:
-    """显式注入匹配的 repository 时优先使用，不偷偷替换。"""
-
-    v14_repo = ContractMilvusVectorRepository(_settings(), 1024)
-    ingestion = create_vector_ingestion_service(
-        repository=v14_repo,
-        embedding_worker=_worker(),
-        schema_profile="v14",
-    )
-    assert ingestion.repository is v14_repo
+    """显式注入 V15 repository 时优先使用，不偷偷替换。"""
 
     v15_repo = ContractMilvusV15VectorRepository(_settings(), 1024)
     ingestion_v15 = create_vector_ingestion_service(
@@ -462,9 +430,9 @@ def test_v15_update_metadata_uses_v15_mapper_and_repository() -> None:
 
 
 def test_mapper_v15_with_v14_profile_fail_closed() -> None:
-    """schema_profile='v14' + 显式 V15 mapper → ValueError。"""
+    """schema_profile='v14' 先于 mapper 校验 fail-closed（V14 已退役）。"""
 
-    with pytest.raises(ValueError, match="冲突"):
+    with pytest.raises(ValueError, match="V14"):
         create_vector_ingestion_service(
             milvus_settings=_settings(),
             embedding_worker=_worker(),
@@ -473,60 +441,34 @@ def test_mapper_v15_with_v14_profile_fail_closed() -> None:
         )
 
 
-def test_mapper_v14_with_v15_profile_fail_closed() -> None:
-    """schema_profile='v15' + 显式 V14 mapper → ValueError。"""
+def test_non_mapper_object_with_v15_profile_fail_closed() -> None:
+    """schema_profile='v15' + 显式传入不符合 RowMapper 协议的对象 → ValueError。"""
 
-    with pytest.raises(ValueError, match="冲突"):
+    with pytest.raises(ValueError, match="V15"):
         create_vector_ingestion_service(
             milvus_settings=_settings(),
             embedding_worker=_worker(),
-            row_mapper=MilvusRowMapper(),
+            row_mapper=object(),  # type: ignore[arg-type]
             schema_profile="v15",
         )
 
 
-def test_mapper_v14_with_explicit_v15_repo_fail_closed() -> None:
-    """显式 V15 repo + V14 mapper → ValueError（与 schema_profile 无关）。"""
+def test_v15_mapper_with_explicit_v15_repo_allowed() -> None:
+    """显式 V15 repo + V15 mapper → 允许。"""
 
     v15_repo = ContractMilvusV15VectorRepository(_settings(), 1024)
-    with pytest.raises(ValueError, match="冲突"):
-        create_vector_ingestion_service(
-            repository=v15_repo,
-            embedding_worker=_worker(),
-            row_mapper=MilvusRowMapper(),
-            schema_profile="v15",
-        )
-    with pytest.raises(ValueError, match="冲突"):
-        create_vector_ingestion_service(
-            repository=v15_repo,
-            embedding_worker=_worker(),
-            row_mapper=MilvusRowMapper(),
-            schema_profile="v14",
-        )
-
-
-def test_mapper_v15_with_explicit_v14_repo_fail_closed() -> None:
-    """显式 V14 repo + V15 mapper → ValueError（与 schema_profile 无关）。"""
-
-    v14_repo = ContractMilvusVectorRepository(_settings(), 1024)
-    with pytest.raises(ValueError, match="冲突"):
-        create_vector_ingestion_service(
-            repository=v14_repo,
-            embedding_worker=_worker(),
-            row_mapper=MilvusV15RowMapper(),
-            schema_profile="v14",
-        )
-    with pytest.raises(ValueError, match="冲突"):
-        create_vector_ingestion_service(
-            repository=v14_repo,
-            embedding_worker=_worker(),
-            row_mapper=MilvusV15RowMapper(),
-            schema_profile="v15",
-        )
+    ingestion = create_vector_ingestion_service(
+        repository=v15_repo,
+        embedding_worker=_worker(),
+        row_mapper=MilvusV15RowMapper(),
+        schema_profile="v15",
+    )
+    assert ingestion.repository is v15_repo
+    assert isinstance(ingestion.row_mapper, MilvusV15RowMapper)
 
 
 def test_mapper_matching_profile_allowed() -> None:
-    """正常组合：v15+V15 mapper / v14+V14 mapper → 允许。"""
+    """正常组合：v15 + V15 mapper → 允许。"""
 
     ingestion_v15 = create_vector_ingestion_service(
         milvus_settings=_settings(),
@@ -537,19 +479,9 @@ def test_mapper_matching_profile_allowed() -> None:
     assert isinstance(ingestion_v15.row_mapper, MilvusV15RowMapper)
     assert isinstance(ingestion_v15.repository, ContractMilvusV15VectorRepository)
 
-    ingestion_v14 = create_vector_ingestion_service(
-        milvus_settings=_settings(),
-        embedding_worker=_worker(),
-        row_mapper=MilvusRowMapper(),
-        schema_profile="v14",
-    )
-    assert isinstance(ingestion_v14.row_mapper, MilvusRowMapper)
-    assert isinstance(ingestion_v14.repository, ContractMilvusVectorRepository)
-    assert not isinstance(ingestion_v14.repository, ContractMilvusV15VectorRepository)
-
 
 def test_mapper_auto_follows_repository_when_not_given() -> None:
-    """未显式 mapper 时仍自动跟随 repository/profile（不受本校验影响）。"""
+    """未显式 mapper 时默认跟随为 V15 mapper（V14 已退役）。"""
 
     ingestion_v15 = create_vector_ingestion_service(
         milvus_settings=_settings(),
@@ -558,33 +490,25 @@ def test_mapper_auto_follows_repository_when_not_given() -> None:
     )
     assert isinstance(ingestion_v15.row_mapper, MilvusV15RowMapper)
 
-    ingestion_v14 = create_vector_ingestion_service(
-        milvus_settings=_settings(),
-        embedding_worker=_worker(),
-        schema_profile="v14",
-    )
-    assert isinstance(ingestion_v14.row_mapper, MilvusRowMapper)
-    assert not isinstance(ingestion_v14.row_mapper, MilvusV15RowMapper)
-
 
 def test_reconciliation_factory_mapper_profile_protected() -> None:
     """reconciliation factory 同样受显式 mapper 一致性保护。"""
 
-    # v15 profile + V14 mapper → fail-closed
-    with pytest.raises(ValueError, match="冲突"):
-        create_full_vector_reconciliation_service(
-            milvus_settings=_settings(),
-            embedding_worker=_worker(),
-            row_mapper=MilvusRowMapper(),
-            schema_profile="v15",
-        )
-    # v14 profile + V15 mapper → fail-closed
-    with pytest.raises(ValueError, match="冲突"):
+    # v14 profile → fail-closed（V14 已退役，先于 mapper 校验）
+    with pytest.raises(ValueError, match="V14"):
         create_full_vector_reconciliation_service(
             milvus_settings=_settings(),
             embedding_worker=_worker(),
             row_mapper=MilvusV15RowMapper(),
             schema_profile="v14",
+        )
+    # 非 RowMapper 对象 + v15 profile → fail-closed
+    with pytest.raises(ValueError, match="V15"):
+        create_full_vector_reconciliation_service(
+            milvus_settings=_settings(),
+            embedding_worker=_worker(),
+            row_mapper=object(),  # type: ignore[arg-type]
+            schema_profile="v15",
         )
     # 正常组合仍可组装，且同一 repository
     service = create_full_vector_reconciliation_service(

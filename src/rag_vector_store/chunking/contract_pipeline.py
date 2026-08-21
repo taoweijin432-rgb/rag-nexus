@@ -21,11 +21,12 @@ from pydantic import ValidationError
 from expert_contracts.models import (
     ContractPreparedChunk,
     EmbeddedContractPreparedChunk,
+    EmploymentMetadata,
     ExpertChunkEmbeddingInput,
 )
 
 from ..embedding import EmbeddingModel
-from ..milvus.contract import contract_milvus_field_specs
+from ..milvus.schemas.contract_v15 import v15_milvus_field_specs
 
 EXPECTED_EMBEDDING_DIMENSION = 1024
 
@@ -179,8 +180,10 @@ class ContractValidator:
 
         # 时间跨字段约束：is_current 只存在于 employment Metadata，
         # 只有 employment 需要执行 is_current=true 时 end_month 必须为 null。
+        # 用 isinstance 收窄类型，等价于 chunk_type == "employment"
+        # （ExpertChunkEmbeddingInput 已强制 metadata 类型匹配 chunk_type）。
         if (
-            value.chunk_type == "employment"
+            isinstance(metadata, EmploymentMetadata)
             and metadata.is_current is True
             and metadata.end_month is not None
         ):
@@ -424,7 +427,11 @@ class ContractEmbeddingWorker:
 def expected_contract_output_fields(
     vector_dimension: int = EXPECTED_EMBEDDING_DIMENSION,
 ) -> dict[str, dict[str, object]]:
-    """返回完整保存契约输入与向量化输出所需的最小 Milvus 字段。"""
+    """返回完整保存契约输入与向量化输出所需的最小 Milvus 字段。
+
+    V14 25 字段形态已退役；当前以 V15 精简 4 字段物理 Schema 为正式契约
+    输出基线（``vector_doc_id`` / ``chunk_text`` / ``embedding`` / ``metadata``）。
+    """
 
     return {
         spec.name: {
@@ -434,7 +441,7 @@ def expected_contract_output_fields(
             "max_length": spec.max_length,
             "dim": spec.dim,
         }
-        for spec in contract_milvus_field_specs(vector_dimension)
+        for spec in v15_milvus_field_specs(vector_dimension)
     }
 
 
@@ -484,7 +491,7 @@ def compare_contract_output_schema(
                 "actual": _as_int(params.get("dim")),
             }
 
-        expected_max_length = expected_field.get("max_length")
+        expected_max_length = _as_int(expected_field.get("max_length"))
         actual_max_length = _as_int(params.get("max_length"))
         if (
             expected_max_length is not None

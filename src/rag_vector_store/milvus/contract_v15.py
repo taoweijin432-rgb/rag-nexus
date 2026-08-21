@@ -8,9 +8,9 @@ Contract 信息（含 ``expert_id`` / ``content_hash`` / ``metadata_hash`` /
 Task State。
 
 与 v14 的关系：
-    - v14 的 ``MilvusExpertChunkEntity`` / ``MilvusRowMapper``（``milvus/contract.py``）
-      保持不变，继续服务现有 v14 Collection；
-    - V15 是独立的新映射，Schema 定义见 ``schemas/contract_v15.py``。
+    - v14 的 25 字段物理形态（``MilvusExpertChunkEntity`` / ``MilvusRowMapper``）
+      已退役删除；真实 v14 Collection 仍受保护性检查保护，不被迁移。
+    - V15 是当前唯一正式映射，Schema 定义见 ``schemas/contract_v15.py``。
 
 flat ``metadata`` 设计约束：
     - 单层 flat JSON，不使用 ``contract`` / ``metadata`` / ``source`` /

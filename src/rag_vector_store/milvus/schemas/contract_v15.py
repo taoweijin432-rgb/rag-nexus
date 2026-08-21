@@ -1,9 +1,8 @@
 """V15 精简物理 Schema 定义（导出契约 4.0.0 的 V15 存储形态）。
 
 V15 与 v14 的关系：
-    - v14 是当前正式 Collection 的 25 字段 Schema（含高频标量投影和三份 JSON
-      extension），保持不变，继续由 ``schemas/contract.py`` 与
-      ``milvus/contract.py`` 服务，作为迁移期历史实现。
+    - v14 是历史上的 25 字段 Schema（含高频标量投影和三份 JSON extension），
+      已随 V14 物理形态退役删除；真实 v14 Collection 仍受保护性检查保护。
     - V15 是本项目冻结的纯 4 字段物理 Schema：
       ``vector_doc_id`` / ``chunk_text`` / ``embedding`` / ``metadata``。
       其余 Contract 信息（含 ``expert_id`` / ``content_hash`` /
@@ -33,7 +32,7 @@ from .specs import MilvusFieldSpec
 
 V15_CONTRACT_VECTOR_DIMENSION = 1024
 V15_VECTOR_DOC_ID_MAX_BYTES = 2048
-# chunk_text 的 Milvus VARCHAR 字节容量沿用 v14 与 ContractValidator 的 UTF-8
+# chunk_text 的 Milvus VARCHAR 字节容量沿用 ContractValidator 的 UTF-8
 # 上限（8192 bytes），保证任意合法 Contract chunk_text 都能落库。
 V15_CHUNK_TEXT_MAX_BYTES = 8192
 
@@ -86,11 +85,11 @@ def build_v15_schema(
 ) -> Any:
     """构造 V15 精简 Contract Collection Schema，不执行 Collection 操作。
 
-    签名与 v14 的 ``build_contract_schema`` 保持一致；``settings`` 当前仅用于
-    保持调用形态统一（V15 的字段集合与 collection 配置无关）。
+    ``settings`` 当前仅用于保持调用形态统一（V15 的字段集合与 collection
+    配置无关）；签名沿用历史 ``build_contract_schema`` 以兼容 Repository 调用。
     """
 
-    del settings  # 与 v14 build_contract_schema 保持签名一致的占位参数
+    del settings  # 占位参数，V15 字段集合与 collection 配置无关
     if vector_dimension is None:
         raise ValueError("vector dimension is not configured")
     return build_schema_from_specs(v15_milvus_field_specs(vector_dimension))

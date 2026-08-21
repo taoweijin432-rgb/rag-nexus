@@ -358,8 +358,8 @@ class EmbeddedContractPreparedChunk(ContractPreparedChunk):
         - 产生：``ContractEmbeddingWorker.embed`` 对每条 eligible 记录调用
           ``EmbeddingModel.embed`` 后构造。
         - 消费：``ContractIngestionService`` / ``ContractBatchIngestionService``
-          把 embedded 记录交给 ``ContractMilvusVectorRepository.upsert_batch``。
-        - 下一站：``MilvusRowMapper.to_entity`` 映射为 Milvus 物理行。
+          把 embedded 记录交给 ``ContractMilvusV15VectorRepository.upsert_batch``。
+        - 下一站：``MilvusV15RowMapper.to_entity`` 映射为 Milvus 物理行。
 
     ``embedded_at`` 是内部 Embedding 完成时间，与下游回填的 ``indexed_at``
     （Milvus upsert 成功时间）保持独立。向量字段带模型空间信息，保证写入前

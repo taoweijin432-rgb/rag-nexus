@@ -7,8 +7,7 @@
     - expert_id / content_hash / metadata_hash 已进入 metadata，不再是一级字段；
     - 一级字段不重复出现在 metadata；namespace 键被禁止；key 冲突 fail-closed；
     - null / [] / Decimal / datetime 序列化语义；source / versions 平铺；
-    - from_row round-trip：embedding、hash、update_metadata 所需字段完整恢复；
-    - v14 现有映射（MilvusRowMapper）不受影响。
+    - from_row round-trip：embedding、hash、update_metadata 所需字段完整恢复。
 """
 
 from __future__ import annotations
@@ -25,8 +24,6 @@ from expert_contracts import adapt_expert_chunk_mapping
 from rag_vector_store import ContractEmbeddingWorker, EmbeddedContractPreparedChunk
 from rag_vector_store.config import MilvusSettings
 from rag_vector_store.milvus import (
-    CONTRACT_SCALAR_INDEX_FIELDS,
-    MilvusRowMapper,
     MilvusV15Entity,
     MilvusV15RowMapper,
     index_specs_v15,
@@ -150,7 +147,9 @@ def test_v15_index_specs_only_vector_index() -> None:
 
 def test_v15_index_specs_do_not_include_any_scalar_field() -> None:
     v15_names = {spec.field_name for spec in index_specs_v15(v15_settings())}
-    for field in CONTRACT_SCALAR_INDEX_FIELDS:
+    # V14 历史 scalar index 字段（expert_id / chunk_type /
+    # eligible_for_recommendation）已退役，不应出现在 V15 索引中。
+    for field in ("expert_id", "chunk_type", "eligible_for_recommendation"):
         assert field not in v15_names
     for moved in V15_MOVED_TO_METADATA:
         assert moved not in v15_names
@@ -491,19 +490,3 @@ def test_v15_metadata_json_size_limit() -> None:
     )
     with pytest.raises(ValueError, match="超过 Milvus JSON 65536 bytes"):
         MilvusV15RowMapper._validate_storage_limits(oversized)
-
-
-def test_v14_row_mapper_unaffected() -> None:
-    """v14 映射行为不被 V15 改动破坏。"""
-    from tests.test_contract_milvus_repository import embedded_contract_chunks
-
-    chunk = embedded_contract_chunks()[0]
-    entity = MilvusRowMapper().to_entity(chunk)
-    assert entity.metadata_ext == chunk.metadata.model_dump(mode="json")
-    assert entity.source_ext == chunk.source.model_dump(mode="json")
-    assert entity.versions_ext == chunk.versions.model_dump(mode="json")
-    assert tuple(entity.model_dump().keys())[:3] == (
-        "vector_doc_id",
-        "expert_id",
-        "serial_number",
-    )

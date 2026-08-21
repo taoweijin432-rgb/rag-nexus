@@ -52,23 +52,15 @@ from .ingestion import (
     VectorQueryResult,
     create_vector_ingestion_service,
 )
-from .milvus.contract import (
-    CONTRACT_SCALAR_INDEX_FIELDS,
-    CONTRACT_VECTOR_DIMENSION,
-    CONTRACT_VECTOR_DOC_ID_MAX_BYTES,
-    MilvusExpertChunkEntity,
-    MilvusFieldSpec,
-    MilvusRowMapper,
-    contract_milvus_field_specs,
-)
 from .milvus.contract_v15 import (
     V15_CONTRACT_VECTOR_DIMENSION,
     V15_VECTOR_DOC_ID_MAX_BYTES,
     MilvusV15Entity,
     MilvusV15RowMapper,
 )
-from .milvus.repository import ContractMilvusVectorRepository
+from .milvus.repository import ContractMilvusRepositoryBase
 from .milvus.repository_v15 import ContractMilvusV15VectorRepository
+from .milvus.schemas import MilvusFieldSpec
 from .model_space import (
     FORMAL_EMBEDDING_DIMENSION,
     FORMAL_EMBEDDING_MODEL,
@@ -86,9 +78,6 @@ from .reconciliation import (
 )
 
 __all__ = [
-    "CONTRACT_SCALAR_INDEX_FIELDS",
-    "CONTRACT_VECTOR_DIMENSION",
-    "CONTRACT_VECTOR_DOC_ID_MAX_BYTES",
     "EXPECTED_EMBEDDING_DIMENSION",
     "EXPERT_CHUNK_CONTRACT_VERSION",
     "FORMAL_EMBEDDING_DIMENSION",
@@ -109,8 +98,8 @@ __all__ = [
     "ContractIngestionError",
     "ContractIngestionResult",
     "ContractIngestionService",
+    "ContractMilvusRepositoryBase",
     "ContractMilvusV15VectorRepository",
-    "ContractMilvusVectorRepository",
     "ContractPreparedChunk",
     "ContractRepository",
     "ContractValidationError",
@@ -125,9 +114,7 @@ __all__ = [
     "ExpertChunkVersions",
     "FullVectorReconciliationResult",
     "FullVectorReconciliationService",
-    "MilvusExpertChunkEntity",
     "MilvusFieldSpec",
-    "MilvusRowMapper",
     "MilvusSettings",
     "MilvusV15Entity",
     "MilvusV15RowMapper",
@@ -150,7 +137,6 @@ __all__ = [
     "VectorQueryResult",
     "build_model_space_id",
     "compare_contract_output_schema",
-    "contract_milvus_field_specs",
     "create_full_vector_reconciliation_service",
     "create_vector_ingestion_service",
     "expected_contract_output_fields",

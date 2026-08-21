@@ -3,6 +3,11 @@
 本模块只描述“应该有哪些索引及参数”，不直接调用 Client。Repository 负责执行
 这些声明，Compatibility 模块负责比较服务端实际结果；这样索引变更不会和 CRUD
 流程混在一起。
+
+V14 专属的 ``index_specs``（含 3 个 INVERTED scalar index）已随 V14 物理形态
+退役；当前唯一正式索引集合为 V15 的 ``index_specs_v15``（仅 1 个 embedding
+向量索引）。通用 ``IndexSpec`` / ``vector_index_spec`` / ``build_index_params``
+仍保留，供 V15 复用。
 """
 
 from __future__ import annotations
@@ -12,17 +17,15 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from ..config import MilvusSettings
-from .schemas.contract import CONTRACT_SCALAR_INDEX_FIELDS
 
 
 @dataclass(frozen=True)
 class IndexSpec:
     """一个 Milvus Index 的声明，不包含任何 Client 操作。
 
-    向量索引携带 metric 和构建参数；scalar 索引只声明字段和类型。当前 Contract
-    集合由一个向量索引（``embedding_vector``）和 3 个 INVERTED 标量索引
-    （``expert_id`` / ``chunk_type`` / ``eligible_for_recommendation``）组成，
-    与 ``contract.CONTRACT_SCALAR_INDEX_FIELDS`` 保持一致。
+    向量索引携带 metric 和构建参数；scalar 索引只声明字段和类型。V15 精简
+    Collection 只有一个向量索引（``embedding_vector``）；V14 的 3 个 INVERTED
+    scalar index 已退役。
     """
 
     field_name: str
@@ -61,38 +64,11 @@ def vector_index_spec(settings: MilvusSettings) -> IndexSpec:
     )
 
 
-def index_specs(settings: MilvusSettings) -> tuple[IndexSpec, ...]:
-    """返回正式 Contract Collection 应具备的完整索引集合。
-
-    谁使用：
-        - ``Repository.initialize``：创建 Collection 时的索引声明；
-        - ``Repository.compare_contract_indexes``：只读索引对比基准。
-
-    构成：
-        1 个向量索引（``embedding_vector``，HNSW/COSINE，参数来自环境配置）+ 3 个
-        INVERTED 标量索引（``expert_id`` / ``chunk_type`` /
-        ``eligible_for_recommendation``，见 ``contract.CONTRACT_SCALAR_INDEX_FIELDS``）。
-    """
-
-    vector = vector_index_spec(settings)
-    return (
-        vector,
-        *(
-            IndexSpec(
-                field_name=field_name,
-                index_name=f"{field_name}_inverted",
-                index_type="INVERTED",
-            )
-            for field_name in CONTRACT_SCALAR_INDEX_FIELDS
-        ),
-    )
-
-
 def index_specs_v15(settings: MilvusSettings) -> tuple[IndexSpec, ...]:
     """返回 V15 精简 Contract Collection 应具备的完整索引集合。
 
     谁使用：
-        - 后续 V15 Repository 创建 Collection 时的索引声明；
+        - V15 Repository 创建 Collection 时的索引声明；
         - V15 只读索引对比基准。
 
     构成：

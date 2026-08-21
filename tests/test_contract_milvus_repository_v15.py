@@ -1,19 +1,18 @@
 """V15 精简 Contract Collection Repository 的接通测试（Fake/Mock，不连真实 Milvus）。
 
 覆盖 Task5-3 Pivot 要求：
-    1. V14 repository 行为完全不变（profile 默认值断言 + 现有 V14 测试套件）；
+    1. V15 repository 持久化 profile 默认值指向 V15 符号；
     2. V15 initialize 使用 4 个字段；
     3. V15 initialize 只有 1 个索引（embedding HNSW/COSINE）；
     4. V15 upsert 使用 MilvusV15RowMapper，只产出 4 个物理字段；
     5. expert_id / content_hash / metadata_hash 已进入 metadata，不再是一级字段；
-    6. V15 get 不请求 V14-only 字段；
+    6. V15 get 不请求历史一级字段；
     7. V15 query_by_expert_id 使用 metadata["expert_id"] JSON path 过滤；
     8. V15 list_all_vector_states 物理读取 vector_doc_id+metadata，从 metadata
        提取两个 hash，公共返回语义保持 vector_doc_id/content_hash/metadata_hash；
     9. V15 full scan filter 不引用任何不存在的 V15 scalar；
     10. V15 destructive compatibility 使用 4 字段 V15 schema；
-    11. V15 model-space validation 仍从 metadata 读取；
-    12. V14/V15 mapper/spec/index 不串线。
+    11. V15 model-space validation 仍从 metadata 读取。
 """
 
 from __future__ import annotations
@@ -29,18 +28,12 @@ import pytest
 from expert_contracts import adapt_expert_chunk_mapping
 from rag_vector_store import (
     ContractEmbeddingWorker,
-    ContractMilvusVectorRepository,
     EmbeddedContractPreparedChunk,
     MilvusSettings,
 )
 from rag_vector_store.milvus import ContractMilvusV15VectorRepository
-from rag_vector_store.milvus.contract import MilvusRowMapper
 from rag_vector_store.milvus.contract_v15 import MilvusV15RowMapper
-from rag_vector_store.milvus.indexes import index_specs, index_specs_v15
-from rag_vector_store.milvus.schemas.contract import (
-    build_contract_schema,
-    contract_milvus_field_specs,
-)
+from rag_vector_store.milvus.indexes import index_specs_v15
 from rag_vector_store.milvus.schemas.contract_v15 import v15_milvus_field_specs
 
 FIXTURE_PATH = (
@@ -321,16 +314,31 @@ def v15_description(repository: Any) -> dict[str, Any]:
     return repository._build_schema(1024).to_dict()
 
 
-def v14_description() -> dict[str, Any]:
-    return build_contract_schema(
-        MilvusSettings(
-            collection_name="expert_candidates_v14_contract_dev",
-            index_type="HNSW",
-            metric_type="COSINE",
-            index_params={"M": 16, "efConstruction": 200},
-        ),
-        1024,
-    ).to_dict()
+def incompatible_description() -> dict[str, Any]:
+    """构造一个与 V15 4 字段 Schema 不兼容的 Collection description。
+
+    在 V15 的 4 个字段基础上额外加入一级 ``expert_id``（历史 V14 标量投影），
+    使 V15 compatibility gate 检测到 unexpected_fields 并 fail-closed。
+    """
+
+    fields = [
+        {"name": "vector_doc_id", "type": "VARCHAR", "is_primary": True,
+         "nullable": False, "params": {"max_length": 2048}},
+        {"name": "chunk_text", "type": "VARCHAR", "is_primary": False,
+         "nullable": False, "params": {"max_length": 8192}},
+        {"name": "embedding", "type": "FLOAT_VECTOR", "is_primary": False,
+         "nullable": False, "params": {"dim": 1024}},
+        {"name": "metadata", "type": "JSON", "is_primary": False,
+         "nullable": False, "params": {}},
+        # 额外一级字段：V15 不允许，触发 unexpected_fields
+        {"name": "expert_id", "type": "INT64", "is_primary": False,
+         "nullable": False, "params": {}},
+    ]
+    return {
+        "auto_id": False,
+        "enable_dynamic_field": False,
+        "fields": fields,
+    }
 
 
 def _seed_rows(
@@ -349,19 +357,16 @@ def _seed_rows(
 # ---------------------------------------------------------------------------
 
 
-def test_v14_repository_profile_defaults_are_still_v14() -> None:
-    """V14 Repository 的持久化 profile 必须仍指向 V14 符号（不串线）。"""
+def test_v15_repository_profile_defaults_point_to_v15_symbols() -> None:
+    """V15 Repository 的持久化 profile 必须指向 V15 符号（不串线）。"""
 
-    repository = ContractMilvusVectorRepository(
-        v15_settings("expert_candidates_v14_contract_dev"),
-        1024,
-    )
-    assert repository._schema_field_specs is contract_milvus_field_specs
-    assert repository._row_mapper_cls is MilvusRowMapper
-    assert repository._index_specs_fn is index_specs
-    assert repository._full_scan_filter == "embedding_dim >= 0"
-    assert isinstance(repository._contract_row_mapper, MilvusRowMapper)
-    assert not isinstance(repository._contract_row_mapper, MilvusV15RowMapper)
+    repository = make_v15_repository()
+    assert repository._schema_field_specs is v15_milvus_field_specs
+    assert repository._row_mapper_cls is MilvusV15RowMapper
+    assert repository._index_specs_fn is index_specs_v15
+    assert repository._full_scan_filter == 'vector_doc_id != ""'
+    assert repository._model_space_fields == ("metadata",)
+    assert isinstance(repository._contract_row_mapper, MilvusV15RowMapper)
 
 
 # ---------------------------------------------------------------------------
@@ -426,10 +431,10 @@ def test_v15_initialize_existing_collection_passes_v15_gate() -> None:
     assert client.create_calls == []
 
 
-def test_v15_initialize_rejects_v14_collection() -> None:
+def test_v15_initialize_rejects_incompatible_collection() -> None:
     client = FakeV15MilvusClient(exists=True)
     repository = make_v15_repository(client)
-    client.description = v14_description()
+    client.description = incompatible_description()
     with pytest.raises(ValueError, match="不兼容"):
         repository.initialize(1024)
     assert client.create_calls == []
@@ -769,8 +774,8 @@ def test_v15_destructive_guard_passes_with_v15_schema() -> None:
     assert summary["embedding_dim"] == 1024
 
 
-def test_v15_destructive_guard_rejects_v14_schema() -> None:
-    """V15 guard 必须用 V15 4 字段预期判断，不能拿 V14 25 字段 schema 放行。"""
+def test_v15_destructive_guard_rejects_incompatible_schema() -> None:
+    """V15 guard 必须用 V15 4 字段预期判断，不能拿不兼容 schema 放行。"""
 
     collection_name = "expert_candidates_v15_contract_dev"
     client = FakeV15MilvusClient(exists=True)
@@ -779,7 +784,7 @@ def test_v15_destructive_guard_rejects_v14_schema() -> None:
         collection_name=collection_name,
         allowed=(collection_name,),
     )
-    client.description = v14_description()
+    client.description = incompatible_description()
 
     with pytest.raises(ValueError, match="不兼容"):
         repository.assert_destructive_maintenance_allowed(
@@ -804,41 +809,30 @@ def test_v15_destructive_guard_unauthorized_fails_closed() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_v14_v15_profiles_are_isolated() -> None:
-    v14_repo = ContractMilvusVectorRepository(
-        v15_settings("expert_candidates_v14_contract_dev"),
-        1024,
-    )
+def test_v15_profile_symbols_are_stable() -> None:
+    """V15 Repository 的持久化 profile 符号稳定，full-scan filter 不引用
+    不存在的 V15 scalar。"""
+
     v15_repo = make_v15_repository()
 
-    assert v14_repo._schema_field_specs is not v15_repo._schema_field_specs
-    assert v14_repo._schema_field_specs is contract_milvus_field_specs
     assert v15_repo._schema_field_specs is v15_milvus_field_specs
-    assert v14_repo._row_mapper_cls is MilvusRowMapper
     assert v15_repo._row_mapper_cls is MilvusV15RowMapper
-    assert v14_repo._index_specs_fn is index_specs
     assert v15_repo._index_specs_fn is index_specs_v15
-    assert v14_repo._full_scan_filter == "embedding_dim >= 0"
     assert v15_repo._full_scan_filter == 'vector_doc_id != ""'
     # V15 full-scan filter 不引用任何不存在的 V15 scalar。
     assert "metadata" not in v15_repo._full_scan_filter
     assert "metadata[" not in v15_repo._full_scan_filter
     assert "expert_id" not in v15_repo._full_scan_filter
     assert "embedding_dim" not in v15_repo._full_scan_filter
-    assert v14_repo._model_space_fields == (
-        "embedding_model_alias",
-        "embedding_model_version",
-        "embedding_dim",
-    )
     assert v15_repo._model_space_fields == ("metadata",)
 
 
-def test_v15_schema_and_v14_schema_field_sets_differ() -> None:
+def test_v15_schema_field_set_is_4_fields() -> None:
     v15_fields = {spec.name for spec in v15_milvus_field_specs(1024)}
-    v14_fields = {spec.name for spec in contract_milvus_field_specs(1024)}
     assert v15_fields == set(V15_FIELD_NAMES)
     assert len(v15_fields) == 4
-    assert len(v14_fields) == 25
+    # 历史 V14 一级字段（metadata_ext / source_ext / versions_ext / chunk_type /
+    # expert_id）不应出现在 V15 精简 Schema 中。
     assert v15_fields.isdisjoint(
         {"metadata_ext", "source_ext", "versions_ext", "chunk_type", "expert_id"}
     )
@@ -931,11 +925,10 @@ def test_v15_model_space_cache_skips_scan_on_second_upsert() -> None:
     assert len(client.upsert_calls) == 2
 
 
-def test_v15_model_space_cache_isolated_from_v14() -> None:
-    """V14 与 V15 是不同 Repository 类/实例，缓存各自独立，互不串跳。
+def test_v15_model_space_cache_isolated_per_instance() -> None:
+    """不同 V15 Repository 实例的 model-space 缓存各自独立，互不串跳。
 
-    V14 Repository 行为不变由 test_contract_milvus_repository.py 的完整套件
-    覆盖；这里用两个不同 model space 的 V15 实例验证实例级缓存隔离。
+    用两个不同 model space 的 V15 实例验证实例级缓存隔离。
     """
 
     chunks = embedded_contract_chunks()

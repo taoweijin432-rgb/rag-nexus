@@ -41,7 +41,8 @@ class ContractRepository(Protocol):
         在 Worker 完成 Eligibility 与向量化后，用这里写入 Milvus。
 
     当前正式实现：
-        ``ContractMilvusVectorRepository``（见 ``milvus/repository.py``）。
+        ``ContractMilvusV15VectorRepository``（见 ``milvus/repository_v15.py``），
+        继承通用基类 ``ContractMilvusRepositoryBase``。
 
     输入：
         Sequence[EmbeddedContractPreparedChunk] —— 已通过 Contract 校验、Eligibility
@@ -219,7 +220,7 @@ class ContractIngestionService:
         if embedded is None:  # 由 _single_worker_result 保证，仅用于保护未来修改。
             raise ContractIngestionError("Worker 未返回 embedded 或 skipped 结果")
 
-        # 正式 Milvus Repository 内部负责 Schema gate、MilvusRowMapper 和 upsert。
+        # 正式 Milvus Repository 内部负责 Schema gate、RowMapper 和 upsert。
         mutation = self.repository.upsert_batch([embedded])
         self._validate_repository_result(embedded, mutation)
         return ContractIngestionResult(

@@ -1,20 +1,19 @@
 """V15 精简 Contract Collection 的 Milvus Repository 实现。
 
-V15 与 v14 的关系：
-    - ``ContractMilvusVectorRepository``（``milvus/repository.py``）是 V14 正式
-      Repository，保持不变：25 字段 Schema、``MilvusRowMapper``、``index_specs``；
-    - 本类是同一套 CRUD / Query / Safety 编排的 V15 变体，通过整体替换 base
-      Repository 的持久化 profile 实现，不复制任何 CRUD 逻辑，也不在方法内
-      按版本分支：
-        * Schema：``v15_milvus_field_specs``（4 字段）+ ``build_v15_schema``；
-        * 行映射：``MilvusV15RowMapper``（4 字段 + flat metadata JSON）；
-        * 索引：``index_specs_v15``（仅 embedding HNSW/COSINE）；
-        * 全量扫描 filter：基于一级 PK ``vector_doc_id`` 的恒真合法范围
-          （``vector_doc_id != ""``），Full Reconciliation 状态扫描不依赖
-          任何不存在的 V15 scalar；
-        * 模型空间一致性检查从 metadata JSON 读取（V15 的
-          ``embedding_model_alias`` / ``embedding_model_version`` /
-          ``embedding_dim`` 位于其中）。
+V15 是当前唯一正式物理 profile，直接继承通用基类 ``ContractMilvusRepositoryBase``，
+整体替换其持久化 profile 类属性（不复制任何 CRUD 逻辑，也不在方法内按版本分支）：
+    * Schema：``v15_milvus_field_specs``（4 字段）+ ``build_v15_schema``；
+    * 行映射：``MilvusV15RowMapper``（4 字段 + flat metadata JSON）；
+    * 索引：``index_specs_v15``（仅 embedding HNSW/COSINE）；
+    * 全量扫描 filter：基于一级 PK ``vector_doc_id`` 的恒真合法范围
+      （``vector_doc_id != ""``），Full Reconciliation 状态扫描不依赖
+      任何不存在的 V15 scalar；
+    * 模型空间一致性检查从 metadata JSON 读取（V15 的
+      ``embedding_model_alias`` / ``embedding_model_version`` /
+      ``embedding_dim`` 位于其中）。
+
+旧的 V14 25 字段物理形态已退役；通用 CRUD / Query / Safety 编排逻辑全部
+继承自基类，本类只替换持久化 profile 与 V15 专属的 Query/状态提取行为。
 
 V15 物理 Schema（4 字段，dynamic=False）：
 
@@ -37,7 +36,7 @@ V15 物理 Schema（4 字段，dynamic=False）：
 metadata 提取 ``content_hash`` / ``metadata_hash`` —— 这是纯 4 字段设计明确
 接受的 tradeoff，不为了优化而重新增加 hash scalar。
 
-职责边界与 base Repository 完全一致：不负责 Contract Validation、Eligibility、
+职责边界与基类完全一致：不负责 Contract Validation、Eligibility、
 Embedding、Task State；不创建真实 Collection（是否创建由调用方结合
 ``allow_collection_creation`` 决定）；不修改 .env；不迁移真实数据。
 
@@ -57,7 +56,7 @@ from expert_contracts.models import EmbeddedContractPreparedChunk
 from .compatibility import compare_model_space
 from .contract_v15 import MilvusV15RowMapper
 from .indexes import index_specs_v15
-from .repository import ContractMilvusVectorRepository
+from .repository import ContractMilvusRepositoryBase
 from .schemas.contract_v15 import build_v15_schema, v15_milvus_field_specs
 
 __all__ = ["ContractMilvusV15VectorRepository"]
@@ -72,13 +71,13 @@ _MODEL_SPACE_SAMPLE_LIMIT = 50
 _V15_FORBIDDEN_TOP_LEVEL_FIELDS = ("expert_id", "content_hash", "metadata_hash")
 
 
-class ContractMilvusV15VectorRepository(ContractMilvusVectorRepository):
+class ContractMilvusV15VectorRepository(ContractMilvusRepositoryBase):
     """V15 精简 Contract Collection 的 Repository 类型。
 
     构造参数、initialize / upsert_batch / get_by_vector_doc_id /
     delete_by_vector_doc_ids / query_by_expert_id / list_all_vector_states /
-    assert_destructive_maintenance_allowed / close 的语义与 base Repository
-    一致；差异只体现在持久化 profile 上（见模块 docstring）。
+    assert_destructive_maintenance_allowed / close 的语义与基类一致；差异只体现
+    在持久化 profile 上（见模块 docstring）。
 
     ``search`` 暂不支持（V15 检索通路未接通），调用抛 ``NotImplementedError``。
     """
@@ -101,7 +100,7 @@ class ContractMilvusV15VectorRepository(ContractMilvusVectorRepository):
     ) -> dict[str, object]:
         """从 V15 行的 flat metadata JSON 提取模型空间字段。
 
-        与 base Repository 的区别：V15 的 ``embedding_model_alias`` /
+        与基类的区别：V15 的 ``embedding_model_alias`` /
         ``embedding_model_version`` / ``embedding_dim`` 位于 metadata JSON 内，
         而不是一级字段；提取失败（缺少合法 metadata 对象）一律 fail-closed。
         """
@@ -121,7 +120,7 @@ class ContractMilvusV15VectorRepository(ContractMilvusVectorRepository):
     ) -> None:
         """在 upsert 前采样校验既有 Entity 的模型空间一致性（V15 版本）。
 
-        与 base Repository 的区别：V15 不再对整个 Collection 做全表
+        与基类的区别：V15 不再对整个 Collection 做全表
         ``query_iterator(limit=-1)`` 扫描——该扫描会随 Collection 行数线性
         增长，在 SSH 隧道 + 远端 Milvus 链路下达到数十秒级超时，导致 upsert
         在写入前卡死（已写入约 7 万行时复现）。改为限量采样前
@@ -132,7 +131,7 @@ class ContractMilvusV15VectorRepository(ContractMilvusVectorRepository):
             - 当前正式数据向量空间一致，采样校验足以阻止异空间混写；
             - 采样到任一不一致行仍 fail-closed，拒绝本次 upsert。
 
-        缓存语义与 base 一致：同一 Repository 生命周期内、同一 model space
+        缓存语义与基类一致：同一 Repository 生命周期内、同一 model space
         采样通过后才写缓存；采样中发现不一致或查询异常时不写缓存，下次
         同名 model space 仍会重新采样。model space 任一字段变化会使缓存失效。
         """
@@ -180,7 +179,7 @@ class ContractMilvusV15VectorRepository(ContractMilvusVectorRepository):
     ) -> list[dict[str, object]]:
         """按 ``expert_id`` 查询该专家的全部向量记录（V15 迁移期兼容路径）。
 
-        与 base 的区别：
+        与基类的区别：
             - V15 的 ``expert_id`` 位于 flat metadata JSON，因此过滤表达式为
               ``metadata["expert_id"] == N``（JSON path filter，不把 expert_id
               提升成一级字段，也不新增 scalar projection）；
@@ -245,7 +244,7 @@ class ContractMilvusV15VectorRepository(ContractMilvusVectorRepository):
     ) -> list[dict[str, object]]:
         """列出当前 Collection 中全部向量的最小状态（V15 版本）。
 
-        公共返回语义与 base 保持一致：
+        公共返回语义与基类保持一致：
             每行包含 ``vector_doc_id`` / ``content_hash`` / ``metadata_hash``
             （供 Full Reconciliation 差异判断与 stale 计算）。
 

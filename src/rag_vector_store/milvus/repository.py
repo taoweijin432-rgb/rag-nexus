@@ -1,9 +1,19 @@
-"""正式 Contract Collection 的 Milvus Repository 实现。
+"""正式 Contract Collection 的通用 Milvus Repository 基类。
 
 Repository 是 Milvus Client 的唯一业务访问入口，负责连接生命周期、Collection
 初始化/只读兼容性检查、CRUD、Query 和 Search 编排。Schema/Index 定义、兼容性
 判断、Contract 行映射分别委托给 ``schemas``、``indexes``、``compatibility`` 和
-``MilvusRowMapper``；本模块不负责 Contract 校验、Embedding 或 Task State。
+子类提供的 ``RowMapper``；本模块不负责 Contract 校验、Embedding 或 Task State。
+
+本类是**通用基类**，只承载与具体物理 Schema 无关的 CRUD / Schema / Index /
+Model Space / 删除保护编排逻辑。具体的持久化 profile（字段集合、Schema
+builder、索引集合、RowMapper、全量扫描 filter、模型空间字段）由子类整体
+提供，禁止在方法内部按版本分支。当前唯一正式子类是
+``ContractMilvusV15VectorRepository``（V15 精简 4 字段 Schema）。
+
+旧的 V14 25 字段物理形态（``MilvusRowMapper`` / ``contract_milvus_field_specs`` /
+``index_specs`` 等）已退役；其代码与专属测试已删除，但真实 V14 Collection
+仍受保护性检查保护，不被 drop、alter 或迁移。
 """
 
 from __future__ import annotations
@@ -28,16 +38,22 @@ from .compatibility import (
     compare_schema_specs,
     field_map,
 )
-from .contract import MilvusRowMapper
-from .indexes import build_index_params, index_specs, vector_index_spec
-from .schemas import (
-    build_contract_schema,
-    contract_milvus_field_specs,
+from .indexes import build_index_params, vector_index_spec
+
+# 子类必须整体提供的持久化 profile 抽象类属性名。基类不再自带任何 V14 默认值；
+# 子类必须在类定义时声明全部这些属性，否则 ``__init_subclass__`` fail-closed。
+_REQUIRED_PROFILE_ATTRS = (
+    "_schema_field_specs",
+    "_schema_builder",
+    "_index_specs_fn",
+    "_row_mapper_cls",
+    "_full_scan_filter",
+    "_model_space_fields",
 )
 
 
-class ContractMilvusVectorRepository:
-    """封装 Milvus 连接、Schema 管理和 CRUD 写操作。
+class ContractMilvusRepositoryBase:
+    """封装 Milvus 连接、Schema 管理和 CRUD 写操作的通用基类。
 
     调用方：
         - ``ContractIngestionService.ingest_one`` / ``ContractBatchIngestionService.ingest_batch``
@@ -51,7 +67,7 @@ class ContractMilvusVectorRepository:
     内部主要步骤（见 ``upsert_batch``）：
         1. Collection / Schema / Index compatibility gate；
         2. model-space / embedding dimension 检查；
-        3. ``MilvusRowMapper`` 行转换；
+        3. RowMapper 行转换；
         4. vector_doc_id / PK 一致性检查；
         5. SDK upsert；
         6. ``MutationResult``（affected_count / primary_keys）fail-closed 校验。
@@ -67,23 +83,25 @@ class ContractMilvusVectorRepository:
         会阻断，不自动 drop、alter 或 recreate。
 
     持久化 profile：
-        V14（本类默认）使用 25 字段 Schema、``MilvusRowMapper`` 与
-        ``index_specs``；V15 由 ``ContractMilvusV15VectorRepository`` 子类整体
-        替换下面声明的 profile 属性，禁止在方法内部按版本分支。
+        本基类不携带任何物理 Schema 默认值；子类必须整体提供
+        ``_schema_field_specs`` / ``_schema_builder`` / ``_index_specs_fn`` /
+        ``_row_mapper_cls`` / ``_full_scan_filter`` / ``_model_space_fields``
+        六个类属性（见 ``__init_subclass__``），禁止在方法内部按版本分支。
     """
 
-    # ---- 持久化 profile（默认 V14；V15 子类整体替换，禁止方法内按版本分支）----
-    _schema_field_specs = staticmethod(contract_milvus_field_specs)
-    _schema_builder = staticmethod(build_contract_schema)
-    _index_specs_fn = staticmethod(index_specs)
-    _row_mapper_cls = MilvusRowMapper
-    # 全量扫描/模型空间一致性检查使用的 filter 表达式与输出字段。
-    _full_scan_filter = "embedding_dim >= 0"
-    _model_space_fields = (
-        "embedding_model_alias",
-        "embedding_model_version",
-        "embedding_dim",
-    )
+    def __init_subclass__(cls, **kwargs: Any) -> None:
+        """校验子类整体提供了全部持久化 profile 类属性。
+
+        基类不再自带 V14 默认值；任一 profile 属性缺失即 fail-closed，避免
+        子类在运行时因 ``AttributeError`` 才暴露 profile 配置不完整。
+        """
+
+        super().__init_subclass__(**kwargs)
+        missing = [name for name in _REQUIRED_PROFILE_ATTRS if not hasattr(cls, name)]
+        if missing:
+            raise TypeError(
+                f"{cls.__name__} 必须声明持久化 profile 类属性 {list(missing)}"
+            )
 
     def __init__(
         self,
@@ -95,7 +113,7 @@ class ContractMilvusVectorRepository:
     ) -> None:
         if settings.schema_mode != "contract":
             raise ValueError(
-                "ContractMilvusVectorRepository 要求 MILVUS_SCHEMA_MODE=contract"
+                "ContractMilvusRepositoryBase 要求 MILVUS_SCHEMA_MODE=contract"
             )
         self.settings = settings
         self._vector_dimension: int | None = None
@@ -342,7 +360,7 @@ class ContractMilvusVectorRepository:
             -> _validate_batch_model_space         # 批内模型空间一致 + 非占位版本
             -> initialize(dimension)               # Collection/Index gate（已存在只读校验）
             -> _validate_existing_model_space      # 遍历已有 Entity 对比模型空间
-            -> _to_rows(records)                   # MilvusRowMapper 行映射 + PK 去重
+            -> _to_rows(records)                   # RowMapper 行映射 + PK 去重
             -> SDK upsert
             -> _mutation_result                    # upsert_count/PK 严格解析
             -> MutationResult
@@ -369,7 +387,7 @@ class ContractMilvusVectorRepository:
             return MutationResult(affected_count=0)
         if not all(isinstance(item, EmbeddedContractPreparedChunk) for item in items):
             raise TypeError(
-                "ContractMilvusVectorRepository 只接受 EmbeddedContractPreparedChunk"
+                "ContractMilvusRepositoryBase 只接受 EmbeddedContractPreparedChunk"
             )
 
         self._ensure_dimension_from_records(items)
@@ -676,7 +694,7 @@ class ContractMilvusVectorRepository:
                 from pymilvus import MilvusClient
             except ImportError as exc:  # pragma: no cover - 依赖已在 pyproject 中声明
                 raise RuntimeError(
-                    "pymilvus is required to use ContractMilvusVectorRepository; "
+                    "pymilvus is required to use ContractMilvusRepositoryBase; "
                     "run `uv sync` first"
                 ) from exc
             self._client = MilvusClient(**self.settings.client_kwargs)
@@ -806,7 +824,11 @@ class ContractMilvusVectorRepository:
         self,
         row: Mapping[str, Any],
     ) -> dict[str, object]:
-        """从单行 Entity 提取模型空间字段（默认 V14 一级字段投影）。"""
+        """从单行 Entity 提取模型空间字段。
+
+        基类提供默认的一级字段投影实现；子类可覆盖为从 flat metadata JSON 读取
+        （如 V15 的模型空间字段位于 metadata）。
+        """
 
         return {
             "embedding_model_alias": row.get("embedding_model_alias"),

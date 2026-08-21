@@ -43,7 +43,7 @@ from ..ingestion.errors import (
     VectorMilvusError,
 )
 from ..ingestion.vector_ingestion import VectorIngestionService
-from ..milvus.repository import ContractMilvusVectorRepository
+from ..milvus.repository import ContractMilvusRepositoryBase
 from .models import FullVectorReconciliationResult
 
 _STALE_SAMPLE_LIMIT = 20
@@ -86,7 +86,7 @@ class FullVectorReconciliationService:
 
     def __init__(
         self,
-        repository: ContractMilvusVectorRepository,
+        repository: ContractMilvusRepositoryBase,
         *,
         ingestion: VectorIngestionService | None = None,
         validator: ContractValidator | None = None,
