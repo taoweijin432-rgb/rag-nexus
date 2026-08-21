@@ -21,7 +21,7 @@ from expert_index.config import DatabaseConfig, Settings
 from expert_index.models import ExpertAggregate, ExpertCandidate, ExpertSource
 from expert_index.pipeline import ExpertIndexPipeline, VectorSyncSummary
 from expert_index.ports import ExpertBatchSyncInput
-from expert_index.repository import BatchItemSummary, FullBatchCheckpoint
+from expert_index.repositories import BatchItemSummary, FullBatchCheckpoint
 from expert_index.vector_sync import ExpertVectorSyncResult
 
 
@@ -238,7 +238,9 @@ def _pipeline(
     return ExpertIndexPipeline(
         _settings(),
         source=source,  # type: ignore[arg-type]
-        repository=repository,  # type: ignore[arg-type]
+        build_lock_repository=repository,  # type: ignore[arg-type]
+        batch_repository=repository,  # type: ignore[arg-type]
+        batch_item_repository=repository,  # type: ignore[arg-type]
         vector_sync=vector_sync or FakeVectorSync(),
     )
 

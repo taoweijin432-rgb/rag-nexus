@@ -16,7 +16,7 @@ from pathlib import Path
 
 from .config import Settings
 from .pipeline import ExpertIndexPipeline
-from .repository import MySQLIndexRepository
+from .schema_initializer import MySQLSchemaInitializer
 from .test_fixture import ensure_complete_test_expert
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -109,12 +109,11 @@ def main(argv: list[str] | None = None) -> None:
 
     args = build_parser().parse_args(argv)
     settings = Settings.from_env()
-    repository = MySQLIndexRepository(settings.index_db)
     if args.command == "init-db":
-        repository.initialize_schema(args.ddl)
+        MySQLSchemaInitializer(settings.index_db).initialize_schema(args.ddl)
         print(json.dumps({"status": "ok", "schema": settings.index_db.database}, ensure_ascii=False))
     elif args.command == "build":
-        result = _build_pipeline(settings, repository).build_single_expert(
+        result = _build_pipeline(settings).build_single_expert(
             args.expert_id,
             data_version=args.data_version,
             batch_no=args.batch_no,
@@ -123,7 +122,7 @@ def main(argv: list[str] | None = None) -> None:
     elif args.command == "build-batch":
         # build_expert_batch 内部完成全局互斥、固定扫描上界、分页、专家失败隔离、
         # 批次明细和生命周期处理；CLI 只负责接收参数并输出不含专家正文的数量摘要。
-        result = _build_pipeline(settings, repository).build_expert_batch(
+        result = _build_pipeline(settings).build_expert_batch(
             data_version=args.data_version,
             page_size=args.page_size,
             max_experts=args.max_experts,
@@ -133,13 +132,13 @@ def main(argv: list[str] | None = None) -> None:
     elif args.command == "resume-batch":
         # data_version、扫描上界、批次号和累计计数均从原批次恢复，CLI 只允许调整
         # 本次读取页大小，防止续跑意外改变原任务范围。
-        result = _build_pipeline(settings, repository).resume_expert_batch(
+        result = _build_pipeline(settings).resume_expert_batch(
             args.batch_id,
             page_size=args.page_size,
         )
         print(json.dumps(asdict(result), ensure_ascii=False, sort_keys=True))
     elif args.command == "retry-batch":
-        result = _build_pipeline(settings, repository).retry_failed_batch_experts(
+        result = _build_pipeline(settings).retry_failed_batch_experts(
             args.batch_id,
             page_size=args.page_size,
         )
@@ -149,10 +148,7 @@ def main(argv: list[str] | None = None) -> None:
         print(json.dumps(asdict(fixture), ensure_ascii=False, sort_keys=True))
 
 
-def _build_pipeline(
-    settings: Settings,
-    repository: MySQLIndexRepository,
-) -> ExpertIndexPipeline:
+def _build_pipeline(settings: Settings) -> ExpertIndexPipeline:
     """组装只使用内存 Contract 连接下游的正式 Pipeline。"""
 
     from rag_vector_store import create_vector_ingestion_service
@@ -162,7 +158,6 @@ def _build_pipeline(
     vector_service = create_vector_ingestion_service()
     return ExpertIndexPipeline(
         settings,
-        repository=repository,
         vector_sync=ExpertVectorSynchronizer(vector_service),
     )
 

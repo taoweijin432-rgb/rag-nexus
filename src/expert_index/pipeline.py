@@ -11,7 +11,9 @@
 * ``normalize.py``：清洗和标准化来源字段，生成 Stage 对象；
 * ``chunk_builder.py``：生成三类 Chunk Text 与扁平 Metadata；
 * ``validators.py``：在向量同步前验证文本、ID、哈希、枚举和 PII；
-* ``repository.py``：持久化批次、专家明细和分页检查点；
+* ``repositories/batch.py``：持久化批次状态和页级进度；
+* ``repositories/batch_item.py``：持久化批次内每位专家的处理状态；
+* ``repositories/build_lock.py``：控制 single/full 构建任务互斥；
 * ``vector_sync.py``：把内存中的 Chunk Contract 交给下游向量服务。
 
 批量任务按固定 ID 上界分页，逐专家隔离领域处理失败，并只在完整一页处理结束后推进
@@ -33,7 +35,12 @@ from .contract_bridge import chunk_records_to_contracts
 from .models import ChunkRecord, ExpertCandidate
 from .normalize import normalize_aggregate
 from .ports import ExpertBatchSyncInput, ExpertVectorSyncPort
-from .repository import FullBatchCheckpoint, MySQLIndexRepository
+from .repositories import (
+    FullBatchCheckpoint,
+    MySQLBatchItemRepository,
+    MySQLBatchRepository,
+    MySQLBuildLockRepository,
+)
 from .source import MAX_FULL_SCAN_PAGE_SIZE, MySQLSourceAdapter
 from .validators import validate_chunks
 from .vector_sync import ExpertVectorSyncResult
@@ -136,7 +143,8 @@ class _ExpertProgress:
 class ExpertIndexPipeline:
     """提供单专家构建、新建批量任务、断点续跑和失败重试入口。
 
-    默认从配置创建 MySQL Source 和 Repository，也支持注入同接口实现。所有入口共享
+    默认从配置创建 MySQL Source、构建锁 Repository、批次 Repository 和专家明细
+    Repository，也支持分别注入同接口实现。所有入口共享
     ``_process_active_expert``，确保单专家与批量任务采用相同的标准化、校验和同步规则。
     """
 
@@ -145,12 +153,22 @@ class ExpertIndexPipeline:
         settings: Settings,
         *,
         source: MySQLSourceAdapter | None = None,
-        repository: MySQLIndexRepository | None = None,
+        build_lock_repository: MySQLBuildLockRepository | None = None,
+        batch_repository: MySQLBatchRepository | None = None,
+        batch_item_repository: MySQLBatchItemRepository | None = None,
         vector_sync: ExpertVectorSyncPort,
     ) -> None:
         self.settings = settings
         self.source = source or MySQLSourceAdapter(settings.source_db)
-        self.repository = repository or MySQLIndexRepository(settings.index_db)
+        self.build_lock_repository = (
+            build_lock_repository or MySQLBuildLockRepository(settings.index_db)
+        )
+        self.batch_repository = batch_repository or MySQLBatchRepository(
+            settings.index_db
+        )
+        self.batch_item_repository = batch_item_repository or MySQLBatchItemRepository(
+            settings.index_db
+        )
         self.vector_sync = vector_sync
         self.factory = ChunkFactory(settings)
 
@@ -171,7 +189,7 @@ class ExpertIndexPipeline:
         _validate_data_version(data_version)
         if expert_id <= 0:
             raise ValueError("expert_id 必须大于 0")
-        with self.repository.build_lock("single"):
+        with self.build_lock_repository.build_lock("single"):
             return self._build_single_expert_locked(
                 expert_id,
                 data_version=data_version,
@@ -193,7 +211,7 @@ class ExpertIndexPipeline:
         """
 
         actual_batch_no = batch_no or _generate_single_batch_number(expert_id)
-        batch_id = self.repository.start_batch(actual_batch_no, "single")
+        batch_id = self.batch_repository.start_batch(actual_batch_no, "single")
         progress = _ExpertProgress(expert_id=expert_id)
         vector_sync = VectorSyncSummary()
         try:
@@ -207,7 +225,7 @@ class ExpertIndexPipeline:
             vector_sync = vector_sync.add(progress.vector_sync)
             # 当前只生成完整 Chunk；返回结构中的 partial 数量固定为 0。
             partial_count = 0
-            self.repository.finish_batch(
+            self.batch_repository.finish_batch(
                 batch_id,
                 status="success",
                 extracted_count=progress.extracted_count,
@@ -228,7 +246,7 @@ class ExpertIndexPipeline:
             )
         except Exception as exc:
             # 批次错误摘要只记录异常类型和截断消息，不保存专家正文或 Chunk Text。
-            self.repository.finish_batch(
+            self.batch_repository.finish_batch(
                 batch_id,
                 status="failed",
                 extracted_count=progress.extracted_count,
@@ -266,7 +284,7 @@ class ExpertIndexPipeline:
             or max_experts < 1
         ):
             raise ValueError("max_experts 必须是正整数或 None")
-        with self.repository.build_lock("full"):
+        with self.build_lock_repository.build_lock("full"):
             return self._build_expert_batch_locked(
                 data_version=data_version,
                 page_size=page_size,
@@ -292,8 +310,8 @@ class ExpertIndexPipeline:
             raise ValueError(
                 f"page_size 必须位于 1 到 {MAX_FULL_SCAN_PAGE_SIZE} 之间"
             )
-        with self.repository.build_lock("full"):
-            checkpoint = self.repository.resume_batch(batch_id)
+        with self.build_lock_repository.build_lock("full"):
+            checkpoint = self.batch_repository.resume_batch(batch_id)
             return self._build_expert_batch_locked(
                 data_version=checkpoint.data_version,
                 page_size=page_size,
@@ -325,8 +343,8 @@ class ExpertIndexPipeline:
             raise ValueError(
                 f"page_size 必须位于 1 到 {MAX_FULL_SCAN_PAGE_SIZE} 之间"
             )
-        with self.repository.build_lock("full"):
-            checkpoint = self.repository.load_partial_batch_for_retry(batch_id)
+        with self.build_lock_repository.build_lock("full"):
+            checkpoint = self.batch_repository.load_partial_batch_for_retry(batch_id)
             return self._retry_failed_batch_experts_locked(
                 checkpoint,
                 page_size=page_size,
@@ -346,7 +364,7 @@ class ExpertIndexPipeline:
         vector_sync = VectorSyncSummary()
         persisted_vector_sync = _checkpoint_vector_sync(checkpoint)
         while True:
-            expert_ids = self.repository.load_retryable_batch_item_ids(
+            expert_ids = self.batch_item_repository.load_retryable_batch_item_ids(
                 checkpoint.batch_id,
                 after_expert_id=after_expert_id,
                 limit=page_size,
@@ -356,7 +374,10 @@ class ExpertIndexPipeline:
 
             for expert_id in expert_ids:
                 progress = _ExpertProgress(expert_id=expert_id)
-                self.repository.mark_batch_item_running(checkpoint.batch_id, expert_id)
+                self.batch_item_repository.mark_batch_item_running(
+                    checkpoint.batch_id,
+                    expert_id,
+                )
                 terminal_status: str
                 result_code: str | None = None
                 error_type: str | None = None
@@ -383,7 +404,7 @@ class ExpertIndexPipeline:
                     result_code = "expert_processing_failed"
                     error_type = type(exc).__name__
 
-                self.repository.finish_batch_item(
+                self.batch_item_repository.finish_batch_item(
                     checkpoint.batch_id,
                     expert_id,
                     status=terminal_status,
@@ -407,7 +428,7 @@ class ExpertIndexPipeline:
 
             after_expert_id = expert_ids[-1]
 
-        summary = self.repository.summarize_batch_items(checkpoint.batch_id)
+        summary = self.batch_item_repository.summarize_batch_items(checkpoint.batch_id)
         unfinished_count = summary.pending_count + summary.running_count
         final_status = (
             "partial"
@@ -421,7 +442,7 @@ class ExpertIndexPipeline:
         if error_summary is None and unfinished_count:
             error_summary = {"unfinished_item_count": unfinished_count}
 
-        self.repository.finish_batch(
+        self.batch_repository.finish_batch(
             checkpoint.batch_id,
             status=final_status,
             extracted_count=summary.extracted_count,
@@ -486,7 +507,7 @@ class ExpertIndexPipeline:
                 max_experts=max_experts,
             )
             actual_batch_no = batch_no or _generate_full_batch_number()
-            batch_id = self.repository.start_batch(
+            batch_id = self.batch_repository.start_batch(
                 actual_batch_no,
                 "full",
                 data_version=data_version,
@@ -543,7 +564,7 @@ class ExpertIndexPipeline:
                 if not candidates:
                     # 固定范围内没有后续候选时，把游标推进到上界并落库，表示扫描完成。
                     cursor_id = upper_bound_id
-                    self.repository.update_batch_progress(
+                    self.batch_repository.update_batch_progress(
                         batch_id,
                         cursor_id=cursor_id,
                         candidate_count=candidate_count,
@@ -575,7 +596,7 @@ class ExpertIndexPipeline:
                     upper_bound_id=upper_bound_id,
                 )
                 # 先幂等登记整页明细。登记失败时不开始处理专家，游标保持在上一完整页。
-                self.repository.prepare_batch_items(
+                self.batch_item_repository.prepare_batch_items(
                     batch_id,
                     [candidate.id for candidate in candidates],
                 )
@@ -597,7 +618,10 @@ class ExpertIndexPipeline:
                 for candidate in candidates:
                     candidate_count += 1
                     progress = _ExpertProgress(expert_id=candidate.id)
-                    self.repository.mark_batch_item_running(batch_id, candidate.id)
+                    self.batch_item_repository.mark_batch_item_running(
+                        batch_id,
+                        candidate.id,
+                    )
                     terminal_status: str
                     result_code: str | None = None
                     error_type: str | None = None
@@ -643,7 +667,7 @@ class ExpertIndexPipeline:
                     if terminal_status != "failed":
                         progress.vector_sync = sync_results.get(candidate.id)
                     # 先持久化专家终态，再把该专家计入批次累计数量。
-                    self.repository.finish_batch_item(
+                    self.batch_item_repository.finish_batch_item(
                         batch_id,
                         candidate.id,
                         status=terminal_status,
@@ -681,7 +705,7 @@ class ExpertIndexPipeline:
 
                 # 整页明细全部到达终态后，才把游标和累计数量作为同一检查点持久化。
                 cursor_id = candidates[-1].id
-                self.repository.update_batch_progress(
+                self.batch_repository.update_batch_progress(
                     batch_id,
                     cursor_id=cursor_id,
                     candidate_count=candidate_count,
@@ -709,7 +733,7 @@ class ExpertIndexPipeline:
 
         except Exception as exc:
             # 批次级错误无法安全跳过。使用最后完整页快照结束批次，使中断页可以重跑。
-            self.repository.finish_batch(
+            self.batch_repository.finish_batch(
                 batch_id,
                 status="failed",
                 extracted_count=reliable_progress["extracted_count"],
@@ -730,7 +754,7 @@ class ExpertIndexPipeline:
 
         # 最终状态写回失败时直接抛出，不重复调用同一方法，以免掩盖数据库异常。
         final_status = "partial" if failed_count else "success"
-        self.repository.finish_batch(
+        self.batch_repository.finish_batch(
             batch_id,
             status=final_status,
             extracted_count=extracted_count,

@@ -13,11 +13,14 @@ import pytest
 
 from expert_index.config import DatabaseConfig
 from expert_index.models import BatchSourceScan, SourceCheckpoint, SourceScanCursor
-from expert_index.repository import (
+from expert_index.repositories import (
     BatchNotResumableError,
     BatchNotRetryableError,
     ConcurrentBuildError,
-    MySQLIndexRepository,
+    MySQLBatchItemRepository,
+    MySQLBatchRepository,
+    MySQLBuildLockRepository,
+    MySQLSourceStateRepository,
 )
 
 
@@ -73,21 +76,78 @@ class RecordingConnection:
         self.closed = True
 
 
-def _repository() -> MySQLIndexRepository:
-    """构造使用虚构连接参数的 Repository；测试会替换 connect。"""
+def _source_state_repository() -> MySQLSourceStateRepository:
+    """构造使用虚构连接参数的来源状态 Repository。"""
 
     config = DatabaseConfig("127.0.0.1", 3306, "test", "test", "index_test")
-    return MySQLIndexRepository(config)
+    return MySQLSourceStateRepository(config)
 
 
-def _patch_connection(
+def _batch_item_repository() -> MySQLBatchItemRepository:
+    """构造使用虚构连接参数的批次专家明细 Repository。"""
+
+    config = DatabaseConfig("127.0.0.1", 3306, "test", "test", "index_test")
+    return MySQLBatchItemRepository(config)
+
+
+def _batch_repository() -> MySQLBatchRepository:
+    """构造使用虚构连接参数的批次主表 Repository。"""
+
+    config = DatabaseConfig("127.0.0.1", 3306, "test", "test", "index_test")
+    return MySQLBatchRepository(config)
+
+
+def _build_lock_repository() -> MySQLBuildLockRepository:
+    """构造使用虚构连接参数的构建互斥锁 Repository。"""
+
+    config = DatabaseConfig("127.0.0.1", 3306, "test", "test", "index_test")
+    return MySQLBuildLockRepository(config)
+
+
+def _patch_source_state_connection(
     monkeypatch: pytest.MonkeyPatch,
     connection: RecordingConnection,
 ) -> None:
-    """让一次 Repository 操作使用指定 Recording Connection。"""
+    """让一次来源状态操作使用指定 Recording Connection。"""
 
     monkeypatch.setattr(
-        "expert_index.repository.pymysql.connect",
+        "expert_index.repositories.source_state.pymysql.connect",
+        lambda **_kwargs: connection,
+    )
+
+
+def _patch_batch_item_connection(
+    monkeypatch: pytest.MonkeyPatch,
+    connection: RecordingConnection,
+) -> None:
+    """让一次批次专家明细操作使用指定 Recording Connection。"""
+
+    monkeypatch.setattr(
+        "expert_index.repositories.batch_item.pymysql.connect",
+        lambda **_kwargs: connection,
+    )
+
+
+def _patch_batch_connection(
+    monkeypatch: pytest.MonkeyPatch,
+    connection: RecordingConnection,
+) -> None:
+    """让一次批次主表操作使用指定 Recording Connection。"""
+
+    monkeypatch.setattr(
+        "expert_index.repositories.batch.pymysql.connect",
+        lambda **_kwargs: connection,
+    )
+
+
+def _patch_build_lock_connection(
+    monkeypatch: pytest.MonkeyPatch,
+    connection: RecordingConnection,
+) -> None:
+    """让一次构建锁操作使用指定 Recording Connection。"""
+
+    monkeypatch.setattr(
+        "expert_index.repositories.build_lock.pymysql.connect",
         lambda **_kwargs: connection,
     )
 
@@ -110,9 +170,9 @@ def test_get_source_checkpoint_returns_committed_state(
         }
     )
     connection = RecordingConnection(cursor)
-    _patch_connection(monkeypatch, connection)
+    _patch_source_state_connection(monkeypatch, connection)
 
-    checkpoint = _repository().get_source_checkpoint("experts_work_experience")
+    checkpoint = _source_state_repository().get_source_checkpoint("experts_work_experience")
 
     assert checkpoint == SourceCheckpoint(
         source_table="experts_work_experience",
@@ -135,9 +195,9 @@ def test_get_source_checkpoint_returns_none_when_not_initialized(
 
     cursor = RecordingCursor(one=None)
     connection = RecordingConnection(cursor)
-    _patch_connection(monkeypatch, connection)
+    _patch_source_state_connection(monkeypatch, connection)
 
-    assert _repository().get_source_checkpoint("experts") is None
+    assert _source_state_repository().get_source_checkpoint("experts") is None
     assert connection.commit_count == 0
     assert connection.closed is True
 
@@ -150,10 +210,13 @@ def test_get_source_checkpoint_rejects_unknown_table_before_connecting(
     def unexpected_connect(**_kwargs: object) -> None:
         raise AssertionError("非法来源表不应连接数据库")
 
-    monkeypatch.setattr("expert_index.repository.pymysql.connect", unexpected_connect)
+    monkeypatch.setattr(
+        "expert_index.repositories.source_state.pymysql.connect",
+        unexpected_connect,
+    )
 
     with pytest.raises(ValueError, match="不支持的 Checkpoint 来源表"):
-        _repository().get_source_checkpoint("expert_work_experience")
+        _source_state_repository().get_source_checkpoint("expert_work_experience")
 
 
 def test_initialize_source_checkpoint_inserts_explicit_safe_position(
@@ -165,9 +228,9 @@ def test_initialize_source_checkpoint_inserts_explicit_safe_position(
     success_time = datetime(2026, 8, 20, 10, 0, tzinfo=timezone.utc)
     cursor = RecordingCursor()
     connection = RecordingConnection(cursor)
-    _patch_connection(monkeypatch, connection)
+    _patch_source_state_connection(monkeypatch, connection)
 
-    _repository().initialize_source_checkpoint(
+    _source_state_repository().initialize_source_checkpoint(
         SourceCheckpoint(
             source_table="experts_project_experience",
             last_updated_at=checkpoint_time,
@@ -200,7 +263,10 @@ def test_initialize_source_checkpoint_rejects_nonzero_lock_version(
     def unexpected_connect(**_kwargs: object) -> None:
         raise AssertionError("非法初始版本不应连接数据库")
 
-    monkeypatch.setattr("expert_index.repository.pymysql.connect", unexpected_connect)
+    monkeypatch.setattr(
+        "expert_index.repositories.source_state.pymysql.connect",
+        unexpected_connect,
+    )
     checkpoint = SourceCheckpoint(
         source_table="experts",
         last_updated_at=datetime(2026, 8, 13, 22, 0, tzinfo=timezone.utc),
@@ -209,7 +275,7 @@ def test_initialize_source_checkpoint_rejects_nonzero_lock_version(
     )
 
     with pytest.raises(ValueError, match="lock_version 必须为 0"):
-        _repository().initialize_source_checkpoint(checkpoint)
+        _source_state_repository().initialize_source_checkpoint(checkpoint)
 
 
 def test_create_batch_source_scan_inserts_fixed_range(
@@ -221,9 +287,9 @@ def test_create_batch_source_scan_inserts_fixed_range(
     upper_bound_time = datetime(2026, 8, 20, 10, 0, tzinfo=timezone.utc)
     cursor = RecordingCursor()
     connection = RecordingConnection(cursor)
-    _patch_connection(monkeypatch, connection)
+    _patch_source_state_connection(monkeypatch, connection)
 
-    _repository().create_batch_source_scan(
+    _source_state_repository().create_batch_source_scan(
         BatchSourceScan(
             batch_id=903,
             source_table="experts_education_experience",
@@ -264,11 +330,14 @@ def test_create_batch_source_scan_rejects_already_started_state(
     def unexpected_connect(**_kwargs: object) -> None:
         raise AssertionError("已推进的扫描状态不应连接数据库")
 
-    monkeypatch.setattr("expert_index.repository.pymysql.connect", unexpected_connect)
+    monkeypatch.setattr(
+        "expert_index.repositories.source_state.pymysql.connect",
+        unexpected_connect,
+    )
     start_time = datetime(2026, 8, 13, 22, 0, tzinfo=timezone.utc)
 
     with pytest.raises(ValueError, match="current_cursor 必须等于 start_cursor"):
-        _repository().create_batch_source_scan(
+        _source_state_repository().create_batch_source_scan(
             BatchSourceScan(
                 batch_id=903,
                 source_table="experts",
@@ -307,9 +376,9 @@ def test_get_batch_source_scan_returns_persisted_state(
         }
     )
     connection = RecordingConnection(cursor)
-    _patch_connection(monkeypatch, connection)
+    _patch_source_state_connection(monkeypatch, connection)
 
-    scan = _repository().get_batch_source_scan(
+    scan = _source_state_repository().get_batch_source_scan(
         903,
         "experts_education_experience",
     )
@@ -338,9 +407,9 @@ def test_get_batch_source_scan_returns_none_when_not_initialized(
 
     cursor = RecordingCursor(one=None)
     connection = RecordingConnection(cursor)
-    _patch_connection(monkeypatch, connection)
+    _patch_source_state_connection(monkeypatch, connection)
 
-    assert _repository().get_batch_source_scan(903, "experts") is None
+    assert _source_state_repository().get_batch_source_scan(903, "experts") is None
     assert connection.commit_count == 0
     assert connection.closed is True
 
@@ -352,9 +421,9 @@ def test_full_batch_start_persists_version_cursor_and_upper_bound(
 
     cursor = RecordingCursor()
     connection = RecordingConnection(cursor)
-    _patch_connection(monkeypatch, connection)
+    _patch_batch_connection(monkeypatch, connection)
 
-    batch_id = _repository().start_batch(
+    batch_id = _batch_repository().start_batch(
         "full_repository_test",
         "full",
         data_version="20260814_01",
@@ -403,9 +472,9 @@ def test_resume_batch_reuses_checkpoint_and_reactivates_original_row(
         }
     )
     connection = RecordingConnection(cursor)
-    _patch_connection(monkeypatch, connection)
+    _patch_batch_connection(monkeypatch, connection)
 
-    checkpoint = _repository().resume_batch(801)
+    checkpoint = _batch_repository().resume_batch(801)
 
     assert checkpoint.batch_id == 801
     assert checkpoint.data_version == "20260818_04"
@@ -443,10 +512,10 @@ def test_resume_batch_rejects_completed_batch_without_reactivating_it(
         }
     )
     connection = RecordingConnection(cursor)
-    _patch_connection(monkeypatch, connection)
+    _patch_batch_connection(monkeypatch, connection)
 
     with pytest.raises(BatchNotResumableError, match="不能断点续跑"):
-        _repository().resume_batch(801)
+        _batch_repository().resume_batch(801)
 
     assert len(cursor.executed) == 1
     assert connection.commit_count == 0
@@ -486,9 +555,9 @@ def test_partial_batch_retry_context_requires_completed_full_scan(
         }
     )
     connection = RecordingConnection(cursor)
-    _patch_connection(monkeypatch, connection)
+    _patch_batch_connection(monkeypatch, connection)
 
-    checkpoint = _repository().load_partial_batch_for_retry(801)
+    checkpoint = _batch_repository().load_partial_batch_for_retry(801)
 
     assert checkpoint.batch_no == "partial_retry_batch"
     assert checkpoint.data_version == "20260818_06"
@@ -517,10 +586,10 @@ def test_partial_batch_retry_rejects_non_partial_status(
         }
     )
     connection = RecordingConnection(cursor)
-    _patch_connection(monkeypatch, connection)
+    _patch_batch_connection(monkeypatch, connection)
 
     with pytest.raises(BatchNotRetryableError, match="partial full"):
-        _repository().load_partial_batch_for_retry(801)
+        _batch_repository().load_partial_batch_for_retry(801)
 
 
 def test_retryable_items_include_failed_and_interrupted_running_rows(
@@ -530,9 +599,9 @@ def test_retryable_items_include_failed_and_interrupted_running_rows(
 
     cursor = RecordingCursor(rows=[{"expert_id": 20}, {"expert_id": 30}])
     connection = RecordingConnection(cursor)
-    _patch_connection(monkeypatch, connection)
+    _patch_batch_item_connection(monkeypatch, connection)
 
-    expert_ids = _repository().load_retryable_batch_item_ids(
+    expert_ids = _batch_item_repository().load_retryable_batch_item_ids(
         801,
         after_expert_id=10,
         limit=50,
@@ -565,9 +634,9 @@ def test_batch_item_summary_recalculates_all_counts(
         }
     )
     connection = RecordingConnection(cursor)
-    _patch_connection(monkeypatch, connection)
+    _patch_batch_item_connection(monkeypatch, connection)
 
-    summary = _repository().summarize_batch_items(801)
+    summary = _batch_item_repository().summarize_batch_items(801)
 
     assert summary.candidate_count == 4
     assert summary.success_count == 2
@@ -595,11 +664,16 @@ def test_batch_item_lifecycle_and_page_progress_use_safe_columns(
         connections.append(connection)
         return connection
 
-    monkeypatch.setattr("expert_index.repository.pymysql.connect", connect)
-    repository = _repository()
-    repository.prepare_batch_items(801, [10, 20])
-    repository.mark_batch_item_running(801, 10)
-    repository.finish_batch_item(
+    monkeypatch.setattr("expert_index.repositories.batch.pymysql.connect", connect)
+    monkeypatch.setattr(
+        "expert_index.repositories.batch_item.pymysql.connect",
+        connect,
+    )
+    batch_repository = _batch_repository()
+    batch_item_repository = _batch_item_repository()
+    batch_item_repository.prepare_batch_items(801, [10, 20])
+    batch_item_repository.mark_batch_item_running(801, 10)
+    batch_item_repository.finish_batch_item(
         801,
         10,
         status="success",
@@ -607,7 +681,7 @@ def test_batch_item_lifecycle_and_page_progress_use_safe_columns(
         stage_count=3,
         chunk_count=5,
     )
-    repository.update_batch_progress(
+    batch_repository.update_batch_progress(
         801,
         cursor_id=20,
         candidate_count=2,
@@ -648,9 +722,9 @@ def test_full_batch_finish_persists_final_cursor_and_all_expert_counts(
 
     cursor = RecordingCursor()
     connection = RecordingConnection(cursor)
-    _patch_connection(monkeypatch, connection)
+    _patch_batch_connection(monkeypatch, connection)
 
-    _repository().finish_batch(
+    _batch_repository().finish_batch(
         801,
         status="partial",
         cursor_id=999,
@@ -691,9 +765,9 @@ def test_single_batch_finish_persists_vector_sync_counts(
 
     cursor = RecordingCursor()
     connection = RecordingConnection(cursor)
-    _patch_connection(monkeypatch, connection)
+    _patch_batch_connection(monkeypatch, connection)
 
-    _repository().finish_batch(
+    _batch_repository().finish_batch(
         801,
         status="success",
         extracted_count=4,
@@ -721,9 +795,12 @@ def test_batch_item_rejects_message_like_result_code_before_connect(
     def unexpected_connect(**_kwargs: Any) -> None:
         raise AssertionError("参数校验失败时不应连接 MySQL")
 
-    monkeypatch.setattr("expert_index.repository.pymysql.connect", unexpected_connect)
+    monkeypatch.setattr(
+        "expert_index.repositories.batch_item.pymysql.connect",
+        unexpected_connect,
+    )
     with pytest.raises(ValueError, match="结果标识"):
-        _repository().finish_batch_item(
+        _batch_item_repository().finish_batch_item(
             801,
             10,
             status="failed",
@@ -738,12 +815,12 @@ def test_build_lock_releases_named_lock_after_pipeline_error(
 
     cursor = RecordingCursor(one={"acquired": 1})
     connection = RecordingConnection(cursor)
-    _patch_connection(monkeypatch, connection)
+    _patch_build_lock_connection(monkeypatch, connection)
 
     with pytest.raises(
         RuntimeError,
         match="虚构流水线失败",
-    ), _repository().build_lock("full"):
+    ), _build_lock_repository().build_lock("full"):
         raise RuntimeError("虚构流水线失败")
 
     assert "GET_LOCK" in cursor.executed[0][0]
@@ -758,10 +835,12 @@ def test_build_lock_fails_fast_when_another_task_is_running(
 
     cursor = RecordingCursor(one={"acquired": 0})
     connection = RecordingConnection(cursor)
-    _patch_connection(monkeypatch, connection)
+    _patch_build_lock_connection(monkeypatch, connection)
 
     entered = False
-    with pytest.raises(ConcurrentBuildError), _repository().build_lock("full"):
+    with pytest.raises(
+        ConcurrentBuildError
+    ), _build_lock_repository().build_lock("full"):
         entered = True
 
     assert entered is False
