@@ -339,6 +339,71 @@ class ContractMilvusV15VectorRepository(ContractMilvusRepositoryBase):
         projected["metadata_hash"] = metadata_hash
         return projected
 
+    def list_all_vector_activity_states(self) -> list[dict[str, object]]:
+        """列出全部向量的轻量状态并附带经过校验的 ``is_active``（V15 版本）。
+
+        与 ``list_all_vector_states`` 的区别：返回行额外包含严格布尔
+        ``is_active``（读自 flat metadata），供 Full Reconciliation 以单一扫描
+        同时获得 active / inactive 分区；inactive 只作统计审计，不参与差异分类。
+        物理读取与全量状态扫描一致（Strong 一致性 + 全扫 filter）。
+
+        fail-closed：
+            - metadata 缺 ``is_active`` 或非严格 bool → ``RuntimeError``
+              （不默认为 active，避免掩盖数据缺陷）；
+            - 其余语义（非法批次 / 重复主键 / 非法 metadata）与
+              ``list_all_vector_states`` 一致。
+        """
+
+        iterator = self._get_client().query_iterator(
+            collection_name=self.settings.collection_name,
+            batch_size=1000,
+            limit=-1,
+            filter=self._full_scan_filter,
+            output_fields=["vector_doc_id", "metadata"],
+            consistency_level="Strong",
+            **self._timeout_kwargs(),
+        )
+        rows: list[dict[str, object]] = []
+        seen_ids: set[str] = set()
+        try:
+            while True:
+                batch = iterator.next()
+                if not isinstance(batch, list) or not all(
+                    isinstance(row, Mapping) for row in batch
+                ):
+                    raise TypeError("Milvus 活动状态 iterator 返回了非法 Entity 批次")
+                if not batch:
+                    break
+                for row in batch:
+                    raw = dict(row)
+                    flat = raw.get("metadata")
+                    if not isinstance(flat, Mapping):
+                        raise TypeError(
+                            "Milvus V15 活动状态行缺少合法 metadata JSON 对象"
+                        )
+                    # 先在原始 flat metadata 上提取 is_active，再复用轻量状态提取。
+                    is_active = flat.get("is_active")
+                    if not isinstance(is_active, bool):
+                        # 与 _extract_light_state 的 hash 校验保持同类语义：
+                        # 数据形态缺陷而非调用方类型错误，保留 RuntimeError。
+                        raise RuntimeError(  # noqa: TRY004
+                            "Milvus V15 活动状态 metadata 缺少合法 is_active 布尔值"
+                        )
+                    projected = self._extract_light_state(raw)
+                    projected["is_active"] = is_active
+                    rows.append(projected)
+                    vector_doc_id = projected.get("vector_doc_id")
+                    if isinstance(vector_doc_id, str):
+                        if vector_doc_id in seen_ids:
+                            raise RuntimeError(
+                                "Milvus 活动状态扫描返回了重复 vector_doc_id: "
+                                f"{vector_doc_id!r}"
+                            )
+                        seen_ids.add(vector_doc_id)
+        finally:
+            iterator.close()
+        return rows
+
     def search(
         self,
         embedding: Sequence[float],

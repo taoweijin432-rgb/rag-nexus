@@ -8,8 +8,10 @@
       （missing / content_changed → upsert，metadata_changed → update_metadata），
       **绝不删除 stale**。
     - ``apply_full_reconciliation``：全库维护入口，在正向同步全部成功后
-      重新读库，删除全部 stale，再做最终一致性验证（本类维护能力，
-      非日常专家同步路径）。
+      重新读库，逻辑下线全部 active 多余实体，再做最终一致性验证
+      （只比较当前有效集合：MySQL 当前有效 Chunk ↔ Milvus 中
+      ``is_active=true`` 的 Entity；inactive 实体保留在 Collection 中，
+      只作统计审计，永不判为多余数据或导致终验失败）。
 
 三个入口共用同一套私有 ``_build_plan`` diff 算法，避免复制分类逻辑；
 ``apply_positive_changes`` 与 ``apply_full_reconciliation`` 共用以
@@ -79,6 +81,8 @@ class _FullSyncPlan:
     unchanged_ids: tuple[str, ...]
     stale_ids: tuple[str, ...]
     existing_count: int
+    active_count: int
+    inactive_count: int
 
 
 class FullVectorReconciliationService:
@@ -170,9 +174,11 @@ class FullVectorReconciliationService:
             3. 任何 mutation 前 ``assert_destructive_maintenance_allowed``；
             4. 执行正向 change（missing / content_changed → upsert，
                metadata_changed → update_metadata）；
-            5. 重新读取 Milvus，计算 ``stale_after_write``；
-            6. 分批删除 stale；
-            7. 再次读取 Milvus，验证 ``final_existing_ids == desired_ids``。
+            5. 重新读取 Milvus，在 active 集合内计算 ``stale_after_write``
+               （inactive 实体不参与，不会被重复下线）；
+            6. 分批逻辑下线 stale；
+            7. 再次读取 Milvus，验证 active ID 集 == desired ID 集，
+               且逐条 content_hash / metadata_hash 一致。
 
         本方法是全 Collection 维护能力，并非日常专家同步路径（后者由
         ``expert_index`` 的 ``ExpertVectorSynchronizer`` 负责）。
@@ -203,23 +209,41 @@ class FullVectorReconciliationService:
         # 4. 正向 change（内部先执行维护守卫）。
         embedded, metadata_updated = self._apply_positive(plan)
 
-        # 5. 写全部成功后重新读取，计算 stale_after_write（不使用写前 stale_ids）。
-        existing_after, _ = self._list_existing()
+        # 5. 写全部成功后重新读取，在 active 集合内计算 stale_after_write
+        #    （不使用写前 stale_ids；inactive 实体不参与、不重复下线）。
+        active_after, _, _ = self._scan_existing()
         stale_after_write = [
             vector_doc_id
-            for vector_doc_id in existing_after
+            for vector_doc_id in active_after
             if vector_doc_id not in desired_ids
         ]
 
-        # 6. 分批删除 stale；某一批失败即停止后续批次（已完成删除不回滚）。
+        # 6. 分批逻辑下线 stale；某一批失败即停止后续批次（已完成下线不回滚）。
         deleted = self._delete_stale(stale_after_write)
 
-        # 7. 删除后再读取并做最终一致性验证。
-        final_existing, final_count = self._list_existing()
-        if set(final_existing) != desired_ids:
+        # 7. 下线后再读取并做最终一致性验证（只比较当前有效集合：
+        #    active ID 集 == desired ID 集，且逐条 hash 一致；
+        #    inactive 实体只作审计计数，永不导致失败）。
+        final_active, _final_total, final_inactive_count = self._scan_existing()
+        final_active_count = len(final_active)
+        extra_active = sorted(set(final_active) - desired_ids)
+        missing_active = sorted(desired_ids - set(final_active))
+        hash_mismatch: list[str] = []
+        if not extra_active and not missing_active:
+            for record in plan.desired:
+                current = final_active[record.vector_doc_id]
+                if (
+                    record.content_hash != current[0]
+                    or record.metadata_hash != current[1]
+                ):
+                    hash_mismatch.append(record.vector_doc_id)
+        if extra_active or missing_active or hash_mismatch:
             raise VectorInconsistentStateError(
                 "apply_full_reconciliation 最终一致性验证失败："
-                f"final_existing({len(final_existing)}) != desired({len(desired_ids)})"
+                f"final_active({final_active_count}) != desired({len(desired_ids)})；"
+                f"多余={len(extra_active)} 缺失={len(missing_active)} "
+                f"hash不一致={len(hash_mismatch)}；"
+                f"inactive={final_inactive_count}（不参与判定）"
             )
 
         base = self._result_from_plan(
@@ -228,7 +252,8 @@ class FullVectorReconciliationService:
         return base.model_copy(
             update={
                 "deleted_count": deleted,
-                "final_existing_count": final_count,
+                "final_existing_count": final_active_count,
+                "active_mismatch_count": 0,
                 "consistent": True,
             }
         )
@@ -342,8 +367,9 @@ class FullVectorReconciliationService:
             desired_ids.add(vector_doc_id)
             desired.append(record)
 
-        # 2. 读取 Milvus 现有向量状态（只读；异常直接 fail-closed）。
-        existing, _ = self._list_existing()
+        # 2. 读取 Milvus 现有向量活动状态（只读；异常直接 fail-closed）。
+        #    只有 is_active=true 的实体参与差异分类；inactive 实体只作统计。
+        existing, total_entities, inactive_count = self._scan_existing()
 
         # 3. 五类差异分类。
         missing: list[ContractPreparedChunk] = []
@@ -377,26 +403,34 @@ class FullVectorReconciliationService:
             metadata_changed=metadata_changed,
             unchanged_ids=tuple(unchanged),
             stale_ids=tuple(stale_ids),
-            existing_count=len(existing),
+            existing_count=total_entities,
+            active_count=len(existing),
+            inactive_count=inactive_count,
         )
 
-    def _list_existing(self) -> tuple[dict[str, tuple[str, str]], int]:
-        """读取 Milvus 现有向量状态，返回 (id→(content_hash, metadata_hash), 行数)。
+    def _scan_existing(
+        self,
+    ) -> tuple[dict[str, tuple[str, str]], int, int]:
+        """读取 Milvus 活动状态并分区，返回 (active, 全部实体数, inactive 数)。
 
+        只有 ``is_active=true`` 的实体进入差异分类字典；``is_active=false``
+        的实体（逻辑下线保留）只计入审计数量，永不判为多余数据。
         Milvus 边界（扫描失败 / SDK 异常）统一转 ``VectorMilvusError``；
         读取到的行字段不可信则 fail-closed，转 ``VectorInconsistentStateError``。
         """
 
         try:
-            existing_rows = self.repository.list_all_vector_states()
+            existing_rows = self.repository.list_all_vector_activity_states()
         except _MILVUS_BOUNDARY_TYPES as error:
             raise VectorMilvusError(_safe_message(error)) from error
 
-        existing: dict[str, tuple[str, str]] = {}
+        active: dict[str, tuple[str, str]] = {}
+        inactive_count = 0
         for row in existing_rows:
             vector_doc_id = row.get("vector_doc_id")
             content_hash = row.get("content_hash")
             metadata_hash = row.get("metadata_hash")
+            is_active = row.get("is_active")
             if not (
                 isinstance(vector_doc_id, str)
                 and bool(vector_doc_id.strip())
@@ -409,8 +443,15 @@ class FullVectorReconciliationService:
                     "Milvus 现有向量状态字段不可信：vector_doc_id / content_hash / "
                     "metadata_hash 必须是非空字符串"
                 )
-            existing[vector_doc_id] = (content_hash, metadata_hash)
-        return existing, len(existing_rows)
+            if not isinstance(is_active, bool):
+                raise VectorInconsistentStateError(
+                    "Milvus 现有向量状态字段不可信：is_active 必须是布尔值"
+                )
+            if is_active:
+                active[vector_doc_id] = (content_hash, metadata_hash)
+            else:
+                inactive_count += 1
+        return active, len(existing_rows), inactive_count
 
     @staticmethod
     def _result_from_plan(
@@ -427,12 +468,15 @@ class FullVectorReconciliationService:
             skipped_count=plan.skipped_count,
             desired_count=len(plan.desired),
             existing_count=plan.existing_count,
+            active_entity_count=plan.active_count,
+            inactive_entity_count=plan.inactive_count,
             missing_count=len(plan.missing),
             content_changed_count=len(plan.content_changed),
             metadata_changed_count=len(plan.metadata_changed),
             unchanged_count=len(plan.unchanged_ids),
             stale_count=len(plan.stale_ids),
             stale_sample=plan.stale_ids[:_STALE_SAMPLE_LIMIT],
+            active_mismatch_count=len(plan.missing) + len(plan.stale_ids),
             embedded_count=embedded,
             metadata_updated_count=metadata_updated,
         )

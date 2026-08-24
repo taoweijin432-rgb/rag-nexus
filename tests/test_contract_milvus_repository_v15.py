@@ -749,6 +749,154 @@ def test_v15_list_all_vector_states_rejects_duplicate_ids() -> None:
         repository.list_all_vector_states()
 
 
+def test_v15_list_all_vector_activity_states_partitions_by_is_active() -> None:
+    """活动状态扫描：返回行含严格布尔 is_active，active/inactive 可分区。"""
+
+    client = FakeV15MilvusClient(exists=True)
+    repository = make_v15_repository(client)
+    client.description = v15_description(repository)
+    client.model_space_batches = [
+        [
+            {
+                "vector_doc_id": "expert:1:profile_summary:a:0",
+                "metadata": {
+                    "content_hash": "a" * 64,
+                    "metadata_hash": "b" * 64,
+                    "is_active": True,
+                },
+            },
+            {
+                "vector_doc_id": "expert:1:profile_summary:b:0",
+                "metadata": {
+                    "content_hash": "c" * 64,
+                    "metadata_hash": "d" * 64,
+                    "is_active": False,
+                },
+            },
+        ]
+    ]
+
+    rows = repository.list_all_vector_activity_states()
+
+    scan_call = client.query_iterator_calls[0]
+    assert scan_call["output_fields"] == ["vector_doc_id", "metadata"]
+    assert scan_call["filter"] == 'vector_doc_id != ""'
+    by_id = {row["vector_doc_id"]: row for row in rows}
+    assert by_id["expert:1:profile_summary:a:0"]["is_active"] is True
+    assert by_id["expert:1:profile_summary:b:0"]["is_active"] is False
+    active_ids = {r["vector_doc_id"] for r in rows if r["is_active"]}
+    inactive_ids = {r["vector_doc_id"] for r in rows if not r["is_active"]}
+    assert active_ids == {"expert:1:profile_summary:a:0"}
+    assert inactive_ids == {"expert:1:profile_summary:b:0"}
+
+
+def test_v15_list_all_vector_states_still_returns_inactive_entities() -> None:
+    """全量语义未被破坏：list_all_vector_states 仍返回全部实体（含 inactive），
+    且公共返回语义保持轻量三字段（不含 is_active）。"""
+
+    client = FakeV15MilvusClient(exists=True)
+    repository = make_v15_repository(client)
+    client.description = v15_description(repository)
+    client.model_space_batches = [
+        [
+            {
+                "vector_doc_id": "expert:1:profile_summary:a:0",
+                "metadata": {
+                    "content_hash": "a" * 64,
+                    "metadata_hash": "b" * 64,
+                    "is_active": True,
+                },
+            },
+            {
+                "vector_doc_id": "expert:1:profile_summary:b:0",
+                "metadata": {
+                    "content_hash": "c" * 64,
+                    "metadata_hash": "d" * 64,
+                    "is_active": False,
+                },
+            },
+        ]
+    ]
+
+    rows = repository.list_all_vector_states()
+
+    # 全量语义：inactive 实体同样返回，不做任何过滤
+    assert {row["vector_doc_id"] for row in rows} == {
+        "expert:1:profile_summary:a:0",
+        "expert:1:profile_summary:b:0",
+    }
+    # 公共返回语义保持：仅轻量三字段，无 is_active 泄漏
+    for row in rows:
+        assert set(row) == set(V15_LIGHT_STATE_FIELDS)
+
+
+def test_v15_list_all_vector_activity_states_missing_is_active_fails_closed() -> None:
+    client = FakeV15MilvusClient(exists=True)
+    repository = make_v15_repository(client)
+    client.description = v15_description(repository)
+    client.model_space_batches = [
+        [
+            {
+                "vector_doc_id": "expert:1:profile_summary:a:0",
+                "metadata": {"content_hash": "a" * 64, "metadata_hash": "b" * 64},
+            }
+        ]
+    ]
+
+    with pytest.raises(RuntimeError, match="is_active"):
+        repository.list_all_vector_activity_states()
+
+
+def test_v15_list_all_vector_activity_states_non_bool_is_active_fails_closed() -> None:
+    client = FakeV15MilvusClient(exists=True)
+    repository = make_v15_repository(client)
+    client.description = v15_description(repository)
+    client.model_space_batches = [
+        [
+            {
+                "vector_doc_id": "expert:1:profile_summary:a:0",
+                "metadata": {
+                    "content_hash": "a" * 64,
+                    "metadata_hash": "b" * 64,
+                    "is_active": 1,  # 非 bool（JSON int）
+                },
+            }
+        ]
+    ]
+
+    with pytest.raises(RuntimeError, match="is_active"):
+        repository.list_all_vector_activity_states()
+
+
+def test_v15_list_all_vector_activity_states_rejects_duplicate_ids() -> None:
+    client = FakeV15MilvusClient(exists=True)
+    repository = make_v15_repository(client)
+    client.description = v15_description(repository)
+    client.model_space_batches = [
+        [
+            {
+                "vector_doc_id": "expert:1:profile_summary:dup:0",
+                "metadata": {
+                    "content_hash": "a" * 64,
+                    "metadata_hash": "b" * 64,
+                    "is_active": True,
+                },
+            },
+            {
+                "vector_doc_id": "expert:1:profile_summary:dup:0",
+                "metadata": {
+                    "content_hash": "c" * 64,
+                    "metadata_hash": "d" * 64,
+                    "is_active": False,
+                },
+            },
+        ]
+    ]
+
+    with pytest.raises(RuntimeError, match="重复 vector_doc_id"):
+        repository.list_all_vector_activity_states()
+
+
 # ---------------------------------------------------------------------------
 # 10. V15 destructive compatibility 使用 4 字段 V15 schema
 # ---------------------------------------------------------------------------

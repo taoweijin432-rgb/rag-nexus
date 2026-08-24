@@ -623,6 +623,23 @@ class ContractMilvusRepositoryBase:
             iterator.close()
         return rows
 
+    def list_all_vector_activity_states(self) -> list[dict[str, object]]:
+        """列出全部向量的轻量状态并附带经过校验的 ``is_active``（活动状态扫描）。
+
+        与 ``list_all_vector_states`` 的区别：返回行额外包含严格布尔
+        ``is_active``，供 Full Reconciliation 以单一扫描同时获得 active /
+        inactive 分区（inactive 只作统计审计，不参与差异分类）。
+
+        默认实现不可用：活动状态字段的位置由具体 Schema Profile 决定
+        （V14 为一级标量列，已退役；V15 位于 flat metadata JSON），
+        因此基类不提供通用实现，子类必须覆盖。
+        """
+
+        raise NotImplementedError(
+            "当前 Repository Profile 不支持活动状态扫描；"
+            "list_all_vector_activity_states 仅由 V15 Repository 实现"
+        )
+
     def search(
         self,
         embedding: Sequence[float],

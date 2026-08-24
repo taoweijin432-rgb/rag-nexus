@@ -2,10 +2,13 @@
 
 重点验证：
     - 五类差异分类正确；
-    - skipped / rejected / is_active=false 不进入 desired（其旧向量归入 stale）；
+    - skipped / rejected / is_active=false 不进入 desired（其旧向量若仍为
+      active 则归入 stale）；
+    - Milvus 中 is_active=false 的逻辑下线实体只作统计审计：不参与差异分类、
+      不判为多余 Entity、不参与终验失败判定；
     - fail-closed：Contract 无效、desired 重复、Milvus list 异常、状态不可信；
     - 空快照正确求 diff 但不执行任何删除；
-    - 全过程零 Embedding / 零 Milvus 写操作。
+    - 全过程零 Embedding / 零物理删除操作。
 """
 
 from __future__ import annotations
@@ -119,16 +122,37 @@ class FakeReconRepository:
             raise self.list_error
         return [dict(row) for row in self.rows]
 
+    def _activity_rows(self) -> list[dict[str, Any]]:
+        """活动状态扫描行源：与全量扫描同源，缺省补 is_active=True。"""
+
+        if self.list_error is not None:
+            raise self.list_error
+        rows = []
+        for row in self.rows:
+            item = dict(row)
+            item.setdefault("is_active", True)
+            rows.append(item)
+        return rows
+
+    def list_all_vector_activity_states(self) -> list[dict[str, Any]]:
+        """Service 实际使用的活动状态扫描（与全量扫描同源同帧）。"""
+
+        self.list_calls.append({})
+        return self._activity_rows()
+
 
 def existing_row(
     vector_doc_id: str,
     content_hash: str,
     metadata_hash: str,
+    *,
+    is_active: bool = True,
 ) -> dict[str, Any]:
     return {
         "vector_doc_id": vector_doc_id,
         "content_hash": content_hash,
         "metadata_hash": metadata_hash,
+        "is_active": is_active,
     }
 
 
@@ -341,8 +365,9 @@ def test_reconcile_all_empty_snapshot_is_pure_diff() -> None:
 class FakePositiveRepository(FakeReconRepository):
     """在只读 Fake 基础上增加可注入的安全守卫（用于正向同步测试）。
 
-    ``list_rows_sequence`` 支持多次 ``list_all_vector_states`` 调用返回不同结果
+    ``list_rows_sequence`` 支持多次扫描调用返回不同结果
     （写后重读、删除后终验），每次调用消耗一帧；耗尽后回落到 ``rows``。
+    全量扫描与活动状态扫描共享同一帧序列。
     """
 
     def __init__(
@@ -360,13 +385,26 @@ class FakePositiveRepository(FakeReconRepository):
             list(list_rows_sequence) if list_rows_sequence is not None else []
         )
 
+    def _next_rows(self) -> list[dict[str, Any]]:
+        if self._list_frames:
+            return [dict(r) for r in self._list_frames.pop(0)]
+        return [dict(r) for r in self.rows]
+
     def list_all_vector_states(self, **kwargs: Any) -> list[dict[str, Any]]:
         self.list_calls.append(kwargs)
         if self.list_error is not None:
             raise self.list_error
-        if self._list_frames:
-            return [dict(r) for r in self._list_frames.pop(0)]
-        return [dict(r) for r in self.rows]
+        return self._next_rows()
+
+    def _activity_rows(self) -> list[dict[str, Any]]:
+        if self.list_error is not None:
+            raise self.list_error
+        rows = []
+        for row in self._next_rows():
+            item = dict(row)
+            item.setdefault("is_active", True)
+            rows.append(item)
+        return rows
 
     def assert_destructive_maintenance_allowed(self, **kwargs: Any) -> dict[str, Any]:
         self.guard_calls.append(kwargs)
@@ -1028,3 +1066,177 @@ def test_wiring_error_is_vector_ingestion_error() -> None:
 
     with pytest.raises(VectorIngestionError, match="ingestion"):
         service.apply_full_reconciliation([])
+
+
+# ---------------------------------------------------------------------------
+# 逻辑下线（inactive Entity）与 Full Reconciliation 兼容性
+# ---------------------------------------------------------------------------
+
+
+def test_reconcile_with_inactive_stale_entity_passes() -> None:
+    """存在 inactive 多余实体时 reconciliation 通过：不判 stale、不触发下线。"""
+
+    records = default_records(2)  # r0 unchanged；r1 missing -> upsert
+    active_row = existing_row(
+        records[0].vector_doc_id, records[0].content_hash, records[0].metadata_hash
+    )
+    inactive_extra = existing_row(
+        "expert:900001:profile_summary:disabled:0",
+        "i" * 64,
+        "j" * 64,
+        is_active=False,
+    )
+    after_write = [active_row, existing_row(
+        records[1].vector_doc_id, records[1].content_hash, records[1].metadata_hash
+    ), inactive_extra]
+    repo = FakePositiveRepository(
+        rows=[active_row],
+        list_rows_sequence=[
+            [active_row, inactive_extra],  # plan 读：r1 缺失 + 1 条 inactive
+            after_write,                    # 写后重读
+            after_write,                    # 终验
+        ],
+    )
+    ing = FakeIngestionService()
+    result = make_positive_service(repo, ing).apply_full_reconciliation(records)
+
+    # dry-run 口径（同一 plan）：inactive 不参与分类
+    assert result.stale_count == 0
+    assert result.stale_sample == ()
+    assert result.inactive_entity_count == 1
+    assert result.active_entity_count == 1  # plan 时点：仅 r0 为 active
+    assert result.existing_count == 2       # total = active + inactive
+    # 终读口径：成功时 active/desired ID 集一致，mismatch 恒为 0
+    assert result.active_mismatch_count == 0
+    assert result.embedded_count == 1
+    # 关键：inactive 实体未被重复下线，终验通过
+    assert ing.delete_calls == []
+    assert result.deleted_count == 0
+    assert result.final_existing_count == 2
+    assert result.consistent is True
+
+
+def test_full_recon_final_missing_active_fails_closed() -> None:
+    """终验时 active 实体缺失（写入未生效模拟）-> fail-closed。"""
+
+    record = make_record(0)
+    # 三次读取均不含 desired（upsert 声称成功但数据丢失）
+    repo = FakePositiveRepository(rows=[], list_rows_sequence=[[], [], []])
+    ing = FakeIngestionService()
+
+    with pytest.raises(VectorInconsistentStateError) as excinfo:
+        make_positive_service(repo, ing).apply_full_reconciliation([record])
+
+    assert "最终一致性验证失败" in str(excinfo.value)
+    assert "缺失=1" in str(excinfo.value)
+    assert "多余=0" in str(excinfo.value)
+
+
+def test_full_recon_final_active_hash_mismatch_fails_closed() -> None:
+    """终验时 active 实体 hash 与 desired 不一致 -> fail-closed。"""
+
+    record = make_record(0)
+    wrong_hash_row = existing_row(
+        record.vector_doc_id,
+        "f" * 64,  # content_hash 与 desired 不一致（写入被篡改模拟）
+        record.metadata_hash,
+    )
+    repo = FakePositiveRepository(
+        rows=[], list_rows_sequence=[[wrong_hash_row], [wrong_hash_row], [wrong_hash_row]],
+    )
+    ing = FakeIngestionService()
+
+    with pytest.raises(VectorInconsistentStateError) as excinfo:
+        make_positive_service(repo, ing).apply_full_reconciliation([record])
+
+    assert "最终一致性验证失败" in str(excinfo.value)
+    assert "hash不一致=1" in str(excinfo.value)
+
+
+def test_inactive_entities_never_counted_as_stale() -> None:
+    """仅剩 inactive 实体时 dry-run 不报任何 stale / mismatch（纯审计计数）。"""
+
+    record = make_record(0)
+    inactive_a = existing_row(
+        "expert:900001:profile_summary:old-a:0", "a" * 64, "b" * 64, is_active=False
+    )
+    inactive_b = existing_row(
+        "expert:900001:profile_summary:old-b:0", "c" * 64, "d" * 64, is_active=False
+    )
+    repo = FakeReconRepository([inactive_a, inactive_b])
+    result = make_service(repo).reconcile_all([record])
+
+    # record 缺失（其唯一实体 inactive），但 inactive 永不入 stale
+    assert result.missing_count == 1
+    assert result.stale_count == 0
+    assert result.stale_sample == ()
+    assert result.active_entity_count == 0
+    assert result.inactive_entity_count == 2
+    assert result.existing_count == 2
+    assert result.active_mismatch_count == 1  # 仅缺失，无多余
+
+
+def test_reconciliation_after_disable_is_stable_across_runs() -> None:
+    """下线后重复执行 apply_full_reconciliation 结果稳定（幂等零写入）。"""
+
+    record = make_record(0)
+    desired_row = existing_row(
+        record.vector_doc_id, record.content_hash, record.metadata_hash
+    )
+    inactive_entity = existing_row(
+        "expert:900001:profile_summary:disabled:0",
+        "i" * 64,
+        "j" * 64,
+        is_active=False,
+    )
+
+    def run(frames: list[list[dict[str, Any]]]) -> Any:
+        repo = FakePositiveRepository(
+            rows=[desired_row, inactive_entity],
+            list_rows_sequence=[list(frame) for frame in frames],
+        )
+        ing = FakeIngestionService()
+        result = make_positive_service(repo, ing).apply_full_reconciliation([record])
+        return result, ing
+
+    # 第一次：record 尚未写入（missing -> upsert）；inactive 保持不动
+    first, ing1 = run(
+        [
+            [inactive_entity],             # plan 读：只有 inactive
+            [desired_row, inactive_entity],  # 写后
+            [desired_row, inactive_entity],  # 终验
+        ]
+    )
+    # 第二次：全部就位（全 unchanged），结果与第一次一致且零写入
+    second, ing2 = run(
+        [
+            [desired_row, inactive_entity],
+            [desired_row, inactive_entity],
+            [desired_row, inactive_entity],
+        ]
+    )
+
+    for result in (first, second):
+        assert result.consistent is True
+        assert result.deleted_count == 0
+        assert result.stale_count == 0
+        assert result.inactive_entity_count == 1
+        assert result.final_existing_count == 1
+    assert len(ing1.delete_calls) == 0
+    assert len(ing2.delete_calls) == 0
+    assert len(ing2.upsert_calls) == 0  # 第二次完全幂等零写
+
+
+def test_untrustworthy_is_active_fails_closed() -> None:
+    """is_active 非布尔值 -> VectorInconsistentStateError（不默认为 active）。"""
+
+    bad_row = {
+        "vector_doc_id": "expert:900001:profile_summary:p-0:0",
+        "content_hash": "a" * 64,
+        "metadata_hash": "b" * 64,
+        "is_active": "yes",  # 类型错误
+    }
+    repo = FakeReconRepository([bad_row])
+
+    with pytest.raises(VectorInconsistentStateError, match="is_active 必须是布尔值"):
+        make_service(repo).reconcile_all(default_records(1))

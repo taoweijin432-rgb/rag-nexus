@@ -9,7 +9,7 @@
     并直接以 ``ingestion.repository``（同一个对象）作为
     ``FullVectorReconciliationService.repository``。因此：
 
-        - ``repository.list_all_vector_states()``（读库 / 计算 stale 与终验）
+        - ``repository.list_all_vector_activity_states()``（读库 / 计算 stale 与终验）
         - ``ingestion.upsert_chunks / update_metadata / delete_vectors``（写库）
 
     必然作用于同一个 Milvus Collection，从结构上杜绝「读 Collection A、
