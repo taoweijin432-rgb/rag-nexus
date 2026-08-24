@@ -22,6 +22,9 @@ SYNC_TASK_MIGRATION = PROJECT_ROOT / "sql" / "010_add_incremental_sync_task.sql"
 CONTROL_TABLE_MIGRATION = (
     PROJECT_ROOT / "sql" / "012_complete_incremental_control_tables.sql"
 )
+INCREMENTAL_SCAN_INDEX_MIGRATION = (
+    PROJECT_ROOT / "sql" / "013_add_incremental_scan_lookup_index.sql"
+)
 
 VECTOR_STAT_FIELDS = {
     "vector_sync_expert_count",
@@ -155,6 +158,10 @@ def test_initial_schema_contains_source_batch_scan_range() -> None:
         assert field in source_batch
     assert "UNIQUE KEY uk_expert_batch_source (batch_id, source_table)" in source_batch
     assert "KEY idx_expert_batch_source_status (batch_id, status)" in source_batch
+    assert (
+        "KEY idx_expert_batch_source_claim (source_table, status, id)"
+        in source_batch
+    )
 
 
 def test_initial_schema_contains_minimal_cdc_event_tracking() -> None:
@@ -529,3 +536,67 @@ def test_control_table_migration_never_modifies_source_tables_or_drops_state() -
         "DELETE FROM",
     ):
         assert destructive_statement not in executable_sql.upper()
+
+
+def test_incremental_scan_index_migration_is_guarded_and_idempotent() -> None:
+    """013 应只在索引缺失时增加恢复查询索引，并拒绝同名错误定义。"""
+
+    migration = _read(INCREMENTAL_SCAN_INDEX_MIGRATION)
+
+    assert (
+        "ALTER TABLE expert_index_batch_source ADD KEY "
+        "idx_expert_batch_source_claim (source_table, status, id)"
+        in migration
+    )
+    assert "FROM information_schema.STATISTICS" in migration
+    assert "TABLE_SCHEMA = DATABASE()" in migration
+    assert "INDEX_NAME = 'idx_expert_batch_source_claim'" in migration
+    assert "GROUP_CONCAT(COLUMN_NAME ORDER BY SEQ_IN_INDEX SEPARATOR ',')" in migration
+    assert "'source_table,status,id'" in migration
+    assert "MIN(NON_UNIQUE) = 1" in migration
+    assert (
+        migration.count(
+            "ALTER TABLE expert_index_batch_source ADD KEY "
+            "idx_expert_batch_source_claim (source_table, status, id)"
+        )
+        == 2
+    )
+    assert "duplicate key name" in migration
+    assert "PREPARE expert_index_p3_stmt FROM @expert_index_ddl" in migration
+    assert "DEALLOCATE PREPARE expert_index_p3_stmt" in migration
+
+
+def test_incremental_scan_index_migration_only_changes_local_batch_source_index() -> None:
+    """013 不能修改来源表、控制表数据或任何下游结构。"""
+
+    migration = _read(INCREMENTAL_SCAN_INDEX_MIGRATION)
+    executable_sql = "\n".join(
+        line for line in migration.splitlines() if not line.lstrip().startswith("--")
+    )
+
+    for source_table in (
+        "experts",
+        "experts_work_experience",
+        "experts_project_experience",
+        "experts_education_experience",
+    ):
+        pattern = rf"ALTER\s+TABLE\s+{source_table}(?:\s|$)"
+        assert re.search(pattern, executable_sql, re.IGNORECASE) is None
+    for forbidden_statement in (
+        "INSERT INTO",
+        "UPDATE expert_index_",
+        "DELETE FROM",
+        "TRUNCATE TABLE",
+        "DROP TABLE",
+        "DROP COLUMN",
+    ):
+        assert forbidden_statement not in executable_sql.upper()
+    for forbidden_target in (
+        "expert_chunk",
+        "expert_index_source_checkpoint",
+        "expert_index_sync_task",
+        "expert_index_cdc_event",
+        "rag_vector_store",
+        "milvus",
+    ):
+        assert forbidden_target not in executable_sql.lower()

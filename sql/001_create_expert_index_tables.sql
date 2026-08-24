@@ -120,6 +120,7 @@ CREATE TABLE IF NOT EXISTS expert_index_batch_source (
     PRIMARY KEY (id),
     UNIQUE KEY uk_expert_batch_source (batch_id, source_table),
     KEY idx_expert_batch_source_status (batch_id, status),
+    KEY idx_expert_batch_source_claim (source_table, status, id),
     CONSTRAINT chk_expert_batch_source_table CHECK (
         source_table IN (
             'experts',
