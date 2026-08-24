@@ -461,6 +461,10 @@ class MySQLV15VectorizationRepository:
         这是显式触发路径：claim_work_items 不会自动捞取 failed 条目，
         避免失败任务被无限自动重试。上一次失败的 error_type / error_message
         保留在行上供追溯，成功提交后由 mark_work_item_committed 清空。
+
+        重排会把条目移出 failed，因此同一事务内同步回退批次的
+        failed_count（撤销这些条目此前 mark_work_item_failed 的 +1），
+        保证 Σ(committed+failed+rejected) ≤ total_count 的计数不变式。
         """
 
         if max_attempts <= 0:
@@ -490,6 +494,25 @@ class MySQLV15VectorizationRepository:
                         (lease_until, row["work_item_id"]),
                     )
                 if rows:
+                    # 计数回退：条目离开 failed 时，同步撤销其在
+                    # mark_work_item_failed 中累计的 failed_count+1；
+                    # 否则重试成功会被 committed/failed 双计，再次失败
+                    # 还会继续膨胀。守卫条件要求 failed_count 足以扣减，
+                    # rowcount!=1 说明计数漂移或批次缺失，按数据错误
+                    # fail-closed 回滚。
+                    rollback_count = len(rows)
+                    cursor.execute(
+                        f"UPDATE {_BATCH_TABLE} "
+                        "SET failed_count=failed_count - %s, "
+                        "updated_at=CURRENT_TIMESTAMP(6) "
+                        "WHERE batch_id=%s AND failed_count >= %s",
+                        (rollback_count, batch_id, rollback_count),
+                    )
+                    if cursor.rowcount != 1:
+                        raise V15PersistenceError(
+                            f"批次 {batch_id} 的 failed_count 回退失败"
+                            "（计数与明细不一致或批次不存在），操作已回滚"
+                        )
                     ids = [int(r["work_item_id"]) for r in rows]
                     placeholders = ", ".join(["%s"] * len(ids))
                     cursor.execute(

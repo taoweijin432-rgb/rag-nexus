@@ -509,6 +509,7 @@ def test_requeue_failed_items_resets_to_running_with_lease() -> None:
         ScriptedCursor()
         .expect(rows=[_item_row(status="failed", attempts=1)])
         .expect(rowcount=1)
+        .expect(rowcount=1)  # 批次 failed_count 回退
         .expect(rows=[_item_row(status="running", attempts=2)])
     )
     repo, connection = _repository(cursor)
@@ -534,6 +535,102 @@ def test_requeue_failed_items_resets_to_running_with_lease() -> None:
         datetime(2026, 8, 21, 12, 5, tzinfo=timezone.utc),
         7,
     )
+
+    # 计数回退断言：本次重排 1 条，批次 failed_count 应同步 -1。
+    batch_sql, batch_params = cursor.executed[2]
+    assert "failed_count=failed_count - %s" in batch_sql
+    assert "AND failed_count >= %s" in batch_sql
+    assert batch_params == (1, 3, 1)
+
+
+def test_requeue_decrements_failed_count_by_item_count() -> None:
+    # 多条目重排时，批次 failed_count 按本次重排条数回退。
+    now = datetime(2026, 8, 21, 12, 0, tzinfo=timezone.utc)
+    cursor = (
+        ScriptedCursor()
+        .expect(
+            rows=[
+                _item_row(work_item_id=7, status="failed", attempts=1),
+                _item_row(work_item_id=8, status="failed", attempts=1),
+            ]
+        )
+        .expect(rowcount=1)
+        .expect(rowcount=1)
+        .expect(rowcount=1)  # failed_count - 2
+        .expect(
+            rows=[
+                _item_row(work_item_id=7, status="running", attempts=2),
+                _item_row(work_item_id=8, status="running", attempts=2),
+            ]
+        )
+    )
+    repo, _connection = _repository(cursor)
+
+    requeued = repo.requeue_failed_work_items(
+        batch_id=3, max_attempts=3, lease_seconds=300, now=now
+    )
+
+    assert len(requeued) == 2
+    batch_sql, batch_params = cursor.executed[3]
+    assert "failed_count=failed_count - %s" in batch_sql
+    assert batch_params == (2, 3, 2)
+
+
+def test_requeue_aborts_when_failed_count_underflows() -> None:
+    # 计数漂移防御：批次 failed_count 不足以扣减时守卫 UPDATE 不命中，
+    # 必须 fail-closed 抛错回滚，而不是静默钳位到 0 掩盖漂移。
+    cursor = (
+        ScriptedCursor()
+        .expect(rows=[_item_row(work_item_id=7, status="failed", attempts=1)])
+        .expect(rowcount=1)
+        .expect(rowcount=0)  # 守卫 WHERE 未命中
+    )
+    repo, connection = _repository(cursor)
+
+    with pytest.raises(V15PersistenceError, match="failed_count"):
+        repo.requeue_failed_work_items(
+            batch_id=3, max_attempts=3, lease_seconds=300
+        )
+
+    assert connection.rollback_count == 1
+    # 只有 SELECT / 条目 UPDATE / 失败的计数 UPDATE，没有后续回读。
+    assert len(cursor.executed) == 3
+
+
+def test_requeue_fail_commit_lifecycle_keeps_counters_consistent() -> None:
+    # 全链路回归：失败(+1) -> 重排(-1) -> 重试成功(committed+1)。
+    # 同一条目在任何路径下都不得同时计入 failed 与 committed。
+    now = datetime(2026, 8, 21, 12, 0, tzinfo=timezone.utc)
+    cursor = (
+        # 失败：锁定 running -> UPDATE item -> failed_count+1
+        ScriptedCursor()
+        .expect(one={"status": "running", "batch_id": 3})
+        .expect(rowcount=1)
+        .expect(rowcount=1)
+        # 重排：SELECT failed -> UPDATE item -> failed_count-1 -> 回读
+        .expect(rows=[_item_row(work_item_id=7, status="failed", attempts=1)])
+        .expect(rowcount=1)
+        .expect(rowcount=1)
+        .expect(rows=[_item_row(work_item_id=7, status="running", attempts=2)])
+        # 重试成功：锁定 running -> UPDATE item -> committed_count+1
+        .expect(one={"status": "running", "batch_id": 3})
+        .expect(rowcount=1)
+        .expect(rowcount=1)
+    )
+    repo, _connection = _repository(cursor)
+
+    repo.mark_work_item_failed(
+        work_item_id=7, error_type="MilvusTimeout", error_message="写入超时"
+    )
+    repo.requeue_failed_work_items(
+        batch_id=3, max_attempts=3, lease_seconds=300, now=now
+    )
+    repo.mark_work_item_committed(work_item_id=7)
+
+    sql_text = "\n".join(_executed_sql(cursor))
+    assert sql_text.count("failed_count=failed_count+1") == 1
+    assert sql_text.count("failed_count=failed_count - %s") == 1
+    assert sql_text.count("committed_count=committed_count+1") == 1
 
 
 def test_requeue_returns_empty_when_attempts_exhausted() -> None:
