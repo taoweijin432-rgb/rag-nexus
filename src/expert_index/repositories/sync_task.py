@@ -8,11 +8,7 @@ from __future__ import annotations
 import pymysql
 
 from ..config import DatabaseConfig, require_index_database
-from ..models import (
-    CHECKPOINT_SOURCE_TABLES,
-    SOURCE_SYNC_OPERATION_TYPES,
-    SourceSyncTask,
-)
+from ..models import NewSourceSyncTask, SourceSyncTask
 
 
 class MySQLSourceSyncTaskRepository:
@@ -26,27 +22,17 @@ class MySQLSourceSyncTaskRepository:
 
     def create_source_sync_task(
         self,
-        *,
-        batch_id: int,
-        source_table: str,
-        source_record_id: int,
-        expert_id: int | None,
-        operation_type: str,
+        task: NewSourceSyncTask,
     ) -> int:
-        """幂等创建 pending 任务并返回任务 ID。
+        """按跨扫描 ``dedupe_key`` 幂等创建 pending 任务并返回 ID。
 
-        同一批次、来源表和来源记录已存在任务时返回原任务 ID，不覆盖其专家映射、
-        操作类型、处理状态或结果字段。
+        新任务固定从 ``candidate/pending`` 开始。唯一键冲突后会再按
+        ``dedupe_key`` 及其公式字段查询；只有确认是同一业务身份时才返回
+        原任务 ID。旧批次内唯一键如果误命中不同任务，方法会回滚并报错。
         """
 
-        _validate_positive_integer("batch_id", batch_id)
-        _validate_positive_integer("source_record_id", source_record_id)
-        if expert_id is not None:
-            _validate_positive_integer("expert_id", expert_id)
-        if source_table not in CHECKPOINT_SOURCE_TABLES:
-            raise ValueError(f"不支持的同步任务来源表: {source_table}")
-        if operation_type not in SOURCE_SYNC_OPERATION_TYPES:
-            raise ValueError(f"不支持的同步任务操作类型: {operation_type}")
+        if not isinstance(task, NewSourceSyncTask):
+            raise TypeError("task 必须是 NewSourceSyncTask")
 
         connection = pymysql.connect(**self.config.as_kwargs())
         try:
@@ -54,21 +40,59 @@ class MySQLSourceSyncTaskRepository:
                 cursor.execute(
                     """
                     INSERT INTO expert_index_sync_task(
-                        batch_id, source_table, source_record_id,
-                        expert_id, operation_type, sync_status, retry_count
-                    ) VALUES (%s, %s, %s, %s, %s, 'pending', 0)
+                        dedupe_key, batch_id, event_source,
+                        source_table, source_record_id, source_updated_at,
+                        expert_id, operation_type, target_type,
+                        processing_stage, sync_status, retry_count,
+                        policy_version
+                    ) VALUES (
+                        %s, %s, %s, %s, %s, %s, %s, %s, %s,
+                        'candidate', 'pending', 0, %s
+                    )
                     ON DUPLICATE KEY UPDATE id=LAST_INSERT_ID(id)
                     """,
                     (
-                        batch_id,
-                        source_table,
-                        source_record_id,
-                        expert_id,
-                        operation_type,
+                        task.dedupe_key,
+                        task.batch_id,
+                        task.event_source,
+                        task.source_table,
+                        task.source_record_id,
+                        task.source_updated_at,
+                        task.expert_id,
+                        task.operation_type,
+                        task.target_type,
+                        task.policy_version,
                     ),
                 )
-                # INSERT 返回新 ID；唯一键冲突时 LAST_INSERT_ID 返回原任务 ID。
-                task_id = int(cursor.lastrowid)
+                # 不依赖命中的具体唯一索引；只认可完整幂等身份对应的任务。
+                cursor.execute(
+                    """
+                    SELECT id
+                    FROM expert_index_sync_task
+                    WHERE dedupe_key=%s
+                      AND event_source=%s
+                      AND source_table=%s
+                      AND source_record_id=%s
+                      AND source_updated_at <=> %s
+                      AND operation_type=%s
+                      AND target_type=%s
+                      AND policy_version=%s
+                    """,
+                    (
+                        task.dedupe_key,
+                        task.event_source,
+                        task.source_table,
+                        task.source_record_id,
+                        task.source_updated_at,
+                        task.operation_type,
+                        task.target_type,
+                        task.policy_version,
+                    ),
+                )
+                identity_row = cursor.fetchone()
+                if identity_row is None:
+                    raise RuntimeError("同步任务唯一键冲突，但未找到匹配的 dedupe_key 身份")
+                task_id = int(identity_row["id"])
             connection.commit()
             return task_id
         except Exception:
@@ -89,10 +113,14 @@ class MySQLSourceSyncTaskRepository:
             with connection.cursor() as cursor:
                 cursor.execute(
                     """
-                    SELECT id, batch_id, source_table, source_record_id,
-                           expert_id, operation_type, sync_status, retry_count,
-                           error_stage, error_type, error_message, result_code,
-                           started_at, completed_at, created_at
+                    SELECT id, dedupe_key, batch_id, event_source,
+                           source_table, source_record_id, source_updated_at,
+                           expert_id, operation_type, target_type,
+                           processing_stage, sync_status, retry_count,
+                           attempt_token, lease_until, next_retry_at,
+                           policy_version, error_stage, error_code,
+                           error_type, error_message, result_code,
+                           started_at, completed_at, created_at, updated_at
                     FROM expert_index_sync_task
                     WHERE id=%s
                     """,
@@ -105,20 +133,31 @@ class MySQLSourceSyncTaskRepository:
                 raise RuntimeError("同步任务查询结果与请求 ID 不一致")
             return SourceSyncTask(
                 task_id=task_id,
+                dedupe_key=str(row["dedupe_key"]),
                 batch_id=int(row["batch_id"]),
+                event_source=str(row["event_source"]),
                 source_table=str(row["source_table"]),
                 source_record_id=int(row["source_record_id"]),
+                source_updated_at=row.get("source_updated_at"),
                 expert_id=(int(row["expert_id"]) if row.get("expert_id") is not None else None),
                 operation_type=str(row["operation_type"]),
+                target_type=str(row["target_type"]),
+                processing_stage=str(row["processing_stage"]),
                 sync_status=str(row["sync_status"]),
                 retry_count=int(row["retry_count"]),
+                attempt_token=row.get("attempt_token"),
+                lease_until=row.get("lease_until"),
+                next_retry_at=row.get("next_retry_at"),
+                policy_version=row.get("policy_version"),
                 error_stage=row.get("error_stage"),
+                error_code=row.get("error_code"),
                 error_type=row.get("error_type"),
                 error_message=row.get("error_message"),
                 result_code=row.get("result_code"),
                 started_at=row.get("started_at"),
                 completed_at=row.get("completed_at"),
                 created_at=row["created_at"],
+                updated_at=row["updated_at"],
             )
         finally:
             connection.close()

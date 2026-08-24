@@ -603,8 +603,8 @@ def _clean_unique(values: Iterable[object]) -> tuple[str, ...]:
 def _latest_source_time(profile: object, educations: Iterable[object]) -> datetime | None:
     """取主档和教育记录的最新业务时间，作为画像来源版本时间。
 
-    Profile 是多表聚合结果，因此只使用 experts.updated_at 会漏掉教育表更新。取所有
-    参与记录的最新时间，可以让 ``source_version`` 在任一教育记录变化后同步前进；
+    Profile 是多表聚合结果，因此只使用映射后的专家正式来源时间会漏掉教育表更新。
+    取所有参与记录的最新时间，可以让 ``source_version`` 在任一教育记录变化后同步前进；
     全部没有审计时间时返回 ``None``，不伪造运行时间。
     """
 

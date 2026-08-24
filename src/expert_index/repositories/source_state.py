@@ -45,7 +45,8 @@ class MySQLSourceStateRepository:
                 cursor.execute(
                     """
                     SELECT source_table, last_updated_at, last_id,
-                           last_batch_id, last_success_time, lock_version
+                           last_batch_id, last_success_time, lock_version,
+                           lease_owner, lease_until
                     FROM expert_index_source_checkpoint
                     WHERE source_table=%s
                     """,
@@ -65,6 +66,8 @@ class MySQLSourceStateRepository:
                 ),
                 last_success_time=row.get("last_success_time"),
                 lock_version=int(row["lock_version"]),
+                lease_owner=row.get("lease_owner"),
+                lease_until=row.get("lease_until"),
             )
         finally:
             connection.close()
@@ -80,6 +83,8 @@ class MySQLSourceStateRepository:
             raise TypeError("checkpoint 必须是 SourceCheckpoint")
         if checkpoint.lock_version != 0:
             raise ValueError("初始化 Checkpoint 的 lock_version 必须为 0")
+        if checkpoint.lease_owner is not None or checkpoint.lease_until is not None:
+            raise ValueError("初始化 Checkpoint 不能携带扫描租约")
 
         connection = pymysql.connect(**self.config.as_kwargs())
         try:
@@ -88,8 +93,9 @@ class MySQLSourceStateRepository:
                     """
                     INSERT INTO expert_index_source_checkpoint(
                         source_table, last_updated_at, last_id,
-                        last_batch_id, last_success_time, lock_version
-                    ) VALUES (%s, %s, %s, %s, %s, 0)
+                        last_batch_id, last_success_time, lock_version,
+                        lease_owner, lease_until
+                    ) VALUES (%s, %s, %s, %s, %s, 0, NULL, NULL)
                     """,
                     (
                         checkpoint.source_table,
@@ -119,6 +125,16 @@ class MySQLSourceStateRepository:
             raise ValueError("新建批次来源记录的 current_cursor 必须等于 start_cursor")
         if scan.status != "pending" or scan.started_at is not None or scan.finished_at is not None:
             raise ValueError("新建批次来源记录必须处于未开始的 pending 状态")
+        if any(
+            count != 0
+            for count in (
+                scan.candidate_count,
+                scan.success_count,
+                scan.failed_count,
+                scan.skipped_count,
+            )
+        ):
+            raise ValueError("新建批次来源记录的处理计数必须全部为 0")
 
         connection = pymysql.connect(**self.config.as_kwargs())
         try:
@@ -131,8 +147,13 @@ class MySQLSourceStateRepository:
                         cursor_updated_at, cursor_id,
                         upper_bound_updated_at, upper_bound_id,
                         checkpoint_lock_version, status,
+                        candidate_count, success_count,
+                        failed_count, skipped_count,
                         started_at, finished_at
-                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    ) VALUES (
+                        %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
+                        %s, %s, %s, %s, %s, %s
+                    )
                     """,
                     (
                         scan.batch_id,
@@ -145,6 +166,10 @@ class MySQLSourceStateRepository:
                         scan.upper_bound.record_id,
                         scan.checkpoint_lock_version,
                         scan.status,
+                        scan.candidate_count,
+                        scan.success_count,
+                        scan.failed_count,
+                        scan.skipped_count,
                         scan.started_at,
                         scan.finished_at,
                     ),
@@ -182,6 +207,8 @@ class MySQLSourceStateRepository:
                            cursor_updated_at, cursor_id,
                            upper_bound_updated_at, upper_bound_id,
                            checkpoint_lock_version, status,
+                           candidate_count, success_count,
+                           failed_count, skipped_count,
                            started_at, finished_at
                     FROM expert_index_batch_source
                     WHERE batch_id=%s AND source_table=%s
@@ -210,6 +237,10 @@ class MySQLSourceStateRepository:
                 ),
                 checkpoint_lock_version=int(row["checkpoint_lock_version"]),
                 status=row["status"],
+                candidate_count=int(row["candidate_count"]),
+                success_count=int(row["success_count"]),
+                failed_count=int(row["failed_count"]),
+                skipped_count=int(row["skipped_count"]),
                 started_at=row.get("started_at"),
                 finished_at=row.get("finished_at"),
             )

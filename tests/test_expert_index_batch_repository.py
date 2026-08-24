@@ -187,6 +187,7 @@ def test_get_source_checkpoint_returns_committed_state(
 
     checkpoint_time = datetime(2026, 8, 20, 9, 30, tzinfo=timezone.utc)
     success_time = datetime(2026, 8, 20, 9, 35, tzinfo=timezone.utc)
+    lease_until = datetime(2026, 8, 20, 9, 40, tzinfo=timezone.utc)
     cursor = RecordingCursor(
         one={
             "source_table": "experts_work_experience",
@@ -195,6 +196,8 @@ def test_get_source_checkpoint_returns_committed_state(
             "last_batch_id": 901,
             "last_success_time": success_time,
             "lock_version": 3,
+            "lease_owner": "scanner-1",
+            "lease_until": lease_until,
         }
     )
     connection = RecordingConnection(cursor)
@@ -209,6 +212,8 @@ def test_get_source_checkpoint_returns_committed_state(
         last_batch_id=901,
         last_success_time=success_time,
         lock_version=3,
+        lease_owner="scanner-1",
+        lease_until=lease_until,
     )
     assert "FROM expert_index_source_checkpoint" in cursor.executed[0][0]
     assert cursor.executed[0][1] == ("experts_work_experience",)
@@ -271,6 +276,8 @@ def test_initialize_source_checkpoint_inserts_explicit_safe_position(
     sql, params = cursor.executed[0]
     assert "INSERT INTO expert_index_source_checkpoint" in sql
     assert "ON DUPLICATE KEY UPDATE" not in sql
+    assert "lease_owner, lease_until" in sql
+    assert "0, NULL, NULL" in sql
     assert params == (
         "experts_project_experience",
         checkpoint_time,
@@ -304,6 +311,32 @@ def test_initialize_source_checkpoint_rejects_nonzero_lock_version(
 
     with pytest.raises(ValueError, match="lock_version 必须为 0"):
         _source_state_repository().initialize_source_checkpoint(checkpoint)
+
+
+def test_initialize_source_checkpoint_rejects_active_lease(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """初始安全位置不能携带已认领租约或访问数据库。"""
+
+    def unexpected_connect(**_kwargs: object) -> None:
+        raise AssertionError("携带租约的初始 Checkpoint 不应连接数据库")
+
+    monkeypatch.setattr(
+        "expert_index.repositories.source_state.pymysql.connect",
+        unexpected_connect,
+    )
+    checkpoint_time = datetime(2026, 8, 13, 22, 0, tzinfo=timezone.utc)
+
+    with pytest.raises(ValueError, match="初始化 Checkpoint 不能携带扫描租约"):
+        _source_state_repository().initialize_source_checkpoint(
+            SourceCheckpoint(
+                source_table="experts",
+                last_updated_at=checkpoint_time,
+                last_id=0,
+                lease_owner="scanner-1",
+                lease_until=checkpoint_time,
+            )
+        )
 
 
 def test_create_batch_source_scan_inserts_fixed_range(
@@ -342,6 +375,10 @@ def test_create_batch_source_scan_inserts_fixed_range(
         300,
         4,
         "pending",
+        0,
+        0,
+        0,
+        0,
         None,
         None,
     )
@@ -378,6 +415,34 @@ def test_create_batch_source_scan_rejects_already_started_state(
         )
 
 
+def test_create_batch_source_scan_rejects_nonzero_initial_counts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """创建来源扫描范围时不能伪造已完成的处理计数。"""
+
+    def unexpected_connect(**_kwargs: object) -> None:
+        raise AssertionError("非零初始计数不应连接数据库")
+
+    monkeypatch.setattr(
+        "expert_index.repositories.source_state.pymysql.connect",
+        unexpected_connect,
+    )
+    start_time = datetime(2026, 8, 13, 22, 0, tzinfo=timezone.utc)
+
+    with pytest.raises(ValueError, match="处理计数必须全部为 0"):
+        _source_state_repository().create_batch_source_scan(
+            BatchSourceScan(
+                batch_id=903,
+                source_table="experts",
+                start_cursor=SourceScanCursor(start_time, 0),
+                current_cursor=SourceScanCursor(start_time, 0),
+                upper_bound=SourceScanCursor(start_time, 10),
+                checkpoint_lock_version=0,
+                candidate_count=1,
+            )
+        )
+
+
 def test_get_batch_source_scan_returns_persisted_state(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -399,6 +464,10 @@ def test_get_batch_source_scan_returns_persisted_state(
             "upper_bound_id": 300,
             "checkpoint_lock_version": 4,
             "status": "running",
+            "candidate_count": 12,
+            "success_count": 8,
+            "failed_count": 1,
+            "skipped_count": 3,
             "started_at": started_at,
             "finished_at": None,
         }
@@ -419,6 +488,10 @@ def test_get_batch_source_scan_returns_persisted_state(
         upper_bound=SourceScanCursor(upper_bound_time, 300),
         checkpoint_lock_version=4,
         status="running",
+        candidate_count=12,
+        success_count=8,
+        failed_count=1,
+        skipped_count=3,
         started_at=started_at,
     )
     sql, params = cursor.executed[0]

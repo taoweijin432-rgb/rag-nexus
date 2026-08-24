@@ -8,7 +8,7 @@ from typing import Any, Self
 import pytest
 
 from expert_index.config import DatabaseConfig, DatabaseRole
-from expert_index.models import SourceSyncTask
+from expert_index.models import NewSourceSyncTask, SourceSyncTask
 from expert_index.repositories import MySQLSourceSyncTaskRepository
 
 
@@ -74,6 +74,25 @@ def _repository() -> MySQLSourceSyncTaskRepository:
     return MySQLSourceSyncTaskRepository(config)
 
 
+def _new_task(**changes: object) -> NewSourceSyncTask:
+    """构造一条符合 012 身份约束的待创建任务。"""
+
+    values: dict[str, object] = {
+        "dedupe_key": "a" * 64,
+        "batch_id": 701,
+        "event_source": "poll",
+        "source_table": "experts_work_experience",
+        "source_record_id": 901,
+        "source_updated_at": datetime(2026, 8, 21, 9, 0, tzinfo=timezone.utc),
+        "expert_id": 101,
+        "operation_type": "update",
+        "target_type": "employment",
+        "policy_version": "1.3",
+    }
+    values.update(changes)
+    return NewSourceSyncTask(**values)  # type: ignore[arg-type]
+
+
 def _patch_connection(
     monkeypatch: pytest.MonkeyPatch,
     connection: RecordingConnection,
@@ -86,37 +105,57 @@ def _patch_connection(
     )
 
 
-def test_create_source_sync_task_is_idempotent_by_source_record(
+def test_create_source_sync_task_is_idempotent_by_cross_scan_dedupe_key(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """重复来源记录应返回唯一键对应的原任务 ID。"""
+    """重复扫描应在核验冻结身份后返回 dedupe_key 对应的原任务 ID。"""
 
-    cursor = RecordingCursor(lastrowid=801)
+    cursor = RecordingCursor(one={"id": 801}, lastrowid=801)
     connection = RecordingConnection(cursor)
     _patch_connection(monkeypatch, connection)
 
-    task_id = _repository().create_source_sync_task(
-        batch_id=701,
-        source_table="experts_work_experience",
-        source_record_id=901,
-        expert_id=101,
-        operation_type="update",
-    )
+    task = _new_task()
+    task_id = _repository().create_source_sync_task(task)
 
-    sql, params = cursor.executed[0]
+    insert_sql, insert_params = cursor.executed[0]
+    identity_sql, identity_params = cursor.executed[1]
     assert task_id == 801
-    assert "VALUES (%s, %s, %s, %s, %s, 'pending', 0)" in sql
-    assert "ON DUPLICATE KEY UPDATE id=LAST_INSERT_ID(id)" in sql
-    assert params == (701, "experts_work_experience", 901, 101, "update")
+    assert "dedupe_key, batch_id, event_source" in insert_sql
+    assert "'candidate', 'pending', 0" in insert_sql
+    assert "ON DUPLICATE KEY UPDATE id=LAST_INSERT_ID(id)" in insert_sql
+    assert insert_params == (
+        task.dedupe_key,
+        701,
+        "poll",
+        "experts_work_experience",
+        901,
+        task.source_updated_at,
+        101,
+        "update",
+        "employment",
+        "1.3",
+    )
+    assert "source_updated_at <=> %s" in identity_sql
+    assert "batch_id" not in identity_sql
+    assert identity_params == (
+        task.dedupe_key,
+        "poll",
+        "experts_work_experience",
+        901,
+        task.source_updated_at,
+        "update",
+        "employment",
+        "1.3",
+    )
     assert connection.commit_count == 1
     assert connection.rollback_count == 0
     assert connection.closed is True
 
 
-def test_create_source_sync_task_validates_identity_before_connecting(
+def test_create_source_sync_task_requires_domain_contract_before_connecting(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """非法来源定位字段不应访问数据库。"""
+    """非 NewSourceSyncTask 对象不应访问数据库。"""
 
     def unexpected_connect(**_kwargs: object) -> None:
         raise AssertionError("参数校验失败时不应连接 MySQL")
@@ -126,14 +165,25 @@ def test_create_source_sync_task_validates_identity_before_connecting(
         unexpected_connect,
     )
 
-    with pytest.raises(ValueError, match="source_record_id 必须是正整数"):
-        _repository().create_source_sync_task(
-            batch_id=701,
-            source_table="experts",
-            source_record_id=0,
-            expert_id=101,
-            operation_type="update",
-        )
+    with pytest.raises(TypeError, match="task 必须是 NewSourceSyncTask"):
+        _repository().create_source_sync_task(object())  # type: ignore[arg-type]
+
+
+def test_create_source_sync_task_rolls_back_mismatched_unique_conflict(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """旧批次唯一键命中不同身份时必须回滚，不得误报幂等成功。"""
+
+    cursor = RecordingCursor(one=None)
+    connection = RecordingConnection(cursor)
+    _patch_connection(monkeypatch, connection)
+
+    with pytest.raises(RuntimeError, match="未找到匹配的 dedupe_key 身份"):
+        _repository().create_source_sync_task(_new_task())
+
+    assert connection.commit_count == 0
+    assert connection.rollback_count == 1
+    assert connection.closed is True
 
 
 def test_get_source_sync_task_returns_complete_domain_model(
@@ -142,24 +192,37 @@ def test_get_source_sync_task_returns_complete_domain_model(
     """查询结果应完整映射为 SourceSyncTask。"""
 
     created_at = datetime(2026, 8, 21, 10, 0, tzinfo=timezone.utc)
+    updated_at = datetime(2026, 8, 21, 10, 2, tzinfo=timezone.utc)
     started_at = datetime(2026, 8, 21, 10, 1, tzinfo=timezone.utc)
+    lease_until = datetime(2026, 8, 21, 10, 3, tzinfo=timezone.utc)
     cursor = RecordingCursor(
         one={
             "id": 801,
+            "dedupe_key": "b" * 64,
             "batch_id": 701,
+            "event_source": "poll",
             "source_table": "experts_project_experience",
             "source_record_id": 901,
+            "source_updated_at": created_at,
             "expert_id": 101,
             "operation_type": "insert",
+            "target_type": "project",
+            "processing_stage": "source_read",
             "sync_status": "processing",
             "retry_count": 0,
+            "attempt_token": "attempt-801",
+            "lease_until": lease_until,
+            "next_retry_at": None,
+            "policy_version": "1.3",
             "error_stage": None,
+            "error_code": None,
             "error_type": None,
             "error_message": None,
             "result_code": None,
             "started_at": started_at,
             "completed_at": None,
             "created_at": created_at,
+            "updated_at": updated_at,
         }
     )
     connection = RecordingConnection(cursor)
@@ -169,14 +232,23 @@ def test_get_source_sync_task_returns_complete_domain_model(
 
     assert task == SourceSyncTask(
         task_id=801,
+        dedupe_key="b" * 64,
         batch_id=701,
+        event_source="poll",
         source_table="experts_project_experience",
         source_record_id=901,
+        source_updated_at=created_at,
         expert_id=101,
         operation_type="insert",
+        target_type="project",
+        processing_stage="source_read",
         sync_status="processing",
         retry_count=0,
+        attempt_token="attempt-801",
+        lease_until=lease_until,
+        policy_version="1.3",
         created_at=created_at,
+        updated_at=updated_at,
         started_at=started_at,
     )
     assert cursor.executed[0][1] == (801,)

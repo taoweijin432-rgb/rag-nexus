@@ -33,12 +33,22 @@ def test_batch_source_scan_records_fixed_range_and_temporary_progress() -> None:
         upper_bound=upper_bound,
         checkpoint_lock_version=3,
         status="running",
+        candidate_count=12,
+        success_count=8,
+        failed_count=1,
+        skipped_count=3,
     )
 
     assert scan.start_cursor == start_cursor
     assert scan.current_cursor == current_cursor
     assert scan.upper_bound == upper_bound
     assert scan.status in BATCH_SOURCE_SCAN_STATUSES
+    assert (
+        scan.candidate_count,
+        scan.success_count,
+        scan.failed_count,
+        scan.skipped_count,
+    ) == (12, 8, 1, 3)
 
 
 @pytest.mark.parametrize(
@@ -97,6 +107,35 @@ def test_batch_source_scan_rejects_invalid_status_and_lock_version() -> None:
         )
 
 
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"candidate_count": -1},
+        {"success_count": True},
+        {"failed_count": 1.5},
+        {"skipped_count": -1},
+    ],
+)
+def test_batch_source_scan_rejects_invalid_processing_counts(
+    changes: dict[str, object],
+) -> None:
+    """来源表级处理计数必须与 MySQL 无符号计数字段一致。"""
+
+    cursor = SourceScanCursor(updated_at=CHECKPOINT_TIME, record_id=0)
+    values: dict[str, object] = {
+        "batch_id": 1,
+        "source_table": "experts",
+        "start_cursor": cursor,
+        "current_cursor": cursor,
+        "upper_bound": cursor,
+        "checkpoint_lock_version": 0,
+    }
+    values.update(changes)
+
+    with pytest.raises(ValueError, match="必须是非负整数"):
+        BatchSourceScan(**values)  # type: ignore[arg-type]
+
+
 def test_source_scan_cursor_orders_by_time_then_record_id() -> None:
     """复合游标顺序必须与增量 SQL 的 updated_at、id 排序一致。"""
 
@@ -146,6 +185,8 @@ def test_source_checkpoint_accepts_each_supported_source_table() -> None:
         assert checkpoint.last_batch_id is None
         assert checkpoint.last_success_time is None
         assert checkpoint.lock_version == 0
+        assert checkpoint.lease_owner is None
+        assert checkpoint.lease_until is None
 
 
 def test_source_checkpoint_rejects_unknown_source_table() -> None:
@@ -187,4 +228,24 @@ def test_source_checkpoint_rejects_invalid_version_and_batch_id() -> None:
             last_updated_at=CHECKPOINT_TIME,
             last_id=1,
             lock_version=-1,
+        )
+
+
+def test_source_checkpoint_requires_complete_valid_lease() -> None:
+    """Checkpoint 租约持有者和到期时间必须成对并符合字段类型。"""
+
+    with pytest.raises(ValueError, match="lease_owner 和 lease_until 必须同时"):
+        SourceCheckpoint(
+            source_table="experts",
+            last_updated_at=CHECKPOINT_TIME,
+            last_id=1,
+            lease_owner="scanner-1",
+        )
+    with pytest.raises(TypeError, match="lease_until 必须是 datetime 或 None"):
+        SourceCheckpoint(
+            source_table="experts",
+            last_updated_at=CHECKPOINT_TIME,
+            last_id=1,
+            lease_owner="scanner-1",
+            lease_until="2026-08-21",  # type: ignore[arg-type]
         )
