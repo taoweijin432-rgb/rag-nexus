@@ -158,6 +158,16 @@ class ExpertIndexPipeline:
         batch_item_repository: MySQLBatchItemRepository | None = None,
         vector_sync: ExpertVectorSyncPort,
     ) -> None:
+        # 默认 Repository 会真实写入状态库；完整注入 Fake 的测试路径不建立数据库连接。
+        if any(
+            repository is None
+            for repository in (
+                build_lock_repository,
+                batch_repository,
+                batch_item_repository,
+            )
+        ):
+            settings.validate_index_write_boundary()
         self.settings = settings
         self.source = source or MySQLSourceAdapter(settings.source_db)
         self.build_lock_repository = (

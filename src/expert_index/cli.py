@@ -17,7 +17,6 @@ from pathlib import Path
 from .config import Settings
 from .pipeline import ExpertIndexPipeline
 from .schema_initializer import MySQLSchemaInitializer
-from .test_fixture import ensure_complete_test_expert
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_DDL = PROJECT_ROOT / "sql" / "001_create_expert_index_tables.sql"
@@ -96,11 +95,6 @@ def build_parser() -> argparse.ArgumentParser:
         help="每页失败专家数，范围 1~1000，默认 200",
     )
 
-    # 该命令是显式测试数据写入入口，不会在 init-db/build 中自动运行。
-    sub.add_parser(
-        "seed-test-expert",
-        help="在测试源库幂等创建主档及工作、项目、教育经历完整关联的虚构专家",
-    )
     return parser
 
 
@@ -109,6 +103,8 @@ def main(argv: list[str] | None = None) -> None:
 
     args = build_parser().parse_args(argv)
     settings = Settings.from_env()
+    # 所有正式命令都会创建或更新本地状态；在加载下游组件或连接 MySQL 前先验证边界。
+    settings.validate_index_write_boundary()
     if args.command == "init-db":
         MySQLSchemaInitializer(settings.index_db).initialize_schema(args.ddl)
         print(json.dumps({"status": "ok", "schema": settings.index_db.database}, ensure_ascii=False))
@@ -143,9 +139,6 @@ def main(argv: list[str] | None = None) -> None:
             page_size=args.page_size,
         )
         print(json.dumps(asdict(result), ensure_ascii=False, sort_keys=True))
-    elif args.command == "seed-test-expert":
-        fixture = ensure_complete_test_expert(settings.source_db)
-        print(json.dumps(asdict(fixture), ensure_ascii=False, sort_keys=True))
 
 
 def _build_pipeline(settings: Settings) -> ExpertIndexPipeline:

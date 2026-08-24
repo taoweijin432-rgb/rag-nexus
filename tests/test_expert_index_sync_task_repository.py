@@ -7,7 +7,7 @@ from typing import Any, Self
 
 import pytest
 
-from expert_index.config import DatabaseConfig
+from expert_index.config import DatabaseConfig, DatabaseRole
 from expert_index.models import SourceSyncTask
 from expert_index.repositories import MySQLSourceSyncTaskRepository
 
@@ -63,7 +63,14 @@ class RecordingConnection:
 def _repository() -> MySQLSourceSyncTaskRepository:
     """构造使用虚构连接参数的同步任务 Repository。"""
 
-    config = DatabaseConfig("127.0.0.1", 3306, "test", "test", "index_test")
+    config = DatabaseConfig(
+        "127.0.0.1",
+        3306,
+        "test",
+        "test",
+        "index_test",
+        role=DatabaseRole.INDEX,
+    )
     return MySQLSourceSyncTaskRepository(config)
 
 

@@ -1,14 +1,12 @@
-"""配置读取与版本常量。
-
-这里支持“源业务库”和“派生索引库”两套连接变量。当前演示环境只有一套 DB_*，
-所以 INDEX_DB_* 会安全地回退到 DB_*；
-"""
+"""读取专家来源库与本地索引状态库配置，并维护版本常量。"""
 
 from __future__ import annotations
 
 import os
 import re
+from collections.abc import Mapping
 from dataclasses import dataclass
+from enum import Enum
 from pathlib import Path
 from typing import Any
 
@@ -23,6 +21,19 @@ DICTIONARY_VERSION = "2026.08"
 CONTRACT_VERSION = "4.1.0"
 
 _ENV_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+
+class DatabaseBoundaryError(RuntimeError):
+    """表示数据库角色或 Source/Index 物理目标不满足写入边界。"""
+
+
+class DatabaseRole(str, Enum):
+    """标识连接配置允许承担的数据库职责。"""
+
+    UNSPECIFIED = "unspecified"
+    SOURCE = "source"
+    INDEX = "index"
+    ISOLATED_TEST = "isolated_test"
 
 
 def load_env_file(path: Path | None = None) -> None:
@@ -49,17 +60,33 @@ def load_env_file(path: Path | None = None) -> None:
 
 @dataclass(frozen=True)
 class DatabaseConfig:
-    """
-        DatabaseConfig 是连接参数的"标准化容器"，把分散的参数打包成不可变对象，
-        并提供统一的 as_kwargs() 方法生成 PyMySQL 连接参数，
-        统一 PyMySQL 的安全默认值。让数据库连接代码干净、统一、不易出错。
-    """
+    """保存一个 MySQL Schema 的连接参数、用途角色和安全连接默认值。"""
 
     host: str
     port: int
     user: str
     password: str
     database: str
+    role: DatabaseRole = DatabaseRole.UNSPECIFIED
+
+    def targets_same_schema(self, other: DatabaseConfig) -> bool:
+        """判断两个配置是否指向同一 MySQL 主机、端口和 Schema。
+
+        用户名和密码不参与目标判断；即使写账号不同，只要物理 Schema 相同就不能把
+        Index 状态写入 Source。常见本机地址会统一为 ``127.0.0.1``。
+        """
+
+        if not isinstance(other, DatabaseConfig):
+            return False
+        return self._target_identity() == other._target_identity()
+
+    def _target_identity(self) -> tuple[str, int, str]:
+        """返回不包含凭据的规范化数据库目标标识。"""
+
+        host = self.host.strip().casefold()
+        if host in {"localhost", "::1", "[::1]"}:
+            host = "127.0.0.1"
+        return host, self.port, self.database.strip().casefold()
 
     def as_kwargs(self, *, autocommit: bool = False) -> dict[str, Any]:
         # DictCursor 能让 SQL 字段与领域字段的映射清晰可读；较短超时避免任务挂死。
@@ -92,26 +119,86 @@ class Settings:
     dictionary_version: str = DICTIONARY_VERSION
 
     @classmethod
-    def from_env(cls) -> Settings:
-        """从环境变量构造配置；未设置密码变量时才拒绝，允许本地空密码。"""
+    def from_env(cls, env: Mapping[str, str] | None = None) -> Settings:
+        """从环境变量构造 Source/Index 配置，并要求 Index 使用独立显式变量。"""
 
-        load_env_file()
-        base_password = os.getenv("DB_PASSWORD")
-        if base_password is None:
-            raise RuntimeError("缺少 DB_PASSWORD，无法连接 MySQL")
+        if env is None:
+            load_env_file()
+            values: Mapping[str, str] = os.environ
+        else:
+            values = env
+
+        source_password = _first_present(values, "SOURCE_DB_PASSWORD", "DB_PASSWORD")
+        if source_password is None:
+            raise RuntimeError("缺少 SOURCE_DB_PASSWORD 或 DB_PASSWORD，无法连接来源 MySQL")
 
         source = DatabaseConfig(
-            host=os.getenv("SOURCE_DB_HOST", os.getenv("DB_HOST", "127.0.0.1")),
-            port=int(os.getenv("SOURCE_DB_PORT", os.getenv("DB_PORT", "3306"))),
-            user=os.getenv("SOURCE_DB_USER", os.getenv("DB_USER", "root")),
-            password=os.getenv("SOURCE_DB_PASSWORD", base_password),
-            database=os.getenv("SOURCE_DB_NAME", os.getenv("DB_NAME", "expert_demo")),
+            host=values.get("SOURCE_DB_HOST", values.get("DB_HOST", "127.0.0.1")),
+            port=_parse_port(
+                "SOURCE_DB_PORT",
+                values.get("SOURCE_DB_PORT", values.get("DB_PORT", "3306")),
+            ),
+            user=values.get("SOURCE_DB_USER", values.get("DB_USER", "root")),
+            password=source_password,
+            database=values.get("SOURCE_DB_NAME", values.get("DB_NAME", "expert_demo")),
+            role=DatabaseRole.SOURCE,
         )
         index = DatabaseConfig(
-            host=os.getenv("INDEX_DB_HOST", os.getenv("DB_HOST", "127.0.0.1")),
-            port=int(os.getenv("INDEX_DB_PORT", os.getenv("DB_PORT", "3306"))),
-            user=os.getenv("INDEX_DB_USER", os.getenv("DB_USER", "root")),
-            password=os.getenv("INDEX_DB_PASSWORD", base_password),
-            database=os.getenv("INDEX_DB_NAME", os.getenv("DB_NAME", "expert_demo")),
+            host=_required_value(values, "INDEX_DB_HOST"),
+            port=_parse_port("INDEX_DB_PORT", _required_value(values, "INDEX_DB_PORT")),
+            user=_required_value(values, "INDEX_DB_USER"),
+            password=_required_value(values, "INDEX_DB_PASSWORD", allow_empty=True),
+            database=_required_value(values, "INDEX_DB_NAME"),
+            role=DatabaseRole.INDEX,
         )
         return cls(source_db=source, index_db=index)
+
+    def validate_index_write_boundary(self) -> None:
+        """拒绝使用非 Index 配置或把状态写入 Source 所在物理 Schema。"""
+
+        require_index_database(self.index_db)
+        if self.source_db.targets_same_schema(self.index_db):
+            raise DatabaseBoundaryError(
+                "INDEX_DB_* 与来源库指向同一 MySQL Schema，已拒绝状态写入"
+            )
+
+
+def require_index_database(config: DatabaseConfig) -> None:
+    """确保状态 Repository 收到由 ``INDEX_DB_*`` 构造的连接配置。"""
+
+    if not isinstance(config, DatabaseConfig) or config.role is not DatabaseRole.INDEX:
+        raise DatabaseBoundaryError("状态 Repository 只能使用 INDEX_DB_* 连接配置")
+
+
+def _first_present(values: Mapping[str, str], *names: str) -> str | None:
+    """返回第一个已声明的环境变量值，允许密码显式为空字符串。"""
+
+    for name in names:
+        if name in values:
+            return values[name]
+    return None
+
+
+def _required_value(
+    values: Mapping[str, str],
+    name: str,
+    *,
+    allow_empty: bool = False,
+) -> str:
+    """读取正式入口必需的环境变量，并对非密码字段拒绝空值。"""
+
+    if name not in values or (not allow_empty and not values[name].strip()):
+        raise RuntimeError(f"缺少必需配置 {name}")
+    return values[name]
+
+
+def _parse_port(name: str, value: str) -> int:
+    """把端口配置转换为有效的 TCP 端口号。"""
+
+    try:
+        port = int(value)
+    except ValueError as exc:
+        raise ValueError(f"{name} 必须是整数") from exc
+    if not 1 <= port <= 65535:
+        raise ValueError(f"{name} 必须位于 1 到 65535 之间")
+    return port

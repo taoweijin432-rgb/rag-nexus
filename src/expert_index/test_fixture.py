@@ -1,17 +1,18 @@
-"""测试环境完整专家 Fixture 的幂等写入器。
+"""仅供独立测试数据库使用的完整专家 Fixture 幂等写入器。
 
-本模块会写业务源表，因此不会被普通 ``build`` 隐式调用；只有操作者显式执行
-``seed-test-expert`` 才会运行。四张表在一个 MySQL 事务中创建或更新，任何失败都
-整体回滚。所有内容都带“流程测试/虚构”标记，不使用真实姓名或联系方式。
+本模块不被正式 CLI 或 Pipeline 导入。调用方必须显式提供 ``ISOLATED_TEST`` 角色且
+数据库名包含独立的 test 标记；校验在建立连接前完成。四张测试表在一个事务中更新，
+任何失败都整体回滚。
 """
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 
 import pymysql
 
-from .config import DatabaseConfig
+from .config import DatabaseBoundaryError, DatabaseConfig, DatabaseRole
 
 # 固定唯一编号使重复执行具有幂等性，也让清理测试数据时可以精确定位。
 TEST_EXPERT_SERIAL = "TST2026081100000001"
@@ -177,8 +178,9 @@ class TestFixtureResult:
 
 
 def ensure_complete_test_expert(config: DatabaseConfig) -> TestFixtureResult:
-    """在测试库幂等创建主档及工作、项目、教育经历均关联的虚构专家。"""
+    """仅在显式隔离测试库中幂等写入四表关联的虚构专家。"""
 
+    _require_isolated_test_database(config)
     connection = pymysql.connect(**config.as_kwargs())
     try:
         with connection.cursor() as cursor:
@@ -199,6 +201,20 @@ def ensure_complete_test_expert(config: DatabaseConfig) -> TestFixtureResult:
         raise
     finally:
         connection.close()
+
+
+def _require_isolated_test_database(config: DatabaseConfig) -> None:
+    """在连接前拒绝非测试角色或名称未明确标识为测试库的目标。"""
+
+    if not isinstance(config, DatabaseConfig) or config.role is not DatabaseRole.ISOLATED_TEST:
+        raise DatabaseBoundaryError("Fixture 只能写入 ISOLATED_TEST 角色的独立测试数据库")
+    name_tokens = {
+        token
+        for token in re.split(r"[^a-z0-9]+", config.database.strip().casefold())
+        if token
+    }
+    if not name_tokens.intersection({"test", "testing", "testdb"}):
+        raise DatabaseBoundaryError("Fixture 数据库名必须包含独立的 test 测试标记")
 
 
 def _upsert_expert(cursor: object) -> int:

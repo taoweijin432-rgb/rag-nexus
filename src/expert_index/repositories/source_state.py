@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import pymysql
 
-from ..config import DatabaseConfig
+from ..config import DatabaseConfig, require_index_database
 from ..models import (
     CHECKPOINT_SOURCE_TABLES,
     BatchSourceScan,
@@ -23,6 +23,7 @@ class MySQLSourceStateRepository:
     def __init__(self, config: DatabaseConfig) -> None:
         """保存索引库连接配置，数据库连接由各方法按需创建。"""
 
+        require_index_database(config)
         self.config = config
 
     def get_source_checkpoint(

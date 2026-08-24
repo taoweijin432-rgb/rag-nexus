@@ -11,7 +11,7 @@ from typing import Any, Self
 
 import pytest
 
-from expert_index.config import DatabaseConfig
+from expert_index.config import DatabaseConfig, DatabaseRole
 from expert_index.models import BatchSourceScan, SourceCheckpoint, SourceScanCursor
 from expert_index.repositories import (
     BatchNotResumableError,
@@ -79,28 +79,56 @@ class RecordingConnection:
 def _source_state_repository() -> MySQLSourceStateRepository:
     """构造使用虚构连接参数的来源状态 Repository。"""
 
-    config = DatabaseConfig("127.0.0.1", 3306, "test", "test", "index_test")
+    config = DatabaseConfig(
+        "127.0.0.1",
+        3306,
+        "test",
+        "test",
+        "index_test",
+        role=DatabaseRole.INDEX,
+    )
     return MySQLSourceStateRepository(config)
 
 
 def _batch_item_repository() -> MySQLBatchItemRepository:
     """构造使用虚构连接参数的批次专家明细 Repository。"""
 
-    config = DatabaseConfig("127.0.0.1", 3306, "test", "test", "index_test")
+    config = DatabaseConfig(
+        "127.0.0.1",
+        3306,
+        "test",
+        "test",
+        "index_test",
+        role=DatabaseRole.INDEX,
+    )
     return MySQLBatchItemRepository(config)
 
 
 def _batch_repository() -> MySQLBatchRepository:
     """构造使用虚构连接参数的批次主表 Repository。"""
 
-    config = DatabaseConfig("127.0.0.1", 3306, "test", "test", "index_test")
+    config = DatabaseConfig(
+        "127.0.0.1",
+        3306,
+        "test",
+        "test",
+        "index_test",
+        role=DatabaseRole.INDEX,
+    )
     return MySQLBatchRepository(config)
 
 
 def _build_lock_repository() -> MySQLBuildLockRepository:
     """构造使用虚构连接参数的构建互斥锁 Repository。"""
 
-    config = DatabaseConfig("127.0.0.1", 3306, "test", "test", "index_test")
+    config = DatabaseConfig(
+        "127.0.0.1",
+        3306,
+        "test",
+        "test",
+        "index_test",
+        role=DatabaseRole.INDEX,
+    )
     return MySQLBuildLockRepository(config)
 
 

@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import pymysql
 
-from ..config import DatabaseConfig
+from ..config import DatabaseConfig, require_index_database
 from ..models import (
     CHECKPOINT_SOURCE_TABLES,
     SOURCE_SYNC_OPERATION_TYPES,
@@ -21,6 +21,7 @@ class MySQLSourceSyncTaskRepository:
     def __init__(self, config: DatabaseConfig) -> None:
         """保存索引库连接配置，数据库连接由各方法按需创建。"""
 
+        require_index_database(config)
         self.config = config
 
     def create_source_sync_task(

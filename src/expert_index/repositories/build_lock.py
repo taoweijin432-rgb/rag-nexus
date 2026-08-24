@@ -11,7 +11,7 @@ from contextlib import contextmanager, suppress
 
 import pymysql
 
-from ..config import DatabaseConfig
+from ..config import DatabaseConfig, require_index_database
 
 # single/full 使用同一锁名前缀，避免两个构建任务同时改写索引派生数据。
 BUILD_LOCK_PREFIX = "expert_index_build_v1"
@@ -27,6 +27,7 @@ class MySQLBuildLockRepository:
     def __init__(self, config: DatabaseConfig) -> None:
         """保存索引库连接配置，获取锁时再建立数据库连接。"""
 
+        require_index_database(config)
         self.config = config
 
     @contextmanager

@@ -10,7 +10,7 @@ from dataclasses import dataclass
 
 import pymysql
 
-from ..config import DatabaseConfig
+from ..config import DatabaseConfig, require_index_database
 
 MAX_BATCH_ITEM_PAGE_SIZE = 1000
 _BATCH_ITEM_FINAL_STATUSES = {"success", "rejected", "deactivated", "failed"}
@@ -38,6 +38,7 @@ class MySQLBatchItemRepository:
     def __init__(self, config: DatabaseConfig) -> None:
         """保存索引库连接配置，数据库连接由各方法按需创建。"""
 
+        require_index_database(config)
         self.config = config
 
     def load_retryable_batch_item_ids(

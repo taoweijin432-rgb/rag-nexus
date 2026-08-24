@@ -9,7 +9,7 @@ from pathlib import Path
 
 import pymysql
 
-from .config import DatabaseConfig
+from .config import DatabaseConfig, require_index_database
 
 
 class MySQLSchemaInitializer:
@@ -18,6 +18,7 @@ class MySQLSchemaInitializer:
     def __init__(self, config: DatabaseConfig) -> None:
         """保存索引库连接配置，执行 SQL 时再建立数据库连接。"""
 
+        require_index_database(config)
         self.config = config
 
     def initialize_schema(self, sql_path: Path) -> None:
