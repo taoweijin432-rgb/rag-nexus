@@ -67,10 +67,13 @@ CREATE TABLE IF NOT EXISTS expert_index_source_checkpoint (
     last_success_time DATETIME(6) NULL COMMENT '最近一次安全提交 Checkpoint 的系统时间',
     lock_version BIGINT UNSIGNED NOT NULL DEFAULT 0
         COMMENT '乐观锁版本，防止旧批次覆盖较新的 Checkpoint',
+    lease_owner VARCHAR(128) NULL COMMENT '当前扫描租约持有者',
+    lease_until DATETIME(6) NULL COMMENT '扫描租约到期时间，到期后可重新认领',
     created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
     updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6)
         ON UPDATE CURRENT_TIMESTAMP(6),
     PRIMARY KEY (source_table),
+    KEY idx_expert_source_checkpoint_lease (lease_until, source_table),
     CONSTRAINT chk_expert_index_source_checkpoint_table CHECK (
         source_table IN (
             'experts',
@@ -78,6 +81,10 @@ CREATE TABLE IF NOT EXISTS expert_index_source_checkpoint (
             'experts_project_experience',
             'experts_education_experience'
         )
+    ),
+    CONSTRAINT chk_expert_source_checkpoint_lease CHECK (
+        (lease_owner IS NULL AND lease_until IS NULL)
+        OR (lease_owner IS NOT NULL AND lease_until IS NOT NULL)
     )
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
@@ -101,6 +108,10 @@ CREATE TABLE IF NOT EXISTS expert_index_batch_source (
         COMMENT '批次启动时读取的 Checkpoint 乐观锁版本',
     status VARCHAR(16) NOT NULL DEFAULT 'pending'
         COMMENT 'pending/running/success/failed',
+    candidate_count INT UNSIGNED NOT NULL DEFAULT 0 COMMENT '该来源范围发现的候选记录数',
+    success_count INT UNSIGNED NOT NULL DEFAULT 0 COMMENT '该来源范围已完成的任务数',
+    failed_count INT UNSIGNED NOT NULL DEFAULT 0 COMMENT '该来源范围失败或进入 Dead Letter 的任务数',
+    skipped_count INT UNSIGNED NOT NULL DEFAULT 0 COMMENT '该来源范围无需下游动作的任务数',
     started_at DATETIME(6) NULL COMMENT '开始扫描该来源表的时间',
     finished_at DATETIME(6) NULL COMMENT '该来源表批次到达终态的时间',
     created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
@@ -186,29 +197,51 @@ CREATE TABLE IF NOT EXISTS expert_index_cdc_event (
 -- 后续任务领取、状态转换、重试和 Checkpoint 提交由独立代码实现。
 CREATE TABLE IF NOT EXISTS expert_index_sync_task (
     id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+    dedupe_key CHAR(64) CHARACTER SET ascii COLLATE ascii_bin NOT NULL
+        COMMENT '按冻结公式生成的 SHA-256，用于跨批次重复扫描幂等',
     batch_id BIGINT UNSIGNED NOT NULL COMMENT '逻辑关联 expert_index_batch.id',
+    event_source VARCHAR(16) NOT NULL DEFAULT 'poll'
+        COMMENT 'poll/cdc/reconcile/replay',
     source_table VARCHAR(128) NOT NULL COMMENT '发生变化的四张专家来源表之一',
     source_record_id BIGINT UNSIGNED NOT NULL COMMENT '发生变化的来源表主键 id',
+    source_updated_at DATETIME(6) NULL COMMENT '扫描候选的来源 updated_at，物理删除时可为空',
     expert_id BIGINT UNSIGNED NULL COMMENT '受影响的 experts.id；无法映射时等待后续处置',
     operation_type VARCHAR(16) NOT NULL COMMENT 'insert/update/delete',
+    target_type VARCHAR(16) NOT NULL
+        COMMENT 'expert/profile/employment/project/education',
+    processing_stage VARCHAR(32) NOT NULL DEFAULT 'candidate'
+        COMMENT 'candidate/source_read/normalized/chunk_built/validated/contract_ready/handed_off/completed',
     sync_status VARCHAR(16) NOT NULL DEFAULT 'pending'
         COMMENT 'pending/processing/success/failed/retrying/dead',
     retry_count SMALLINT UNSIGNED NOT NULL DEFAULT 0 COMMENT '自动重试次数，不包含首次处理',
+    attempt_token VARCHAR(64) NULL COMMENT '当前认领尝试的唯一令牌，防止过期 Worker 写回',
+    lease_until DATETIME(6) NULL COMMENT '当前任务租约到期时间',
+    next_retry_at DATETIME(6) NULL COMMENT '失败任务下一次允许认领的时间',
+    policy_version VARCHAR(32) NULL COMMENT '产生 dedupe_key 和动作计划时使用的策略版本',
     error_stage VARCHAR(32) NULL
         COMMENT 'source/parse/pii/chunk_builder/generation/validation/embedding/milvus/checkpoint',
+    error_code VARCHAR(64) NULL COMMENT '稳定机器错误码，不保存来源内容',
     error_type VARCHAR(128) NULL COMMENT '安全异常类型，不保存来源内容',
     error_message VARCHAR(512) NULL COMMENT '截断后的安全错误摘要，不保存 PII 或正文',
     result_code VARCHAR(64) NULL COMMENT '机器结果码，如 no_chunkable_content',
     started_at DATETIME(6) NULL COMMENT '最近一次开始处理的时间',
     completed_at DATETIME(6) NULL COMMENT 'success 或 dead 的最终完成时间',
     created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+    updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6)
+        ON UPDATE CURRENT_TIMESTAMP(6),
     PRIMARY KEY (id),
+    UNIQUE KEY uk_expert_sync_task_dedupe (dedupe_key),
     UNIQUE KEY uk_expert_sync_task_source (
         batch_id, source_table, source_record_id
     ),
     KEY idx_expert_sync_task_queue (sync_status, id),
+    KEY idx_expert_sync_task_retry_queue (sync_status, next_retry_at, id),
     KEY idx_expert_sync_task_batch (batch_id, sync_status, id),
     KEY idx_expert_sync_task_expert (expert_id, id),
+    KEY idx_expert_sync_task_history (expert_id, created_at),
+    KEY idx_expert_sync_task_source_locator (
+        source_table, source_record_id, source_updated_at
+    ),
     CONSTRAINT chk_expert_sync_task_table CHECK (
         source_table IN (
             'experts',
@@ -220,8 +253,30 @@ CREATE TABLE IF NOT EXISTS expert_index_sync_task (
     CONSTRAINT chk_expert_sync_task_operation CHECK (
         operation_type IN ('insert', 'update', 'delete')
     ),
+    CONSTRAINT chk_expert_sync_task_event_source CHECK (
+        event_source IN ('poll', 'cdc', 'reconcile', 'replay')
+    ),
+    CONSTRAINT chk_expert_sync_task_target CHECK (
+        target_type IN ('expert', 'profile', 'employment', 'project', 'education')
+    ),
+    CONSTRAINT chk_expert_sync_task_stage CHECK (
+        processing_stage IN (
+            'candidate',
+            'source_read',
+            'normalized',
+            'chunk_built',
+            'validated',
+            'contract_ready',
+            'handed_off',
+            'completed'
+        )
+    ),
     CONSTRAINT chk_expert_sync_task_status CHECK (
         sync_status IN ('pending', 'processing', 'success', 'failed', 'retrying', 'dead')
+    ),
+    CONSTRAINT chk_expert_sync_task_attempt_lease CHECK (
+        (attempt_token IS NULL AND lease_until IS NULL)
+        OR (attempt_token IS NOT NULL AND lease_until IS NOT NULL)
     ),
     CONSTRAINT chk_expert_sync_task_error_stage CHECK (
         error_stage IS NULL OR error_stage IN (
@@ -235,6 +290,79 @@ CREATE TABLE IF NOT EXISTS expert_index_sync_task (
             'milvus',
             'checkpoint'
         )
+    )
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+-- 任务跨阶段恢复所需的受控 Contract 证据。
+-- payload_json 和 payload_reference 只允许二选一；业务代码写入前必须完成
+-- Contract 白名单和 PII 校验。本表不存储向量，不作为来源事实表。
+CREATE TABLE IF NOT EXISTS expert_index_sync_artifact (
+    id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+    task_id BIGINT UNSIGNED NOT NULL COMMENT '逻辑关联 expert_index_sync_task.id',
+    artifact_type VARCHAR(32) NOT NULL COMMENT 'contract_payload/contract_reference',
+    artifact_version VARCHAR(32) NOT NULL COMMENT '恢复 Payload 的 Contract 版本',
+    payload_json JSON NULL COMMENT '通过白名单和 PII 校验的受控 Contract Payload',
+    payload_reference VARCHAR(512) NULL COMMENT '可恢复受控 Contract Payload 的引用',
+    payload_hash CHAR(64) CHARACTER SET ascii COLLATE ascii_bin NOT NULL
+        COMMENT 'Payload 或引用的 SHA-256 完整性摘要',
+    expires_at DATETIME(6) NULL COMMENT '恢复证据的过期时间',
+    created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+    updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6)
+        ON UPDATE CURRENT_TIMESTAMP(6),
+    PRIMARY KEY (id),
+    UNIQUE KEY uk_expert_sync_artifact_version (
+        task_id, artifact_type, artifact_version
+    ),
+    KEY idx_expert_sync_artifact_expiry (expires_at, id),
+    CONSTRAINT chk_expert_sync_artifact_type CHECK (
+        artifact_type IN ('contract_payload', 'contract_reference')
+    ),
+    CONSTRAINT chk_expert_sync_artifact_payload CHECK (
+        (payload_json IS NOT NULL AND payload_reference IS NULL)
+        OR (payload_json IS NULL AND payload_reference IS NOT NULL)
+    )
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+-- 记录无法继续自动重试的任务和后续处置结果。
+-- 失败原因仅保存机器码和截断的安全摘要；artifact_id 只引用受控恢复证据。
+CREATE TABLE IF NOT EXISTS expert_index_sync_dead_letter (
+    id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+    task_id BIGINT UNSIGNED NOT NULL COMMENT '逻辑关联 expert_index_sync_task.id',
+    batch_id BIGINT UNSIGNED NOT NULL COMMENT '冗余所属批次，便于审计和补偿筛选',
+    source_table VARCHAR(128) NOT NULL COMMENT '发生失败的物理来源表',
+    source_record_id BIGINT UNSIGNED NOT NULL COMMENT '发生失败的来源表主键 id',
+    expert_id BIGINT UNSIGNED NULL COMMENT '受影响的 experts.id',
+    failure_stage VARCHAR(32) NOT NULL COMMENT '任务进入 Dead Letter 时的处理阶段',
+    reason_code VARCHAR(64) NOT NULL COMMENT '稳定机器失败码',
+    reason_message VARCHAR(512) NULL COMMENT '截断后的安全失败摘要，不保存 PII 或正文',
+    retry_count SMALLINT UNSIGNED NOT NULL COMMENT '进入 Dead Letter 时已执行的自动重试次数',
+    artifact_id BIGINT UNSIGNED NULL COMMENT '逻辑关联可用的受控恢复证据',
+    resolution_status VARCHAR(16) NOT NULL DEFAULT 'pending'
+        COMMENT 'pending/requeued/resolved/ignored',
+    resolution_note VARCHAR(512) NULL COMMENT '截断后的安全处置说明',
+    resolved_at DATETIME(6) NULL COMMENT '人工或专项补偿完成时间',
+    created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+    updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6)
+        ON UPDATE CURRENT_TIMESTAMP(6),
+    PRIMARY KEY (id),
+    UNIQUE KEY uk_expert_sync_dead_letter_task (task_id),
+    KEY idx_expert_sync_dead_letter_resolution (resolution_status, created_at),
+    KEY idx_expert_sync_dead_letter_batch (batch_id, id),
+    KEY idx_expert_sync_dead_letter_expert (expert_id, id),
+    CONSTRAINT chk_expert_sync_dead_letter_table CHECK (
+        source_table IN (
+            'experts',
+            'experts_work_experience',
+            'experts_project_experience',
+            'experts_education_experience'
+        )
+    ),
+    CONSTRAINT chk_expert_sync_dead_letter_resolution CHECK (
+        resolution_status IN ('pending', 'requeued', 'resolved', 'ignored')
+    ),
+    CONSTRAINT chk_expert_sync_dead_letter_resolved_at CHECK (
+        (resolution_status = 'pending' AND resolved_at IS NULL)
+        OR (resolution_status IN ('requeued', 'resolved', 'ignored') AND resolved_at IS NOT NULL)
     )
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
