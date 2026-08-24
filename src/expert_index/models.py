@@ -505,11 +505,11 @@ class ExpertSource:
     id: int  # experts.id：专家主键，与三张经历表的 expert_id 关联。
     serial_number: str | None  # experts.serial_number：专家业务编号，不是数据库主键。
     company: str | None  # experts.company：专家当前或最近任职公司。
-    job_status: int | None  # experts.job_status：岗位状态原始枚举；业务值映射待产品确认。
+    job_status: int | None  # experts.job_status：岗位状态原始枚举，1=现任、2=曾任。
     job_name: str | None  # experts.job_name：专家当前或最近岗位。
-    contact_status: int | None  # experts.contact_status：联系状态原始枚举；不在 Source 层猜测语义。
-    doubtful_flag: int | None  # experts.doubtful_flag：疑似异常标记原值，用于后续推荐资格规则。
-    abroad_flag: int | None  # experts.abroad_flag：海外背景原始标量，只有 0/1 可安全转成布尔值。
+    contact_status: int | None  # experts.contact_status：联系状态原始枚举，Normalize 映射推荐资格。
+    doubtful_flag: int | None  # experts.doubtful_flag：1=普通、2=存疑，Normalize 映射核验状态。
+    abroad_flag: int | None  # experts.abroad_flag：1=海外、2=非海外，其他值保持未知。
     background: str | None  # experts.background：专家背景和能力概述。
     work_years: float | None  # experts.work_years：工作年限；源表为 INT，领域层兼容历史小数值。
     updated_at: datetime | None  # experts_updated_at 的别名；表达正式来源版本时间。
@@ -594,7 +594,7 @@ class ProfileStage:
     role_code: str | None  # 按岗位词典映射的标准岗位代码。
     role_level: str | None  # 按岗位词典映射的职级/责任等级。
     job_status_norm: str | None  # 岗位状态规范码：active/former，未知值为 None。
-    abroad_flag_norm: bool | None  # 海外背景规范值；源值 0/1 分别映射 False/True。
+    abroad_flag_norm: bool | None  # 海外背景规范值；源值 1/2 分别映射 True/False。
     background_clean: str | None  # 删除噪声与 PII 后的 experts.background。
     school_names_raw: tuple[str, ...]  # 有效教育经历的学校原始名，清洗、去空并稳定去重。
     major_names_raw: tuple[str, ...]  # 有效教育经历的专业原始名，清洗、去空并稳定去重。
@@ -627,8 +627,8 @@ class EmploymentStage:
     is_current: bool | None  # is_employed 转换结果：1=True，2=False，其他=None。
     responsibilities_clean: str | None  # 从 work_description 的“工作职责”区段提取并清洗。
     achievements_clean: str | None  # 从 work_description 的“代表性成果”区段提取并清洗。
-    industry_codes: tuple[str, ...]  # 仅从当前任职证据匹配的行业代码，已去重排序。
-    topic_codes: tuple[str, ...]  # 仅从当前任职证据匹配的主题代码，已去重排序。
+    industry_codes: tuple[str, ...]  # 任职行业代码预留字段；当前版本固定为空元组。
+    topic_codes: tuple[str, ...]  # 任职主题代码预留字段；当前版本固定为空元组。
     source_hash: str  # 当前任职允许字段规范 JSON 的 SHA-256。
     source_updated_at: datetime | None  # 优先取工作经历 updated_at，为空时取 created_at。
     data_version: str  # 运行时指定的业务数据版本。
@@ -653,8 +653,8 @@ class ProjectStage:
     objective_clean: str | None  # 从 work_description 的“项目目标”区段提取并清洗。
     actions_clean: str | None  # 从 work_description 的“关键动作”区段提取并清洗。
     results_clean: str | None  # 从 work_description 的“项目结果”区段提取并清洗，无证据时为空。
-    industry_codes: tuple[str, ...]  # 仅从当前项目证据匹配的行业代码，已去重排序。
-    topic_codes: tuple[str, ...]  # 仅从当前项目证据匹配的主题代码，已去重排序。
+    industry_codes: tuple[str, ...]  # 项目行业代码预留字段；当前版本固定为空元组。
+    topic_codes: tuple[str, ...]  # 项目主题代码预留字段；当前版本固定为空元组。
     source_hash: str  # 当前项目允许字段规范 JSON 的 SHA-256。
     source_updated_at: datetime | None  # 优先取项目经历 updated_at，为空时取 created_at。
     data_version: str  # 运行时指定的业务数据版本。
@@ -678,7 +678,7 @@ class ChunkRecord:
     chunk_text: str  # 最终供 Embedding 使用的标准文本。
     char_count: int  # chunk_text 的 Unicode 字符数。
     vector_doc_id: str  # Milvus 唯一标识，按统一基础公式生成且不追加版本后缀。
-    source_table: str  # 物理来源表名。
+    source_table: str  # 来源标识；Profile 使用主档与教育表的聚合标识。
     source_field: str  # 参与生成该 Chunk 的源列名组合，例如 company+job_name+background。
     source_field_id: str  # 来源行主键 ID，用于回查 source_table 中的具体记录。
     source_version: str  # 由 source_updated_at 生成的带时区 ISO 8601 版本串。
@@ -698,9 +698,9 @@ class ChunkRecord:
     start_month: str | None  # 任职/项目开始月份，格式 YYYYMM。
     end_month: str | None  # 任职/项目结束月份，格式 YYYYMM。
     is_current: bool | None  # 是否当前任职；项目和主档 Chunk 通常为空。
-    industry_codes: tuple[str, ...]  # 去重排序后的行业标签代码。模型在当前其他字段中抽取过来的内容，是为了语义拓展用的
+    industry_codes: tuple[str, ...]  # 去重排序后的行业代码；当前版本为预留空元组。
     function_codes: tuple[str, ...]  # profile_summary 的职能代码；本期只保留字段，值为空。
-    topic_codes: tuple[str, ...]  # 去重排序后的业务主题标签代码。模型在当前其他字段中抽取过来的内容，是为了语义拓展用的
+    topic_codes: tuple[str, ...]  # 去重排序后的主题代码；当前版本为预留空元组。
     school_names_raw: tuple[str, ...]  # 仅 profile_summary 使用的学校原始名集合。
     major_names_raw: tuple[str, ...]  # 仅 profile_summary 使用的专业原始名集合。
     eligible_for_recommendation: bool | None  # 仅 profile_summary 使用；其他类型必须为 None。

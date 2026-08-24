@@ -1,4 +1,4 @@
-"""把上游 ``ChunkRecord`` 无损转换为下游正式 Contract 4.0.0。
+"""把上游 ``ChunkRecord`` 无损转换为下游正式 Contract 4.1.0。
 
 Bridge 只负责扁平字段到嵌套 Contract 的结构和类型转换，不重新生成正文、主键或
 哈希。这样上游仍是业务事实与哈希的唯一权威，下游严格模型负责最终 fail-closed
