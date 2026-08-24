@@ -23,6 +23,7 @@ from expert_contracts import (
 )
 
 from .models import ChunkRecord
+from .validators import ChunkValidationError, validate_chunks
 
 
 def chunk_record_to_contract(
@@ -142,7 +143,18 @@ def chunk_records_to_contracts(
     updated_at: datetime,
     timezone_name: str,
 ) -> list[ExpertChunkEmbeddingInput]:
-    """用同一业务时间转换一位专家的完整 Chunk 快照。"""
+    """校验并转换一位专家的完整 Chunk 快照。
+
+    空快照直接返回空列表；非空快照先复用上游 Validator 检查 ID、Hash 和集合唯一性，
+    再拒绝混入多个专家的输入。校验完成后按原顺序转换，并为全部记录使用同一交付
+    时间。任一记录失败时不返回部分 Contract。
+    """
+
+    prepared_chunks = list(chunks)
+    validate_chunks(prepared_chunks)
+    expert_ids = {chunk.expert_id for chunk in prepared_chunks}
+    if len(expert_ids) > 1:
+        raise ChunkValidationError("内存 Contract 批次只能包含同一专家的完整 Chunk 快照")
 
     return [
         chunk_record_to_contract(
@@ -150,7 +162,7 @@ def chunk_records_to_contracts(
             updated_at=updated_at,
             timezone_name=timezone_name,
         )
-        for chunk in chunks
+        for chunk in prepared_chunks
     ]
 
 

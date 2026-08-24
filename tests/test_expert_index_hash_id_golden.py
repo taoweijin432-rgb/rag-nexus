@@ -345,12 +345,20 @@ def test_segmented_chunks_match_exact_golden_output() -> None:
 def test_golden_chunks_pass_contract_formula_without_hash_rewrite() -> None:
     """正式 Contract 必须接受所有 golden ID 并原样保留三个 Hash。"""
 
-    chunks = _build(_normal_aggregate()) + _build(_segmented_aggregate())
-    contracts = chunk_records_to_contracts(
-        chunks,
-        updated_at=datetime(2026, 3, 4, 5, 6, 7, 890123),  # noqa: DTZ001
-        timezone_name=_settings().timezone,
-    )
+    chunk_groups = [
+        _build(_normal_aggregate()),
+        _build(_segmented_aggregate()),
+    ]
+    chunks = [chunk for group in chunk_groups for chunk in group]
+    contracts = [
+        contract
+        for group in chunk_groups
+        for contract in chunk_records_to_contracts(
+            group,
+            updated_at=datetime(2026, 3, 4, 5, 6, 7, 890123),  # noqa: DTZ001
+            timezone_name=_settings().timezone,
+        )
+    ]
 
     assert [item.vector_doc_id for item in contracts] == [item.vector_doc_id for item in chunks]
     assert [item.source.source_hash for item in contracts] == [item.source_hash for item in chunks]
