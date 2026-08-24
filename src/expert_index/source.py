@@ -31,7 +31,7 @@ MAX_FULL_SCAN_PAGE_SIZE = 1000
 MAX_SOURCE_SCAN_PAGE_SIZE = 1000
 
 # MySQL 不能用参数占位符绑定表名，因此这里只允许从固定白名单选择完整 SQL。
-# 查询不排除 deleted_at：逻辑删除同样属于必须进入增量处理的来源变化。
+# 上界始终使用中间表 ``updated_at`` 和物理 ``id``，逻辑删除不会改变扫描字段。
 _SOURCE_SCAN_UPPER_BOUND_SQL = {
     source_table: (
         f"SELECT updated_at, id FROM {source_table} "
@@ -40,12 +40,14 @@ _SOURCE_SCAN_UPPER_BOUND_SQL = {
     for source_table in CHECKPOINT_SOURCE_TABLES
 }
 
-# experts 使用自身主键作为 expert_id；三张经历表读取实际关联字段。所有查询只返回
-# 调度所需的 ID、时间和删除标记，不提前读取公司、经历描述等业务内容。
+# experts 使用自身主键作为 expert_id，并把正式来源删除时间映射为统一的 deleted_at；
+# 三张经历表读取实际关联字段和各自的 deleted_at。所有表仍用中间表 updated_at 扫描，
+# 查询只返回调度所需的 ID、扫描时间和删除标记。
 _SOURCE_CHANGE_PAGE_SQL = {
     source_table: f"""
         SELECT id, {"id AS expert_id" if source_table == "experts" else "expert_id"},
-               updated_at, deleted_at
+               updated_at,
+               {"experts_deleted_at AS deleted_at" if source_table == "experts" else "deleted_at"}
         FROM {source_table}
         WHERE (updated_at > %s OR (updated_at = %s AND id > %s))
           AND (updated_at < %s OR (updated_at = %s AND id <= %s))
@@ -176,8 +178,8 @@ class MySQLSourceAdapter:
         ``id <= upper_bound_id``，因此批次不会超过指定专家数，运行期间新增专家也不会
         扩大当前范围。
 
-        查询故意不排除 ``deleted_at``，因为已逻辑删除专家仍需进入批次，触发历史
-        Chunk 停用。该方法只读取边界，不读取任何专家正文或经历数据。
+        查询故意不排除正式来源删除时间 ``experts_deleted_at``，因为已删除专家仍需
+        进入批次，触发历史 Chunk 停用。该方法只读取边界，不读取任何专家正文或经历数据。
         """
 
         if max_experts is not None and (
@@ -258,7 +260,7 @@ class MySQLSourceAdapter:
             with connection.cursor() as cursor:
                 cursor.execute(
                     """
-                    SELECT id, deleted_at
+                    SELECT id, experts_deleted_at AS deleted_at
                     FROM experts
                     WHERE id > %s AND id <= %s
                     ORDER BY id ASC
@@ -290,7 +292,7 @@ class MySQLSourceAdapter:
         try:
             with connection.cursor() as cursor:
                 cursor.execute(
-                    "SELECT id, deleted_at FROM experts WHERE id=%s",
+                    "SELECT id, experts_deleted_at AS deleted_at FROM experts WHERE id=%s",
                     (expert_id,),
                 )
                 row = cursor.fetchone()
@@ -359,13 +361,16 @@ class MySQLSourceAdapter:
     def _load_profile(cursor: Any, expert_id: int) -> ExpertSource:
         # 姓名、电话、邮箱、旧经历长文本、personal_intro、comment、remark、
         # source_link 等字段都不进入查询结果。
+        # Profile 将正式来源时间映射到领域模型字段：experts_updated_at 决定后续
+        # source_updated_at/source_version，experts_deleted_at 决定专家是否仍然有效。
         cursor.execute(
             """
             SELECT id, serial_number, company, job_status, job_name,
                    contact_status, doubtful_flag, abroad_flag, background,
-                   work_years, updated_at, created_at, deleted_at
+                   work_years, experts_updated_at AS updated_at, created_at,
+                   experts_deleted_at AS deleted_at
             FROM experts
-            WHERE id = %s AND deleted_at IS NULL
+            WHERE id = %s AND experts_deleted_at IS NULL
             """,
             (expert_id,),
         )

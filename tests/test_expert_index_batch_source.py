@@ -190,11 +190,18 @@ def test_source_change_candidates_use_fixed_composite_range(
     assert candidates[1].is_deleted is True
     sql, params = cursor.executed[0]
     expected_expert_field = "id AS expert_id" if source_table == "experts" else "expert_id"
-    assert f"SELECT id, {expected_expert_field}, updated_at, deleted_at" in sql
+    expected_deleted_field = (
+        "experts_deleted_at AS deleted_at"
+        if source_table == "experts"
+        else "deleted_at"
+    )
+    assert f"SELECT id, {expected_expert_field}, updated_at, {expected_deleted_field}" in sql
     assert "updated_at > %s OR (updated_at = %s AND id > %s)" in sql
     assert "updated_at < %s OR (updated_at = %s AND id <= %s)" in sql
     assert "ORDER BY updated_at ASC, id ASC" in sql
     assert "deleted_at IS NULL" not in sql
+    if source_table == "experts":
+        assert "experts_updated_at" not in sql
     assert params == (start_time, start_time, 100, end_time, end_time, 120, 50)
     assert connect_calls[0]["autocommit"] is True
     assert connection.closed is True
@@ -356,9 +363,10 @@ def test_full_scan_candidates_use_keyset_and_keep_deleted_experts(
     assert candidates[1].is_deleted is True
     assert candidates[1].deleted_at == deleted_at
     sql, params = cursor.executed[0]
+    assert "SELECT id, experts_deleted_at AS deleted_at FROM experts" in sql
     assert "WHERE id > %s AND id <= %s" in sql
     assert "ORDER BY id ASC LIMIT %s" in sql
-    assert "deleted_at IS NULL" not in sql
+    assert "experts_deleted_at IS NULL" not in sql
     assert params == (100, 500, 2)
     assert connect_calls[0]["autocommit"] is True
     assert connection.closed is True
@@ -379,7 +387,10 @@ def test_load_expert_candidate_reads_lifecycle_without_source_text(
     assert candidate.id == 105
     assert candidate.is_deleted is True
     assert cursor.executed == [
-        ("SELECT id, deleted_at FROM experts WHERE id=%s", (105,))
+        (
+            "SELECT id, experts_deleted_at AS deleted_at FROM experts WHERE id=%s",
+            (105,),
+        )
     ]
     assert connect_calls[0]["autocommit"] is True
     assert connection.closed is True
@@ -467,7 +478,9 @@ def test_load_expert_reads_four_tables_in_one_consistent_snapshot(
         "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ",
         "START TRANSACTION WITH CONSISTENT SNAPSHOT, READ ONLY",
     ]
-    assert "FROM experts WHERE id = %s AND deleted_at IS NULL" in executed_sql[2]
+    assert "experts_updated_at AS updated_at" in executed_sql[2]
+    assert "experts_deleted_at AS deleted_at" in executed_sql[2]
+    assert "FROM experts WHERE id = %s AND experts_deleted_at IS NULL" in executed_sql[2]
     assert "FROM experts_work_experience" in executed_sql[3]
     assert "FROM experts_project_experience" in executed_sql[4]
     assert "FROM experts_education_experience" in executed_sql[5]
