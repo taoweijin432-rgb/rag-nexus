@@ -7,6 +7,7 @@ from typing import Any, Self
 
 import pytest
 
+from expert_index.checkpoint import CheckpointManager
 from expert_index.cli import build_parser
 from expert_index.config import (
     DatabaseBoundaryError,
@@ -118,6 +119,7 @@ def test_index_write_boundary_rejects_same_schema_with_localhost_alias() -> None
         MySQLBuildLockRepository,
         MySQLSourceStateRepository,
         MySQLSourceSyncTaskRepository,
+        CheckpointManager,
         MySQLSchemaInitializer,
     ],
 )
