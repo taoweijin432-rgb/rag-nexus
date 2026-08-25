@@ -21,14 +21,16 @@ import html
 import json
 import re
 import unicodedata
-from collections.abc import Iterable
+from collections.abc import Iterable, Sequence
 from datetime import date, datetime
 from typing import Any
 
 from .models import (
+    EducationSource,
     EmploymentSource,
     EmploymentStage,
     ExpertAggregate,
+    ExpertSource,
     ProfileStage,
     ProjectSource,
     ProjectStage,
@@ -394,9 +396,53 @@ def normalize_aggregate(
     ``pipeline.py::_process_active_expert`` 在 Source 读取之后调用本函数，随后把返回
     结果交给 ``ChunkFactory.build_all``。因此这里决定 Chunk 使用什么标准化事实，
     但不负责文本模板、长度切分或 MySQL 写入。
+
+    实现上组合调用三个单对象入口（``normalize_profile``/``normalize_employment``/
+    ``normalize_project``），保证 full build 与 incremental 只有一套清洗与 Hash 实现。
+    返回结果与抽取前逐字段一致。
     """
 
-    profile = aggregate.profile
+    profile_stage = normalize_profile(
+        aggregate.profile,
+        aggregate.educations,
+        data_version=data_version,
+        build_batch_id=build_batch_id,
+    )
+    # 一条源经历对应一个 Stage，保持 source_field_id 可回查；经历为空时自然得到空列表，
+    # 属于合法业务情况，不会阻止 Profile 或其他类型 Chunk 生成。
+    employment_stages = [
+        normalize_employment(item, data_version=data_version, build_batch_id=build_batch_id)
+        for item in aggregate.employments
+    ]
+    project_stages = [
+        normalize_project(item, data_version=data_version, build_batch_id=build_batch_id)
+        for item in aggregate.projects
+    ]
+    return profile_stage, employment_stages, project_stages
+
+
+def normalize_profile(
+    profile: ExpertSource,
+    educations: Sequence[EducationSource],
+    *,
+    data_version: str,
+    build_batch_id: int,
+) -> ProfileStage:
+    """把专家主档与全部当前有效教育聚合为一个可溯源的 ``ProfileStage``。
+
+    Profile 是多表聚合结果：主档与教育经历合并为单一画像来源。教育按 ``id ASC``
+    稳定排序后首次出现去重，任一教育记录变化都会推动画像 ``source_hash`` 与
+    ``source_version`` 前进。本函数只做清洗、映射和哈希，不生成正文或分片，
+    也不从事件行重建教育事实。
+
+    有效教育事实的过滤由 P4.3 读取层负责，本函数接收的 ``educations`` 视为全部
+    当前有效教育；不自行按 ``deleted_at`` 过滤，避免与 P4.3 形成两套生命周期语义。
+    """
+
+    # 按教育主键稳定排序，保证相同输入产生相同学校/专业顺序与哈希。Full Build
+    # 的 _load_educations 已按 id ASC 返回，这里重新排序使公开入口对任意调用方
+    # 都具备确定性（P4 Handler 可能传入未排序的集合）。
+    ordered_educations = tuple(sorted(educations, key=lambda item: item.id))
     # 先清洗和映射当前公司、岗位及背景，供 Profile Stage、正文和 Metadata 共用，
     # 避免不同下游字段各自清洗后产生不一致结果。
     company_raw, company_norm, company_status = normalize_company(profile.company)
@@ -404,15 +450,15 @@ def normalize_aggregate(
     background = clean_text(profile.background) or None
     # 教育经历是独立结构化表，不再解析 experts.edu_experience 自由文本。稳定去重时
     # 保留源表排序中的首次出现，既避免重复 Metadata，也保证相同输入得到相同哈希。
-    school_names = _clean_unique(item.school_name for item in aggregate.educations)
-    major_names = _clean_unique(item.major for item in aggregate.educations)
+    school_names = _clean_unique(item.school_name for item in ordered_educations)
+    major_names = _clean_unique(item.major for item in ordered_educations)
     education_facts = [
         {
             "id": item.id,
             "school_name": clean_text(item.school_name) or None,
             "major": clean_text(item.major) or None,
         }
-        for item in aggregate.educations
+        for item in ordered_educations
     ]
     # profile_allowed 是画像来源哈希的唯一输入白名单。它同时纳入教育事实，使学校或
     # 专业变化也能改变 source_hash；未列出的 PII 和备注字段不会影响索引增量判断。
@@ -431,7 +477,7 @@ def normalize_aggregate(
     }
     # ProfileStage 是主档与教育的标准化聚合结果：ChunkFactory 用公司、岗位和背景生成
     # 正文，其余状态、教育、年限等字段进入 profile_summary Metadata。
-    profile_stage = ProfileStage(
+    return ProfileStage(
         expert_id=profile.id,
         serial_number=profile_allowed["serial_number"],
         company_name_raw=company_raw,
@@ -450,25 +496,15 @@ def normalize_aggregate(
         verification_status=profile_verification_status(profile.doubtful_flag),
         source_hash=source_hash(profile_allowed),
         # 任一教育记录变化都应推动 profile_summary 的来源版本前进。
-        source_updated_at=_latest_source_time(profile, aggregate.educations),
+        source_updated_at=_latest_source_time(profile, ordered_educations),
         data_version=data_version,
         build_batch_id=build_batch_id,
     )
 
-    # 一条源经历对应一个 Stage，保持 source_field_id 可回查；经历为空时自然得到空列表，
-    # 属于合法业务情况，不会阻止 Profile 或其他类型 Chunk 生成。
-    employment_stages = [
-        _normalize_employment(item, data_version=data_version, build_batch_id=build_batch_id)
-        for item in aggregate.employments
-    ]
-    project_stages = [
-        _normalize_project(item, data_version=data_version, build_batch_id=build_batch_id)
-        for item in aggregate.projects
-    ]
-    return profile_stage, employment_stages, project_stages
 
-
-def _normalize_employment(item: EmploymentSource, *, data_version: str, build_batch_id: int) -> EmploymentStage:
+def normalize_employment(
+    item: EmploymentSource, *, data_version: str, build_batch_id: int
+) -> EmploymentStage:
     """把一条有效工作经历转换为可溯源的 ``EmploymentStage``。
 
     公司、岗位、日期、在职状态和描述只处理当前源记录，不与其他任职合并。普通描述
@@ -531,7 +567,9 @@ def _normalize_employment(item: EmploymentSource, *, data_version: str, build_ba
     )
 
 
-def _normalize_project(item: ProjectSource, *, data_version: str, build_batch_id: int) -> ProjectStage:
+def normalize_project(
+    item: ProjectSource, *, data_version: str, build_batch_id: int
+) -> ProjectStage:
     """把一条有效项目经历转换为可溯源的 ``ProjectStage``。
 
     项目名称、公司、日期和描述仅来自当前源记录。目标、动作、结果按照显式标签拆分；
