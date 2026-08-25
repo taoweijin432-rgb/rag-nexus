@@ -721,3 +721,240 @@ class ChunkRecord:
     indexed_at: datetime | None  # 下游写入 Milvus 成功后的索引时间；上游初始为空。
     is_active: bool  # 当前记录是否有效；逻辑删除来源对应的旧 Chunk 会被停用。
     build_batch_id: int  # 对应 expert_index_batch.id，追溯产生该 Chunk 的运行批次。
+
+
+# ---------------------------------------------------------------------------
+# P4 增量影响范围与内存期望 Chunk 集模型
+# ---------------------------------------------------------------------------
+# 下游影响范围与任务发现 target_type 故意分离：target_type（SOURCE_SYNC_TARGET_TYPES）
+# 保留 education 供 P3 扫描触发，而影响范围只表达下游真正处理的四类范围，
+# education 事件在 P4 Handler 中映射到 profile 范围（重建 Profile Summary Metadata），
+# 不新增 education Chunk 类型。
+INCREMENTAL_IMPACT_SCOPE_TYPES = frozenset({"expert", "profile", "employment", "project"})
+
+# 影响范围允许的 Chunk 主类型；expert 范围跨三类，其余范围绑定单一类型。
+INCREMENTAL_IMPACT_CHUNK_TYPES = frozenset({"profile_summary", "employment", "project"})
+
+# Profile 范围的规范化来源标识，与 ChunkFactory.build_profile 实际输出保持一致。
+_PROFILE_IMPACT_SOURCE_TABLE = "experts+experts_education_experience"
+
+# Employment / Project 范围的固定来源表，与 EmploymentStage/ProjectStage.source_table 一致。
+_EMPLOYMENT_IMPACT_SOURCE_TABLE = "experts_work_experience"
+_PROJECT_IMPACT_SOURCE_TABLE = "experts_project_experience"
+
+
+
+@dataclass(frozen=True)
+class IncrementalImpactScope:
+    """增量处理的下游影响范围。
+
+    仅表达“本次 desired set 适用于哪个下游范围”，不读取 previous state、不比较 Hash、
+    不决定下游动作。四类范围与字段组合的约束见 ``__post_init__``；``education``
+    不作为范围类型，由 Handler 经 ``impact_scope_from_target`` 映射到 ``profile``。
+    """
+
+    scope_type: str  # expert/profile/employment/project。
+    expert_id: int  # 影响范围所属专家 ID。
+    chunk_type: str | None  # expert 范围为 None（跨三类）；其余范围绑定单一类型。
+    source_table: str | None  # expert 范围为 None；其余范围固定来源表。
+    source_field_id: str | None  # expert 为 None；profile 为 str(expert_id)；
+    # employment/project 为来源行主键字符串。统一使用 source_field_id，禁止 source_record_id。
+
+    def __post_init__(self) -> None:
+        """校验四类范围的字段组合，非法组合 fail-closed。"""
+
+        _validate_positive_integer("expert_id", self.expert_id)
+        if self.scope_type not in INCREMENTAL_IMPACT_SCOPE_TYPES:
+            raise ValueError(f"不支持的影响范围类型: {self.scope_type}")
+        if self.scope_type == "expert":
+            if self.chunk_type is not None or self.source_table is not None or self.source_field_id is not None:
+                raise ValueError("expert 范围必须跨三类 Chunk，chunk_type/source_table/source_field_id 必须为 None")
+            return
+        # 非 expert 范围：chunk_type/source_table/source_field_id 必须齐备。
+        if self.chunk_type is None or self.source_table is None or self.source_field_id is None:
+            raise ValueError(f"{self.scope_type} 范围必须提供 chunk_type/source_table/source_field_id")
+        if self.chunk_type not in INCREMENTAL_IMPACT_CHUNK_TYPES:
+            raise ValueError(f"不支持的影响范围 Chunk 类型: {self.chunk_type}")
+        if self.scope_type == "profile":
+            if self.chunk_type != "profile_summary":
+                raise ValueError("profile 范围的 chunk_type 必须为 profile_summary")
+            if self.source_table != _PROFILE_IMPACT_SOURCE_TABLE:
+                raise ValueError(f"profile 范围的 source_table 必须为 {_PROFILE_IMPACT_SOURCE_TABLE}")
+            if self.source_field_id != str(self.expert_id):
+                raise ValueError("profile 范围的 source_field_id 必须等于 str(expert_id)")
+        elif self.scope_type == "employment":
+            if self.chunk_type != "employment":
+                raise ValueError("employment 范围的 chunk_type 必须为 employment")
+            if self.source_table != _EMPLOYMENT_IMPACT_SOURCE_TABLE:
+                raise ValueError(f"employment 范围的 source_table 必须为 {_EMPLOYMENT_IMPACT_SOURCE_TABLE}")
+            if not isinstance(self.source_field_id, str) or not self.source_field_id.strip():
+                raise ValueError("employment 范围的 source_field_id 必须是非空字符串")
+            if self.source_field_id != self.source_field_id.strip():
+                raise ValueError("employment 范围的 source_field_id 不得含首尾空白")
+        elif self.scope_type == "project":
+            if self.chunk_type != "project":
+                raise ValueError("project 范围的 chunk_type 必须为 project")
+            if self.source_table != _PROJECT_IMPACT_SOURCE_TABLE:
+                raise ValueError(f"project 范围的 source_table 必须为 {_PROJECT_IMPACT_SOURCE_TABLE}")
+            if not isinstance(self.source_field_id, str) or not self.source_field_id.strip():
+                raise ValueError("project 范围的 source_field_id 必须是非空字符串")
+            if self.source_field_id != self.source_field_id.strip():
+                raise ValueError("project 范围的 source_field_id 不得含首尾空白")
+
+
+def impact_scope_from_target(
+    *,
+    target_type: str,
+    expert_id: int,
+    source_field_id: str | None = None,
+) -> IncrementalImpactScope:
+    """把任务发现的 target_type 映射为下游影响范围。
+
+    ``education`` 任务（P3 保留独立类型用于触发 Profile 重聚合）映射到 ``profile``
+    范围；其余 target_type 与 scope 一一对应。``expert``/``profile``/``education``
+    的来源身份由专家 ID 唯一决定，传入 ``source_field_id`` 必须为 ``None``，否则
+    fail-closed（避免调用方误以为可以覆盖来源身份）。``employment``/``project``
+    必须提供非空白 ``source_field_id``。本函数只做范围映射，不读取来源行、
+    不构造 Chunk；调用方需保证 expert_id/source_field_id 已是当前事实。
+    """
+
+    if target_type in {"expert", "profile", "education"} and source_field_id is not None:
+        raise ValueError(
+            f"{target_type} 范围不接受 source_field_id，来源身份由 expert_id 决定"
+        )
+    if target_type == "education":
+        return IncrementalImpactScope(
+            scope_type="profile",
+            expert_id=expert_id,
+            chunk_type="profile_summary",
+            source_table=_PROFILE_IMPACT_SOURCE_TABLE,
+            source_field_id=str(expert_id),
+        )
+    if target_type == "expert":
+        return IncrementalImpactScope(
+            scope_type="expert",
+            expert_id=expert_id,
+            chunk_type=None,
+            source_table=None,
+            source_field_id=None,
+        )
+    if target_type == "profile":
+        return IncrementalImpactScope(
+            scope_type="profile",
+            expert_id=expert_id,
+            chunk_type="profile_summary",
+            source_table=_PROFILE_IMPACT_SOURCE_TABLE,
+            source_field_id=str(expert_id),
+        )
+    if target_type == "employment":
+        if source_field_id is None or not source_field_id.strip():
+            raise ValueError("employment 范围必须提供非空白 source_field_id")
+        if source_field_id != source_field_id.strip():
+            raise ValueError("employment 范围的 source_field_id 不得含首尾空白")
+        return IncrementalImpactScope(
+            scope_type="employment",
+            expert_id=expert_id,
+            chunk_type="employment",
+            source_table=_EMPLOYMENT_IMPACT_SOURCE_TABLE,
+            source_field_id=source_field_id,
+        )
+    if target_type == "project":
+        if source_field_id is None or not source_field_id.strip():
+            raise ValueError("project 范围必须提供非空白 source_field_id")
+        if source_field_id != source_field_id.strip():
+            raise ValueError("project 范围的 source_field_id 不得含首尾空白")
+        return IncrementalImpactScope(
+            scope_type="project",
+            expert_id=expert_id,
+            chunk_type="project",
+            source_table=_PROJECT_IMPACT_SOURCE_TABLE,
+            source_field_id=source_field_id,
+        )
+    raise ValueError(f"不支持的同步任务目标类型: {target_type}")
+
+
+@dataclass(frozen=True)
+class PreparedChunkSet:
+    """单个已领取任务的内存期望 Chunk 集合。
+
+    保存任务/批次定位、影响范围和不可变 desired ChunkRecord 序列。空 desired set
+    合法且必须保留范围，表示该范围当前应为空（合法清空语义，不是 Skip）；下游在
+    P5 根据范围读取 previous state、比较三 Hash 并执行动作。本模型不保存
+    previous state、Vector、Upsert/Metadata/Disable/Skip Action 或下游版本。
+    """
+
+    task_id: int  # 对应 expert_index_sync_task.id。
+    batch_id: int  # 对应 expert_index_batch.id。
+    data_version: str  # 增量审计值；不进入 Chunk/Hash/Contract，仅用于任务定位。
+    impact_scope: IncrementalImpactScope  # 本次 desired set 适用的下游范围。
+    desired_chunks: tuple[ChunkRecord, ...]  # 不可变、稳定排序去重后的期望 Chunk。
+
+    def __post_init__(self) -> None:
+        """校验任务定位、范围一致性和 Chunk 归属，并稳定排序去重。"""
+
+        _validate_positive_integer("task_id", self.task_id)
+        _validate_positive_integer("batch_id", self.batch_id)
+        if not isinstance(self.data_version, str) or not self.data_version.strip():
+            raise ValueError("data_version 必须是非空字符串")
+        if not isinstance(self.impact_scope, IncrementalImpactScope):
+            raise TypeError("impact_scope 必须是 IncrementalImpactScope")
+        chunks = tuple(self.desired_chunks)
+        self._validate_chunks(chunks)
+        deduped = self._dedupe(chunks)
+        sorted_chunks = tuple(
+            sorted(deduped, key=lambda c: (c.chunk_type, c.source_field_id, c.chunk_index, c.vector_doc_id))
+        )
+        object.__setattr__(self, "desired_chunks", sorted_chunks)
+
+    def _validate_chunks(self, chunks: tuple[ChunkRecord, ...]) -> None:
+        """校验每个 Chunk 归属当前范围。"""
+
+        scope = self.impact_scope
+        for chunk in chunks:
+            if chunk.expert_id != scope.expert_id:
+                raise ValueError(
+                    f"Chunk expert_id={chunk.expert_id} 不属于范围 expert_id={scope.expert_id}"
+                )
+            if scope.scope_type == "expert":
+                if chunk.chunk_type not in INCREMENTAL_IMPACT_CHUNK_TYPES:
+                    raise ValueError(f"expert 范围不允许 chunk_type={chunk.chunk_type}")
+                continue
+            if chunk.chunk_type != scope.chunk_type:
+                raise ValueError(
+                    f"{scope.scope_type} 范围不允许 chunk_type={chunk.chunk_type}"
+                )
+            if chunk.source_table != scope.source_table:
+                raise ValueError(
+                    f"{scope.scope_type} 范围 Chunk source_table={chunk.source_table} 与范围不一致"
+                )
+            if chunk.source_field_id != scope.source_field_id:
+                raise ValueError(
+                    f"{scope.scope_type} 范围 Chunk source_field_id={chunk.source_field_id} 与范围不一致"
+                )
+
+    def _dedupe(self, chunks: tuple[ChunkRecord, ...]) -> list[ChunkRecord]:
+        """按 vector_doc_id 去重：相同 ID 的相同记录可折叠，不同记录必须拒绝。"""
+
+        seen: dict[str, ChunkRecord] = {}
+        for chunk in chunks:
+            existing = seen.get(chunk.vector_doc_id)
+            if existing is None:
+                seen[chunk.vector_doc_id] = chunk
+                continue
+            if existing != chunk:
+                raise ValueError(
+                    f"vector_doc_id={chunk.vector_doc_id} 存在不一致的重复 Chunk"
+                )
+        return list(seen.values())
+
+    @property
+    def is_empty(self) -> bool:
+        """当前范围应为空（合法清空语义，区别于无结果）。"""
+
+        return len(self.desired_chunks) == 0
+
+    @property
+    def desired_vector_doc_ids(self) -> tuple[str, ...]:
+        """稳定排序后的期望 vector_doc_id 列表，供下游计算 stale 差集。"""
+
+        return tuple(chunk.vector_doc_id for chunk in self.desired_chunks)
