@@ -613,13 +613,36 @@ class TestReceiptInvariants:
 
     def test_committed_count_mismatch_rejected(self):
         scope = self._scope()
-        with pytest.raises(ValueError, match="desired_count =="):
+        # resolved(embedding+metadata_only+unchanged) > desired_count → 违反 committed 不变式
+        with pytest.raises(ValueError, match="committed 回执收敛计数超过 desired_count"):
+            ScopeHandoffReceipt(
+                request_id="handoff:abc", task_id=701, batch_id=8, attempt_token=TOKEN,
+                payload_hash="x" * 64, impact_scope=scope, status="committed",
+                result_code="converged", desired_count=2, embedding_count=3,
+                metadata_only_count=0, unchanged_count=0,
+            )
+
+    def test_committed_unresolved_without_disable_rejected(self):
+        scope = self._scope()
+        # 存在未收敛且未下线的 desired（desired-resolved > disable_count）→ 违反不变式
+        with pytest.raises(ValueError, match="committed 回执存在未收敛且未下线的 desired"):
             ScopeHandoffReceipt(
                 request_id="handoff:abc", task_id=701, batch_id=8, attempt_token=TOKEN,
                 payload_hash="x" * 64, impact_scope=scope, status="committed",
                 result_code="converged", desired_count=3, embedding_count=1,
-                metadata_only_count=1, unchanged_count=0,
+                metadata_only_count=1, unchanged_count=0, disable_count=0,
             )
+
+    def test_committed_resolved_with_disable_covers_unresolved_ok(self):
+        scope = self._scope()
+        # ineligible desired 经逻辑下线：disable_count 兑底未收敛 desired，committed 成立
+        receipt = ScopeHandoffReceipt(
+            request_id="handoff:abc", task_id=701, batch_id=8, attempt_token=TOKEN,
+            payload_hash="x" * 64, impact_scope=scope, status="committed",
+            result_code="converged", desired_count=3, embedding_count=1,
+            metadata_only_count=1, unchanged_count=0, disable_count=1,
+        )
+        assert receipt.status == "committed"
 
     def test_committed_with_error_rejected(self):
         scope = self._scope()

@@ -268,12 +268,17 @@ class ScopeHandoffReceipt:
                 raise ValueError("committed 回执不得携带错误字段")
             if self.retryable:
                 raise ValueError("committed 回执 retryable 必须为 False")
-            if self.desired_count != (
-                self.embedding_count + self.metadata_only_count + self.unchanged_count
-            ):
+            # committed 收敛不变式（P5.2 放宽以涵盖 Eligibility 逻辑下线 desired）：
+            # 成功收敛的 embedding/metadata-only/unchanged 不得超过 desired；
+            # 未被这三类覆盖的 desired（如 ineligible 逻辑下线）必须由 disable_count 兜底。
+            resolved = self.embedding_count + self.metadata_only_count + self.unchanged_count
+            if resolved > self.desired_count:
                 raise ValueError(
-                    "committed 回执必须满足 desired_count == "
-                    "embedding_count + metadata_only_count + unchanged_count"
+                    "committed 回执收敛计数超过 desired_count"
+                )
+            if self.desired_count - resolved > self.disable_count:
+                raise ValueError(
+                    "committed 回执存在未收敛且未下线的 desired"
                 )
         elif self.status == "rejected":
             if self.retryable:

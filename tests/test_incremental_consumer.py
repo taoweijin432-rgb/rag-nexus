@@ -814,4 +814,35 @@ def test_consumer_has_no_state_persistence_dependencies() -> None:
     private_state = vars(consumer)
     assert set(private_state.keys()) == {"_adapter", "_core"}
     core_state = vars(private_state["_core"])
-    assert set(core_state.keys()) == {"_vector_store", "_event_order"}
+    assert set(core_state.keys()) == {"_vector_store", "_event_order", "_eligibility_skip_of"}
+
+
+# ---------------------------------------------------------------------------
+# ContractConsumerCore.process_contracts fail-closed（advisor 要求）
+# ---------------------------------------------------------------------------
+class TestProcessContractsFailClosed:
+    def test_process_contracts_without_eligibility_rejected(self):
+        """未注入 eligibility_skip_of 时 process_contracts 必须拒绝执行，
+        避免静默按 None 放行 ineligible desired。"""
+        from rag_vector_store.incremental.consumer_core import ContractConsumerCore
+
+        core = ContractConsumerCore(vector_store=FakeVectorStore())
+        contract = _real_contract("employment")
+        with pytest.raises(RuntimeError, match="eligibility_skip_of"):
+            core.process_contracts([contract])
+
+    def test_process_contracts_with_eligibility_routes_skip(self):
+        """注入 eligibility 后 is_active=false desired 被 skip → eligibility-disable。"""
+        from rag_vector_store.chunking.contract_pipeline import EmbeddingEligibilityValidator
+        from rag_vector_store.incremental.consumer_core import ContractConsumerCore
+
+        store = FakeVectorStore()
+        core = ContractConsumerCore(
+            vector_store=store,
+            eligibility_skip_of=EmbeddingEligibilityValidator().get_skip_reason,
+        )
+        contract = _real_contract("employment").model_copy(update={"is_active": False})
+        results = core.process_contracts([contract])
+        assert len(results) == 1
+        assert results[0].status == "committed"
+        assert results[0].result_code == "targets_disabled"

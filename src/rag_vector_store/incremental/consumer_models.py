@@ -103,6 +103,18 @@ ERROR_CODE_ELIGIBILITY_DISABLE_FAILED = "eligibility_disable_failed"
 ERROR_CODE_DISABLE_INFRA_FAILED = "disable_infra_failed"
 ERROR_CODE_STALE_DISABLE_FAILED = "stale_disable_failed"
 
+# ---------------------------------------------------------------------------
+# P5.2 范围 Consumer 稳定错误码（scope 层收敛失败，不语义复用核心错误码）
+# ---------------------------------------------------------------------------
+#: scope 字段组合非法（不支持的范围类型或字段不一致）。
+ERROR_CODE_SCOPE_UNSUPPORTED_TYPE = "scope_unsupported_type"
+#: scope 当前 active 向量状态查询基础设施失败（可重试）。
+ERROR_CODE_SCOPE_QUERY_FAILED = "scope_query_failed"
+#: scope active 状态提取失败（metadata 缺字段/类型非法，确定性）。
+ERROR_CODE_SCOPE_ACTIVE_STATE_INVALID = "scope_active_state_invalid"
+#: scope stale 逻辑下线失败（desired 已完成，可重试）。
+ERROR_CODE_SCOPE_STALE_DISABLE_FAILED = "scope_stale_disable_failed"
+
 
 class ExecutionResult(BaseModel):
     """单条输入的 Consumer 处理结果（纯描述，无任何状态写回语义）。
@@ -204,6 +216,10 @@ __all__ = [
     "ERROR_CODE_METADATA_TARGET_MISSING",
     "ERROR_CODE_METADATA_UPDATE_INFRA_FAILED",
     "ERROR_CODE_MODEL_SPACE_MISMATCH",
+    "ERROR_CODE_SCOPE_ACTIVE_STATE_INVALID",
+    "ERROR_CODE_SCOPE_QUERY_FAILED",
+    "ERROR_CODE_SCOPE_STALE_DISABLE_FAILED",
+    "ERROR_CODE_SCOPE_UNSUPPORTED_TYPE",
     "ERROR_CODE_STALE_DISABLE_FAILED",
     "ERROR_CODE_STALE_SOURCE_EVENT_ID",
     "ERROR_CODE_UPSERT_CONTRACT_FAILED",

@@ -356,11 +356,19 @@ class ContractConsumerCore:
         ``vector_store``：满足 :class:`VectorMutationPort` 的向量能力入口。
         ``event_order``：可选只读事件顺序视图，用于 source_event_id 旧事件拦截；
           未提供时不拦截（生产由后续唯一状态表适配层接入）。
+        ``eligibility_skip_of``：可选的 Eligibility 预判函数，把一条正式 Contract 映射为
+          skip reason（``None`` 表示允许 Embedding）。正式范围 Consumer 经
+          :meth:`process_contracts` 调用时内部复用该函数，避免调用方复制 Eligibility 规则；
+          生产注入 ``EmbeddingEligibilityValidator().get_skip_reason``。
 
     入口：
         :meth:`process` 接收标准 Contract/Disable 输入序列。批内先做幂等裁决：
         同 ``vector_doc_id`` 取 source_event_id 最高者（并列取输入靠后者），落选者
         记 skipped(duplicate_superseded)，胜者按输入顺序执行并逐条返回结果。
+
+        :meth:`process_contracts` 接收正式 ``ExpertChunkEmbeddingInput`` 序列：内部对每条
+        调用 ``eligibility_skip_of`` 得到 skip reason，包成 :class:`ContractUpsertIntent`
+        后委托 :meth:`process`。不携带 stale（范围 Consumer 在收敛后单独计算并下线 stale）。
 
         ``plan_only=True`` 时只生成执行计划（status=planned），除 ``get_vectors``
         只读查询外不触发任何写入动作。
@@ -371,9 +379,11 @@ class ContractConsumerCore:
         *,
         vector_store: VectorMutationPort,
         event_order: SourceEventOrderView | None = None,
+        eligibility_skip_of: Callable[[ExpertChunkEmbeddingInput], str | None] | None = None,
     ) -> None:
         self._vector_store = vector_store
         self._event_order = event_order
+        self._eligibility_skip_of = eligibility_skip_of
 
     # ------------------------------------------------------------------
     # 批量入口
@@ -404,6 +414,46 @@ class ContractConsumerCore:
                 continue
             results.append(self._process_one(item, plan_only=plan_only))
         return results
+
+    def process_contracts(
+        self,
+        contracts: Sequence[ExpertChunkEmbeddingInput],
+        *,
+        plan_only: bool = False,
+    ) -> list[ExecutionResult]:
+        """面向正式 Contract 的入口：内部做 Eligibility 预判后委托 :meth:`process`。
+
+        调用方传入正式 ``ExpertChunkEmbeddingInput`` 序列，本方法对每条调用构造时注入的
+        ``eligibility_skip_of`` 得到 skip reason（``None`` 表示允许 Embedding），包成
+        :class:`ContractUpsertIntent`（``eligibility_skip_reason`` 透传）后再走
+        :meth:`process`。这样 Eligibility 规则只在构造时注入的单一函数中实现，
+        调用方（如正式范围 Consumer）不复制 Eligibility 判定逻辑，也不漏判 active/
+        verification_status 导致的 skip。
+
+        fail-closed：若未注入 ``eligibility_skip_of``，本方法拒绝执行（避免静默按
+        ``None`` 放行 ineligible desired）。兼容入口 :meth:`process` 不受此约束
+        （调用方自行构造 intent 并预填 skip reason）。
+
+        不携带 ``stale_vector_doc_ids``：范围 Consumer 在 desired 全部收敛后单独计算并
+        下线 stale（见 :mod:`scope_consumer`）。
+        """
+
+        if self._eligibility_skip_of is None:
+            raise RuntimeError(
+                "process_contracts 要求 ContractConsumerCore 注入 eligibility_skip_of，"
+                "未注入时拒绝执行以避免静默放行 ineligible desired"
+            )
+        intents: list[ContractConsumerInput] = []
+        for contract in contracts:
+            skip_reason = (
+                self._eligibility_skip_of(contract)
+                if self._eligibility_skip_of is not None
+                else None
+            )
+            intents.append(
+                ContractUpsertIntent(contract=contract, eligibility_skip_reason=skip_reason)
+            )
+        return self.process(intents, plan_only=plan_only)
 
     @staticmethod
     def _operation_of(item: ContractConsumerInput) -> ConsumerOperation:

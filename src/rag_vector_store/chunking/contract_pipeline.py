@@ -256,9 +256,13 @@ class EmbeddingEligibilityValidator:
           tombstone，生命周期动作由上层后续流程处理。
     """
 
-    def get_skip_reason(self, record: ContractPreparedChunk) -> str | None:
+    def get_skip_reason(self, record: ExpertChunkEmbeddingInput) -> str | None:
         """返回跳过原因；返回 None 表示允许进入向量消费。
 
+        参数放宽为 ``ExpertChunkEmbeddingInput``：本方法只访问 ``is_active`` 与
+        ``metadata.verification_status``，二者均在基类上；``ContractPreparedChunk``
+        作为子类调用者仍有效。正式范围 Consumer 通过 ``ContractConsumerCore`` 注入
+        本方法时对 ``ExpertChunkEmbeddingInput`` 直接判定，避免 duck-typing 的类型臆断。
         只保留两个规则：``is_active=false`` 与 ``verification_status=rejected``。
         ``weight_tier`` 是检索权重字段、``eligible_for_recommendation`` 是 profile
         推荐资格字段，均不影响是否向量化。
@@ -270,12 +274,12 @@ class EmbeddingEligibilityValidator:
             return "verification_status=rejected 不允许进入正常向量消费"
         return None
 
-    def is_eligible(self, record: ContractPreparedChunk) -> bool:
+    def is_eligible(self, record: ExpertChunkEmbeddingInput) -> bool:
         """判断记录是否允许进入 Embedding（get_skip_reason 的布尔视图）。"""
 
         return self.get_skip_reason(record) is None
 
-    def validate(self, record: ContractPreparedChunk) -> None:
+    def validate(self, record: ExpertChunkEmbeddingInput) -> None:
         """不满足资格时抛出明确异常（供需要 fail-fast 的场景）。"""
 
         reason = self.get_skip_reason(record)
