@@ -16,7 +16,7 @@ import hashlib
 import json
 from collections.abc import Sequence
 from pathlib import Path
-from typing import Any
+from typing import Any, Final
 
 import pytest
 
@@ -59,6 +59,16 @@ _CONTENT_HASH = hashlib.sha256(_DEFAULT_TEXT.encode("utf-8")).hexdigest()
 _NEW_CONTENT_HASH = hashlib.sha256(_CHANGED_TEXT.encode("utf-8")).hexdigest()
 _METADATA_HASH = "c" * 64
 _NEW_METADATA_HASH = "d" * 64
+# 与 _work_item() 默认 employment 结构保留键同源的 source_hash，供 _stored_record
+# 默认 seed，使三 Hash 全同 skip 测试不再被路由到 metadata-only。
+# 使用哨兵类延迟到 _FIXTURES 定义后计算，并保持 pyright 类型可 narrow。
+
+
+class _UnsetSourceHash:
+    """哨兵：_stored_record 的 source_hash 默认值，避免与 None/str 淑淆。"""
+
+
+_USE_DEFAULT_SOURCE_HASH: Final = _UnsetSourceHash()
 
 
 # ---------------------------------------------------------------------------
@@ -168,17 +178,32 @@ def _stored_record(
     metadata_hash: str = _METADATA_HASH,
     is_active: bool = True,
     chunk_text: str = _DEFAULT_TEXT,
+    source_hash: str | None | _UnsetSourceHash = _USE_DEFAULT_SOURCE_HASH,
 ) -> dict[str, object]:
-    """构造 Fake 向量存储中的已存记录（V15 形态：hash 平铺在 metadata JSON）。"""
+    """构造 Fake 向量存储中的已存记录（V15 形态：hash 平铺在 metadata JSON）。
 
+    ``source_hash`` 默认 seed 与 employment Work Item 同源（三 Hash 全同 skip
+    测试需要）；传 ``None`` 模拟旧版行未写 source_hash 的历史场景；传字符串
+    模拟 source_hash 变化的 metadata-only 场景。
+    """
+
+    if isinstance(source_hash, _UnsetSourceHash):
+        employment_source = _FIXTURES["employment"]["source"]
+        assert isinstance(employment_source, dict)
+        resolved: str | None = str(employment_source["source_hash"])
+    else:
+        resolved = source_hash
+    metadata: dict[str, object] = {
+        "content_hash": content_hash,
+        "metadata_hash": metadata_hash,
+        "is_active": is_active,
+    }
+    if resolved is not None:
+        metadata["source_hash"] = resolved
     return {
         "vector_doc_id": vector_doc_id,
         "chunk_text": chunk_text,
-        "metadata": {
-            "content_hash": content_hash,
-            "metadata_hash": metadata_hash,
-            "is_active": is_active,
-        },
+        "metadata": metadata,
     }
 
 
@@ -562,6 +587,46 @@ def test_reactivation_of_disabled_entity_routes_to_metadata_only_update() -> Non
     assert CONSUMER_ACTION_METADATA_ONLY_UPDATE in result.actions
     assert store.upsert_calls == []
     assert worker.embed_calls == []  # 重新激活复用旧向量
+
+
+# ---------------------------------------------------------------------------
+# C1：Work Item 入口的 source_hash 三 Hash 动作矩阵
+# ---------------------------------------------------------------------------
+def test_work_item_absent_stored_source_hash_routes_to_metadata_only_not_skip() -> None:
+    """Work Item：已存 source_hash 缺失不得误判为三 Hash 全同 Skip。
+
+    source_hash 端到端透传与三 Hash 路由判定分别由
+    ``test_incremental_contract_adapter.py``（适配器透传）与
+    ``test_contract_consumer_core.py``（core 三 Hash 矩阵）覆盖；
+    此处验证 Work Item 兼容入口下已存缺失 source_hash 的收敛行为。
+    """
+
+    worker = FakeEmbeddingWorker()
+    store = FakeVectorStore(embedding_worker=worker)
+    store.seed(_stored_record(_EMPLOYMENT_VID, source_hash=None))
+
+    result = _consumer(store).process([_work_item("upsert")])[0]
+
+    assert result.status == "committed"
+    assert result.result_code == "metadata_updated"
+    assert result.metadata_only is True
+    assert result.embedding_performed is False
+    assert worker.embed_calls == []
+
+
+def test_work_item_three_hash_equal_inactive_reactivates() -> None:
+    """Work Item：三 Hash 全等但已存 inactive → metadata-only 恢复，不得误 Skip。"""
+
+    worker = FakeEmbeddingWorker()
+    store = FakeVectorStore(embedding_worker=worker)
+    store.seed(_stored_record(_EMPLOYMENT_VID, is_active=False))
+
+    result = _consumer(store).process([_work_item("upsert")])[0]
+
+    assert result.status == "committed"
+    assert result.result_code == "metadata_updated"
+    assert result.metadata_only is True
+    assert CONSUMER_ACTION_SKIP_UNCHANGED not in result.actions
 
 
 # ---------------------------------------------------------------------------

@@ -476,15 +476,18 @@ def test_get_vectors_v15_projects_hash_from_metadata_to_top() -> None:
     # 物理顶层仍不含哈希（投影只作用于逻辑返回，不改物理 row）
     assert "content_hash" not in repo.rows[chunk.vector_doc_id]
     assert "metadata_hash" not in repo.rows[chunk.vector_doc_id]
-    # 逻辑返回顶层已投影哈希，且与 metadata 中存储的值一致
+    assert "source_hash" not in repo.rows[chunk.vector_doc_id]
+    # 逻辑返回顶层已投影三个哈希，且与 metadata 中存储的值一致
     flat = repo.rows[chunk.vector_doc_id]["metadata"]
     assert record["content_hash"] == flat["content_hash"]
     assert record["metadata_hash"] == flat["metadata_hash"]
+    assert record["source_hash"] == flat["source_hash"]
     assert record["content_hash"] == chunk.content_hash
     assert record["metadata_hash"] == chunk.metadata_hash
+    assert record["source_hash"] == chunk.source.source_hash
     # 仍不暴露 embedding
     assert "embedding" not in record
-    # 只投影两个哈希，不平铺其它 metadata 字段
+    # 只投影三个哈希，不平铺其它 metadata 字段
     for other in ("expert_id", "chunk_type", "is_active"):
         assert other not in record
 

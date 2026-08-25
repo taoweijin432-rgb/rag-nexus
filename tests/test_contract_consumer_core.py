@@ -13,6 +13,7 @@ import hashlib
 import json
 from collections.abc import Sequence
 from pathlib import Path
+from typing import Final
 
 import pytest
 from pydantic import ValidationError
@@ -52,6 +53,16 @@ _FIXTURE_PATH = (
 _DEFAULT_TEXT = "上游传入的最终正文，本模块不改写"
 _CHANGED_TEXT = "正文发生变化后的新文本"
 _METADATA_HASH = "c" * 64
+# 与 _intent() 默认 employment 契约同源的 source_hash，供 _stored_record 默认
+# seed，使三 Hash 全同 skip 测试不再被路由到 metadata-only。
+# 使用哨兵类延迟到 _fixture_contract 定义后计算，并保持 pyright 类型可 narrow。
+
+
+class _UnsetSourceHash:
+    """哨兵：_stored_record 的 source_hash 默认值，避免与 None/str 淑淆。"""
+
+
+_USE_DEFAULT_SOURCE_HASH: Final = _UnsetSourceHash()
 
 
 def _fixture_contract(chunk_type: str) -> ExpertChunkEmbeddingInput:
@@ -94,19 +105,31 @@ def _stored_record(
     metadata_hash: str = _METADATA_HASH,
     is_active: bool = True,
     chunk_text: str = _DEFAULT_TEXT,
+    source_hash: str | None | _UnsetSourceHash = _USE_DEFAULT_SOURCE_HASH,
 ) -> dict[str, object]:
+    """构造已存记录。
+
+    ``source_hash`` 默认 seed 与 employment fixture 同源（三 Hash 全同 skip
+    测试需要）；传 ``None`` 模拟旧版行未写 source_hash 的历史场景；传字符串
+    模拟 source_hash 变化的 metadata-only 场景。
+    """
+    if isinstance(source_hash, _UnsetSourceHash):
+        source_hash = _fixture_contract("employment").source.source_hash
+    metadata: dict[str, object] = {
+        "content_hash": (
+            content_hash
+            if content_hash is not None
+            else hashlib.sha256(chunk_text.encode("utf-8")).hexdigest()
+        ),
+        "metadata_hash": metadata_hash,
+        "is_active": is_active,
+    }
+    if source_hash is not None:
+        metadata["source_hash"] = source_hash
     return {
         "vector_doc_id": vector_doc_id,
         "chunk_text": chunk_text,
-        "metadata": {
-            "content_hash": (
-                content_hash
-                if content_hash is not None
-                else hashlib.sha256(chunk_text.encode("utf-8")).hexdigest()
-            ),
-            "metadata_hash": metadata_hash,
-            "is_active": is_active,
-        },
+        "metadata": metadata,
     }
 
 
@@ -392,6 +415,165 @@ def test_core_hash_unchanged_skips_without_writes() -> None:
     assert result.result_code == "unchanged_skipped"
     assert result.error_code is None
     assert CONSUMER_ACTION_SKIP_UNCHANGED in result.actions
+
+
+# ---------------------------------------------------------------------------
+# C1：source_hash 投影与三 Hash 动作矩阵
+# ---------------------------------------------------------------------------
+def _intent_with_source_hash(source_hash: str) -> ContractUpsertIntent:
+    """构造一个仅 source_hash 与默认不同的 upsert 意图（content/metadata 不变）。"""
+
+    template = _intent()
+    new_source = template.contract.source.model_copy(update={"source_hash": source_hash})
+    return ContractUpsertIntent(
+        contract=template.contract.model_copy(update={"source": new_source}),
+        eligibility_skip_reason=None,
+        stale_vector_doc_ids=(),
+        source_event_id=None,
+    )
+
+
+def test_core_source_hash_only_change_routes_to_metadata_only() -> None:
+    """content_hash 不变、仅 source_hash 变化 → metadata-only 更新。"""
+
+    worker = FakeEmbeddingWorker()
+    store = FakeVectorStore(embedding_worker=worker)
+    template = _intent()
+    store.seed(_stored_record(template.vector_doc_id))
+
+    result = _core(store).process([_intent_with_source_hash("e" * 64)])[0]
+
+    assert result.status == "committed"
+    assert result.result_code == "metadata_updated"
+    assert result.metadata_only is True
+    assert result.embedding_performed is False
+    assert CONSUMER_ACTION_METADATA_ONLY_UPDATE in result.actions
+
+
+def test_core_source_hash_only_change_has_zero_embedding() -> None:
+    """source_hash-only 变化不得调用 Embedding。"""
+
+    worker = FakeEmbeddingWorker()
+    store = FakeVectorStore(embedding_worker=worker)
+    template = _intent()
+    store.seed(_stored_record(template.vector_doc_id))
+
+    _core(store).process([_intent_with_source_hash("e" * 64)])[0]
+
+    assert worker.embed_calls == []
+    assert store.upsert_calls == []
+    assert len(store.update_calls) == 1
+
+
+def test_core_metadata_hash_only_change_routes_to_metadata_only() -> None:
+    """content_hash/source_hash 不变、仅 metadata_hash 变化 → metadata-only。"""
+
+    worker = FakeEmbeddingWorker()
+    store = FakeVectorStore(embedding_worker=worker)
+    template = _intent()
+    store.seed(_stored_record(template.vector_doc_id))
+
+    changed = ContractUpsertIntent(
+        contract=template.contract.model_copy(update={"metadata_hash": "f" * 64}),
+        eligibility_skip_reason=None,
+        stale_vector_doc_ids=(),
+        source_event_id=None,
+    )
+    result = _core(store).process([changed])[0]
+
+    assert result.status == "committed"
+    assert result.result_code == "metadata_updated"
+    assert result.metadata_only is True
+    assert result.embedding_performed is False
+    assert worker.embed_calls == []
+    assert store.upsert_calls == []
+
+
+def test_core_content_hash_change_still_reembeds() -> None:
+    """content_hash 变化仍重新 Embedding（三 Hash 矩阵中 content 优先级最高）。"""
+
+    worker = FakeEmbeddingWorker()
+    store = FakeVectorStore(embedding_worker=worker)
+    template = _intent()
+    store.seed(_stored_record(template.vector_doc_id))
+
+    result = _core(store).process([_intent(text=_CHANGED_TEXT)])[0]
+
+    assert result.status == "committed"
+    assert result.result_code == "embedded"
+    assert result.embedding_performed is True
+    assert len(worker.embed_calls) == 1
+
+
+def test_core_absent_stored_source_hash_routes_to_metadata_only_not_skip() -> None:
+    """已存 source_hash 缺失（旧版行）不得误判为三 Hash 全同 Skip。
+
+    content_hash 相同且旧 source_hash 缺失 → 路由到 metadata-only 收敛 previous state，
+    不调用 Embedding。
+    """
+
+    worker = FakeEmbeddingWorker()
+    store = FakeVectorStore(embedding_worker=worker)
+    template = _intent()
+    # 已存记录不带 source_hash（模拟旧版行）
+    store.seed(_stored_record(template.vector_doc_id, source_hash=None))
+
+    result = _core(store).process([template])[0]
+
+    assert result.status == "committed"
+    assert result.result_code == "metadata_updated"
+    assert result.metadata_only is True
+    assert result.embedding_performed is False
+    assert worker.embed_calls == []
+    assert store.upsert_calls == []
+
+
+def test_core_three_hash_equal_inactive_reactivates_via_metadata_only() -> None:
+    """三 Hash 全等但已存 inactive、本次 active → metadata-only 恢复，不得误 Skip。"""
+
+    worker = FakeEmbeddingWorker()
+    store = FakeVectorStore(embedding_worker=worker)
+    template = _intent()  # 输入 active
+    store.seed(_stored_record(template.vector_doc_id, is_active=False))
+
+    result = _core(store).process([template])[0]
+
+    assert result.status == "committed"
+    assert result.result_code == "metadata_updated"
+    assert result.metadata_only is True
+    assert result.embedding_performed is False
+    assert worker.embed_calls == []
+    assert CONSUMER_ACTION_SKIP_UNCHANGED not in result.actions
+
+
+def test_core_source_hash_malformed_fails_closed() -> None:
+    """已存 source_hash 存在但类型非法（空字符串）→ fail-closed，不静默当缺失。"""
+
+    store = FakeVectorStore()
+    template = _intent()
+    store.seed(_stored_record(template.vector_doc_id, source_hash=""))
+
+    result = _core(store).process([template])[0]
+
+    assert result.status == "rejected"
+    assert result.error_code == "existing_state_invalid"
+
+
+def test_core_gate_blocked_on_source_hash_change_path_also_rejects() -> None:
+    """source_hash-only 变化走 metadata-only 遇安全门失败 → 确定性拒绝零 Embedding。"""
+
+    worker = FakeEmbeddingWorker()
+    store = FakeVectorStore(embedding_worker=worker, update_mode="gate_fail")
+    template = _intent()
+    store.seed(_stored_record(template.vector_doc_id))
+
+    result = _core(store).process([_intent_with_source_hash("e" * 64)])[0]
+
+    assert result.status == "rejected"
+    assert result.error_code == "model_space_mismatch"
+    assert result.embedding_performed is False
+    assert worker.embed_calls == []
+    assert store.upsert_calls == []
 
 
 def test_core_upsert_disables_stale_subchunks_after_commit() -> None:

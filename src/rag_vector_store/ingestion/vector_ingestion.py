@@ -140,10 +140,14 @@ def _dedupe(vector_doc_ids: Sequence[str]) -> list[str]:
     return cleaned
 
 
-# 增量幂等读取需要投影到逻辑返回顶层的两个哈希字段名。V15 把它们存进
+# 增量幂等读取需要投影到逻辑返回顶层的三个哈希字段名。V15 把它们存进
 # ``metadata`` JSON；本常量只服务于 get_vectors 的逻辑投影，不代表物理
-# Schema 字段。
-_HASH_PROJECTION_FIELDS = ("content_hash", "metadata_hash")
+# Schema 字段。三 Hash 动作矩阵（C1，仅增量 ``ContractConsumerCore`` 消费）：
+# content_hash 变化→重新 Embedding；content_hash 不变而 source_hash /
+# metadata_hash 任一变化→metadata-only；三 Hash 全同且 active→Skip。
+# 全量对账 ``ExpertVectorSynchronizer``（同事侧）仍只消费前两个哈希，
+# 多投影的 source_hash 对它无害。
+_HASH_PROJECTION_FIELDS = ("content_hash", "metadata_hash", "source_hash")
 
 
 def _project_hash_fields(row: Mapping[str, object]) -> dict[str, object]:
@@ -154,9 +158,15 @@ def _project_hash_fields(row: Mapping[str, object]) -> dict[str, object]:
         - 顶层已有合法哈希时保持不变（兼容历史 V14 物理 row 形态，已是死分支
           但无害，避免误处理旧回放数据）；
         - 顶层缺失时，从 ``metadata`` JSON 中提取 ``content_hash`` /
-          ``metadata_hash`` 到逻辑返回顶层（V15 物理 row 哈希位于 metadata）；
+          ``metadata_hash`` / ``source_hash`` 到逻辑返回顶层（V15 物理 row
+          哈希位于 metadata）；
         - 只投影本模块明确声明需要的哈希字段，不平铺其它 metadata 字段；
-        - 顶层与 ``metadata`` 均缺失时不补造哈希，交由调用方 fail-closed。
+        - 顶层与 ``metadata`` 均缺失时不补造哈希，交由调用方 fail-closed
+          （``content_hash`` / ``metadata_hash`` 缺失即 fail-closed；
+          ``source_hash`` 例外：旧版行可能未写 source_hash，缺失时不补造，
+          下游 ``ContractConsumerCore`` 把已存 source_hash 缺失路由到
+          metadata-only，不误判为三 Hash 全同；存在但空字符串/非字符串仍
+          fail-closed，不静默当缺失）。
 
     Args:
         row: Repository ``get_by_vector_doc_id`` 返回的物理 row。
@@ -323,13 +333,22 @@ class VectorIngestionService:
 
         保留输入去重顺序；``records`` 为命中的记录，``missing`` 为未命中主键。
 
-        hash 投影契约：上游 ``ExpertVectorSynchronizer`` 增量幂等判断只读取
-        逻辑 record 顶层的 ``content_hash`` / ``metadata_hash``（V15 把这两个
-        哈希存进 ``metadata`` JSON）。这里在
-        Service 边界做统一的逻辑投影——顶层已有合法哈希时保持不变，否则从
-        ``metadata`` JSON 中提取这两个字段到逻辑返回顶层。这是纯内存投影，
-        不修改 Milvus 物理 Schema，不增加一级字段，不平铺其它 metadata 字段；
-        顶层与 ``metadata`` 都缺失时不在本层补造哈希，交由调用方 fail-closed。
+        hash 投影契约：本方法在 Service 边界统一投影三个哈希字段
+        （``content_hash`` / ``metadata_hash`` / ``source_hash``，V15 把它们存进
+        ``metadata`` JSON）到逻辑返回顶层——顶层已有合法哈希时保持不变，否则从
+        ``metadata`` JSON 中提取。这是纯内存投影，不修改 Milvus 物理 Schema，
+        不增加一级字段，不平铺其它 metadata 字段。
+
+        下游消费差异：
+        - 增量 ``ContractConsumerCore`` 读取全部三个哈希做三 Hash 动作矩阵；
+        - 全量对账 ``ExpertVectorSynchronizer``（同事侧 expert_index）仍只消费
+          ``content_hash`` / ``metadata_hash``，未升级为三 Hash，不在本次
+          C1 范围；多投影出的 ``source_hash`` 对它是多余但无害的字段。
+
+        缺失策略：顶层与 ``metadata`` 都缺失 ``content_hash`` / ``metadata_hash``
+        时不补造，交调用方 fail-closed；``source_hash`` 缺失同样不补造，由
+        ``ContractConsumerCore`` 按三 Hash 矩阵把已存缺失路由到 metadata-only
+        （不误判为全同 Skip，不调用 Embedding）。
         """
 
         cleaned = _dedupe(vector_doc_ids)

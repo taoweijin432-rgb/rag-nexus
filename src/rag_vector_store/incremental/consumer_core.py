@@ -113,7 +113,7 @@ class VectorMutationPort(Protocol):
         ...
 
     def get_vectors(self, vector_doc_ids: Sequence[str]) -> VectorQueryResult:
-        """批量查询已存记录（顶层投影两个 hash；不含 embedding）。"""
+        """批量查询已存记录（顶层投影三个 hash；不含 embedding）。"""
         ...
 
 
@@ -255,11 +255,19 @@ def duplicate_superseded_result(
 
 @dataclass(frozen=True)
 class _ExistingVectorState:
-    """增量判定所需的已存实体轻量状态（严格 fail-closed 提取）。"""
+    """增量判定所需的已存实体轻量状态（严格 fail-closed 提取）。
+
+    ``source_hash`` 允许为 ``None``：旧版行可能未写 source_hash，缺失时不
+    fail-closed，而是交由 ``_decide_text_mode`` 路由到 metadata-only
+    （content_hash 相同且 source_hash 缺失 → 收敛 previous state 的非向量更新，
+    不误判为三 Hash 全同、不调用 Embedding）。``content_hash`` / ``metadata_hash``
+    缺失仍 fail-closed。
+    """
 
     vector_doc_id: str
     content_hash: str
     metadata_hash: str
+    source_hash: str | None
     is_active: bool
 
 
@@ -290,11 +298,14 @@ def validation_error_summary(error: Exception) -> str:
 
 
 def _extract_existing_state(record: dict[str, object]) -> _ExistingVectorState:
-    """从 get_vectors 返回记录中提取轻量状态（严格 fail-closed）。
+    """从 get_vectors 返回记录中提取轻量状态（content/metadata 严格 fail-closed）。
 
-    - content_hash / metadata_hash：优先顶层投影字段，其次 metadata JSON 内键；
-      缺失或类型非法即抛错，交由调用方转 rejected；
-    - is_active：V15 将其平铺在 metadata JSON 中；缺失或非布尔值一律抛错
+    - ``content_hash`` / ``metadata_hash``：优先顶层投影字段，其次 metadata JSON
+      内键；缺失或类型非法即抛错，交由调用方转 rejected；
+    - ``source_hash``：优先顶层投影字段，其次 metadata JSON 内键；缺失时返回
+      ``None``（历史行可能未写），但 **存在且类型非法** 仍 fail-closed
+      （与 V15 仓储侧的存储语义一致）；
+    - ``is_active``：V15 将其平铺在 metadata JSON 中；缺失或非布尔值一律抛错
       （与 V15 仓储侧 strict-bool 提取语义一致）。
     """
 
@@ -311,6 +322,19 @@ def _extract_existing_state(record: dict[str, object]) -> _ExistingVectorState:
                 return value
         raise _ExistingStateError(f"已存记录缺少 {field}")
 
+    def _optional_hash_field(field: str) -> str | None:
+        for source in (record, flat):
+            value = source.get(field)
+            if value is None:
+                continue
+            if isinstance(value, str) and value:
+                return value
+            # 存在但类型非法（空字符串 / 非字符串）→ fail-closed，不静默当缺失。
+            raise _ExistingStateError(
+                f"已存记录 {field} 类型非法：{type(value).__name__}"
+            )
+        return None
+
     is_active = flat.get("is_active")
     if not isinstance(is_active, bool):
         raise _ExistingStateError(
@@ -320,6 +344,7 @@ def _extract_existing_state(record: dict[str, object]) -> _ExistingVectorState:
         vector_doc_id=vector_doc_id,
         content_hash=_hash_field("content_hash"),
         metadata_hash=_hash_field("metadata_hash"),
+        source_hash=_optional_hash_field("source_hash"),
         is_active=is_active,
     )
 
@@ -539,6 +564,7 @@ class ContractConsumerCore:
             preloaded_state,
             contract.content_hash,
             contract.metadata_hash,
+            contract.source.source_hash,
         )
         result = self._execute_text_plan(
             contract=contract,
@@ -561,23 +587,41 @@ class ContractConsumerCore:
         state: _ExistingVectorState | None,
         content_hash: str,
         metadata_hash: str,
+        source_hash: str,
     ) -> str:
         """差分判定：embedding_upsert / metadata_only_update / skip_unchanged。
 
-        ``state`` 为 None 表示已存实体不存在（新 Chunk）。重新激活守卫：hash
-        全等但已存实体 inactive、本次输入 active 时走 metadata-only 更新
-        （原因：逻辑下线只翻转 is_active、不重算已存 metadata_hash）。
+        三 Hash 动作矩阵（C1）：
+
+        1. ``state`` 为 None（已存实体不存在）→ embedding_upsert；
+        2. ``content_hash`` 变化 → embedding_upsert；
+        3. ``content_hash`` 不变但已存 ``source_hash`` 缺失 → metadata-only
+           （不误判为三 Hash 全同、不调用 Embedding，收敛 previous state）；
+        4. ``content_hash`` 不变但 ``source_hash`` 或 ``metadata_hash`` 变化 →
+           metadata-only（Embedding 调用次数为 0）；
+        5. 三 Hash 全等且已存 active → skip_unchanged；
+        6. 三 Hash 全等但已存 inactive、本次输入 active → metadata-only
+           （重新激活守卫；逻辑下线只翻转 is_active、不重算已存 metadata_hash，
+           故 hash 全等但仍需写入以恢复 active）。
         """
 
         if state is None:
             return CONSUMER_ACTION_EMBEDDING_UPSERT
         content_changed = state.content_hash != content_hash
-        metadata_changed = state.metadata_hash != metadata_hash
-        if not content_changed and not metadata_changed and state.is_active:
-            return CONSUMER_ACTION_SKIP_UNCHANGED
-        if not content_changed:
+        if content_changed:
+            return CONSUMER_ACTION_EMBEDDING_UPSERT
+        # 已存 source_hash 缺失：不能判定为三 Hash 全同，content_hash 不变时
+        # 路由到 metadata-only（零 Embedding），收敛 previous state。
+        if state.source_hash is None:
             return CONSUMER_ACTION_METADATA_ONLY_UPDATE
-        return CONSUMER_ACTION_EMBEDDING_UPSERT
+        source_changed = state.source_hash != source_hash
+        metadata_changed = state.metadata_hash != metadata_hash
+        if not source_changed and not metadata_changed and state.is_active:
+            return CONSUMER_ACTION_SKIP_UNCHANGED
+        if not source_changed and not metadata_changed and not state.is_active:
+            # 重新激活守卫：三 Hash 全等但已存 inactive → metadata-only 恢复 active。
+            return CONSUMER_ACTION_METADATA_ONLY_UPDATE
+        return CONSUMER_ACTION_METADATA_ONLY_UPDATE
 
     def _execute_text_plan(
         self,
@@ -605,7 +649,7 @@ class ContractConsumerCore:
                 operation=op,
                 status="skipped",
                 result_code=RESULT_CODE_UNCHANGED_SKIPPED,
-                reason="hash_unchanged：双 hash 与已存实体一致且仍 active",
+                reason="hash_unchanged：三 hash 与已存实体一致且仍 active",
                 actions=tuple(actions) + (mode,),
             )
 
