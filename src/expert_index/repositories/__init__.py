@@ -8,13 +8,19 @@ from .batch import (
 )
 from .batch_item import BatchItemSummary, MySQLBatchItemRepository
 from .build_lock import ConcurrentBuildError, MySQLBuildLockRepository
-from .source_state import MySQLSourceStateRepository
+from .source_state import (
+    BatchSourceRecoveryConflictError,
+    MySQLSourceStateRepository,
+    SourceCheckpointNotInitializedError,
+    SourceLeaseConflictError,
+)
 from .sync_task import MySQLSourceSyncTaskRepository
 
 __all__ = [
     "BatchItemSummary",
     "BatchNotResumableError",
     "BatchNotRetryableError",
+    "BatchSourceRecoveryConflictError",
     "ConcurrentBuildError",
     "FullBatchCheckpoint",
     "MySQLBatchItemRepository",
@@ -22,4 +28,6 @@ __all__ = [
     "MySQLBuildLockRepository",
     "MySQLSourceStateRepository",
     "MySQLSourceSyncTaskRepository",
+    "SourceCheckpointNotInitializedError",
+    "SourceLeaseConflictError",
 ]

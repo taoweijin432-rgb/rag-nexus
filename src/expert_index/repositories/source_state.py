@@ -1,10 +1,12 @@
 """来源表 Checkpoint 与批次扫描状态的 MySQL 数据访问层。
 
-本模块提供安全位置读取与初始化，以及批次固定扫描范围的创建与查询。每个公开方法
-自行建立短连接，写操作在成功后提交，异常时回滚，最后关闭连接。
+本模块提供安全位置读写、扫描 lease 管理，以及批次固定扫描范围的创建、查询与恢复。
+每个公开方法自行建立短连接，写操作在成功后提交，异常时回滚，最后关闭连接。
 """
 
 from __future__ import annotations
+
+from typing import Any
 
 import pymysql
 
@@ -15,6 +17,18 @@ from ..models import (
     SourceCheckpoint,
     SourceScanCursor,
 )
+
+
+class SourceCheckpointNotInitializedError(RuntimeError):
+    """表示指定来源表尚未建立显式初始 Checkpoint。"""
+
+
+class SourceLeaseConflictError(RuntimeError):
+    """表示来源扫描 lease 已被占用或调用方不再拥有有效 lease。"""
+
+
+class BatchSourceRecoveryConflictError(RuntimeError):
+    """表示同一来源表存在多个未完成批次，无法安全选择恢复目标。"""
 
 
 class MySQLSourceStateRepository:
@@ -36,8 +50,7 @@ class MySQLSourceStateRepository:
         不锁定记录，也不推进 Checkpoint。
         """
 
-        if not isinstance(source_table, str) or source_table not in CHECKPOINT_SOURCE_TABLES:
-            raise ValueError(f"不支持的 Checkpoint 来源表: {source_table}")
+        _validate_source_table(source_table)
 
         connection = pymysql.connect(**self.config.as_kwargs(autocommit=True))
         try:
@@ -55,20 +68,7 @@ class MySQLSourceStateRepository:
                 row = cursor.fetchone()
             if row is None:
                 return None
-            if row.get("source_table") != source_table:
-                raise RuntimeError("Checkpoint 查询结果与请求来源表不一致")
-            return SourceCheckpoint(
-                source_table=source_table,
-                last_updated_at=row["last_updated_at"],
-                last_id=int(row["last_id"]),
-                last_batch_id=(
-                    int(row["last_batch_id"]) if row.get("last_batch_id") is not None else None
-                ),
-                last_success_time=row.get("last_success_time"),
-                lock_version=int(row["lock_version"]),
-                lease_owner=row.get("lease_owner"),
-                lease_until=row.get("lease_until"),
-            )
+            return _source_checkpoint_from_row(row, expected_source_table=source_table)
         finally:
             connection.close()
 
@@ -106,6 +106,224 @@ class MySQLSourceStateRepository:
                     ),
                 )
             connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+
+    def acquire_source_lease(
+        self,
+        source_table: str,
+        lease_owner: str,
+        *,
+        lease_seconds: int,
+    ) -> SourceCheckpoint:
+        """原子认领一张来源表的扫描 lease，并返回数据库生成的到期时间。
+
+        方法锁定 Checkpoint 行，只允许认领空闲或已过期 lease。仍然有效的 lease 即使
+        owner 文本相同也会被拒绝，调用方应使用 ``renew_source_lease`` 显式续租。
+        """
+
+        _validate_source_table(source_table)
+        _validate_lease_owner(lease_owner)
+        _validate_lease_seconds(lease_seconds)
+
+        connection = pymysql.connect(**self.config.as_kwargs())
+        try:
+            with connection.cursor() as cursor:
+                locked_row = _lock_source_checkpoint(cursor, source_table)
+                if bool(locked_row["lease_is_active"]):
+                    raise SourceLeaseConflictError(
+                        f"来源表 {source_table} 的扫描 lease 仍在有效期内"
+                    )
+                cursor.execute(
+                    """
+                    UPDATE expert_index_source_checkpoint
+                    SET lease_owner=%s,
+                        lease_until=TIMESTAMPADD(
+                            SECOND, %s, CURRENT_TIMESTAMP(6)
+                        )
+                    WHERE source_table=%s
+                      AND (
+                          lease_until IS NULL
+                          OR lease_until <= CURRENT_TIMESTAMP(6)
+                      )
+                    """,
+                    (lease_owner, lease_seconds, source_table),
+                )
+                if cursor.rowcount != 1:
+                    raise SourceLeaseConflictError(
+                        f"来源表 {source_table} 的扫描 lease 认领失败"
+                    )
+                checkpoint = _read_source_checkpoint(cursor, source_table)
+            connection.commit()
+            return checkpoint
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+
+    def renew_source_lease(
+        self,
+        source_table: str,
+        lease_owner: str,
+        *,
+        lease_seconds: int,
+    ) -> SourceCheckpoint:
+        """续租调用方当前持有且尚未过期的来源扫描 lease。"""
+
+        _validate_source_table(source_table)
+        _validate_lease_owner(lease_owner)
+        _validate_lease_seconds(lease_seconds)
+
+        connection = pymysql.connect(**self.config.as_kwargs())
+        try:
+            with connection.cursor() as cursor:
+                locked_row = _lock_source_checkpoint(cursor, source_table)
+                if (
+                    locked_row.get("lease_owner") != lease_owner
+                    or not bool(locked_row["lease_is_active"])
+                ):
+                    raise SourceLeaseConflictError(
+                        f"调用方不再拥有来源表 {source_table} 的有效扫描 lease"
+                    )
+                cursor.execute(
+                    """
+                    UPDATE expert_index_source_checkpoint
+                    SET lease_until=TIMESTAMPADD(
+                        SECOND, %s, CURRENT_TIMESTAMP(6)
+                    )
+                    WHERE source_table=%s
+                      AND lease_owner=%s
+                      AND lease_until > CURRENT_TIMESTAMP(6)
+                    """,
+                    (lease_seconds, source_table, lease_owner),
+                )
+                if cursor.rowcount != 1:
+                    raise SourceLeaseConflictError(
+                        f"来源表 {source_table} 的扫描 lease 续租失败"
+                    )
+                checkpoint = _read_source_checkpoint(cursor, source_table)
+            connection.commit()
+            return checkpoint
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+
+    def release_source_lease(
+        self,
+        source_table: str,
+        lease_owner: str,
+    ) -> SourceCheckpoint:
+        """释放 owner 匹配且尚未过期的来源扫描 lease，并返回未推进的 Checkpoint。"""
+
+        _validate_source_table(source_table)
+        _validate_lease_owner(lease_owner)
+
+        connection = pymysql.connect(**self.config.as_kwargs())
+        try:
+            with connection.cursor() as cursor:
+                locked_row = _lock_source_checkpoint(cursor, source_table)
+                if (
+                    locked_row.get("lease_owner") != lease_owner
+                    or not bool(locked_row["lease_is_active"])
+                ):
+                    raise SourceLeaseConflictError(
+                        f"调用方不再拥有来源表 {source_table} 的有效扫描 lease"
+                    )
+                cursor.execute(
+                    """
+                    UPDATE expert_index_source_checkpoint
+                    SET lease_owner=NULL, lease_until=NULL
+                    WHERE source_table=%s
+                      AND lease_owner=%s
+                      AND lease_until > CURRENT_TIMESTAMP(6)
+                    """,
+                    (source_table, lease_owner),
+                )
+                if cursor.rowcount != 1:
+                    raise SourceLeaseConflictError(
+                        f"来源表 {source_table} 的扫描 lease 释放失败"
+                    )
+                checkpoint = _read_source_checkpoint(cursor, source_table)
+            connection.commit()
+            return checkpoint
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+
+    def get_recoverable_batch_source_scan(
+        self,
+        source_table: str,
+        lease_owner: str,
+    ) -> BatchSourceScan | None:
+        """在有效来源 lease 下读取唯一未完成的 Batch Source。
+
+        ``pending/running/failed`` 都属于尚未提交安全水位的恢复范围。不存在时返回
+        ``None``；存在多条时 fail-closed，避免任意选择一个重叠范围继续处理。
+        """
+
+        _validate_source_table(source_table)
+        _validate_lease_owner(lease_owner)
+
+        connection = pymysql.connect(**self.config.as_kwargs())
+        try:
+            with connection.cursor() as cursor:
+                locked_row = _lock_source_checkpoint(cursor, source_table)
+                if (
+                    locked_row.get("lease_owner") != lease_owner
+                    or not bool(locked_row["lease_is_active"])
+                ):
+                    raise SourceLeaseConflictError(
+                        f"调用方不再拥有来源表 {source_table} 的有效扫描 lease"
+                    )
+                cursor.execute(
+                    """
+                    SELECT id, batch_id, source_table,
+                           start_updated_at, start_id,
+                           cursor_updated_at, cursor_id,
+                           upper_bound_updated_at, upper_bound_id,
+                           checkpoint_lock_version, status,
+                           candidate_count, success_count,
+                           failed_count, skipped_count,
+                           started_at, finished_at
+                    FROM expert_index_batch_source
+                    WHERE source_table=%s
+                      AND status IN ('pending', 'running', 'failed')
+                    ORDER BY id ASC
+                    LIMIT 2
+                    FOR UPDATE
+                    """,
+                    (source_table,),
+                )
+                rows = list(cursor.fetchall())
+                if len(rows) > 1:
+                    raise BatchSourceRecoveryConflictError(
+                        f"来源表 {source_table} 存在多个未完成 Batch Source"
+                    )
+                scan = _batch_source_scan_from_row(rows[0]) if rows else None
+                if scan is not None:
+                    checkpoint_cursor = SourceScanCursor(
+                        updated_at=locked_row["last_updated_at"],
+                        record_id=int(locked_row["last_id"]),
+                    )
+                    if (
+                        scan.start_cursor != checkpoint_cursor
+                        or scan.checkpoint_lock_version
+                        != int(locked_row["lock_version"])
+                    ):
+                        raise BatchSourceRecoveryConflictError(
+                            f"来源表 {source_table} 的未完成 Batch Source "
+                            "与当前安全 Checkpoint 不一致"
+                        )
+            connection.commit()
+            return scan
         except Exception:
             connection.rollback()
             raise
@@ -194,8 +412,7 @@ class MySQLSourceStateRepository:
 
         if isinstance(batch_id, bool) or not isinstance(batch_id, int) or batch_id < 1:
             raise ValueError("batch_id 必须是正整数")
-        if not isinstance(source_table, str) or source_table not in CHECKPOINT_SOURCE_TABLES:
-            raise ValueError(f"不支持的 Checkpoint 来源表: {source_table}")
+        _validate_source_table(source_table)
 
         connection = pymysql.connect(**self.config.as_kwargs(autocommit=True))
         try:
@@ -220,29 +437,134 @@ class MySQLSourceStateRepository:
                 return None
             if int(row["batch_id"]) != batch_id or row.get("source_table") != source_table:
                 raise RuntimeError("批次来源扫描查询结果与请求条件不一致")
-            return BatchSourceScan(
-                batch_id=batch_id,
-                source_table=source_table,
-                start_cursor=SourceScanCursor(
-                    updated_at=row["start_updated_at"],
-                    record_id=int(row["start_id"]),
-                ),
-                current_cursor=SourceScanCursor(
-                    updated_at=row["cursor_updated_at"],
-                    record_id=int(row["cursor_id"]),
-                ),
-                upper_bound=SourceScanCursor(
-                    updated_at=row["upper_bound_updated_at"],
-                    record_id=int(row["upper_bound_id"]),
-                ),
-                checkpoint_lock_version=int(row["checkpoint_lock_version"]),
-                status=row["status"],
-                candidate_count=int(row["candidate_count"]),
-                success_count=int(row["success_count"]),
-                failed_count=int(row["failed_count"]),
-                skipped_count=int(row["skipped_count"]),
-                started_at=row.get("started_at"),
-                finished_at=row.get("finished_at"),
-            )
+            return _batch_source_scan_from_row(row)
         finally:
             connection.close()
+
+
+def _validate_source_table(source_table: str) -> None:
+    """校验来源表属于四表 Checkpoint 白名单。"""
+
+    if not isinstance(source_table, str) or source_table not in CHECKPOINT_SOURCE_TABLES:
+        raise ValueError(f"不支持的 Checkpoint 来源表: {source_table}")
+
+
+def _validate_lease_owner(lease_owner: str) -> None:
+    """校验 lease owner 能安全写入 Checkpoint 字段。"""
+
+    if (
+        not isinstance(lease_owner, str)
+        or not lease_owner.strip()
+        or len(lease_owner) > 128
+    ):
+        raise ValueError("lease_owner 必须是长度不超过 128 的非空字符串")
+
+
+def _validate_lease_seconds(lease_seconds: int) -> None:
+    """校验 lease 时长为正整数秒。"""
+
+    if (
+        isinstance(lease_seconds, bool)
+        or not isinstance(lease_seconds, int)
+        or lease_seconds < 1
+    ):
+        raise ValueError("lease_seconds 必须是正整数")
+
+
+def _lock_source_checkpoint(cursor: Any, source_table: str) -> dict[str, Any]:
+    """锁定 Checkpoint，并由 Index MySQL 判断 lease 当前是否有效。"""
+
+    cursor.execute(
+        """
+        SELECT source_table, last_updated_at, last_id,
+               last_batch_id, last_success_time, lock_version,
+               lease_owner, lease_until,
+               (
+                   lease_owner IS NOT NULL
+                   AND lease_until > CURRENT_TIMESTAMP(6)
+               ) AS lease_is_active
+        FROM expert_index_source_checkpoint
+        WHERE source_table=%s
+        FOR UPDATE
+        """,
+        (source_table,),
+    )
+    row = cursor.fetchone()
+    if row is None:
+        raise SourceCheckpointNotInitializedError(
+            f"来源表 {source_table} 尚未初始化 Checkpoint"
+        )
+    if row.get("source_table") != source_table:
+        raise RuntimeError("锁定的 Checkpoint 与请求来源表不一致")
+    return row
+
+
+def _read_source_checkpoint(cursor: Any, source_table: str) -> SourceCheckpoint:
+    """在当前事务中读取刚写入的完整 Checkpoint 状态。"""
+
+    cursor.execute(
+        """
+        SELECT source_table, last_updated_at, last_id,
+               last_batch_id, last_success_time, lock_version,
+               lease_owner, lease_until
+        FROM expert_index_source_checkpoint
+        WHERE source_table=%s
+        """,
+        (source_table,),
+    )
+    row = cursor.fetchone()
+    if row is None:
+        raise RuntimeError("Checkpoint 在 lease 状态写入后不存在")
+    return _source_checkpoint_from_row(row, expected_source_table=source_table)
+
+
+def _source_checkpoint_from_row(
+    row: dict[str, Any],
+    *,
+    expected_source_table: str,
+) -> SourceCheckpoint:
+    """把数据库 Checkpoint 行转换为显式领域模型。"""
+
+    if row.get("source_table") != expected_source_table:
+        raise RuntimeError("Checkpoint 查询结果与请求来源表不一致")
+    return SourceCheckpoint(
+        source_table=expected_source_table,
+        last_updated_at=row["last_updated_at"],
+        last_id=int(row["last_id"]),
+        last_batch_id=(
+            int(row["last_batch_id"]) if row.get("last_batch_id") is not None else None
+        ),
+        last_success_time=row.get("last_success_time"),
+        lock_version=int(row["lock_version"]),
+        lease_owner=row.get("lease_owner"),
+        lease_until=row.get("lease_until"),
+    )
+
+
+def _batch_source_scan_from_row(row: dict[str, Any]) -> BatchSourceScan:
+    """把数据库 Batch Source 行转换为固定范围扫描模型。"""
+
+    return BatchSourceScan(
+        batch_id=int(row["batch_id"]),
+        source_table=str(row["source_table"]),
+        start_cursor=SourceScanCursor(
+            updated_at=row["start_updated_at"],
+            record_id=int(row["start_id"]),
+        ),
+        current_cursor=SourceScanCursor(
+            updated_at=row["cursor_updated_at"],
+            record_id=int(row["cursor_id"]),
+        ),
+        upper_bound=SourceScanCursor(
+            updated_at=row["upper_bound_updated_at"],
+            record_id=int(row["upper_bound_id"]),
+        ),
+        checkpoint_lock_version=int(row["checkpoint_lock_version"]),
+        status=str(row["status"]),
+        candidate_count=int(row["candidate_count"]),
+        success_count=int(row["success_count"]),
+        failed_count=int(row["failed_count"]),
+        skipped_count=int(row["skipped_count"]),
+        started_at=row.get("started_at"),
+        finished_at=row.get("finished_at"),
+    )
