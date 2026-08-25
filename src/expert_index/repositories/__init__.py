@@ -9,6 +9,7 @@ from .batch import (
 from .batch_item import BatchItemSummary, MySQLBatchItemRepository
 from .build_lock import ConcurrentBuildError, MySQLBuildLockRepository
 from .source_state import (
+    BatchSourceCursorConflictError,
     BatchSourceRecoveryConflictError,
     MySQLSourceStateRepository,
     SourceCheckpointNotInitializedError,
@@ -20,6 +21,7 @@ __all__ = [
     "BatchItemSummary",
     "BatchNotResumableError",
     "BatchNotRetryableError",
+    "BatchSourceCursorConflictError",
     "BatchSourceRecoveryConflictError",
     "ConcurrentBuildError",
     "FullBatchCheckpoint",

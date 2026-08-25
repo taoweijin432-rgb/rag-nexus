@@ -10,6 +10,7 @@ import pytest
 from expert_index.config import DatabaseConfig, DatabaseRole
 from expert_index.models import BatchSourceScan, SourceCheckpoint, SourceScanCursor
 from expert_index.repositories import (
+    BatchSourceCursorConflictError,
     BatchSourceRecoveryConflictError,
     MySQLSourceStateRepository,
     SourceCheckpointNotInitializedError,
@@ -30,11 +31,13 @@ class ScriptedCursor:
         one_results: list[dict[str, Any] | None] | None = None,
         all_results: list[list[dict[str, Any]]] | None = None,
         rowcounts: list[int] | None = None,
+        lastrowid: int = 901,
     ) -> None:
         self.one_results = list(one_results or [])
         self.all_results = list(all_results or [])
         self.rowcounts = list(rowcounts or [])
         self.rowcount = 0
+        self.lastrowid = lastrowid
         self.executed: list[tuple[str, tuple[object, ...] | None]] = []
 
     def __enter__(self) -> Self:
@@ -126,22 +129,32 @@ def _checkpoint_row(
     }
 
 
-def _batch_source_row(*, batch_id: int = 901) -> dict[str, Any]:
+def _batch_source_row(
+    *,
+    batch_id: int = 901,
+    current_cursor: SourceScanCursor | None = None,
+    candidate_count: int = 100,
+    status: str = "running",
+) -> dict[str, Any]:
     """构造一条可恢复的固定来源扫描范围。"""
 
+    actual_cursor = current_cursor or SourceScanCursor(
+        datetime(2026, 8, 20, 8, 0, tzinfo=timezone.utc),
+        100,
+    )
     return {
         "id": 11,
         "batch_id": batch_id,
         "source_table": "experts",
         "start_updated_at": CHECKPOINT_TIME,
         "start_id": 0,
-        "cursor_updated_at": datetime(2026, 8, 20, 8, 0, tzinfo=timezone.utc),
-        "cursor_id": 100,
+        "cursor_updated_at": actual_cursor.updated_at,
+        "cursor_id": actual_cursor.record_id,
         "upper_bound_updated_at": datetime(2026, 8, 24, 8, 0, tzinfo=timezone.utc),
         "upper_bound_id": 300,
         "checkpoint_lock_version": 0,
-        "status": "running",
-        "candidate_count": 100,
+        "status": status,
+        "candidate_count": candidate_count,
         "success_count": 80,
         "failed_count": 1,
         "skipped_count": 19,
@@ -550,6 +563,294 @@ def test_get_recoverable_batch_source_scan_requires_current_active_lease(
 
     assert len(cursor.executed) == 1
     assert connection.rollback_count == 1
+
+
+def test_create_incremental_batch_source_scan_is_atomic(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """批次主记录和固定来源范围必须在持有 lease 的同一事务中创建。"""
+
+    upper_bound = SourceScanCursor(
+        datetime(2026, 8, 24, 8, 0, tzinfo=timezone.utc),
+        300,
+    )
+    cursor = ScriptedCursor(
+        one_results=[
+            _checkpoint_row(
+                lease_owner="scanner-attempt-4",
+                lease_until=LEASE_UNTIL,
+                lease_is_active=1,
+            ),
+            None,
+        ],
+        rowcounts=[0, 0, 1, 1],
+        lastrowid=901,
+    )
+    connection = ScriptedConnection(cursor)
+    _patch_connection(monkeypatch, connection)
+
+    scan = _repository().create_incremental_batch_source_scan(
+        "experts",
+        "scanner-attempt-4",
+        batch_no="incremental-experts-20260825-001",
+        upper_bound=upper_bound,
+    )
+
+    assert scan == BatchSourceScan(
+        batch_id=901,
+        source_table="experts",
+        start_cursor=SourceScanCursor(CHECKPOINT_TIME, 0),
+        current_cursor=SourceScanCursor(CHECKPOINT_TIME, 0),
+        upper_bound=upper_bound,
+        checkpoint_lock_version=0,
+    )
+    unfinished_sql, unfinished_params = cursor.executed[1]
+    batch_sql, batch_params = cursor.executed[2]
+    source_sql, source_params = cursor.executed[3]
+    assert "status IN ('pending', 'running', 'failed')" in unfinished_sql
+    assert "FOR UPDATE" in unfinished_sql
+    assert unfinished_params == ("experts",)
+    assert "VALUES (%s, 'incremental', 'running')" in batch_sql
+    assert batch_params == ("incremental-experts-20260825-001",)
+    assert "'pending', 0, 0, 0, 0" in source_sql
+    assert source_params == (
+        901,
+        "experts",
+        CHECKPOINT_TIME,
+        0,
+        CHECKPOINT_TIME,
+        0,
+        upper_bound.updated_at,
+        300,
+        0,
+    )
+    assert connection.commit_count == 1
+    assert connection.rollback_count == 0
+
+
+def test_create_incremental_batch_source_scan_rejects_existing_range(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """已有未完成范围时不能创建第二个逻辑批次。"""
+
+    cursor = ScriptedCursor(
+        one_results=[
+            _checkpoint_row(
+                lease_owner="scanner-attempt-4",
+                lease_until=LEASE_UNTIL,
+                lease_is_active=1,
+            ),
+            {"id": 11},
+        ],
+        rowcounts=[0, 0],
+    )
+    connection = ScriptedConnection(cursor)
+    _patch_connection(monkeypatch, connection)
+
+    with pytest.raises(BatchSourceRecoveryConflictError, match="已存在未完成"):
+        _repository().create_incremental_batch_source_scan(
+            "experts",
+            "scanner-attempt-4",
+            batch_no="incremental-experts-20260825-001",
+            upper_bound=SourceScanCursor(
+                datetime(2026, 8, 24, 8, 0, tzinfo=timezone.utc),
+                300,
+            ),
+        )
+
+    assert len(cursor.executed) == 2
+    assert connection.commit_count == 0
+    assert connection.rollback_count == 1
+
+
+def test_advance_batch_source_scan_cursor_requires_persisted_tasks(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """一页任务全部存在后才能以期望游标 CAS 推进临时位置。"""
+
+    current_cursor = SourceScanCursor(
+        datetime(2026, 8, 20, 8, 0, tzinfo=timezone.utc),
+        100,
+    )
+    next_cursor = SourceScanCursor(
+        datetime(2026, 8, 20, 8, 0, tzinfo=timezone.utc),
+        101,
+    )
+    updated_row = _batch_source_row(
+        current_cursor=next_cursor,
+        candidate_count=101,
+    )
+    cursor = ScriptedCursor(
+        one_results=[
+            _checkpoint_row(
+                lease_owner="scanner-attempt-4",
+                lease_until=LEASE_UNTIL,
+                lease_is_active=1,
+            ),
+            _batch_source_row(current_cursor=current_cursor),
+            {"task_count": 101},
+            updated_row,
+        ],
+        rowcounts=[0, 0, 0, 1, 0],
+    )
+    connection = ScriptedConnection(cursor)
+    _patch_connection(monkeypatch, connection)
+
+    scan = _repository().advance_batch_source_scan_cursor(
+        "experts",
+        901,
+        "scanner-attempt-4",
+        checkpoint_lock_version=0,
+        expected_cursor=current_cursor,
+        next_cursor=next_cursor,
+        candidate_increment=1,
+    )
+
+    assert scan.current_cursor == next_cursor
+    assert scan.candidate_count == 101
+    task_sql, task_params = cursor.executed[2]
+    update_sql, update_params = cursor.executed[3]
+    assert "COUNT(*) AS task_count" in task_sql
+    assert task_params == (901, "experts")
+    assert "candidate_count=%s, status='running'" in update_sql
+    assert "cursor_updated_at=%s AND cursor_id=%s" in update_sql
+    assert update_params == (
+        next_cursor.updated_at,
+        101,
+        101,
+        11,
+        current_cursor.updated_at,
+        100,
+        0,
+    )
+    assert connection.commit_count == 1
+
+
+def test_advance_batch_source_scan_cursor_rejects_task_count_mismatch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """部分任务落库或额外任务存在时都不能推进页游标。"""
+
+    current_cursor = SourceScanCursor(
+        datetime(2026, 8, 20, 8, 0, tzinfo=timezone.utc),
+        100,
+    )
+    cursor = ScriptedCursor(
+        one_results=[
+            _checkpoint_row(
+                lease_owner="scanner-attempt-4",
+                lease_until=LEASE_UNTIL,
+                lease_is_active=1,
+            ),
+            _batch_source_row(current_cursor=current_cursor),
+            {"task_count": 100},
+        ],
+        rowcounts=[0, 0, 0],
+    )
+    connection = ScriptedConnection(cursor)
+    _patch_connection(monkeypatch, connection)
+
+    with pytest.raises(BatchSourceCursorConflictError, match="任务总数"):
+        _repository().advance_batch_source_scan_cursor(
+            "experts",
+            901,
+            "scanner-attempt-4",
+            checkpoint_lock_version=0,
+            expected_cursor=current_cursor,
+            next_cursor=SourceScanCursor(current_cursor.updated_at, 101),
+            candidate_increment=1,
+        )
+
+    assert len(cursor.executed) == 3
+    assert connection.commit_count == 0
+    assert connection.rollback_count == 1
+
+
+def test_advance_batch_source_scan_cursor_seals_empty_tail_at_upper_bound(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """空页只允许在任务计数不变时把临时游标封口到固定上界。"""
+
+    current_cursor = SourceScanCursor(
+        datetime(2026, 8, 20, 8, 0, tzinfo=timezone.utc),
+        100,
+    )
+    upper_bound = SourceScanCursor(
+        datetime(2026, 8, 24, 8, 0, tzinfo=timezone.utc),
+        300,
+    )
+    cursor = ScriptedCursor(
+        one_results=[
+            _checkpoint_row(
+                lease_owner="scanner-attempt-4",
+                lease_until=LEASE_UNTIL,
+                lease_is_active=1,
+            ),
+            _batch_source_row(current_cursor=current_cursor),
+            {"task_count": 100},
+            _batch_source_row(current_cursor=upper_bound),
+        ],
+        rowcounts=[0, 0, 0, 1, 0],
+    )
+    connection = ScriptedConnection(cursor)
+    _patch_connection(monkeypatch, connection)
+
+    scan = _repository().advance_batch_source_scan_cursor(
+        "experts",
+        901,
+        "scanner-attempt-4",
+        checkpoint_lock_version=0,
+        expected_cursor=current_cursor,
+        next_cursor=upper_bound,
+        candidate_increment=0,
+    )
+
+    assert scan.current_cursor == upper_bound
+    assert scan.candidate_count == 100
+    assert connection.commit_count == 1
+
+
+def test_advance_batch_source_scan_cursor_reactivates_sealed_failed_range(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """已封口 failed 范围可在任务总数一致时只恢复为 running。"""
+
+    upper_bound = SourceScanCursor(
+        datetime(2026, 8, 24, 8, 0, tzinfo=timezone.utc),
+        300,
+    )
+    cursor = ScriptedCursor(
+        one_results=[
+            _checkpoint_row(
+                lease_owner="scanner-attempt-4",
+                lease_until=LEASE_UNTIL,
+                lease_is_active=1,
+            ),
+            _batch_source_row(
+                current_cursor=upper_bound,
+                status="failed",
+            ),
+            {"task_count": 100},
+            _batch_source_row(current_cursor=upper_bound),
+        ],
+        rowcounts=[0, 0, 0, 1, 0],
+    )
+    connection = ScriptedConnection(cursor)
+    _patch_connection(monkeypatch, connection)
+
+    scan = _repository().advance_batch_source_scan_cursor(
+        "experts",
+        901,
+        "scanner-attempt-4",
+        checkpoint_lock_version=0,
+        expected_cursor=upper_bound,
+        next_cursor=upper_bound,
+        candidate_increment=0,
+    )
+
+    assert scan.current_cursor == upper_bound
+    assert scan.status == "running"
+    assert connection.commit_count == 1
 
 
 @pytest.mark.parametrize(

@@ -10,10 +10,20 @@ from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import datetime
 
-from .models import NewSourceSyncTask, SourceChangeCandidate
+from .models import (
+    CHECKPOINT_SOURCE_TABLES,
+    BatchSourceScan,
+    NewSourceSyncTask,
+    SourceChangeCandidate,
+    SourceScanCursor,
+)
 from .normalize import canonical_json, sha256_value
+from .repositories import MySQLSourceStateRepository, MySQLSourceSyncTaskRepository
+from .source import MAX_SOURCE_SCAN_PAGE_SIZE, MySQLSourceAdapter
 
 POLL_EVENT_SOURCE = "poll"
+DEFAULT_INCREMENTAL_PAGE_SIZE = 500
+DEFAULT_SOURCE_LEASE_SECONDS = 120
 
 _POLL_TARGET_TYPE_BY_SOURCE_TABLE = {
     "experts": "expert",
@@ -130,10 +140,247 @@ class IncrementalScanner:
         )
 
 
+class CrossBatchTaskConflictError(RuntimeError):
+    """表示候选幂等键意外命中其他逻辑批次的已有任务。"""
+
+
+@dataclass(frozen=True)
+class IncrementalScanResult:
+    """一张来源表完成候选扫描后的固定范围结果。"""
+
+    source_table: str
+    batch_source: BatchSourceScan | None
+    recovered: bool
+    page_count: int
+    scheduled_candidate_count: int
+    lease_released: bool
+
+
+@dataclass(frozen=True)
+class IncrementalSourceScanService:
+    """按固定上界把一张来源表的候选可靠落成 pending 任务。
+
+    服务只完成候选发现和任务调度，不读取业务完整事实、不比较三 Hash，也不处理任务或
+    推进安全 Checkpoint。有固定范围时来源 lease 保持有效，供后续任务处理与提交阶段
+    继续使用；零候选范围会立即释放 lease。
+    """
+
+    source_adapter: MySQLSourceAdapter
+    source_state_repository: MySQLSourceStateRepository
+    task_repository: MySQLSourceSyncTaskRepository
+    policy_version: str
+    page_size: int = DEFAULT_INCREMENTAL_PAGE_SIZE
+    lease_seconds: int = DEFAULT_SOURCE_LEASE_SECONDS
+
+    def __post_init__(self) -> None:
+        """校验分页、租约和策略参数，避免扫描启动后才发现配置错误。"""
+
+        _validate_policy_version(self.policy_version)
+        if (
+            isinstance(self.page_size, bool)
+            or not isinstance(self.page_size, int)
+            or not 1 <= self.page_size <= MAX_SOURCE_SCAN_PAGE_SIZE
+        ):
+            raise ValueError(
+                f"page_size 必须位于 1 到 {MAX_SOURCE_SCAN_PAGE_SIZE} 之间"
+            )
+        if (
+            isinstance(self.lease_seconds, bool)
+            or not isinstance(self.lease_seconds, int)
+            or self.lease_seconds < 1
+        ):
+            raise ValueError("lease_seconds 必须是正整数")
+
+    def scan_source(
+        self,
+        source_table: str,
+        lease_owner: str,
+        *,
+        batch_no: str,
+    ) -> IncrementalScanResult:
+        """恢复或创建固定范围，并按“先任务、后游标”扫描到上界。"""
+
+        _validate_scan_request(source_table, lease_owner, batch_no)
+        checkpoint = self.source_state_repository.acquire_source_lease(
+            source_table,
+            lease_owner,
+            lease_seconds=self.lease_seconds,
+        )
+        scan = self.source_state_repository.get_recoverable_batch_source_scan(
+            source_table,
+            lease_owner,
+        )
+        recovered = scan is not None
+        if scan is None:
+            upper_bound = self.source_adapter.get_source_scan_upper_bound(source_table)
+            start_cursor = SourceScanCursor(
+                updated_at=checkpoint.last_updated_at,
+                record_id=checkpoint.last_id,
+            )
+            if not _has_new_source_range(start_cursor, upper_bound):
+                self.source_state_repository.release_source_lease(
+                    source_table,
+                    lease_owner,
+                )
+                return IncrementalScanResult(
+                    source_table=source_table,
+                    batch_source=None,
+                    recovered=False,
+                    page_count=0,
+                    scheduled_candidate_count=0,
+                    lease_released=True,
+                )
+            assert upper_bound is not None
+            scan = self.source_state_repository.create_incremental_batch_source_scan(
+                source_table,
+                lease_owner,
+                batch_no=batch_no,
+                upper_bound=upper_bound,
+            )
+
+        mapper = IncrementalScanner(policy_version=self.policy_version)
+        page_count = 0
+        scheduled_candidate_count = 0
+        if scan.current_cursor == scan.upper_bound and scan.status == "failed":
+            scan = self.source_state_repository.advance_batch_source_scan_cursor(
+                source_table,
+                scan.batch_id,
+                lease_owner,
+                checkpoint_lock_version=scan.checkpoint_lock_version,
+                expected_cursor=scan.current_cursor,
+                next_cursor=scan.upper_bound,
+                candidate_increment=0,
+            )
+        while scan.current_cursor < scan.upper_bound:
+            self.source_state_repository.renew_source_lease(
+                source_table,
+                lease_owner,
+                lease_seconds=self.lease_seconds,
+            )
+            candidates = self.source_adapter.load_source_change_candidates(
+                source_table,
+                after_cursor=scan.current_cursor,
+                upper_bound=scan.upper_bound,
+                limit=self.page_size,
+            )
+            _validate_candidate_page(candidates, scan, page_size=self.page_size)
+            if not candidates:
+                scan = self.source_state_repository.advance_batch_source_scan_cursor(
+                    source_table,
+                    scan.batch_id,
+                    lease_owner,
+                    checkpoint_lock_version=scan.checkpoint_lock_version,
+                    expected_cursor=scan.current_cursor,
+                    next_cursor=scan.upper_bound,
+                    candidate_increment=0,
+                )
+                break
+
+            tasks = mapper.map_candidates(candidates, batch_id=scan.batch_id)
+            for task in tasks:
+                task_id = self.task_repository.create_source_sync_task(task)
+                persisted_task = self.task_repository.get_source_sync_task(task_id)
+                if persisted_task is None:
+                    raise RuntimeError(
+                        f"任务 {task_id} 创建后无法读取持久化状态"
+                    )
+                if persisted_task.batch_id != scan.batch_id:
+                    raise CrossBatchTaskConflictError(
+                        f"dedupe_key 命中其他批次任务: "
+                        f"current={scan.batch_id}, existing={persisted_task.batch_id}"
+                    )
+
+            next_cursor = candidates[-1].cursor
+            scan = self.source_state_repository.advance_batch_source_scan_cursor(
+                source_table,
+                scan.batch_id,
+                lease_owner,
+                checkpoint_lock_version=scan.checkpoint_lock_version,
+                expected_cursor=scan.current_cursor,
+                next_cursor=next_cursor,
+                candidate_increment=len(candidates),
+            )
+            page_count += 1
+            scheduled_candidate_count += len(candidates)
+
+        return IncrementalScanResult(
+            source_table=source_table,
+            batch_source=scan,
+            recovered=recovered,
+            page_count=page_count,
+            scheduled_candidate_count=scheduled_candidate_count,
+            lease_released=False,
+        )
+
+
 def _source_datetime_literal(value: datetime) -> str:
     """把 Source DATETIME 格式化为无时区偏移的六位微秒字面值。"""
 
     return value.replace(tzinfo=None).isoformat(timespec="microseconds")
+
+
+def _has_new_source_range(
+    start_cursor: SourceScanCursor,
+    upper_bound: SourceScanCursor | None,
+) -> bool:
+    """返回 Source 当前上界是否严格位于安全 Checkpoint 之后。"""
+
+    if upper_bound is None:
+        return False
+    try:
+        return upper_bound > start_cursor
+    except TypeError as exc:
+        raise ValueError("Source 上界与 Checkpoint 必须使用一致的时间类型") from exc
+
+
+def _validate_candidate_page(
+    candidates: list[SourceChangeCandidate],
+    scan: BatchSourceScan,
+    *,
+    page_size: int,
+) -> None:
+    """校验 Source 返回页严格位于当前游标和固定上界之间并保持升序。"""
+
+    if len(candidates) > page_size:
+        raise RuntimeError("Source 返回候选数超过请求页大小")
+    previous_cursor = scan.current_cursor
+    for candidate in candidates:
+        if not isinstance(candidate, SourceChangeCandidate):
+            raise TypeError("Source 候选页包含非 SourceChangeCandidate 对象")
+        if candidate.source_table != scan.source_table:
+            raise RuntimeError("Source 候选页包含其他来源表记录")
+        try:
+            in_range = previous_cursor < candidate.cursor <= scan.upper_bound
+        except TypeError as exc:
+            raise ValueError("候选和固定范围必须使用一致的时间类型") from exc
+        if not in_range:
+            raise RuntimeError("Source 候选页未严格升序或越过固定范围")
+        previous_cursor = candidate.cursor
+
+
+def _validate_scan_request(
+    source_table: str,
+    lease_owner: str,
+    batch_no: str,
+) -> None:
+    """校验一张来源表扫描请求的表名、owner 和批次号。"""
+
+    if source_table not in CHECKPOINT_SOURCE_TABLES:
+        raise ValueError(f"不支持的 Checkpoint 来源表: {source_table}")
+    if (
+        not isinstance(lease_owner, str)
+        or not lease_owner.strip()
+        or lease_owner != lease_owner.strip()
+        or len(lease_owner) > 128
+    ):
+        raise ValueError("lease_owner 必须是长度不超过 128 的非空字符串")
+    if (
+        not isinstance(batch_no, str)
+        or not batch_no.strip()
+        or batch_no != batch_no.strip()
+        or len(batch_no) > 64
+    ):
+        raise ValueError("batch_no 必须是长度不超过 64 的非空字符串")
 
 
 def _target_type(source_table: str) -> str:
