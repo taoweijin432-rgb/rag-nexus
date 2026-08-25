@@ -16,6 +16,9 @@ from pydantic import BaseModel, ConfigDict, Field, SecretStr, model_validator
 # 运行时只允许正式 Contract v2；旧兼容模式已退役。
 SchemaMode = Literal["contract"]
 
+# 唯一正式 V15 Collection；历史 dev/v14/e2e 名称只作数据保留，不再是运行目标。
+DEFAULT_MILVUS_COLLECTION_NAME = "expert_candidates_v15_contract"
+
 
 class MilvusSettings(BaseModel):
     """供正式 Contract Milvus Repository 使用的连接和集合配置。
@@ -35,7 +38,7 @@ class MilvusSettings(BaseModel):
     timeout: float | None = Field(default=None, gt=0)
 
     collection_name: str = Field(
-        default="expert_candidates_v15_contract_dev",
+        default=DEFAULT_MILVUS_COLLECTION_NAME,
         min_length=1,
     )
     schema_mode: SchemaMode = "contract"
@@ -90,7 +93,7 @@ class MilvusSettings(BaseModel):
             "collection_name": _get(
                 env,
                 "MILVUS_COLLECTION_NAME",
-                "expert_candidates_v15_contract_dev",
+                DEFAULT_MILVUS_COLLECTION_NAME,
             ),
             "schema_mode": _get(env, "MILVUS_SCHEMA_MODE", "contract"),
             "index_type": _get(env, "MILVUS_INDEX_TYPE", "HNSW"),

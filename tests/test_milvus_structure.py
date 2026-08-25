@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 from pydantic import SecretStr
 
-from rag_vector_store.config import MilvusSettings
+import rag_vector_store
+from rag_vector_store.config import DEFAULT_MILVUS_COLLECTION_NAME, MilvusSettings
 
 
 def test_contract_schema_mode_is_the_only_runtime_mode() -> None:
@@ -69,6 +72,62 @@ def test_milvus_destructive_maintenance_collections_default_and_parse() -> None:
 
 def test_milvus_destructive_maintenance_explicit_model_value() -> None:
     settings = MilvusSettings(
-        destructive_maintenance_collections=["a", "b"],
+        destructive_maintenance_collections=("a", "b"),
     )
     assert settings.destructive_maintenance_collections == ("a", "b")
+
+
+def test_default_collection_is_the_formal_v15_contract() -> None:
+    """正式运行默认目标必须是唯一正式 Collection。"""
+
+    assert MilvusSettings().collection_name == DEFAULT_MILVUS_COLLECTION_NAME
+    assert (
+        MilvusSettings.from_env({}).collection_name
+        == DEFAULT_MILVUS_COLLECTION_NAME
+        == "expert_candidates_v15_contract"
+    )
+    # 环境变量显式覆盖仍然生效。
+    overridden = MilvusSettings.from_env(
+        {"MILVUS_COLLECTION_NAME": "custom_collection"}
+    )
+    assert overridden.collection_name == "custom_collection"
+
+
+@pytest.mark.parametrize(
+    "retired_name",
+    [
+        "expert_candidates_v15_contract_dev",
+        "expert_candidates_v14_contract_dev",
+        "expert_candidates_v14_contract_e2e",
+    ],
+)
+def test_retired_collection_names_never_become_formal_default(
+    retired_name: str,
+) -> None:
+    """历史 dev/v14 名称不得成为任何正式入口的默认值。"""
+
+    assert MilvusSettings().collection_name != retired_name
+    assert MilvusSettings.from_env({}).collection_name != retired_name
+
+
+def test_no_retired_collection_names_hardcoded_in_production_code() -> None:
+    """rag_vector_store 生产代码不得硬编码历史 Collection 名。
+
+    唯一允许出现集合名的位置是 config.py 中指向正式名称的
+    ``DEFAULT_MILVUS_COLLECTION_NAME``；历史 dev/v14/e2e 名称只能通过
+    环境变量或显式参数出现在测试/脚本中。
+    """
+
+    forbidden = (
+        "expert_candidates_v15_contract_dev",
+        "expert_candidates_v14_contract_dev",
+        "expert_candidates_v14_contract_e2e",
+    )
+    package_root = Path(rag_vector_store.__file__).resolve().parent
+    hits: list[str] = []
+    for path in sorted(package_root.rglob("*.py")):
+        text = path.read_text(encoding="utf-8")
+        for name in forbidden:
+            if name in text:
+                hits.append(f"{path.relative_to(package_root)}: {name}")
+    assert hits == [], f"生产代码中残留历史 Collection 名：{hits}"
