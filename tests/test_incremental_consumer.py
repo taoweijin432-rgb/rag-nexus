@@ -404,7 +404,7 @@ def test_content_hash_change_reembeds_and_upserts() -> None:
 
 
 # ---------------------------------------------------------------------------
-# 必需覆盖 4：metadata_update 与安全门失败降级
+# 必需覆盖 4：metadata_update 与安全门失败语义（D3A 修正后）
 # ---------------------------------------------------------------------------
 def test_metadata_only_update_reuses_stored_text_without_embedding() -> None:
     worker = FakeEmbeddingWorker()
@@ -421,7 +421,14 @@ def test_metadata_only_update_reuses_stored_text_without_embedding() -> None:
     assert worker.embed_calls == []  # metadata-only 零 Embedding
 
 
-def test_metadata_update_gate_failure_falls_back_to_full_upsert() -> None:
+def test_metadata_update_gate_failure_rejects_without_any_writes() -> None:
+    """D3A 修正：安全门失败（model_space/dim 不一致）→ 确定性拒绝。
+
+    禁止降级重新 Embedding、禁止调用 upsert_chunks、禁止逻辑下线、
+    禁止复用不匹配旧向量；error_code=model_space_mismatch、retryable=False、
+    fallback_used=False。
+    """
+
     worker = FakeEmbeddingWorker()
     store = FakeVectorStore(embedding_worker=worker, update_mode="gate_fail")
     store.seed(_stored_record(_EMPLOYMENT_VID))
@@ -429,13 +436,19 @@ def test_metadata_update_gate_failure_falls_back_to_full_upsert() -> None:
 
     result = _consumer(store).process([item])[0]
 
-    assert result.status == "committed"
-    assert result.fallback_used is True
+    assert result.status == "rejected"
+    assert result.error_code == "model_space_mismatch"
+    assert result.retryable is False
+    assert result.fallback_used is False
+    assert result.embedding_performed is False
+    assert result.metadata_only is False
     assert CONSUMER_ACTION_METADATA_ONLY_UPDATE in result.actions
-    assert CONSUMER_ACTION_EMBEDDING_UPSERT in result.actions
+    assert CONSUMER_ACTION_EMBEDDING_UPSERT not in result.actions
+    # 零 Embedding、零 upsert、零 disable；仅允许一次 update_metadata 探测。
     assert len(store.update_calls) == 1
-    assert len(store.upsert_calls) == 1
-    assert len(worker.embed_calls) == 1  # 降级后才发生 Embedding
+    assert store.upsert_calls == []
+    assert store.disable_calls == []
+    assert worker.embed_calls == []  # 旧向量绝不复用，也绝不重新 Embedding
 
 
 def test_metadata_update_target_missing_is_rejected_without_fallback() -> None:
@@ -699,7 +712,11 @@ def test_consumer_has_no_state_persistence_dependencies() -> None:
     )
     sources = "\n".join(
         (incremental_dir / name).read_text(encoding="utf-8")
-        for name in ("consumer.py", "consumer_models.py")
+        for name in (
+            "consumer.py",
+            "consumer_models.py",
+            "consumer_core.py",
+        )
     )
 
     forbidden_tokens = (
@@ -714,7 +731,22 @@ def test_consumer_has_no_state_persistence_dependencies() -> None:
     for token in forbidden_tokens:
         assert token not in sources, f"禁止出现 {token!r}"
 
-    # 运行时形态：Consumer 仅持有注入的端口依赖，无任何连接器/仓储属性。
+    # 核心判定文件不依赖 Work Item 行模型（D2A 抽取边界）。
+    core_source = (incremental_dir / "consumer_core.py").read_text(encoding="utf-8")
+    work_item_tokens = (
+        "V15VectorizationWorkItem",
+        "V15WorkItemInput",
+        "from .models",
+        "from .contract_adapter",
+        "WorkItemAdapterPort",
+        "adapt_upsert(\n        self, work_item",
+    )
+    for token in work_item_tokens:
+        assert token not in core_source, f"核心不得出现 Work Item 依赖 {token!r}"
+
+    # 运行时形态：兼容入口仅持有适配器与核心，无任何连接器/仓储属性。
     consumer = _consumer(FakeVectorStore())
     private_state = vars(consumer)
-    assert set(private_state.keys()) == {"_adapter", "_vector_store", "_event_order"}
+    assert set(private_state.keys()) == {"_adapter", "_core"}
+    core_state = vars(private_state["_core"])
+    assert set(core_state.keys()) == {"_vector_store", "_event_order"}

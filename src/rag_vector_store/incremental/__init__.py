@@ -1,9 +1,11 @@
-"""V15 增量向量化持久化层、Work Item 适配与 Consumer 业务核心（Phase 0 / 2 / 3A）。
+"""V15 增量向量化持久化层、Work Item 适配与 Consumer 业务核心（Phase 0 / 2 / 3A+）。
 
 提供 Batch / Work Item 的 MySQL 状态持久化与状态机、Work Item 到正式 V15
-Contract 的薄适配，以及无状态持久化的通用 Work Item 消费核心。Consumer 只返回
-结构化 ``ExecutionResult``：不调用 Embedding 实现、不做物理删除、不扫描业务源表、
-不生成 chunk_text，也不新增任何状态存储端口；状态流转由后续唯一状态表适配层负责。
+Contract 的薄适配，以及无状态持久化的通用消费链路：标准 Contract / Disable
+输入 → ContractConsumerCore → ExecutionResult；V15WorkItemConsumer 保留为
+Work Item 兼容入口。Consumer 只返回结构化 ``ExecutionResult``：不调用 Embedding
+实现、不做物理删除、不扫描业务源表、不生成 chunk_text，也不新增任何状态存储
+端口；状态流转由后续唯一状态表适配层负责。
 """
 
 from .consumer import (
@@ -11,6 +13,18 @@ from .consumer import (
     V15WorkItemConsumer,
     VectorMutationPort,
     WorkItemAdapterPort,
+)
+from .consumer_core import (
+    AdaptedContract,
+    ContractConsumerCore,
+    ContractConsumerInput,
+    ContractDisableInput,
+    ContractMetadataUpdateIntent,
+    ContractSynthesisError,
+    ContractUpsertIntent,
+    PreRejectedInput,
+    duplicate_superseded_result,
+    resolve_winner_indices,
 )
 from .consumer_models import (
     CONSUMER_ACTION_ADAPT_DISABLE,
@@ -22,7 +36,30 @@ from .consumer_models import (
     CONSUMER_ACTION_METADATA_ONLY_UPDATE,
     CONSUMER_ACTION_SKIP_UNCHANGED,
     CONSUMER_ACTION_SYNTHESIZE_FROM_STORED,
+    ERROR_CODE_CONTRACT_ADAPTATION_FAILED,
+    ERROR_CODE_DISABLE_ADAPTATION_FAILED,
+    ERROR_CODE_DISABLE_INFRA_FAILED,
+    ERROR_CODE_ELIGIBILITY_DISABLE_FAILED,
+    ERROR_CODE_EXISTING_QUERY_FAILED,
+    ERROR_CODE_EXISTING_STATE_INVALID,
+    ERROR_CODE_METADATA_ONLY_INCONSISTENT,
+    ERROR_CODE_METADATA_STORED_TEXT_MISSING,
+    ERROR_CODE_METADATA_TARGET_MISSING,
+    ERROR_CODE_METADATA_UPDATE_INFRA_FAILED,
+    ERROR_CODE_MODEL_SPACE_MISMATCH,
+    ERROR_CODE_STALE_DISABLE_FAILED,
+    ERROR_CODE_STALE_SOURCE_EVENT_ID,
+    ERROR_CODE_UPSERT_CONTRACT_FAILED,
+    ERROR_CODE_UPSERT_INFRA_FAILED,
+    RESULT_CODE_DUPLICATE_SUPERSEDED,
+    RESULT_CODE_EMBEDDED,
+    RESULT_CODE_METADATA_UPDATED,
+    RESULT_CODE_TARGETS_DISABLED,
+    RESULT_CODE_UNCHANGED_SKIPPED,
+    RESULT_CODE_UPSERT_SKIPPED,
     ConsumerExecutionStatus,
+    ConsumerOperation,
+    ConsumerResultCode,
     ExecutionResult,
 )
 from .contract_adapter import (
@@ -65,10 +102,41 @@ __all__ = [
     "CONSUMER_ACTION_METADATA_ONLY_UPDATE",
     "CONSUMER_ACTION_SKIP_UNCHANGED",
     "CONSUMER_ACTION_SYNTHESIZE_FROM_STORED",
+    "ERROR_CODE_CONTRACT_ADAPTATION_FAILED",
+    "ERROR_CODE_DISABLE_ADAPTATION_FAILED",
+    "ERROR_CODE_DISABLE_INFRA_FAILED",
+    "ERROR_CODE_ELIGIBILITY_DISABLE_FAILED",
+    "ERROR_CODE_EXISTING_QUERY_FAILED",
+    "ERROR_CODE_EXISTING_STATE_INVALID",
+    "ERROR_CODE_METADATA_ONLY_INCONSISTENT",
+    "ERROR_CODE_METADATA_STORED_TEXT_MISSING",
+    "ERROR_CODE_METADATA_TARGET_MISSING",
+    "ERROR_CODE_METADATA_UPDATE_INFRA_FAILED",
+    "ERROR_CODE_MODEL_SPACE_MISMATCH",
+    "ERROR_CODE_STALE_DISABLE_FAILED",
+    "ERROR_CODE_STALE_SOURCE_EVENT_ID",
+    "ERROR_CODE_UPSERT_CONTRACT_FAILED",
+    "ERROR_CODE_UPSERT_INFRA_FAILED",
+    "RESULT_CODE_DUPLICATE_SUPERSEDED",
+    "RESULT_CODE_EMBEDDED",
+    "RESULT_CODE_METADATA_UPDATED",
+    "RESULT_CODE_TARGETS_DISABLED",
+    "RESULT_CODE_UNCHANGED_SKIPPED",
+    "RESULT_CODE_UPSERT_SKIPPED",
+    "AdaptedContract",
     "ConsumerExecutionStatus",
+    "ConsumerOperation",
+    "ConsumerResultCode",
+    "ContractConsumerCore",
+    "ContractConsumerInput",
+    "ContractDisableInput",
+    "ContractMetadataUpdateIntent",
+    "ContractSynthesisError",
+    "ContractUpsertIntent",
     "DisableWorkItem",
     "ExecutionResult",
     "MySQLV15VectorizationRepository",
+    "PreRejectedInput",
     "SourceEventOrderView",
     "V15BatchNotFoundError",
     "V15BatchStatus",
@@ -87,5 +155,7 @@ __all__ = [
     "WorkItemAdapterPort",
     "WorkItemContractAdaptation",
     "WorkItemContractAdapterError",
+    "duplicate_superseded_result",
+    "resolve_winner_indices",
     "vector_doc_id_hash",
 ]
