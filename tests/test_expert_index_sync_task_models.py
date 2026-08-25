@@ -10,6 +10,7 @@ from expert_index.models import (
     SOURCE_SYNC_ERROR_STAGES,
     SOURCE_SYNC_EVENT_SOURCES,
     SOURCE_SYNC_OPERATION_TYPES,
+    SOURCE_SYNC_PROCESSING_STAGE_ORDER,
     SOURCE_SYNC_PROCESSING_STAGES,
     SOURCE_SYNC_TARGET_TYPES,
     SOURCE_SYNC_TASK_STATUSES,
@@ -76,6 +77,16 @@ def test_source_sync_task_defines_frozen_identity_and_lifecycle_sets() -> None:
         "handed_off",
         "completed",
     }
+    assert SOURCE_SYNC_PROCESSING_STAGE_ORDER == (
+        "candidate",
+        "source_read",
+        "normalized",
+        "chunk_built",
+        "validated",
+        "contract_ready",
+        "handed_off",
+        "completed",
+    )
     assert SOURCE_SYNC_ERROR_STAGES == {
         "source",
         "parse",
@@ -234,3 +245,34 @@ def test_source_sync_task_requires_attempt_token_and_lease_as_a_pair() -> None:
         _task(attempt_token="attempt-1")
     with pytest.raises(ValueError, match="attempt_token 和 lease_until 必须同时"):
         _task(lease_until=CREATED_AT)
+
+
+def test_source_sync_task_requires_lease_only_while_processing() -> None:
+    """领域模型应拒绝无租约 processing 和终态残留租约。"""
+
+    with pytest.raises(ValueError, match="processing 任务必须持有"):
+        _task(sync_status="processing")
+    with pytest.raises(ValueError, match="非 processing 任务不能保留"):
+        _task(
+            sync_status="pending",
+            attempt_token="attempt-1",
+            lease_until=CREATED_AT,
+        )
+
+
+def test_source_sync_task_success_requires_completed_evidence() -> None:
+    """success 必须同时具有 completed 阶段和数据库完成时间。"""
+
+    with pytest.raises(ValueError, match="success 任务必须处于 completed"):
+        _task(sync_status="success")
+    with pytest.raises(ValueError, match="success 任务必须处于 completed"):
+        _task(sync_status="success", processing_stage="completed")
+
+    task = _task(
+        sync_status="success",
+        processing_stage="completed",
+        completed_at=CREATED_AT,
+        result_code="applied",
+    )
+
+    assert task.completed_at == CREATED_AT

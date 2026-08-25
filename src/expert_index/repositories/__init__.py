@@ -15,7 +15,11 @@ from .source_state import (
     SourceCheckpointNotInitializedError,
     SourceLeaseConflictError,
 )
-from .sync_task import MySQLSourceSyncTaskRepository
+from .sync_task import (
+    MySQLSourceSyncTaskRepository,
+    SourceSyncTaskLeaseConflictError,
+    SourceSyncTaskStageConflictError,
+)
 
 __all__ = [
     "BatchItemSummary",
@@ -32,4 +36,6 @@ __all__ = [
     "MySQLSourceSyncTaskRepository",
     "SourceCheckpointNotInitializedError",
     "SourceLeaseConflictError",
+    "SourceSyncTaskLeaseConflictError",
+    "SourceSyncTaskStageConflictError",
 ]

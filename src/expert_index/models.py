@@ -49,19 +49,18 @@ _SOURCE_SYNC_TARGETS_BY_TABLE = {
     "experts_education_experience": frozenset({"education"}),
 }
 
-# processing_stage 只描述任务已经完成的标准处理边界。
-SOURCE_SYNC_PROCESSING_STAGES = frozenset(
-    {
-        "candidate",
-        "source_read",
-        "normalized",
-        "chunk_built",
-        "validated",
-        "contract_ready",
-        "handed_off",
-        "completed",
-    }
+# processing_stage 只描述任务已经完成的标准处理边界；元组顺序是状态推进顺序。
+SOURCE_SYNC_PROCESSING_STAGE_ORDER = (
+    "candidate",
+    "source_read",
+    "normalized",
+    "chunk_built",
+    "validated",
+    "contract_ready",
+    "handed_off",
+    "completed",
 )
+SOURCE_SYNC_PROCESSING_STAGES = frozenset(SOURCE_SYNC_PROCESSING_STAGE_ORDER)
 
 # 失败阶段只用于安全定位处理环节，不保存来源正文、Chunk Text 或其他业务数据。
 SOURCE_SYNC_ERROR_STAGES = frozenset(
@@ -186,6 +185,14 @@ class SourceSyncTask:
             raise ValueError(f"不支持的同步任务失败阶段: {self.error_stage}")
         if (self.attempt_token is None) != (self.lease_until is None):
             raise ValueError("attempt_token 和 lease_until 必须同时为空或同时有值")
+        if self.sync_status == "processing" and self.attempt_token is None:
+            raise ValueError("processing 任务必须持有 attempt_token 和 lease_until")
+        if self.sync_status != "processing" and self.attempt_token is not None:
+            raise ValueError("非 processing 任务不能保留 attempt_token 和 lease_until")
+        if self.sync_status == "success" and (
+            self.processing_stage != "completed" or self.completed_at is None
+        ):
+            raise ValueError("success 任务必须处于 completed 阶段并记录 completed_at")
         _validate_optional_text("attempt_token", self.attempt_token, max_length=64)
         _validate_optional_text("policy_version", self.policy_version, max_length=32)
         for field_name, value, max_length in (
