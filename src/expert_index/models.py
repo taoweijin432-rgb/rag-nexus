@@ -958,3 +958,217 @@ class PreparedChunkSet:
         """稳定排序后的期望 vector_doc_id 列表，供下游计算 stale 差集。"""
 
         return tuple(chunk.vector_doc_id for chunk in self.desired_chunks)
+
+
+# ---------------------------------------------------------------------------
+# P4.3 定向只读事实读取：请求/结果模型与 P3 任务转换。
+#
+# 设计要点：
+# - 两层分离：``CurrentFactReadRequest`` 既携带下游 ``IncrementalImpactScope``，也单独
+#   保留触发行的来源定位（``trigger_source_table`` / ``trigger_source_field_id`` /
+#   ``trigger_source_updated_at``），用于校验触发行归属与事件时序。
+# - education 任务的触发行是教育记录，但下游范围是 profile；触发行主键进入
+#   ``trigger_source_field_id``，``impact_scope.source_field_id`` 仍是 str(expert_id)。
+#   消费后不丢弃、不拒绝，保留在 trigger 字段用于归属校验。
+# - 结果模型 ``ScopedCurrentFacts`` 严格按 scope 形状校验；逻辑删除行正常返回
+#   （deleted_at 非空），物理行不存在 fail-closed；子表任务发现父专家已删除时
+#   保留 ``parent_deleted`` 供后续 Handler 升级为 expert scope + 空 desired。
+# - 不引入 ``source_record_id``：P3 任务转换时把 ``int`` 主键以 ``str`` 形式映射到
+#   ``source_field_id``，符合 P4.2 的 source_field_id 契约。
+# ---------------------------------------------------------------------------
+
+# 触发行来源表白名单：与 CHECKPOINT_SOURCE_TABLES 一致，但显式枚举便于 fail-closed 校验。
+_TRIGGER_SOURCE_TABLES = frozenset(
+    {"experts", "experts_work_experience", "experts_project_experience",
+     "experts_education_experience"}
+)
+
+# 来源表到触发 target_type 的映射，用于校验 trigger_source_table 与 P3 任务一致。
+_TRIGGER_TARGET_TYPE_BY_TABLE = {
+    "experts": "expert",
+    "experts_work_experience": "employment",
+    "experts_project_experience": "project",
+    "experts_education_experience": "education",
+}
+
+
+@dataclass(frozen=True)
+class CurrentFactReadRequest:
+    """定向读取当前事实的请求。
+
+    ``impact_scope`` 表达下游真正处理的影响范围（四类）；``trigger_*`` 字段独立保存
+    触发行身份，用于在只读快照中校验触发行归属与事件时序。二者分离使得 education
+    任务的触发行（教育记录）与下游范围（profile）可以同时表达。
+    """
+
+    impact_scope: IncrementalImpactScope
+    trigger_source_table: str
+    trigger_source_field_id: str
+    trigger_source_updated_at: datetime | None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.impact_scope, IncrementalImpactScope):
+            raise TypeError("impact_scope 必须是 IncrementalImpactScope")
+        if self.trigger_source_table not in _TRIGGER_SOURCE_TABLES:
+            raise ValueError(f"不支持的触发来源表: {self.trigger_source_table}")
+        if (not isinstance(self.trigger_source_field_id, str)
+                or not self.trigger_source_field_id.strip()
+                or self.trigger_source_field_id != self.trigger_source_field_id.strip()):
+            raise ValueError("trigger_source_field_id 必须是无首尾空白的非空字符串")
+        if (self.trigger_source_updated_at is not None
+                and not isinstance(self.trigger_source_updated_at, datetime)):
+            raise TypeError("trigger_source_updated_at 必须是 datetime 或 None")
+        self._validate_scope_trigger_consistency()
+
+    def _validate_scope_trigger_consistency(self) -> None:
+        """校验触发来源表与下游影响范围语义一致。"""
+
+        trigger_target = _TRIGGER_TARGET_TYPE_BY_TABLE[self.trigger_source_table]
+        scope_type = self.impact_scope.scope_type
+        # expert 范围触发来源必须是 experts 主档。
+        if scope_type == "expert":
+            if self.trigger_source_table != "experts":
+                raise ValueError(
+                    f"expert 范围的触发来源必须是 experts，实际为 {self.trigger_source_table}"
+                )
+            if self.trigger_source_field_id != str(self.impact_scope.expert_id):
+                raise ValueError(
+                    "expert 范围的触发行 source_field_id 必须等于 str(expert_id)"
+                )
+        elif scope_type == "profile":
+            # profile 范围允许两种触发：experts 主档（profile 自身）或
+            # experts_education_experience（education 映射到 profile）。
+            if self.trigger_source_table == "experts":
+                if self.trigger_source_field_id != str(self.impact_scope.expert_id):
+                    raise ValueError(
+                        "profile 触发行 source_field_id 必须等于 str(expert_id)"
+                    )
+            elif self.trigger_source_table == "experts_education_experience":
+                # education 触发：trigger 保留教育记录主键，不进 impact_scope。
+                # 归属校验在 Adapter 读取教育行后执行。
+                pass
+            else:
+                raise ValueError(
+                    f"profile 范围的触发来源必须是 experts 或 experts_education_experience，"
+                    f"实际为 {self.trigger_source_table}"
+                )
+        elif scope_type == "employment":
+            if self.trigger_source_table != "experts_work_experience":
+                raise ValueError("employment 范围的触发来源必须是 experts_work_experience")
+            if self.trigger_source_field_id != self.impact_scope.source_field_id:
+                raise ValueError("employment 触发行 source_field_id 与范围不一致")
+        elif scope_type == "project":
+            if self.trigger_source_table != "experts_project_experience":
+                raise ValueError("project 范围的触发来源必须是 experts_project_experience")
+            if self.trigger_source_field_id != self.impact_scope.source_field_id:
+                raise ValueError("project 触发行 source_field_id 与范围不一致")
+        # education 触发来源表（trigger_target == "education"）映射到 profile 范围，
+        # trigger_source_field_id 保留教育记录主键用于归属校验，不进 impact_scope。
+        if trigger_target == "education" and scope_type != "profile":
+            raise ValueError("education 触发必须映射到 profile 范围")
+
+
+@dataclass(frozen=True)
+class ScopedCurrentFacts:
+    """定向只读事实读取的结果。
+
+    - ``expert`` 范围：返回完整 ``ExpertAggregate``（有效专家四表全读）或仅生命周期
+      （已删除专家，deleted_at 非空，子表为空元组）。
+    - ``profile`` 范围：返回专家主档 + 全部当前有效教育；已删除父专家只返回生命周期。
+    - ``employment``/``project`` 范围：返回触发行（含 deleted_at）+ 最小父专家身份；
+      父专家已删除时 ``parent_deleted=True`` 且 expert 仍带 deleted_at。
+
+    物理行不存在在 ``MySQLSourceAdapter.read_current_facts`` 层 fail-closed 抛出，
+    不会构造本对象。逻辑删除行通过 ``deleted_at`` 非空正常返回。
+    """
+
+    scope: IncrementalImpactScope
+    expert: ExpertSource
+    employments: tuple[EmploymentSource, ...] = ()
+    projects: tuple[ProjectSource, ...] = ()
+    educations: tuple[EducationSource, ...] = ()
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.scope, IncrementalImpactScope):
+            raise TypeError("scope 必须是 IncrementalImpactScope")
+        if not isinstance(self.expert, ExpertSource):
+            raise TypeError("expert 必须是 ExpertSource")
+        self._validate_scope_shape()
+
+    def _validate_scope_shape(self) -> None:
+        scope_type = self.scope.scope_type
+        if scope_type == "expert":
+            # expert 范围允许三类子表；逻辑删除专家子表应为空。
+            if self.expert.deleted_at is not None and (
+                self.employments or self.projects or self.educations
+            ):
+                raise ValueError("已删除专家的子表必须为空")
+        elif scope_type == "profile":
+            # profile 只读专家 + 教育；不读工作和项目。
+            if self.employments or self.projects:
+                raise ValueError("profile 范围不读取工作和项目")
+            if self.expert.deleted_at is not None and self.educations:
+                raise ValueError("已删除专家的有效教育应为空")
+        if scope_type == "employment":
+            # employment 范围只携带单条触发行；不读项目/教育。
+            if len(self.employments) != 1:
+                raise ValueError("employment 范围必须恰好一条工作行")
+            if self.projects or self.educations:
+                raise ValueError("employment 范围不读取项目和教育")
+        if scope_type == "project":
+            # project 范围只携带单条触发行；不读工作/教育。
+            if len(self.projects) != 1:
+                raise ValueError("project 范围必须恰好一条项目行")
+            if self.employments or self.educations:
+                raise ValueError("project 范围不读取工作和教育")
+
+    @property
+    def parent_deleted(self) -> bool:
+        """子表任务发现父专家已删除（deleted_at 非空）。
+
+        供后续 Handler 在 employment/project 范围发现父专家已删除时，
+        升级为 expert scope + 空 desired，触发旧 Chunk 逻辑清理。
+        """
+
+        return self.expert.deleted_at is not None
+
+    @property
+    def expert_deleted(self) -> bool:
+        """expert/profile 范围内专家本身已逻辑删除。"""
+
+        return self.expert.deleted_at is not None
+
+
+def source_sync_task_to_read_request(task: SourceSyncTask) -> CurrentFactReadRequest:
+    """把 P3 的 :class:`SourceSyncTask` 转换为 P4 定向读取请求。
+
+    本函数是 ``source_record_id``（P3 旧边界字段）的唯一消费点，用于兼容转换；
+    P4 请求/结果模型不暴露 ``source_record_id``，本转换不重引入该字段。P3 任务、
+    scanner、同步任务表均不被修改。转换规则：
+    - 把 ``source_record_id`` 以 ``str`` 映射为 ``trigger_source_field_id``；
+    - 通过 :func:`impact_scope_from_target` 把 ``target_type``（含 education）映射为
+      下游 ``IncrementalImpactScope``；education 触发行主键进入 trigger 字段，
+      impact_scope 仍为 profile（source_field_id=str(expert_id)）；
+    - education 任务最终映射：``impact_scope.scope_type == 'profile'``、
+      ``impact_scope.source_field_id == str(expert_id)``、
+      ``trigger_source_field_id == str(education.id)``；
+    - ``task.expert_id is None`` 时本函数 fail-closed：P4.3 不负责从教育行反推专家，
+      后续 Handler 或上游需先补齐 expert_id。
+    """
+
+    if task.expert_id is None:
+        raise ValueError("P3 任务缺少 expert_id，无法构造定向读取请求")
+    scope = impact_scope_from_target(
+        target_type=task.target_type,
+        expert_id=task.expert_id,
+        source_field_id=(
+            None if task.target_type in {"expert", "profile", "education"}
+            else str(task.source_record_id)
+        ),
+    )
+    return CurrentFactReadRequest(
+        impact_scope=scope,
+        trigger_source_table=task.source_table,
+        trigger_source_field_id=str(task.source_record_id),
+        trigger_source_updated_at=task.source_updated_at,
+    )

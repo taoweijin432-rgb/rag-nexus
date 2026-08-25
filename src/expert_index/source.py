@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+from datetime import datetime
 from typing import Any
 
 import pymysql
@@ -14,12 +15,14 @@ import pymysql
 from .config import DatabaseConfig
 from .models import (
     CHECKPOINT_SOURCE_TABLES,
+    CurrentFactReadRequest,
     EducationSource,
     EmploymentSource,
     ExpertAggregate,
     ExpertCandidate,
     ExpertSource,
     ProjectSource,
+    ScopedCurrentFacts,
     SourceChangeCandidate,
     SourceScanCursor,
 )
@@ -494,3 +497,269 @@ class MySQLSourceAdapter:
                 deleted_at=row.get("deleted_at"),
             ))
         return result
+
+    # ------------------------------------------------------------------
+    # P4.3 定向只读事实读取
+    # ------------------------------------------------------------------
+
+    def read_current_facts(self, request: CurrentFactReadRequest) -> ScopedCurrentFacts:
+        """在同一只读一致性快照中按 :class:`CurrentFactReadRequest` 读取当前事实。
+
+        四类影响范围共用一个短连接与一致性快照（REPEATABLE READ, READ ONLY）。
+        物理行不存在 fail-closed；逻辑删除行（deleted_at 非空）正常返回，
+        由后续 Handler 决定生成空 desired 或升级范围。触发行的 ``updated_at``
+        早于候选 ``trigger_source_updated_at`` 时 fail-closed（事件比当前事实更新）。
+
+        本方法不调用公开 :meth:`load_expert`（会另开连接破坏一致性快照），而是复用
+        内部按主键查询的 helper，在同一个 cursor 上执行所有 SELECT。
+        """
+
+        connection = pymysql.connect(**self.config.as_kwargs(autocommit=False))
+        try:
+            with connection.cursor() as cursor:
+                self._begin_consistent_read(cursor)
+                facts = self._read_scoped_facts(cursor, request)
+            connection.rollback()
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+        return facts
+
+    def _read_scoped_facts(
+        self,
+        cursor: Any,
+        request: CurrentFactReadRequest,
+    ) -> ScopedCurrentFacts:
+        scope = request.impact_scope
+        scope_type = scope.scope_type
+
+        if scope_type == "expert":
+            expert = self._load_expert_row_by_id(cursor, scope.expert_id)
+            self._assert_current_not_older_than_candidate(
+                expert.updated_at, request.trigger_source_updated_at,
+                "experts.updated_at",
+            )
+            if expert.deleted_at is not None:
+                # 已删除专家：只返回生命周期，子表为空（不触发子表读取）。
+                return ScopedCurrentFacts(scope=scope, expert=expert)
+            employments = self._load_employments(cursor, scope.expert_id)
+            projects = self._load_projects(cursor, scope.expert_id)
+            educations = self._load_educations(cursor, scope.expert_id)
+            return ScopedCurrentFacts(
+                scope=scope, expert=expert,
+                employments=tuple(employments), projects=tuple(projects),
+                educations=tuple(educations),
+            )
+
+        if scope_type == "profile":
+            expert = self._load_expert_row_by_id(cursor, scope.expert_id)
+            if request.trigger_source_table == "experts_education_experience":
+                # education 触发：先读教育行校验归属与时序，再决定是否读父专家有效教育。
+                edu = self._load_education_row_by_id(
+                    cursor, int(request.trigger_source_field_id),
+                )
+                self._assert_trigger_owns_expert(edu, scope.expert_id, "education")
+                self._assert_current_not_older_than_candidate(
+                    edu.updated_at, request.trigger_source_updated_at,
+                    "experts_education_experience.updated_at",
+                )
+            else:
+                # profile 自身触发：校验专家主档时序。
+                self._assert_current_not_older_than_candidate(
+                    expert.updated_at, request.trigger_source_updated_at,
+                    "experts.updated_at",
+                )
+            if expert.deleted_at is not None:
+                return ScopedCurrentFacts(scope=scope, expert=expert)
+            educations = self._load_educations(cursor, scope.expert_id)
+            return ScopedCurrentFacts(
+                scope=scope, expert=expert, educations=tuple(educations),
+            )
+
+        if scope_type == "employment":
+            trigger = self._load_employment_row_by_id(
+                cursor, int(request.trigger_source_field_id),
+            )
+            self._assert_trigger_owns_expert(trigger, scope.expert_id, "employment")
+            self._assert_current_not_older_than_candidate(
+                trigger.updated_at, request.trigger_source_updated_at,
+                "experts_work_experience.updated_at",
+            )
+            expert = self._load_expert_row_by_id(cursor, scope.expert_id)
+            return ScopedCurrentFacts(
+                scope=scope, expert=expert, employments=(trigger,),
+            )
+
+        if scope_type == "project":
+            trigger = self._load_project_row_by_id(
+                cursor, int(request.trigger_source_field_id),
+            )
+            self._assert_trigger_owns_expert(trigger, scope.expert_id, "project")
+            self._assert_current_not_older_than_candidate(
+                trigger.updated_at, request.trigger_source_updated_at,
+                "experts_project_experience.updated_at",
+            )
+            expert = self._load_expert_row_by_id(cursor, scope.expert_id)
+            return ScopedCurrentFacts(
+                scope=scope, expert=expert, projects=(trigger,),
+            )
+
+        raise ValueError(f"不支持的影响范围类型: {scope_type}")
+
+    @staticmethod
+    def _assert_trigger_owns_expert(
+        row: EmploymentSource | ProjectSource, expert_id: int, label: str,
+    ) -> None:
+        if row.expert_id != expert_id:
+            raise ValueError(
+                f"{label} 触发行 expert_id={row.expert_id} 与请求 expert_id={expert_id} 不一致"
+            )
+
+    @staticmethod
+    def _assert_current_not_older_than_candidate(
+        current: datetime | None,
+        candidate: datetime | None,
+        field_label: str,
+    ) -> None:
+        """当前事实更新时间晚于候选才合法；早于候选 fail-closed（事件比当前新）。
+
+        候选时间为空时不做时序校验（上游尚未提供）。当前时间为空而候选非空也
+        fail-closed：来源行存在却无 updated_at 属于异常。
+        """
+
+        if candidate is None:
+            return
+        if current is None:
+            raise ValueError(f"{field_label} 当前为空，无法校验时序，候选时间非空")
+        if current < candidate:
+            raise ValueError(
+                f"{field_label} 当前 {current} 早于候选 {candidate}，事件比当前事实更新"
+            )
+
+    @staticmethod
+    def _load_expert_row_by_id(cursor: Any, expert_id: int) -> ExpertSource:
+        """按主键读取专家主档，不过滤 ``experts_deleted_at``。
+
+        与 :meth:`_load_profile` 不同：Full Build 路径要求专家有效（deleted_at 为空），
+        因此 ``_load_profile`` 过滤并抛 ``ExpertNotFoundError``；P4.3 路径需要区分物理
+        不存在与逻辑删除，故读取全部行（含 deleted_at 非空）由调用方判断。
+        """
+
+        cursor.execute(
+            """
+            SELECT id, serial_number, company, job_status, job_name,
+                   contact_status, doubtful_flag, abroad_flag, background,
+                   work_years, experts_updated_at AS updated_at, created_at,
+                   experts_deleted_at AS deleted_at
+            FROM experts
+            WHERE id = %s
+            """,
+            (expert_id,),
+        )
+        row = cursor.fetchone()
+        if row is None:
+            raise ExpertNotFoundError(f"专家 {expert_id} 物理不存在")
+        return ExpertSource(
+            id=int(row["id"]),
+            serial_number=row.get("serial_number"),
+            company=row.get("company"),
+            job_status=row.get("job_status"),
+            job_name=row.get("job_name"),
+            contact_status=row.get("contact_status"),
+            doubtful_flag=row.get("doubtful_flag"),
+            abroad_flag=row.get("abroad_flag"),
+            background=row.get("background"),
+            work_years=float(row["work_years"]) if row.get("work_years") is not None else None,
+            updated_at=row.get("updated_at"),
+            created_at=row.get("created_at"),
+            deleted_at=row.get("deleted_at"),
+        )
+
+    @staticmethod
+    def _load_employment_row_by_id(
+        cursor: Any, employment_id: int,
+    ) -> EmploymentSource:
+        """按工作主键读取单条工作行，不过滤 ``deleted_at``。"""
+
+        cursor.execute(
+            """
+            SELECT id, expert_id, company_name, position_title, start_date, end_date,
+                   work_description, is_employed, updated_at, created_at, deleted_at
+            FROM experts_work_experience
+            WHERE id = %s
+            """,
+            (employment_id,),
+        )
+        row = cursor.fetchone()
+        if row is None:
+            raise ExpertNotFoundError(f"工作记录 {employment_id} 物理不存在")
+        return EmploymentSource(
+            id=int(row["id"]),
+            expert_id=int(row["expert_id"]),
+            company_name=row.get("company_name"),
+            position_title=row.get("position_title"),
+            start_date=row.get("start_date"),
+            end_date=row.get("end_date"),
+            work_description=row.get("work_description"),
+            is_employed=row.get("is_employed"),
+            updated_at=row.get("updated_at"),
+            created_at=row.get("created_at"),
+            deleted_at=row.get("deleted_at"),
+        )
+
+    @staticmethod
+    def _load_project_row_by_id(cursor: Any, project_id: int) -> ProjectSource:
+        """按项目主键读取单条项目行，不过滤 ``deleted_at``。"""
+
+        cursor.execute(
+            """
+            SELECT id, expert_id, project_title, company_name, start_date, end_date,
+                   work_description, updated_at, created_at, deleted_at
+            FROM experts_project_experience
+            WHERE id = %s
+            """,
+            (project_id,),
+        )
+        row = cursor.fetchone()
+        if row is None:
+            raise ExpertNotFoundError(f"项目记录 {project_id} 物理不存在")
+        return ProjectSource(
+            id=int(row["id"]),
+            expert_id=int(row["expert_id"]),
+            project_title=row.get("project_title"),
+            company_name=row.get("company_name"),
+            start_date=row.get("start_date"),
+            end_date=row.get("end_date"),
+            work_description=row.get("work_description"),
+            updated_at=row.get("updated_at"),
+            created_at=row.get("created_at"),
+            deleted_at=row.get("deleted_at"),
+        )
+
+    @staticmethod
+    def _load_education_row_by_id(cursor: Any, education_id: int) -> EducationSource:
+        """按教育主键读取单条教育行，不过滤 ``deleted_at``。"""
+
+        cursor.execute(
+            """
+            SELECT id, expert_id, school_name, major,
+                   updated_at, created_at, deleted_at
+            FROM experts_education_experience
+            WHERE id = %s
+            """,
+            (education_id,),
+        )
+        row = cursor.fetchone()
+        if row is None:
+            raise ExpertNotFoundError(f"教育记录 {education_id} 物理不存在")
+        return EducationSource(
+            id=int(row["id"]),
+            expert_id=int(row["expert_id"]),
+            school_name=row.get("school_name"),
+            major=row.get("major"),
+            updated_at=row.get("updated_at"),
+            created_at=row.get("created_at"),
+            deleted_at=row.get("deleted_at"),
+        )
