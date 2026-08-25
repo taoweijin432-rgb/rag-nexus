@@ -195,6 +195,7 @@ class MySQLSourceSyncTaskRepository:
                               sync_status='pending'
                               AND attempt_token IS NULL
                               AND lease_until IS NULL
+                              AND (next_retry_at IS NULL OR next_retry_at <= CURRENT_TIMESTAMP(6))
                           )
                           OR (
                               sync_status='processing'
@@ -417,6 +418,189 @@ class MySQLSourceSyncTaskRepository:
                         attempt_token,
                     ),
                 )
+                if cursor.rowcount != 1:
+                    raise SourceSyncTaskLeaseConflictError(
+                        f"任务 {task_id} 的 attempt lease 已变化"
+                    )
+                task = _select_source_sync_task(cursor, task_id)
+            connection.commit()
+            return task
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+
+    def mark_source_sync_task_rejected(
+        self,
+        task_id: int,
+        attempt_token: str,
+        *,
+        error_stage: str,
+        error_code: str,
+        error_type: str | None = None,
+        safe_error_message: str | None = None,
+    ) -> SourceSyncTask:
+        """把当前有效 attempt 标记为确定性失败 dead，不重试。
+
+        P5 回执为 rejected（不可重试）时使用。要求 processing + 匹配 token +
+        未过期 lease。写 sync_status='dead'、next_retry_at=NULL、清理 token/lease、
+        保留 error_stage/error_code/error_type/error_message，并写入 completed_at。
+        dead 不在现有 claim 取值范围内，不会被再次领取。
+        """
+
+        _validate_positive_integer("task_id", task_id)
+        _validate_attempt_token(attempt_token)
+        _validate_error_stage(error_stage)
+        _validate_safe_identifier("error_code", error_code, max_length=64)
+        _validate_optional_safe_identifier("error_type", error_type, max_length=128)
+        _validate_safe_error_message(safe_error_message)
+        connection = pymysql.connect(**self.config.as_kwargs())
+        try:
+            with connection.cursor() as cursor:
+                _require_active_task_attempt(
+                    _lock_source_sync_task(cursor, task_id),
+                    task_id=task_id,
+                    attempt_token=attempt_token,
+                )
+                cursor.execute(
+                    """
+                    UPDATE expert_index_sync_task
+                    SET sync_status='dead', attempt_token=NULL,
+                        lease_until=NULL, next_retry_at=NULL,
+                        error_stage=%s, error_code=%s, error_type=%s,
+                        error_message=%s, result_code=NULL,
+                        completed_at=CURRENT_TIMESTAMP(6)
+                    WHERE id=%s AND sync_status='processing'
+                      AND attempt_token=%s
+                      AND lease_until > CURRENT_TIMESTAMP(6)
+                    """,
+                    (
+                        error_stage,
+                        error_code,
+                        error_type,
+                        safe_error_message,
+                        task_id,
+                        attempt_token,
+                    ),
+                )
+                if cursor.rowcount != 1:
+                    raise SourceSyncTaskLeaseConflictError(
+                        f"任务 {task_id} 的 attempt lease 已变化"
+                    )
+                task = _select_source_sync_task(cursor, task_id)
+            connection.commit()
+            return task
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+
+    def mark_source_sync_task_retryable(
+        self,
+        task_id: int,
+        attempt_token: str,
+        *,
+        error_stage: str,
+        error_code: str,
+        max_attempts: int,
+        retry_delay_seconds: int,
+        error_type: str | None = None,
+        safe_error_message: str | None = None,
+    ) -> SourceSyncTask:
+        """把当前可重试失败 attempt 退回 pending 或转成确定性 dead。
+
+        P5 回执为 failed（可重试）时使用。要求 processing + 匹配 token +
+        未过期 lease。``max_attempts`` 是显式重试上限（不含首次处理），由调用方提供；
+        ``retry_delay_seconds`` 决定 next_retry_at 退避时长。
+
+        - retry_count < max_attempts：写 sync_status='pending'、设置
+          next_retry_at、清理 token/lease、保留 error 摘要，不增加 retry_count
+          （重试计入由下次 claim 回收时按现有逻辑处理）。completed_at 保持 NULL。
+        - retry_count >= max_attempts：写 sync_status='dead'、清理 token/lease、
+          next_retry_at=NULL、写 completed_at，进入确定性终态。
+
+        pending 退回路径复用现有 claim（claim SQL 已加 next_retry_at 守卫，
+        未到期不可领取），不修改 scanner。
+        """
+
+        _validate_positive_integer("task_id", task_id)
+        _validate_attempt_token(attempt_token)
+        _validate_error_stage(error_stage)
+        _validate_safe_identifier("error_code", error_code, max_length=64)
+        _validate_optional_safe_identifier("error_type", error_type, max_length=128)
+        _validate_safe_error_message(safe_error_message)
+        if (
+            isinstance(max_attempts, bool)
+            or not isinstance(max_attempts, int)
+            or max_attempts < 0
+        ):
+            raise ValueError("max_attempts 必须是非负整数")
+        if (
+            isinstance(retry_delay_seconds, bool)
+            or not isinstance(retry_delay_seconds, int)
+            or retry_delay_seconds < 1
+        ):
+            raise ValueError("retry_delay_seconds 必须是正整数")
+        connection = pymysql.connect(**self.config.as_kwargs())
+        try:
+            with connection.cursor() as cursor:
+                locked_row = _lock_source_sync_task(cursor, task_id)
+                _require_active_task_attempt(
+                    locked_row,
+                    task_id=task_id,
+                    attempt_token=attempt_token,
+                )
+                current_retry = int(locked_row["retry_count"])
+                if current_retry < max_attempts:
+                    cursor.execute(
+                        """
+                        UPDATE expert_index_sync_task
+                        SET sync_status='pending', attempt_token=NULL,
+                            lease_until=NULL,
+                            next_retry_at=TIMESTAMPADD(
+                                SECOND, %s, CURRENT_TIMESTAMP(6)
+                            ),
+                            error_stage=%s, error_code=%s, error_type=%s,
+                            error_message=%s, result_code=NULL,
+                            completed_at=NULL
+                        WHERE id=%s AND sync_status='processing'
+                          AND attempt_token=%s
+                          AND lease_until > CURRENT_TIMESTAMP(6)
+                        """,
+                        (
+                            retry_delay_seconds,
+                            error_stage,
+                            error_code,
+                            error_type,
+                            safe_error_message,
+                            task_id,
+                            attempt_token,
+                        ),
+                    )
+                else:
+                    cursor.execute(
+                        """
+                        UPDATE expert_index_sync_task
+                        SET sync_status='dead', attempt_token=NULL,
+                            lease_until=NULL, next_retry_at=NULL,
+                            error_stage=%s, error_code=%s, error_type=%s,
+                            error_message=%s, result_code=NULL,
+                            completed_at=CURRENT_TIMESTAMP(6)
+                        WHERE id=%s AND sync_status='processing'
+                          AND attempt_token=%s
+                          AND lease_until > CURRENT_TIMESTAMP(6)
+                        """,
+                        (
+                            error_stage,
+                            error_code,
+                            error_type,
+                            safe_error_message,
+                            task_id,
+                            attempt_token,
+                        ),
+                    )
                 if cursor.rowcount != 1:
                     raise SourceSyncTaskLeaseConflictError(
                         f"任务 {task_id} 的 attempt lease 已变化"

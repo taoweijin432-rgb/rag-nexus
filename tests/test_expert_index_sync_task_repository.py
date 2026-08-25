@@ -742,3 +742,313 @@ def test_terminal_writes_reject_unsafe_machine_fields_before_connecting(
 
     with pytest.raises(ValueError, match="安全机器标识"):
         method(801, "attempt-801", **kwargs)
+
+
+# ---------------------------------------------------------------------------
+# P5.3A: 确定性 rejected / 可重试 retryable / claim next_retry_at 退避
+# ---------------------------------------------------------------------------
+
+
+def _locked_processing_row(**changes: object) -> dict[str, Any]:
+    """构造一个 processing + 有效 lease 的锁定行，供 rejected/retryable 测试复用。"""
+
+    base = _task_row(
+        sync_status="processing",
+        attempt_token="attempt-801",
+        lease_until=datetime(2026, 8, 21, 10, 5, tzinfo=timezone.utc),
+        lease_is_active=1,
+    )
+    base.update(changes)
+    return base
+
+
+def test_mark_source_sync_task_rejected_writes_dead_terminal_state(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """rejected 应写入 dead 终态，清理租约并记录 completed_at，不可被 claim 领取。"""
+
+    locked = _locked_processing_row()
+    dead = dict(
+        locked,
+        sync_status="dead",
+        attempt_token=None,
+        lease_until=None,
+        next_retry_at=None,
+        error_stage="handoff",
+        error_code="receipt_rejected",
+        error_type="ReceiptRejected",
+        error_message="deterministic rejection",
+        completed_at=datetime(2026, 8, 21, 10, 6, tzinfo=timezone.utc),
+    )
+    dead.pop("lease_is_active")
+    cursor = RecordingCursor(ones=[locked, dead], rowcounts=[0, 1, 0])
+    connection = RecordingConnection(cursor)
+    _patch_connection(monkeypatch, connection)
+
+    task = _repository().mark_source_sync_task_rejected(
+        801,
+        "attempt-801",
+        error_stage="handoff",
+        error_code="receipt_rejected",
+        error_type="ReceiptRejected",
+        safe_error_message="deterministic rejection",
+    )
+
+    update_sql, update_params = cursor.executed[1]
+    assert "sync_status='dead'" in update_sql
+    assert "attempt_token=NULL" in update_sql
+    assert "next_retry_at=NULL" in update_sql
+    assert "completed_at=CURRENT_TIMESTAMP(6)" in update_sql
+    assert "lease_until > CURRENT_TIMESTAMP(6)" in update_sql
+    assert update_params == (
+        "handoff",
+        "receipt_rejected",
+        "ReceiptRejected",
+        "deterministic rejection",
+        801,
+        "attempt-801",
+    )
+    assert task.sync_status == "dead"
+    assert task.attempt_token is None
+    assert task.next_retry_at is None
+    assert task.completed_at is not None
+    assert connection.commit_count == 1
+    assert connection.rollback_count == 0
+
+
+def test_mark_source_sync_task_rejected_requires_active_attempt(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """错误 token 或过期 lease 必须在更新前回滚，不得写 dead。"""
+
+    locked = _locked_processing_row(
+        attempt_token="attempt-old",
+        lease_is_active=1,
+    )
+    cursor = RecordingCursor(ones=[locked])
+    connection = RecordingConnection(cursor)
+    _patch_connection(monkeypatch, connection)
+
+    with pytest.raises(SourceSyncTaskLeaseConflictError, match="有效 attempt lease"):
+        _repository().mark_source_sync_task_rejected(
+            801,
+            "attempt-current",
+            error_stage="scope_consumer",
+            error_code="downstream_failed",
+        )
+
+    assert len(cursor.executed) == 1
+    assert connection.rollback_count == 1
+
+
+def test_mark_source_sync_task_rejected_rejects_unsafe_error_code_before_connecting(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """error_code 含业务文本时不应建立数据库连接。"""
+
+    def unexpected_connect(**_kwargs: object) -> None:
+        raise AssertionError("安全字段校验失败时不应连接 MySQL")
+
+    monkeypatch.setattr(
+        "expert_index.repositories.sync_task.pymysql.connect",
+        unexpected_connect,
+    )
+
+    with pytest.raises(ValueError, match="安全机器标识"):
+        _repository().mark_source_sync_task_rejected(
+            801,
+            "attempt-801",
+            error_stage="handoff",
+            error_code="contains spaces",
+        )
+
+
+def test_mark_source_sync_task_retryable_returns_pending_with_next_retry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """retry_count 低于上限应退回 pending 并设置 next_retry_at，不增加 retry_count。"""
+
+    locked = _locked_processing_row(retry_count=1)
+    pending = dict(
+        locked,
+        sync_status="pending",
+        attempt_token=None,
+        lease_until=None,
+        next_retry_at=datetime(2026, 8, 21, 10, 7, tzinfo=timezone.utc),
+        error_stage="scope_consumer",
+        error_code="embedding_timeout",
+        error_type="EmbeddingTimeout",
+        error_message="transient infra failure",
+        completed_at=None,
+    )
+    pending.pop("lease_is_active")
+    cursor = RecordingCursor(ones=[locked, pending], rowcounts=[0, 1, 0])
+    connection = RecordingConnection(cursor)
+    _patch_connection(monkeypatch, connection)
+
+    task = _repository().mark_source_sync_task_retryable(
+        801,
+        "attempt-801",
+        error_stage="scope_consumer",
+        error_code="embedding_timeout",
+        max_attempts=3,
+        retry_delay_seconds=60,
+        error_type="EmbeddingTimeout",
+        safe_error_message="transient infra failure",
+    )
+
+    update_sql, update_params = cursor.executed[1]
+    assert "sync_status='pending'" in update_sql
+    assert "next_retry_at=TIMESTAMPADD( SECOND, %s, CURRENT_TIMESTAMP(6) )" in update_sql
+    assert "completed_at=NULL" in update_sql
+    assert update_params[0] == 60  # retry_delay_seconds
+    assert task.sync_status == "pending"
+    assert task.attempt_token is None
+    assert task.next_retry_at is not None
+    assert task.completed_at is None
+    assert connection.commit_count == 1
+
+
+def test_mark_source_sync_task_retryable_at_max_attempts_writes_dead(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """达到 max_attempts 应进入确定性 dead 终态，不再退回 pending。"""
+
+    locked = _locked_processing_row(retry_count=3)
+    dead = dict(
+        locked,
+        sync_status="dead",
+        attempt_token=None,
+        lease_until=None,
+        next_retry_at=None,
+        error_stage="scope_consumer",
+        error_code="embedding_timeout",
+        error_type="EmbeddingTimeout",
+        error_message="exhausted retries",
+        completed_at=datetime(2026, 8, 21, 10, 8, tzinfo=timezone.utc),
+    )
+    dead.pop("lease_is_active")
+    cursor = RecordingCursor(ones=[locked, dead], rowcounts=[0, 1, 0])
+    connection = RecordingConnection(cursor)
+    _patch_connection(monkeypatch, connection)
+
+    task = _repository().mark_source_sync_task_retryable(
+        801,
+        "attempt-801",
+        error_stage="scope_consumer",
+        error_code="embedding_timeout",
+        max_attempts=3,
+        retry_delay_seconds=60,
+        error_type="EmbeddingTimeout",
+        safe_error_message="exhausted retries",
+    )
+
+    update_sql, _ = cursor.executed[1]
+    assert "sync_status='dead'" in update_sql
+    assert "completed_at=CURRENT_TIMESTAMP(6)" in update_sql
+    assert task.sync_status == "dead"
+    assert task.next_retry_at is None
+    assert task.completed_at is not None
+
+
+def test_mark_source_sync_task_retryable_rejects_invalid_max_attempts_before_connecting(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """非法 max_attempts/retry_delay 不应建立数据库连接。"""
+
+    def unexpected_connect(**_kwargs: object) -> None:
+        raise AssertionError("参数校验失败时不应连接 MySQL")
+
+    monkeypatch.setattr(
+        "expert_index.repositories.sync_task.pymysql.connect",
+        unexpected_connect,
+    )
+
+    with pytest.raises(ValueError, match="max_attempts"):
+        _repository().mark_source_sync_task_retryable(
+            801,
+            "attempt-801",
+            error_stage="scope_consumer",
+            error_code="x",
+            max_attempts=-1,
+            retry_delay_seconds=60,
+        )
+
+
+def test_mark_source_sync_task_retryable_rejects_stale_token_rolls_back(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """过期 token 在锁定校验阶段必须回滚，不写状态。"""
+
+    locked = _locked_processing_row(
+        attempt_token="attempt-old",
+        lease_is_active=1,
+    )
+    cursor = RecordingCursor(ones=[locked])
+    connection = RecordingConnection(cursor)
+    _patch_connection(monkeypatch, connection)
+
+    with pytest.raises(SourceSyncTaskLeaseConflictError, match="有效 attempt lease"):
+        _repository().mark_source_sync_task_retryable(
+            801,
+            "attempt-current",
+            error_stage="scope_consumer",
+            error_code="x",
+            max_attempts=3,
+            retry_delay_seconds=60,
+        )
+
+    assert len(cursor.executed) == 1
+    assert connection.rollback_count == 1
+
+
+def test_claim_source_sync_tasks_skips_pending_with_future_next_retry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """设置了未来 next_retry_at 的 pending 不应被 claim 领取。"""
+
+    cursor = RecordingCursor(alls=[[]])
+    connection = RecordingConnection(cursor)
+    _patch_connection(monkeypatch, connection)
+
+    tasks = _repository().claim_source_sync_tasks(
+        701,
+        "experts",
+        limit=5,
+        lease_seconds=60,
+    )
+
+    assert tasks == ()
+    claim_sql = cursor.executed[0][0]
+    assert "next_retry_at IS NULL OR next_retry_at <= CURRENT_TIMESTAMP(6)" in claim_sql
+    assert connection.commit_count == 1
+
+
+def test_claim_source_sync_tasks_pending_without_next_retry_still_claimable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """普通 pending（next_retry_at IS NULL）仍可领取，退避守卫不影响默认路径。"""
+
+    lease_until = datetime(2026, 8, 21, 10, 5, tzinfo=timezone.utc)
+    claimed = _task_row(
+        id=801,
+        sync_status="processing",
+        attempt_token="attempt-801-new",
+        lease_until=lease_until,
+    )
+    cursor = RecordingCursor(
+        alls=[[{"id": 801, "sync_status": "pending"}], [claimed]],
+        rowcounts=[0, 1, 0],
+    )
+    connection = RecordingConnection(cursor)
+    _patch_connection(monkeypatch, connection)
+
+    tasks = _repository_with_tokens("attempt-801-new").claim_source_sync_tasks(
+        701,
+        "experts",
+        limit=5,
+        lease_seconds=60,
+    )
+
+    assert [task.task_id for task in tasks] == [801]
+    assert connection.commit_count == 1

@@ -63,6 +63,12 @@ SOURCE_SYNC_PROCESSING_STAGE_ORDER = (
 SOURCE_SYNC_PROCESSING_STAGES = frozenset(SOURCE_SYNC_PROCESSING_STAGE_ORDER)
 
 # 失败阶段只用于安全定位处理环节，不保存来源正文、Chunk Text 或其他业务数据。
+# 失败阶段只用于安全定位处理环节，不保存来源正文、Chunk Text 或其他业务数据。
+# P5.3A 在原有 9 个阶段基础上增加 4 个正式交付链编排阶段：
+# artifact（受控 Contract Payload 持久化/复用）、handoff（范围级交付请求构造）、
+# scope_consumer（下游范围 Consumer 执行）、receipt（上游回执校验）。
+# 注意：sql/012 的 chk_expert_sync_task_error_stage 仍只允许原 9 个值；
+# 正式部署 012 前同事必须同步该 CHECK 取值集，否则新值会被 DDL 拒绝。
 SOURCE_SYNC_ERROR_STAGES = frozenset(
     {
         "source",
@@ -74,6 +80,10 @@ SOURCE_SYNC_ERROR_STAGES = frozenset(
         "embedding",
         "milvus",
         "checkpoint",
+        "artifact",
+        "handoff",
+        "scope_consumer",
+        "receipt",
     }
 )
 

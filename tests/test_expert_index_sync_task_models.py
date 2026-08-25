@@ -97,6 +97,10 @@ def test_source_sync_task_defines_frozen_identity_and_lifecycle_sets() -> None:
         "embedding",
         "milvus",
         "checkpoint",
+        "artifact",
+        "handoff",
+        "scope_consumer",
+        "receipt",
     }
 
 
@@ -276,3 +280,20 @@ def test_source_sync_task_success_requires_completed_evidence() -> None:
     )
 
     assert task.completed_at == CREATED_AT
+
+
+@pytest.mark.parametrize(
+    "stage",
+    ["artifact", "handoff", "scope_consumer", "receipt"],
+)
+def test_source_sync_task_accepts_p5_delivery_error_stages(stage: str) -> None:
+    """P5.3A 新增的四个正式交付链失败阶段应被模型接受。"""
+
+    task = _task(
+        sync_status="failed",
+        retry_count=1,
+        error_stage=stage,
+        error_code="p5_failure",
+        error_message="orchestration failure",
+    )
+    assert task.error_stage == stage

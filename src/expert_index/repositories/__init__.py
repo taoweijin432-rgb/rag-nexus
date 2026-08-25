@@ -1,5 +1,11 @@
 """专家索引状态 Repository 的公开入口。"""
 
+from .artifact import (
+    ArtifactPayloadConflictError,
+    ArtifactPayloadValidationError,
+    ContractArtifact,
+    MySQLArtifactRepository,
+)
 from .batch import (
     BatchNotResumableError,
     BatchNotRetryableError,
@@ -22,13 +28,17 @@ from .sync_task import (
 )
 
 __all__ = [
+    "ArtifactPayloadConflictError",
+    "ArtifactPayloadValidationError",
     "BatchItemSummary",
     "BatchNotResumableError",
     "BatchNotRetryableError",
     "BatchSourceCursorConflictError",
     "BatchSourceRecoveryConflictError",
     "ConcurrentBuildError",
+    "ContractArtifact",
     "FullBatchCheckpoint",
+    "MySQLArtifactRepository",
     "MySQLBatchItemRepository",
     "MySQLBatchRepository",
     "MySQLBuildLockRepository",
