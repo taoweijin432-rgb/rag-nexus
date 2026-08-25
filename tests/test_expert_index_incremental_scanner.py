@@ -549,6 +549,43 @@ def test_source_scan_creates_fixed_range_and_persists_tasks_before_cursor() -> N
     assert events.index("task:get:802") < first_advance
 
 
+def test_source_scan_handles_same_timestamp_pages_and_later_low_record_id() -> None:
+    """复合游标应跨同时间戳分页，并发现更新时间较新但 ID 较小的记录。"""
+
+    next_time = SOURCE_TIME + timedelta(seconds=1)
+    upper_bound = SourceScanCursor(next_time, 1)
+    pages = [
+        [
+            _candidate(record_id=901, updated_at=SOURCE_TIME),
+            _candidate(record_id=902, updated_at=SOURCE_TIME),
+        ],
+        [
+            _candidate(record_id=903, updated_at=SOURCE_TIME),
+            _candidate(record_id=1, updated_at=next_time),
+        ],
+        [],
+    ]
+    source = FakeSourceAdapter(upper_bound=upper_bound, pages=pages)
+    state = FakeSourceStateRepository()
+    tasks = FakeTaskRepository()
+
+    result = _scan_service(source, state, tasks).scan_source(
+        "experts_work_experience",
+        "scanner-p3-8-composite-cursor",
+        batch_no="incremental-work-20260825-p3-8",
+    )
+
+    assert result.page_count == 2
+    assert result.scheduled_candidate_count == 4
+    assert result.batch_source is not None
+    assert result.batch_source.current_cursor == upper_bound
+    assert state.advance_calls == [
+        (SCAN_START, SourceScanCursor(SOURCE_TIME, 902), 2),
+        (SourceScanCursor(SOURCE_TIME, 902), upper_bound, 2),
+    ]
+    assert len(tasks.tasks_by_key) == 4
+
+
 def test_source_scan_releases_lease_without_new_range() -> None:
     """Source 上界不大于安全水位时不能伪造批次或推进任何位置。"""
 

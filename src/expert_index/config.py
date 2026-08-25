@@ -5,7 +5,7 @@ from __future__ import annotations
 import os
 import re
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
 from typing import Any
@@ -19,6 +19,10 @@ DICTIONARY_VERSION = "2026.08"
 # v4 删除最终表/导出中的 chunk_id、source_item_key、dictionary_version、data_version；
 # 4.1 将 ExpertChunkEmbeddingInput.metadata 从统一 superset 改为 per-type 模型。
 CONTRACT_VERSION = "4.1.0"
+
+DEFAULT_INCREMENTAL_BATCH_SIZE = 500
+DEFAULT_INCREMENTAL_LEASE_SECONDS = 120
+MAX_INCREMENTAL_BATCH_SIZE = 1000
 
 _ENV_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
@@ -34,6 +38,38 @@ class DatabaseRole(str, Enum):
     SOURCE = "source"
     INDEX = "index"
     ISOLATED_TEST = "isolated_test"
+
+
+@dataclass(frozen=True)
+class IncrementalScanConfig:
+    """保存候选扫描开关、单页数量和来源表租约时长。
+
+    该配置只控制 P3 候选扫描，不表示任务已完成，也不允许自动推进安全 Checkpoint。
+    """
+
+    enabled: bool = False
+    batch_size: int = DEFAULT_INCREMENTAL_BATCH_SIZE
+    lease_seconds: int = DEFAULT_INCREMENTAL_LEASE_SECONDS
+
+    def __post_init__(self) -> None:
+        """在建立数据库连接前校验候选分页和租约参数。"""
+
+        if not isinstance(self.enabled, bool):
+            raise TypeError("incremental enabled 必须是布尔值")
+        if (
+            isinstance(self.batch_size, bool)
+            or not isinstance(self.batch_size, int)
+            or not 1 <= self.batch_size <= MAX_INCREMENTAL_BATCH_SIZE
+        ):
+            raise ValueError(
+                f"incremental batch_size 必须位于 1 到 {MAX_INCREMENTAL_BATCH_SIZE} 之间"
+            )
+        if (
+            isinstance(self.lease_seconds, bool)
+            or not isinstance(self.lease_seconds, int)
+            or self.lease_seconds < 1
+        ):
+            raise ValueError("incremental lease_seconds 必须是正整数")
 
 
 def load_env_file(path: Path | None = None) -> None:
@@ -117,6 +153,9 @@ class Settings:
     chunk_policy_version: str = CHUNK_POLICY_VERSION
     metadata_schema_version: str = METADATA_SCHEMA_VERSION
     dictionary_version: str = DICTIONARY_VERSION
+    incremental_scan: IncrementalScanConfig = field(
+        default_factory=IncrementalScanConfig
+    )
 
     @classmethod
     def from_env(cls, env: Mapping[str, str] | None = None) -> Settings:
@@ -151,7 +190,34 @@ class Settings:
             database=_required_value(values, "INDEX_DB_NAME"),
             role=DatabaseRole.INDEX,
         )
-        return cls(source_db=source, index_db=index)
+        incremental_scan = IncrementalScanConfig(
+            enabled=_parse_boolean(
+                "INCREMENTAL_ENABLED",
+                values.get("INCREMENTAL_ENABLED", "0"),
+            ),
+            batch_size=_parse_integer(
+                "INCREMENTAL_BATCH_SIZE",
+                values.get(
+                    "INCREMENTAL_BATCH_SIZE",
+                    str(DEFAULT_INCREMENTAL_BATCH_SIZE),
+                ),
+                minimum=1,
+                maximum=MAX_INCREMENTAL_BATCH_SIZE,
+            ),
+            lease_seconds=_parse_integer(
+                "INCREMENTAL_LEASE_SECONDS",
+                values.get(
+                    "INCREMENTAL_LEASE_SECONDS",
+                    str(DEFAULT_INCREMENTAL_LEASE_SECONDS),
+                ),
+                minimum=1,
+            ),
+        )
+        return cls(
+            source_db=source,
+            index_db=index,
+            incremental_scan=incremental_scan,
+        )
 
     def validate_index_write_boundary(self) -> None:
         """拒绝使用非 Index 配置或把状态写入 Source 所在物理 Schema。"""
@@ -202,3 +268,34 @@ def _parse_port(name: str, value: str) -> int:
     if not 1 <= port <= 65535:
         raise ValueError(f"{name} 必须位于 1 到 65535 之间")
     return port
+
+
+def _parse_boolean(name: str, value: str) -> bool:
+    """把显式环境变量解析为布尔值，并拒绝含义不明确的文本。"""
+
+    normalized = value.strip().casefold()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    raise ValueError(f"{name} 必须是 true/false 或 1/0")
+
+
+def _parse_integer(
+    name: str,
+    value: str,
+    *,
+    minimum: int,
+    maximum: int | None = None,
+) -> int:
+    """把整数环境变量转换后校验闭区间范围。"""
+
+    try:
+        parsed = int(value)
+    except ValueError as exc:
+        raise ValueError(f"{name} 必须是整数") from exc
+    if parsed < minimum or (maximum is not None and parsed > maximum):
+        if maximum is None:
+            raise ValueError(f"{name} 必须大于等于 {minimum}")
+        raise ValueError(f"{name} 必须位于 {minimum} 到 {maximum} 之间")
+    return parsed

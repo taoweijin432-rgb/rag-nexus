@@ -6,10 +6,16 @@
 
 from __future__ import annotations
 
+import re
 from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import datetime
 
+from .config import (
+    DEFAULT_INCREMENTAL_BATCH_SIZE,
+    DEFAULT_INCREMENTAL_LEASE_SECONDS,
+    Settings,
+)
 from .models import (
     CHECKPOINT_SOURCE_TABLES,
     BatchSourceScan,
@@ -22,8 +28,24 @@ from .repositories import MySQLSourceStateRepository, MySQLSourceSyncTaskReposit
 from .source import MAX_SOURCE_SCAN_PAGE_SIZE, MySQLSourceAdapter
 
 POLL_EVENT_SOURCE = "poll"
-DEFAULT_INCREMENTAL_PAGE_SIZE = 500
-DEFAULT_SOURCE_LEASE_SECONDS = 120
+DEFAULT_INCREMENTAL_PAGE_SIZE = DEFAULT_INCREMENTAL_BATCH_SIZE
+DEFAULT_SOURCE_LEASE_SECONDS = DEFAULT_INCREMENTAL_LEASE_SECONDS
+
+# 四表顺序是一次扫描周期的稳定契约，不能从无序白名单集合推导。
+INCREMENTAL_SOURCE_TABLE_ORDER = (
+    "experts",
+    "experts_work_experience",
+    "experts_project_experience",
+    "experts_education_experience",
+)
+
+_SAFE_ORCHESTRATION_IDENTIFIER = re.compile(r"^[A-Za-z0-9_.-]+$")
+_BATCH_SOURCE_ALIAS = {
+    "experts": "experts",
+    "experts_work_experience": "work",
+    "experts_project_experience": "project",
+    "experts_education_experience": "education",
+}
 
 _POLL_TARGET_TYPE_BY_SOURCE_TABLE = {
     "experts": "expert",
@@ -144,6 +166,10 @@ class CrossBatchTaskConflictError(RuntimeError):
     """表示候选幂等键意外命中其他逻辑批次的已有任务。"""
 
 
+class IncrementalScanDisabledError(RuntimeError):
+    """表示环境配置未显式允许创建增量候选任务。"""
+
+
 @dataclass(frozen=True)
 class IncrementalScanResult:
     """一张来源表完成候选扫描后的固定范围结果。"""
@@ -154,6 +180,49 @@ class IncrementalScanResult:
     page_count: int
     scheduled_candidate_count: int
     lease_released: bool
+
+
+@dataclass(frozen=True)
+class IncrementalSourceScanOutcome:
+    """保存一张来源表的扫描结果或不含原始异常文本的失败类型。"""
+
+    source_table: str
+    result: IncrementalScanResult | None = None
+    failure_type: str | None = None
+
+    def __post_init__(self) -> None:
+        """确保成功结果和失败类型二选一，且结果属于当前来源表。"""
+
+        if (self.result is None) == (self.failure_type is None):
+            raise ValueError("扫描结果必须在 result 和 failure_type 之间二选一")
+        if self.result is not None and self.result.source_table != self.source_table:
+            raise ValueError("扫描结果的来源表与 outcome 不一致")
+
+    @property
+    def succeeded(self) -> bool:
+        """返回当前来源表是否完成候选扫描。"""
+
+        return self.result is not None
+
+
+@dataclass(frozen=True)
+class IncrementalScanCycleResult:
+    """按固定四表顺序保存一次候选扫描周期的隔离结果。"""
+
+    cycle_id: str
+    outcomes: tuple[IncrementalSourceScanOutcome, ...]
+
+    @property
+    def succeeded_source_count(self) -> int:
+        """返回本周期成功完成候选扫描的来源表数量。"""
+
+        return sum(outcome.succeeded for outcome in self.outcomes)
+
+    @property
+    def failed_source_count(self) -> int:
+        """返回本周期发生隔离失败的来源表数量。"""
+
+        return len(self.outcomes) - self.succeeded_source_count
 
 
 @dataclass(frozen=True)
@@ -313,10 +382,149 @@ class IncrementalSourceScanService:
         )
 
 
+@dataclass(frozen=True)
+class IncrementalScanCoordinator:
+    """按固定顺序独立调用四张来源表的候选扫描服务。
+
+    每张表使用独立批次号并由单表服务获取各自 lease。单表异常只记录稳定异常类型，
+    协调器继续扫描后续表；本类不处理 pending 任务，也不提交安全 Checkpoint。
+    """
+
+    scan_service: IncrementalSourceScanService
+
+    def scan_all_sources(
+        self,
+        worker_id: str,
+        *,
+        cycle_id: str,
+    ) -> IncrementalScanCycleResult:
+        """执行一次四表候选扫描并返回逐表成功或失败结果。
+
+        ``cycle_id`` 必须由调用方为一次新扫描周期生成唯一值；恢复既有未完成范围时，
+        单表服务会继续使用数据库中保存的原批次，不会创建重复范围。
+        """
+
+        _validate_orchestration_identifier(
+            "worker_id",
+            worker_id,
+            maximum_length=48,
+        )
+        _validate_orchestration_identifier(
+            "cycle_id",
+            cycle_id,
+            maximum_length=48,
+        )
+        batch_numbers = {
+            source_table: _incremental_batch_no(cycle_id, source_table)
+            for source_table in INCREMENTAL_SOURCE_TABLE_ORDER
+        }
+        lease_owners = {
+            source_table: _source_lease_owner(worker_id, cycle_id, source_table)
+            for source_table in INCREMENTAL_SOURCE_TABLE_ORDER
+        }
+
+        outcomes: list[IncrementalSourceScanOutcome] = []
+        for source_table in INCREMENTAL_SOURCE_TABLE_ORDER:
+            try:
+                result = self.scan_service.scan_source(
+                    source_table,
+                    lease_owners[source_table],
+                    batch_no=batch_numbers[source_table],
+                )
+            except Exception as exc:  # noqa: BLE001 - 单表故障必须与后续来源表隔离。
+                # 原始异常文本可能包含数据库值；周期摘要只暴露可聚合的异常类名。
+                outcomes.append(
+                    IncrementalSourceScanOutcome(
+                        source_table=source_table,
+                        failure_type=type(exc).__name__,
+                    )
+                )
+                continue
+            outcomes.append(
+                IncrementalSourceScanOutcome(
+                    source_table=source_table,
+                    result=result,
+                )
+            )
+
+        return IncrementalScanCycleResult(
+            cycle_id=cycle_id,
+            outcomes=tuple(outcomes),
+        )
+
+
+def build_incremental_scan_coordinator(settings: Settings) -> IncrementalScanCoordinator:
+    """从正式 Source/Index 配置组装默认关闭的候选扫描协调器。
+
+    构造阶段先验证所有状态写入明确指向独立 Index Schema，再检查显式启用开关。
+    返回的协调器只创建 pending 候选任务，不领取任务、不写 success，也不推进 Checkpoint。
+    """
+
+    if not isinstance(settings, Settings):
+        raise TypeError("settings 必须是 Settings")
+    settings.validate_index_write_boundary()
+    if not settings.incremental_scan.enabled:
+        raise IncrementalScanDisabledError(
+            "INCREMENTAL_ENABLED 未开启，候选扫描入口保持禁用"
+        )
+    scan_config = settings.incremental_scan
+    return IncrementalScanCoordinator(
+        scan_service=IncrementalSourceScanService(
+            source_adapter=MySQLSourceAdapter(settings.source_db),
+            source_state_repository=MySQLSourceStateRepository(settings.index_db),
+            task_repository=MySQLSourceSyncTaskRepository(settings.index_db),
+            policy_version=settings.chunk_policy_version,
+            page_size=scan_config.batch_size,
+            lease_seconds=scan_config.lease_seconds,
+        )
+    )
+
+
 def _source_datetime_literal(value: datetime) -> str:
     """把 Source DATETIME 格式化为无时区偏移的六位微秒字面值。"""
 
     return value.replace(tzinfo=None).isoformat(timespec="microseconds")
+
+
+def _incremental_batch_no(cycle_id: str, source_table: str) -> str:
+    """生成同一周期内按来源表隔离且满足数据库长度约束的批次号。"""
+
+    batch_no = f"inc-{cycle_id}-{_BATCH_SOURCE_ALIAS[source_table]}"
+    if len(batch_no) > 64:
+        raise ValueError("生成的 incremental batch_no 超过 64 个字符")
+    return batch_no
+
+
+def _source_lease_owner(
+    worker_id: str,
+    cycle_id: str,
+    source_table: str,
+) -> str:
+    """生成一次扫描周期内按来源表隔离且不可跨表复用的 lease owner。"""
+
+    lease_owner = f"{worker_id}.{cycle_id}.{_BATCH_SOURCE_ALIAS[source_table]}"
+    if len(lease_owner) > 128:
+        raise ValueError("生成的 source lease_owner 超过 128 个字符")
+    return lease_owner
+
+
+def _validate_orchestration_identifier(
+    name: str,
+    value: str,
+    *,
+    maximum_length: int,
+) -> None:
+    """校验编排标识可安全用于 lease owner 和批次号。"""
+
+    if (
+        not isinstance(value, str)
+        or not value
+        or len(value) > maximum_length
+        or _SAFE_ORCHESTRATION_IDENTIFIER.fullmatch(value) is None
+    ):
+        raise ValueError(
+            f"{name} 必须是长度不超过 {maximum_length} 的安全非空标识"
+        )
 
 
 def _has_new_source_range(
