@@ -47,6 +47,10 @@ from .consumer_models import (
     ERROR_CODE_METADATA_TARGET_MISSING,
     ERROR_CODE_METADATA_UPDATE_INFRA_FAILED,
     ERROR_CODE_MODEL_SPACE_MISMATCH,
+    ERROR_CODE_SCOPE_ACTIVE_STATE_INVALID,
+    ERROR_CODE_SCOPE_QUERY_FAILED,
+    ERROR_CODE_SCOPE_STALE_DISABLE_FAILED,
+    ERROR_CODE_SCOPE_UNSUPPORTED_TYPE,
     ERROR_CODE_STALE_DISABLE_FAILED,
     ERROR_CODE_STALE_SOURCE_EVENT_ID,
     ERROR_CODE_UPSERT_CONTRACT_FAILED,
@@ -88,6 +92,13 @@ from .repository import (
     V15WorkItemNotFoundError,
     vector_doc_id_hash,
 )
+from .scope_consumer import (
+    ScopeConsumer,
+    ScopeHandoffRequestView,
+    ScopeReceiptSink,
+    ScopeVectorStatePort,
+    ScopeView,
+)
 
 __all__ = [
     "ALLOWED_SOURCE_TABLES",
@@ -113,6 +124,10 @@ __all__ = [
     "ERROR_CODE_METADATA_TARGET_MISSING",
     "ERROR_CODE_METADATA_UPDATE_INFRA_FAILED",
     "ERROR_CODE_MODEL_SPACE_MISMATCH",
+    "ERROR_CODE_SCOPE_ACTIVE_STATE_INVALID",
+    "ERROR_CODE_SCOPE_QUERY_FAILED",
+    "ERROR_CODE_SCOPE_STALE_DISABLE_FAILED",
+    "ERROR_CODE_SCOPE_UNSUPPORTED_TYPE",
     "ERROR_CODE_STALE_DISABLE_FAILED",
     "ERROR_CODE_STALE_SOURCE_EVENT_ID",
     "ERROR_CODE_UPSERT_CONTRACT_FAILED",
@@ -137,6 +152,11 @@ __all__ = [
     "ExecutionResult",
     "MySQLV15VectorizationRepository",
     "PreRejectedInput",
+    "ScopeConsumer",
+    "ScopeHandoffRequestView",
+    "ScopeReceiptSink",
+    "ScopeVectorStatePort",
+    "ScopeView",
     "SourceEventOrderView",
     "V15BatchNotFoundError",
     "V15BatchStatus",
