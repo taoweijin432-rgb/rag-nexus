@@ -175,11 +175,35 @@ class MySQLSourceSyncTaskRepository:
         limit: int,
         lease_seconds: int,
     ) -> tuple[SourceSyncTask, ...]:
-        """并发安全领取 pending 或 lease 已过期的 processing 任务。
+        """并发安全领取当前 Batch 范围内严格队头任务。
 
-        任务按 ID 升序通过 ``FOR UPDATE SKIP LOCKED`` 领取。每条任务获得新的
-        ``attempt_token``；回收过期 processing 任务时增加 ``retry_count``，但不改变
-        已完成的处理阶段。方法只访问本地 Index MySQL。
+        本方法实现严格 head-of-line 语义：先定位当前 Batch 内最早的非终态
+        （``success``/``dead``）任务作为队头，再按队头状态决定领取行为，**绝不
+        跳过队头领取更晚任务**。``id ASC`` 在这里仅表示当前 Batch 内任务队列的
+        确定性顺序，**不等于业务事件时间序**。
+
+        队头状态语义：
+
+        - ``pending`` 且 ``next_retry_at`` 已到或为空：允许领取（首次 attempt，
+          ``retry_count`` 不增加）；
+        - ``pending`` 且 ``next_retry_at`` 未到：**返回空**，不领取更晚任务
+          （等待退避到期）；
+        - ``processing`` 且 lease 已过期：允许回收（``retry_count += 1``）；
+        - ``processing`` 且 lease 未过期：**返回空**，不领取更晚任务；
+        - ``success``：已完成，继续向下一队头扫描；
+        - ``dead``：不可重试终态，继续向下一队头扫描（本批最终由 Checkpoint
+          闸门阻止提交，不在本方法改变 dead）；
+        - ``failed``/``retrying``/未知状态：fail-closed 抛
+          :class:`SourceSyncTaskStageConflictError`，不越过队头。
+
+        ``limit`` 保持接口兼容：严格队头先领取第一条，若 ``limit>1`` 再按
+        **同一套逐条严格 FIFO** 逻辑继续领取后续任务（不再用旧过滤条件跳过
+        正在退避或 lease 未过期的 task）。P5.7 正式调用固定 ``limit=1``，多领取
+        路径仅在接口兼容场景出现。
+
+        每条领取任务获得新的 ``attempt_token``；回收过期 processing 时增加
+        ``retry_count``，不改变已完成的处理阶段。方法只访问本地 Index MySQL，
+        使用 ``CURRENT_TIMESTAMP(6)`` 权威时间与 ``FOR UPDATE SKIP LOCKED``。
         """
 
         _validate_positive_integer("batch_id", batch_id)
@@ -189,71 +213,31 @@ class MySQLSourceSyncTaskRepository:
         connection = pymysql.connect(**self.config.as_kwargs())
         try:
             with connection.cursor() as cursor:
-                cursor.execute(
-                    """
-                    SELECT id, sync_status
-                    FROM expert_index_sync_task
-                    WHERE batch_id=%s AND source_table=%s
-                      AND (
-                          (
-                              sync_status='pending'
-                              AND attempt_token IS NULL
-                              AND lease_until IS NULL
-                              AND (next_retry_at IS NULL OR next_retry_at <= CURRENT_TIMESTAMP(6))
-                          )
-                          OR (
-                              sync_status='processing'
-                              AND attempt_token IS NOT NULL
-                              AND lease_until <= CURRENT_TIMESTAMP(6)
-                          )
-                      )
-                    ORDER BY id ASC
-                    LIMIT %s
-                    FOR UPDATE SKIP LOCKED
-                    """,
-                    (batch_id, source_table, limit),
-                )
-                candidates = cursor.fetchall()
-                if not candidates:
+                task_ids: list[int] = []
+                claimed_tokens: list[str] = []
+                after_id = 0
+                # 逐条严格 FIFO：最多领取 limit 条，绝不跳过阻塞 task 领取更晚 task。
+                for _ in range(limit):
+                    result = self._claim_one_strict(
+                        cursor, batch_id, source_table, lease_seconds, after_id
+                    )
+                    kind = result[0]
+                    if kind == "claimed":
+                        task_ids.append(int(result[1]))
+                        claimed_tokens.append(str(result[3]))
+                        after_id = int(result[1])
+                    elif kind == "skip":
+                        # success/dead 越过，继续扫描下一条。
+                        after_id = int(result[1])
+                    else:  # "stop"
+                        break
+
+                if not task_ids:
                     connection.commit()
                     return ()
 
-                claimed_tokens = [self.attempt_token_factory() for _ in candidates]
-                for token in claimed_tokens:
-                    _validate_attempt_token(token)
                 if len(set(claimed_tokens)) != len(claimed_tokens):
                     raise RuntimeError("本次领取生成了重复的 attempt_token")
-
-                task_ids: list[int] = []
-                for candidate, attempt_token in zip(candidates, claimed_tokens, strict=True):
-                    task_id = int(candidate["id"])
-                    previous_status = str(candidate["sync_status"])
-                    if previous_status not in {"pending", "processing"}:
-                        raise RuntimeError("领取查询返回了不可认领任务状态")
-                    cursor.execute(
-                        """
-                        UPDATE expert_index_sync_task
-                        SET sync_status='processing', attempt_token=%s,
-                            lease_until=TIMESTAMPADD(
-                                SECOND, %s, CURRENT_TIMESTAMP(6)
-                            ),
-                            retry_count=retry_count+%s,
-                            started_at=CURRENT_TIMESTAMP(6), completed_at=NULL
-                        WHERE id=%s AND sync_status=%s
-                        """,
-                        (
-                            attempt_token,
-                            lease_seconds,
-                            1 if previous_status == "processing" else 0,
-                            task_id,
-                            previous_status,
-                        ),
-                    )
-                    if cursor.rowcount != 1:
-                        raise SourceSyncTaskLeaseConflictError(
-                            f"任务 {task_id} 在领取期间状态已变化"
-                        )
-                    task_ids.append(task_id)
 
                 placeholders = ", ".join(["%s"] * len(task_ids))
                 cursor.execute(
@@ -272,6 +256,123 @@ class MySQLSourceSyncTaskRepository:
             raise
         finally:
             connection.close()
+
+    def _claim_one_strict(
+        self,
+        cursor: Any,
+        batch_id: int,
+        source_table: str,
+        lease_seconds: int,
+        after_id: int,
+    ) -> tuple[Any, ...]:
+        """逐条严格 FIFO 领取：定位 ``id > after_id`` 之后最早非终态任务并决策。
+
+        返回带标记的 tuple：
+
+        - ``("claimed", task_id, previous_status, attempt_token)``：已领取该 task；
+        - ``("skip", task_id)``：该 task 在两次读取间变为 success/dead，越过继续扫描；
+        - ``("stop",)``：没有更多非终态任务、被其他 worker 锁定、pending 退避未到、
+          processing lease 未过期，调用方应停止循环；
+        - failed/retrying/未知状态直接抛 :class:`SourceSyncTaskStageConflictError`。
+
+        本方法与队头领取使用同一套决策规则，确保 limit>1 也遵循严格 FIFO，
+        绝不跳过阻塞 task 领取更晚 task。
+        """
+
+        # 第一步：只读定位 id > after_id 之后最早非终态任务（不锁定，不越过
+        # success/dead）。不使用 LIMIT n FOR UPDATE SKIP LOCKED，否则 MySQL 会跳过
+        # 被锁定的行返回下一条，违反“被锁定时停止”的要求。
+        cursor.execute(
+            """
+            SELECT id
+            FROM expert_index_sync_task
+            WHERE batch_id=%s AND source_table=%s
+              AND id > %s
+              AND sync_status NOT IN ('success', 'dead')
+            ORDER BY id ASC
+            LIMIT 1
+            """,
+            (batch_id, source_table, after_id),
+        )
+        frontier_row = cursor.fetchone()
+        if frontier_row is None:
+            return ("stop",)
+        frontier_id = int(frontier_row["id"])
+
+        # 第二步：按 id 精确锁定（SKIP LOCKED 让被其他 worker 锁住的行直接返回 None，
+        # 而不是跳到更晚 task）。
+        cursor.execute(
+            """
+            SELECT id, sync_status, next_retry_at, lease_until, attempt_token
+            FROM expert_index_sync_task
+            WHERE id=%s
+            FOR UPDATE SKIP LOCKED
+            """,
+            (frontier_id,),
+        )
+        locked = cursor.fetchone()
+        if locked is None:
+            return ("stop",)
+
+        status = str(locked["sync_status"])
+        if status in {"success", "dead"}:
+            # 两次读取之间队头已变为终态：越过继续扫描下一条。
+            return ("skip", frontier_id)
+        if status not in {"pending", "processing"}:
+            raise SourceSyncTaskStageConflictError(
+                f"任务 {frontier_id} 处于 {status} 状态，不能跳过该队头任务"
+            )
+
+        next_retry_at = locked.get("next_retry_at")
+        lease_until = locked.get("lease_until")
+        reclaim = False
+        if status == "pending":
+            if next_retry_at is not None:
+                cursor.execute(
+                    "SELECT CURRENT_TIMESTAMP(6) AS now",
+                    (),
+                )
+                now_row = cursor.fetchone()
+                db_now = now_row["now"] if now_row is not None else None
+                if db_now is not None and next_retry_at > db_now:
+                    return ("stop",)
+        else:  # processing
+            reclaim = True
+            cursor.execute(
+                "SELECT CURRENT_TIMESTAMP(6) AS now",
+                (),
+            )
+            now_row = cursor.fetchone()
+            db_now = now_row["now"] if now_row is not None else None
+            if lease_until is not None and db_now is not None and lease_until > db_now:
+                return ("stop",)
+
+        attempt_token = self.attempt_token_factory()
+        _validate_attempt_token(attempt_token)
+        cursor.execute(
+            """
+            UPDATE expert_index_sync_task
+            SET sync_status='processing', attempt_token=%s,
+                lease_until=TIMESTAMPADD(
+                    SECOND, %s, CURRENT_TIMESTAMP(6)
+                ),
+                retry_count=retry_count+%s,
+                started_at=CURRENT_TIMESTAMP(6), completed_at=NULL
+            WHERE id=%s AND sync_status=%s
+            """,
+            (
+                attempt_token,
+                lease_seconds,
+                1 if reclaim else 0,
+                frontier_id,
+                status,
+            ),
+        )
+        if cursor.rowcount != 1:
+            raise SourceSyncTaskLeaseConflictError(
+                f"任务 {frontier_id} 在领取期间状态已变化"
+            )
+        return ("claimed", frontier_id, status, attempt_token)
 
     def renew_source_sync_task_lease(
         self,

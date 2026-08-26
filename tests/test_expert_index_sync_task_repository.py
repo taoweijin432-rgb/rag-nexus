@@ -346,9 +346,16 @@ def test_get_source_sync_task_returns_none_when_missing(
 def test_claim_source_sync_tasks_uses_skip_locked_and_fences_each_attempt(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """pending 和过期 processing 应获得不同新 token，且仅后者增加重试计数。"""
+    """pending 和过期 processing 应获得不同新 token，且仅后者增加重试计数。
+
+    limit=10：第一条 801 为 pending（首次 attempt，retry_count 不增加），
+    第二条 802 为过期 processing（逐条严格 FIFO 第二轮，retry_count += 1），
+    第三轮 find 返回空 → 停止。
+    """
 
     lease_until = datetime(2026, 8, 21, 10, 5, tzinfo=timezone.utc)
+    past_lease = datetime(2026, 8, 21, 9, 0, tzinfo=timezone.utc)
+    now = datetime(2026, 8, 21, 10, 0, tzinfo=timezone.utc)
     claimed_rows = [
         _task_row(
             id=801,
@@ -366,14 +373,35 @@ def test_claim_source_sync_tasks_uses_skip_locked_and_fences_each_attempt(
         ),
     ]
     cursor = RecordingCursor(
-        alls=[
-            [
-                {"id": 801, "sync_status": "pending"},
-                {"id": 802, "sync_status": "processing"},
-            ],
-            claimed_rows,
+        ones=[
+            # 第一轮 find 801。
+            {"id": 801},
+            # 第一轮 lock 801（pending，next_retry_at 为空，不走退避）。
+            {
+                "id": 801,
+                "sync_status": "pending",
+                "next_retry_at": None,
+                "lease_until": None,
+                "attempt_token": None,
+            },
+            # 第二轮 find 802。
+            {"id": 802},
+            # 第二轮 lock 802（processing，lease 已过期，需 CURRENT_TIMESTAMP 比较）。
+            {
+                "id": 802,
+                "sync_status": "processing",
+                "next_retry_at": None,
+                "lease_until": past_lease,
+                "attempt_token": "attempt-802-old",
+            },
+            # 第二轮 CURRENT_TIMESTAMP。
+            {"now": now},
+            # 第三轮 find 返回空 → 停止。
+            None,
         ],
-        rowcounts=[0, 1, 1, 0],
+        alls=[claimed_rows],
+        # 执行序：find1 lock1 UPDATE1 find2 lock2 CURRENT_TIMESTAMP UPDATE2 find3 re-read
+        rowcounts=[0, 0, 1, 0, 0, 0, 1, 0, 0],
     )
     connection = RecordingConnection(cursor)
     _patch_connection(monkeypatch, connection)
@@ -388,15 +416,22 @@ def test_claim_source_sync_tasks_uses_skip_locked_and_fences_each_attempt(
         lease_seconds=120,
     )
 
-    claim_sql, claim_params = cursor.executed[0]
-    first_update_sql, first_update_params = cursor.executed[1]
-    second_update_params = cursor.executed[2][1]
-    assert "FOR UPDATE SKIP LOCKED" in claim_sql
-    assert "batch_id=%s AND source_table=%s" in claim_sql
-    assert "lease_until <= CURRENT_TIMESTAMP(6)" in claim_sql
-    assert claim_params == (701, "experts_work_experience", 10)
+    # 第一轮 find：定位 id > 0 之后最早非终态队头。
+    frontier_sql = cursor.executed[0][0]
+    assert "sync_status NOT IN ('success', 'dead')" in frontier_sql
+    assert "ORDER BY id ASC" in frontier_sql
+    assert "LIMIT 1" in frontier_sql
+    assert cursor.executed[0][1] == (701, "experts_work_experience", 0)
+    # 第一轮 lock：按 id 锁定。
+    lock_sql = cursor.executed[1][0]
+    assert "FOR UPDATE SKIP LOCKED" in lock_sql
+    assert cursor.executed[1][1] == (801,)
+    # 第一轮 UPDATE：801 pending，retry_count 不增加。
+    first_update_sql, first_update_params = cursor.executed[2]
     assert "retry_count=retry_count+%s" in first_update_sql
     assert first_update_params == ("attempt-801-new", 120, 0, 801, "pending")
+    # 第二轮 UPDATE：802 过期 processing，retry_count += 1。
+    second_update_params = cursor.executed[6][1]
     assert second_update_params == (
         "attempt-802-new",
         120,
@@ -412,9 +447,9 @@ def test_claim_source_sync_tasks_uses_skip_locked_and_fences_each_attempt(
 def test_claim_source_sync_tasks_returns_empty_without_updates(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """没有可领取任务时应提交短事务并返回空结果。"""
+    """没有非终态任务（队头查询返回空）时应提交短事务并返回空结果。"""
 
-    cursor = RecordingCursor(alls=[[]])
+    cursor = RecordingCursor(one=None)
     connection = RecordingConnection(cursor)
     _patch_connection(monkeypatch, connection)
 
@@ -433,15 +468,37 @@ def test_claim_source_sync_tasks_returns_empty_without_updates(
 def test_claim_source_sync_tasks_rejects_duplicate_generated_tokens(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """同一领取事务内 token 重复时必须在更新任务前回滚。"""
+    """同一领取事务内 token 重复时必须在回读前回滚。
+
+    limit=2：两条均 pending，均生成同一 token；逐条严格 FIFO 第二轮也需 token。
+    """
 
     cursor = RecordingCursor(
-        alls=[
-            [
-                {"id": 801, "sync_status": "pending"},
-                {"id": 802, "sync_status": "pending"},
-            ]
-        ]
+        ones=[
+            # 第一轮 find 801。
+            {"id": 801},
+            # 第一轮 lock 801（pending，next_retry_at 为空，不走退避）。
+            {
+                "id": 801,
+                "sync_status": "pending",
+                "next_retry_at": None,
+                "lease_until": None,
+                "attempt_token": None,
+            },
+            # 第二轮 find 802。
+            {"id": 802},
+            # 第二轮 lock 802（pending，next_retry_at 为空）。
+            {
+                "id": 802,
+                "sync_status": "pending",
+                "next_retry_at": None,
+                "lease_until": None,
+                "attempt_token": None,
+            },
+        ],
+        alls=[],
+        # 执行序：find1 lock1 UPDATE1 find2 lock2 UPDATE2（回读前触发重复检测）。
+        rowcounts=[0, 0, 1, 0, 0, 1],
     )
     connection = RecordingConnection(cursor)
     _patch_connection(monkeypatch, connection)
@@ -454,7 +511,8 @@ def test_claim_source_sync_tasks_rejects_duplicate_generated_tokens(
             lease_seconds=60,
         )
 
-    assert len(cursor.executed) == 1
+    # 逐条严格 FIFO 两轮：每轮 find + lock + UPDATE，重复检测发生在回读之前。
+    assert len(cursor.executed) == 6
     assert connection.rollback_count == 1
 
 
@@ -1005,9 +1063,23 @@ def test_mark_source_sync_task_retryable_rejects_stale_token_rolls_back(
 def test_claim_source_sync_tasks_skips_pending_with_future_next_retry(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """设置了未来 next_retry_at 的 pending 不应被 claim 领取。"""
+    """队头 pending 但 next_retry_at 未到：返回空，不领取更晚任务。"""
 
-    cursor = RecordingCursor(alls=[[]])
+    future = datetime(2026, 8, 21, 12, 0, tzinfo=timezone.utc)
+    now = datetime(2026, 8, 21, 10, 0, tzinfo=timezone.utc)
+    cursor = RecordingCursor(
+        ones=[
+            {"id": 801},
+            {
+                "id": 801,
+                "sync_status": "pending",
+                "next_retry_at": future,
+                "lease_until": None,
+                "attempt_token": None,
+            },
+            {"now": now},
+        ],
+    )
     connection = RecordingConnection(cursor)
     _patch_connection(monkeypatch, connection)
 
@@ -1019,8 +1091,8 @@ def test_claim_source_sync_tasks_skips_pending_with_future_next_retry(
     )
 
     assert tasks == ()
-    claim_sql = cursor.executed[0][0]
-    assert "next_retry_at IS NULL OR next_retry_at <= CURRENT_TIMESTAMP(6)" in claim_sql
+    # 队头定位 + 锁定 + SELECT CURRENT_TIMESTAMP(6) 比较退避。
+    assert len(cursor.executed) == 3
     assert connection.commit_count == 1
 
 
@@ -1037,8 +1109,23 @@ def test_claim_source_sync_tasks_pending_without_next_retry_still_claimable(
         lease_until=lease_until,
     )
     cursor = RecordingCursor(
-        alls=[[{"id": 801, "sync_status": "pending"}], [claimed]],
-        rowcounts=[0, 1, 0],
+        ones=[
+            # 第一轮 find 801。
+            {"id": 801},
+            # 第一轮 lock 801（pending，next_retry_at 为空，不走退避）。
+            {
+                "id": 801,
+                "sync_status": "pending",
+                "next_retry_at": None,
+                "lease_until": None,
+                "attempt_token": None,
+            },
+            # 第二轮 find 返回空 → 停止。
+            None,
+        ],
+        alls=[[claimed]],
+        # 执行序：find1 lock1 UPDATE1 find2 re-read。
+        rowcounts=[0, 0, 1, 0, 0],
     )
     connection = RecordingConnection(cursor)
     _patch_connection(monkeypatch, connection)
@@ -1052,3 +1139,674 @@ def test_claim_source_sync_tasks_pending_without_next_retry_still_claimable(
 
     assert [task.task_id for task in tasks] == [801]
     assert connection.commit_count == 1
+
+
+# P5.7A：严格 head-of-line 语义专项测试。
+
+
+def test_claim_frontier_pending_not_due_returns_empty_skips_later_tasks(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """队头 pending 但 next_retry_at 未到：返回空，不领取更晚 pending 任务。"""
+
+    future = datetime(2026, 8, 21, 12, 0, tzinfo=timezone.utc)
+    now = datetime(2026, 8, 21, 10, 0, tzinfo=timezone.utc)
+    cursor = RecordingCursor(
+        ones=[
+            {"id": 5},
+            {
+                "id": 5,
+                "sync_status": "pending",
+                "next_retry_at": future,
+                "lease_until": None,
+                "attempt_token": None,
+            },
+            {"now": now},
+        ],
+    )
+    connection = RecordingConnection(cursor)
+    _patch_connection(monkeypatch, connection)
+
+    tasks = _repository().claim_source_sync_tasks(
+        701,
+        "experts",
+        limit=5,
+        lease_seconds=60,
+    )
+
+    assert tasks == ()
+    # 队头定位 + 锁定 + CURRENT_TIMESTAMP 比较退避，未发出 UPDATE。
+    assert len(cursor.executed) == 3
+    assert connection.commit_count == 1
+    assert connection.rollback_count == 0
+
+
+def test_claim_frontier_processing_lease_valid_returns_empty(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """队头 processing 且 lease 未过期：返回空，不领取更晚任务。"""
+
+    future_lease = datetime(2026, 8, 21, 12, 0, tzinfo=timezone.utc)
+    now = datetime(2026, 8, 21, 10, 0, tzinfo=timezone.utc)
+    cursor = RecordingCursor(
+        ones=[
+            {"id": 5},
+            {
+                "id": 5,
+                "sync_status": "processing",
+                "next_retry_at": None,
+                "lease_until": future_lease,
+                "attempt_token": "attempt-5",
+            },
+            {"now": now},
+        ],
+    )
+    connection = RecordingConnection(cursor)
+    _patch_connection(monkeypatch, connection)
+
+    tasks = _repository().claim_source_sync_tasks(
+        701,
+        "experts",
+        limit=3,
+        lease_seconds=60,
+    )
+
+    assert tasks == ()
+    assert len(cursor.executed) == 3
+    assert connection.commit_count == 1
+
+
+def test_claim_frontier_pending_due_claims_only_frontier(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """队头 pending 且 next_retry_at 已到：只领取该队头任务。"""
+
+    past_retry = datetime(2026, 8, 21, 9, 0, tzinfo=timezone.utc)
+    now = datetime(2026, 8, 21, 10, 0, tzinfo=timezone.utc)
+    claimed = _task_row(
+        id=5,
+        sync_status="processing",
+        attempt_token="attempt-5-new",
+        lease_until=datetime(2026, 8, 21, 10, 5, tzinfo=timezone.utc),
+    )
+    cursor = RecordingCursor(
+        ones=[
+            # 第一轮 find 5。
+            {"id": 5},
+            # 第一轮 lock 5（pending，next_retry_at 已到）。
+            {
+                "id": 5,
+                "sync_status": "pending",
+                "next_retry_at": past_retry,
+                "lease_until": None,
+                "attempt_token": None,
+            },
+            # 第一轮 CURRENT_TIMESTAMP。
+            {"now": now},
+            # 第二轮 find 返回空 → 停止。
+            None,
+        ],
+        alls=[[claimed]],
+        # 执行序：find1 lock1 CURRENT_TIMESTAMP UPDATE1 find2 re-read。
+        rowcounts=[0, 0, 0, 1, 0, 0],
+    )
+    connection = RecordingConnection(cursor)
+    _patch_connection(monkeypatch, connection)
+
+    tasks = _repository_with_tokens("attempt-5-new").claim_source_sync_tasks(
+        701,
+        "experts",
+        limit=3,
+        lease_seconds=120,
+    )
+
+    assert [task.task_id for task in tasks] == [5]
+    assert connection.commit_count == 1
+
+
+def test_claim_frontier_processing_expired_reclaims_frontier(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """队头 processing 且 lease 已过期：回收该队头，retry_count += 1。"""
+
+    past_lease = datetime(2026, 8, 21, 9, 0, tzinfo=timezone.utc)
+    now = datetime(2026, 8, 21, 10, 0, tzinfo=timezone.utc)
+    claimed = _task_row(
+        id=5,
+        sync_status="processing",
+        attempt_token="attempt-5-new",
+        lease_until=datetime(2026, 8, 21, 10, 5, tzinfo=timezone.utc),
+        retry_count=3,
+    )
+    cursor = RecordingCursor(
+        ones=[
+            {"id": 5},
+            {
+                "id": 5,
+                "sync_status": "processing",
+                "next_retry_at": None,
+                "lease_until": past_lease,
+                "attempt_token": "attempt-5-old",
+            },
+            {"now": now},
+        ],
+        alls=[[claimed]],
+        rowcounts=[0, 0, 0, 1, 0],
+    )
+    connection = RecordingConnection(cursor)
+    _patch_connection(monkeypatch, connection)
+
+    tasks = _repository_with_tokens("attempt-5-new").claim_source_sync_tasks(
+        701,
+        "experts",
+        limit=1,
+        lease_seconds=120,
+    )
+
+    assert [task.task_id for task in tasks] == [5]
+    # 回收路径：retry_count += 1。
+    _frontier_update_sql, frontier_update_params = cursor.executed[3]
+    assert frontier_update_params == ("attempt-5-new", 120, 1, 5, "processing")
+    assert connection.commit_count == 1
+
+
+def test_claim_frontier_success_allows_next_frontier(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """队头 success 不作为待领取队头：锁定后发现 success，越过继续扫描。
+
+    limit=1：迭代一轮越过 success 后循环结束，返回空（需重新调用 claim 继续
+    扫描更晚 task）。success 不被改变。
+    """
+
+    cursor = RecordingCursor(
+        ones=[
+            # 第一轮 find 5。
+            {"id": 5},
+            # 第一轮 lock 5 发现 success → 越过。
+            {
+                "id": 5,
+                "sync_status": "success",
+                "next_retry_at": None,
+                "lease_until": None,
+                "attempt_token": None,
+            },
+        ],
+    )
+    connection = RecordingConnection(cursor)
+    _patch_connection(monkeypatch, connection)
+
+    tasks = _repository_with_tokens("attempt-5-new").claim_source_sync_tasks(
+        701,
+        "experts",
+        limit=1,
+        lease_seconds=60,
+    )
+
+    # 队头 5 是 success：find + lock 发现 success → 越过，循环结束返回空。
+    assert tasks == ()
+    assert len(cursor.executed) == 2
+    assert connection.commit_count == 1
+
+
+def test_claim_frontier_dead_allows_next_frontier(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """队头 dead 不作为待领取队头：锁定后发现 dead，返回空，不改变 dead。"""
+
+    cursor = RecordingCursor(
+        ones=[
+            {"id": 5},
+            {
+                "id": 5,
+                "sync_status": "dead",
+                "next_retry_at": None,
+                "lease_until": None,
+                "attempt_token": None,
+            },
+        ],
+    )
+    connection = RecordingConnection(cursor)
+    _patch_connection(monkeypatch, connection)
+
+    tasks = _repository().claim_source_sync_tasks(
+        701,
+        "experts",
+        limit=1,
+        lease_seconds=60,
+    )
+
+    assert tasks == ()
+    # 未发出 UPDATE，dead 未被改变。
+    assert len(cursor.executed) == 2
+    assert connection.commit_count == 1
+
+
+def test_claim_frontier_failed_raises_stage_conflict(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """队头 failed/未知状态：fail-closed 抛 SourceSyncTaskStageConflictError。"""
+
+    cursor = RecordingCursor(
+        ones=[
+            {"id": 5},
+            {
+                "id": 5,
+                "sync_status": "failed",
+                "next_retry_at": None,
+                "lease_until": None,
+                "attempt_token": None,
+            },
+        ],
+    )
+    connection = RecordingConnection(cursor)
+    _patch_connection(monkeypatch, connection)
+
+    with pytest.raises(SourceSyncTaskStageConflictError, match="不能跳过该队头任务"):
+        _repository().claim_source_sync_tasks(
+            701,
+            "experts",
+            limit=1,
+            lease_seconds=60,
+        )
+
+    assert connection.rollback_count == 1
+
+
+def test_claim_frontier_retrying_raises_stage_conflict(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """队头 retrying 状态：fail-closed，不越过队头。"""
+
+    cursor = RecordingCursor(
+        ones=[
+            {"id": 5},
+            {
+                "id": 5,
+                "sync_status": "retrying",
+                "next_retry_at": None,
+                "lease_until": None,
+                "attempt_token": None,
+            },
+        ],
+    )
+    connection = RecordingConnection(cursor)
+    _patch_connection(monkeypatch, connection)
+
+    with pytest.raises(SourceSyncTaskStageConflictError, match="不能跳过该队头任务"):
+        _repository().claim_source_sync_tasks(
+            701,
+            "experts",
+            limit=1,
+            lease_seconds=60,
+        )
+
+    assert connection.rollback_count == 1
+
+
+def test_claim_frontier_locked_by_another_worker_returns_empty(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """队头被其他 worker 锁定（FOR UPDATE SKIP LOCKED 返回空）：不跳到更晚任务。"""
+
+    cursor = RecordingCursor(
+        ones=[{"id": 5}, None],
+    )
+    connection = RecordingConnection(cursor)
+    _patch_connection(monkeypatch, connection)
+
+    tasks = _repository().claim_source_sync_tasks(
+        701,
+        "experts",
+        limit=1,
+        lease_seconds=60,
+    )
+
+    assert tasks == ()
+    # 队头定位 + 锁定（SKIP LOCKED 返回 None），未越过队头。
+    assert len(cursor.executed) == 2
+    assert connection.commit_count == 1
+
+
+def test_claim_two_concurrent_do_not_claim_same_frontier(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """两个并发 claim 不能领取同一 Task：SKIP LOCKED 让第二个看到队头被锁。
+
+    本测验证并发语义：第二个 claim 的锁查询返回 None，不领取，也不领取更晚任务。
+    """
+
+    cursor = RecordingCursor(
+        ones=[{"id": 5}, None],
+    )
+    connection = RecordingConnection(cursor)
+    _patch_connection(monkeypatch, connection)
+
+    tasks = _repository().claim_source_sync_tasks(
+        701,
+        "experts",
+        limit=1,
+        lease_seconds=60,
+    )
+
+    assert tasks == ()
+    assert len(cursor.executed) == 2
+    assert connection.commit_count == 1
+    assert connection.rollback_count == 0
+
+
+# P5.7A 补充：limit>1 严格 FIFO 专项测试。
+
+
+def test_claim_fifo_first_claimable_second_backoff_third_claimable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """limit=3：第一条可领、第二条退避未到、第三条可领：只领取第一条。
+
+    逐条严格 FIFO 在第二条遇到退避未到立即停止，不跳到第三条。
+    """
+
+    now = datetime(2026, 8, 21, 10, 0, tzinfo=timezone.utc)
+    future = datetime(2026, 8, 21, 12, 0, tzinfo=timezone.utc)
+    claimed_1 = _task_row(
+        id=1,
+        sync_status="processing",
+        attempt_token="attempt-1-new",
+        lease_until=datetime(2026, 8, 21, 10, 5, tzinfo=timezone.utc),
+    )
+    cursor = RecordingCursor(
+        ones=[
+            # 第一轮 find 1。
+            {"id": 1},
+            # 第一轮 lock 1（pending，next_retry_at 为空）。
+            {
+                "id": 1,
+                "sync_status": "pending",
+                "next_retry_at": None,
+                "lease_until": None,
+                "attempt_token": None,
+            },
+            # 第二轮 find 2。
+            {"id": 2},
+            # 第二轮 lock 2（pending，next_retry_at 未到）。
+            {
+                "id": 2,
+                "sync_status": "pending",
+                "next_retry_at": future,
+                "lease_until": None,
+                "attempt_token": None,
+            },
+            # 第二轮 CURRENT_TIMESTAMP（退避未到 → 停止）。
+            {"now": now},
+        ],
+        alls=[[claimed_1]],
+        # 执行序：find1 lock1 UPDATE1 find2 lock2 CURRENT_TIMESTAMP re-read。
+        rowcounts=[0, 0, 1, 0, 0, 0, 0],
+    )
+    connection = RecordingConnection(cursor)
+    _patch_connection(monkeypatch, connection)
+
+    tasks = _repository_with_tokens("attempt-1-new").claim_source_sync_tasks(
+        701,
+        "experts",
+        limit=3,
+        lease_seconds=60,
+    )
+
+    assert [task.task_id for task in tasks] == [1]
+    assert connection.commit_count == 1
+
+
+def test_claim_fifo_first_two_claimable_third_processing_lease_valid(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """limit=3：前两条可领、第三条 processing lease 未过期：只领取前两条。
+
+    逐条严格 FIFO 在第三条遇到 processing lease 未过期立即停止，不跳到第四条。
+    """
+
+    now = datetime(2026, 8, 21, 10, 0, tzinfo=timezone.utc)
+    future_lease = datetime(2026, 8, 21, 12, 0, tzinfo=timezone.utc)
+    claimed_rows = [
+        _task_row(
+            id=1,
+            sync_status="processing",
+            attempt_token="attempt-1-new",
+            lease_until=datetime(2026, 8, 21, 10, 5, tzinfo=timezone.utc),
+        ),
+        _task_row(
+            id=2,
+            source_record_id=2,
+            sync_status="processing",
+            attempt_token="attempt-2-new",
+            lease_until=datetime(2026, 8, 21, 10, 5, tzinfo=timezone.utc),
+        ),
+    ]
+    cursor = RecordingCursor(
+        ones=[
+            # 第一轮 find 1。
+            {"id": 1},
+            # 第一轮 lock 1（pending）。
+            {
+                "id": 1,
+                "sync_status": "pending",
+                "next_retry_at": None,
+                "lease_until": None,
+                "attempt_token": None,
+            },
+            # 第二轮 find 2。
+            {"id": 2},
+            # 第二轮 lock 2（pending）。
+            {
+                "id": 2,
+                "sync_status": "pending",
+                "next_retry_at": None,
+                "lease_until": None,
+                "attempt_token": None,
+            },
+            # 第三轮 find 3。
+            {"id": 3},
+            # 第三轮 lock 3（processing，lease 未过期）。
+            {
+                "id": 3,
+                "sync_status": "processing",
+                "next_retry_at": None,
+                "lease_until": future_lease,
+                "attempt_token": "attempt-3-old",
+            },
+            # 第三轮 CURRENT_TIMESTAMP（lease 未过期 → 停止）。
+            {"now": now},
+        ],
+        alls=[claimed_rows],
+        # 执行序：find1 lock1 UPDATE1 find2 lock2 UPDATE2 find3 lock3 CURRENT_TIMESTAMP re-read。
+        rowcounts=[0, 0, 1, 0, 0, 1, 0, 0, 0, 0],
+    )
+    connection = RecordingConnection(cursor)
+    _patch_connection(monkeypatch, connection)
+
+    tasks = _repository_with_tokens(
+        "attempt-1-new",
+        "attempt-2-new",
+    ).claim_source_sync_tasks(
+        701,
+        "experts",
+        limit=3,
+        lease_seconds=60,
+    )
+
+    assert [task.task_id for task in tasks] == [1, 2]
+    assert connection.commit_count == 1
+
+
+def test_claim_fifo_three_consecutive_claimable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """limit=3：连续三条均可领：按 id 顺序领取三条。"""
+
+    claimed_rows = [
+        _task_row(
+            id=1,
+            sync_status="processing",
+            attempt_token="attempt-1-new",
+            lease_until=datetime(2026, 8, 21, 10, 5, tzinfo=timezone.utc),
+        ),
+        _task_row(
+            id=2,
+            source_record_id=2,
+            sync_status="processing",
+            attempt_token="attempt-2-new",
+            lease_until=datetime(2026, 8, 21, 10, 5, tzinfo=timezone.utc),
+        ),
+        _task_row(
+            id=3,
+            source_record_id=3,
+            sync_status="processing",
+            attempt_token="attempt-3-new",
+            lease_until=datetime(2026, 8, 21, 10, 5, tzinfo=timezone.utc),
+        ),
+    ]
+    cursor = RecordingCursor(
+        ones=[
+            # 第一轮 find 1 + lock 1（pending）。
+            {"id": 1},
+            {
+                "id": 1,
+                "sync_status": "pending",
+                "next_retry_at": None,
+                "lease_until": None,
+                "attempt_token": None,
+            },
+            # 第二轮 find 2 + lock 2（pending）。
+            {"id": 2},
+            {
+                "id": 2,
+                "sync_status": "pending",
+                "next_retry_at": None,
+                "lease_until": None,
+                "attempt_token": None,
+            },
+            # 第三轮 find 3 + lock 3（pending）。
+            {"id": 3},
+            {
+                "id": 3,
+                "sync_status": "pending",
+                "next_retry_at": None,
+                "lease_until": None,
+                "attempt_token": None,
+            },
+            # 第四轮 find 返回空 → 停止。
+            None,
+        ],
+        alls=[claimed_rows],
+        # 执行序：find1 lock1 UPDATE1 find2 lock2 UPDATE2 find3 lock3 UPDATE3 find4 re-read。
+        rowcounts=[0, 0, 1, 0, 0, 1, 0, 0, 1, 0, 0],
+    )
+    connection = RecordingConnection(cursor)
+    _patch_connection(monkeypatch, connection)
+
+    tasks = _repository_with_tokens(
+        "attempt-1-new",
+        "attempt-2-new",
+        "attempt-3-new",
+    ).claim_source_sync_tasks(
+        701,
+        "experts",
+        limit=3,
+        lease_seconds=60,
+    )
+
+    assert [task.task_id for task in tasks] == [1, 2, 3]
+    assert connection.commit_count == 1
+
+
+def test_claim_fifo_stops_when_later_task_locked_by_other(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """后续某条被其他事务锁定：停止，不跳过。
+
+    limit=3：第一条可领，第二条 find 后 FOR UPDATE SKIP LOCKED 返回 None → 停止。
+    """
+
+    claimed_1 = _task_row(
+        id=1,
+        sync_status="processing",
+        attempt_token="attempt-1-new",
+        lease_until=datetime(2026, 8, 21, 10, 5, tzinfo=timezone.utc),
+    )
+    cursor = RecordingCursor(
+        ones=[
+            # 第一轮 find 1 + lock 1（pending）。
+            {"id": 1},
+            {
+                "id": 1,
+                "sync_status": "pending",
+                "next_retry_at": None,
+                "lease_until": None,
+                "attempt_token": None,
+            },
+            # 第二轮 find 2，但 lock 2 返回 None（被其他事务锁定）。
+            {"id": 2},
+            None,
+        ],
+        alls=[[claimed_1]],
+        # 执行序：find1 lock1 UPDATE1 find2 lock2(None) re-read。
+        rowcounts=[0, 0, 1, 0, 0, 0],
+    )
+    connection = RecordingConnection(cursor)
+    _patch_connection(monkeypatch, connection)
+
+    tasks = _repository_with_tokens("attempt-1-new").claim_source_sync_tasks(
+        701,
+        "experts",
+        limit=3,
+        lease_seconds=60,
+    )
+
+    assert [task.task_id for task in tasks] == [1]
+    assert connection.commit_count == 1
+
+
+def test_claim_fifo_non_frontier_failed_raises_stage_conflict(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """非队头位置的 failed/retrying/未知状态仍 fail-closed。
+
+    limit=3：第一条可领，第二条 find + lock 后发现 failed → 抛 StageConflictError。
+    """
+
+    cursor = RecordingCursor(
+        ones=[
+            # 第一轮 find 1 + lock 1（pending）。
+            {"id": 1},
+            {
+                "id": 1,
+                "sync_status": "pending",
+                "next_retry_at": None,
+                "lease_until": None,
+                "attempt_token": None,
+            },
+            # 第二轮 find 2 + lock 2 发现 failed。
+            {"id": 2},
+            {
+                "id": 2,
+                "sync_status": "failed",
+                "next_retry_at": None,
+                "lease_until": None,
+                "attempt_token": None,
+            },
+        ],
+        # 执行序：find1 lock1 UPDATE1 find2 lock2（拋异常前）。
+        rowcounts=[0, 0, 1, 0, 0],
+    )
+    connection = RecordingConnection(cursor)
+    _patch_connection(monkeypatch, connection)
+
+    with pytest.raises(SourceSyncTaskStageConflictError, match="不能跳过该队头任务"):
+        _repository_with_tokens("attempt-1-new").claim_source_sync_tasks(
+            701,
+            "experts",
+            limit=3,
+            lease_seconds=60,
+        )
+
+    assert connection.rollback_count == 1
