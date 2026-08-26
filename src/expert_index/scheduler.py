@@ -12,6 +12,7 @@ from collections.abc import Iterable
 from dataclasses import dataclass
 
 from .models import CHECKPOINT_SOURCE_TABLES
+from .observability import IncrementalMetrics
 from .scanner import INCREMENTAL_SOURCE_TABLE_ORDER
 from .source_batch_coordinator import SourceBatchRunResult
 
@@ -79,12 +80,20 @@ class IncrementalRoundResult:
 class IncrementalRoundScheduler:
     """执行一次有限来源计划，不提供后台循环或并发 Worker。"""
 
-    def __init__(self, source_batch_coordinator) -> None:
-        """注入已配置的单来源协调器，调度器不自行创建数据库依赖。"""
+    def __init__(
+        self,
+        source_batch_coordinator,
+        *,
+        metrics: IncrementalMetrics | None = None,
+    ) -> None:
+        """注入单来源协调器和可选的进程内指标记录器。"""
 
         if not callable(getattr(source_batch_coordinator, "run_claimed_source_batch", None)):
             raise TypeError("source_batch_coordinator 缺少 run_claimed_source_batch")
         self._coordinator = source_batch_coordinator
+        if metrics is not None and not isinstance(metrics, IncrementalMetrics):
+            raise TypeError("metrics 必须是 IncrementalMetrics 或 None")
+        self._metrics = metrics
 
     def run_once(
         self,
@@ -118,7 +127,10 @@ class IncrementalRoundScheduler:
                 # 不暴露数据库/来源正文；异常类名足够用于聚合和后续诊断。
                 outcome = _failed_source_result(plan, type(error).__name__)
             outcomes.append(outcome)
-        return _summarize(outcomes)
+        result = _summarize(outcomes)
+        if self._metrics is not None:
+            self._metrics.record_round(result)
+        return result
 
 
 def _failed_source_result(
