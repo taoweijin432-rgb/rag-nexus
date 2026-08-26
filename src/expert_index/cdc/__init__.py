@@ -48,6 +48,11 @@ from .replay import (
     replay_batch,
     replay_next_batch,
 )
+from .task_processor import (
+    CdcDeleteTaskProcessor,
+    CdcDeleteTaskRepositoryPort,
+    CdcHandoffOrchestratorPort,
+)
 
 __all__ = [
     "CANAL_DESTINATION",
@@ -71,7 +76,10 @@ __all__ = [
     "CdcBatchReceiveResult",
     "CdcBatchReceiver",
     "CdcDeleteSourcePort",
+    "CdcDeleteTaskProcessor",
+    "CdcDeleteTaskRepositoryPort",
     "CdcEventIdentityProvider",
+    "CdcHandoffOrchestratorPort",
     "CdcIngestError",
     "CdcPersistenceConflictError",
     "CdcTaskPlan",

@@ -31,7 +31,9 @@
   :class:`ContractConsumerCore`（**禁止 None**），Eligibility 规则只有一处实现；
 - ``ScopeConsumer(core, state_port=vector_service, receipt_sink=...)``：P5.2 范围收敛；
 - :class:`HandoffOrchestrator`：P5.3B 编排闭环（只接 ``validated`` 主路径，
-  ``contract_ready``/``handed_off`` 仅供崩溃恢复）。
+  ``contract_ready``/``handed_off`` 仅供崩溃恢复）；
+- :class:`CdcDeleteTaskProcessor`：P7.6 复用同一 Task Repository、Source、
+  ChunkFactory 和 HandoffOrchestrator 处理已领取的 CDC DELETE Task。
 
 Receipt sink 是一个把 :class:`ScopeHandoffReceipt` 构造器适配为
 ``make_receipt(**kwargs)`` 的薄包装，只做 ``impact_scope`` 类型校验与构造，不做任何
@@ -42,13 +44,14 @@ Receipt sink 是一个把 :class:`ScopeHandoffReceipt` 构造器适配为
 - 调用 ``vector_service.repository.initialize()`` 或任何 Milvus/Embedding 实际连接；
 - 启动 Worker / 轮询 / checkpoint 推进（属 P5.7）；
 - 复制 Eligibility / 三 Hash / stale 计算等下游业务逻辑；
-- 引入 V15 Work Item/Batch、CheckpointManager 或物理删除。
+- 引入 V15 Work Item/Batch、CheckpointManager 或向量物理删除。
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 
+from .cdc.task_processor import CdcDeleteTaskProcessor
 from .chunk_builder import ChunkFactory
 from .config import Settings
 from .handoff import ScopeHandoffBuilder, ScopeHandoffReceipt
@@ -77,6 +80,10 @@ class IncrementalHandoffRuntime:
        后进程中断），由 :meth:`HandoffOrchestrator.process` 从已有 Artifact 重建
        Request，不重新调用 Coordinator/Builder。
 
+    已领取的 CDC DELETE Task 调用
+    :meth:`CdcDeleteTaskProcessor.process_claimed`，由它复用同一 Handoff
+    编排器；不经过 Poll 的 ``PreparationCoordinator``。
+
     本结构不暴露任何后台入口、不轮询、不认领任务、不推进 checkpoint。
     """
 
@@ -87,6 +94,7 @@ class IncrementalHandoffRuntime:
     builder: ScopeHandoffBuilder
     preparation_coordinator: PreparationCoordinator
     orchestrator: HandoffOrchestrator
+    cdc_delete_processor: CdcDeleteTaskProcessor
     # 以下两项暴露供 P5.7 续租/重放/诊断使用；本层不直接调用它们的后台方法。
     vector_service: object
     scope_consumer: object
@@ -223,6 +231,18 @@ def build_incremental_handoff_runtime(
         retry_delay_seconds=retry_delay_seconds,
     )
 
+    # 11) P7.6 CDC DELETE：复用同一 Handoff/P6 失败恢复，不提交 CDC Checkpoint，
+    #     也不调用 Canal ACK。
+    cdc_delete_processor = CdcDeleteTaskProcessor(
+        task_repository=task_repo,
+        source=source,
+        factory=chunk_factory,
+        orchestrator=orchestrator,
+        lease_seconds=settings.incremental_scan.lease_seconds,
+        max_attempts=max_attempts,
+        retry_delay_seconds=retry_delay_seconds,
+    )
+
     return IncrementalHandoffRuntime(
         source=source,
         chunk_factory=chunk_factory,
@@ -231,6 +251,7 @@ def build_incremental_handoff_runtime(
         builder=builder,
         preparation_coordinator=preparation_coordinator,
         orchestrator=orchestrator,
+        cdc_delete_processor=cdc_delete_processor,
         vector_service=vector_service,
         scope_consumer=scope_consumer,
     )

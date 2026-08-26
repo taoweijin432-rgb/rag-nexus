@@ -116,6 +116,7 @@ class TestFactoryGates:
 
 class TestAssemblyWiring:
     def test_assembles_all_components_without_connecting(self):
+        from expert_index.cdc import CdcDeleteTaskProcessor
         from expert_index.preparation_coordinator import PreparationCoordinator
 
         settings = _settings()
@@ -150,6 +151,18 @@ class TestAssemblyWiring:
         assert runtime.orchestrator._consumer is runtime.scope_consumer
         assert runtime.orchestrator._max_attempts == 3
         assert runtime.orchestrator._retry_delay_seconds == 45
+        # CDC DELETE 复用同一份 Task、Source、ChunkFactory 与 Handoff 编排依赖。
+        assert isinstance(runtime.cdc_delete_processor, CdcDeleteTaskProcessor)
+        assert runtime.cdc_delete_processor._task_repository is runtime.task_repo
+        assert runtime.cdc_delete_processor._source is runtime.source
+        assert runtime.cdc_delete_processor._factory is runtime.chunk_factory
+        assert runtime.cdc_delete_processor._orchestrator is runtime.orchestrator
+        assert (
+            runtime.cdc_delete_processor._lease_seconds
+            == settings.incremental_scan.lease_seconds
+        )
+        assert runtime.cdc_delete_processor._max_attempts == 3
+        assert runtime.cdc_delete_processor._retry_delay_seconds == 45
 
     def test_eligibility_injected_non_none(self):
         # ContractConsumerCore 必须注入正式 Eligibility，process_contracts 不能因

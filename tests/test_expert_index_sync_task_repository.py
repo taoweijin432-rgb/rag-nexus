@@ -343,6 +343,49 @@ def test_get_source_sync_task_returns_none_when_missing(
     assert connection.closed is True
 
 
+def test_list_cdc_expert_delete_ids_reads_only_matching_batch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """P7.6 应从 Index Task 获取同批专家删除集合并校验双 ID 一致。"""
+
+    cursor = RecordingCursor(
+        alls=[
+            [
+                {"source_record_id": 101, "expert_id": 101},
+                {"source_record_id": 102, "expert_id": 102},
+            ]
+        ]
+    )
+    connection = RecordingConnection(cursor)
+    _patch_connection(monkeypatch, connection)
+
+    expert_ids = _repository().list_cdc_expert_delete_ids(701)
+
+    assert expert_ids == frozenset({101, 102})
+    sql, params = cursor.executed[0]
+    assert "event_source='cdc'" in sql
+    assert "source_table='experts'" in sql
+    assert "operation_type='delete'" in sql
+    assert params == (701,)
+    assert connection.commit_count == 0
+    assert connection.closed is True
+
+
+def test_list_cdc_expert_delete_ids_rejects_inconsistent_identity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """专家 DELETE 的 source_record_id/expert_id 不一致时必须停止。"""
+
+    cursor = RecordingCursor(alls=[[{"source_record_id": 101, "expert_id": 999}]])
+    connection = RecordingConnection(cursor)
+    _patch_connection(monkeypatch, connection)
+
+    with pytest.raises(RuntimeError, match="不一致"):
+        _repository().list_cdc_expert_delete_ids(701)
+
+    assert connection.closed is True
+
+
 def test_claim_source_sync_tasks_uses_skip_locked_and_fences_each_attempt(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

@@ -167,6 +167,41 @@ class MySQLSourceSyncTaskRepository:
         finally:
             connection.close()
 
+    def list_cdc_expert_delete_ids(self, batch_id: int) -> frozenset[int]:
+        """读取同一本地 Canal batch 中的专家物理删除 ID。
+
+        P7.6 使用该集合把同批子表 DELETE 提升为 expert scope。方法只读取 Index Task
+        身份字段，不读取 Source、Artifact、Payload 或向量，也不修改任务状态。
+        """
+
+        _validate_positive_integer("batch_id", batch_id)
+        connection = pymysql.connect(**self.config.as_kwargs(autocommit=True))
+        try:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    SELECT source_record_id, expert_id
+                    FROM expert_index_sync_task
+                    WHERE batch_id=%s AND event_source='cdc'
+                      AND source_table='experts' AND operation_type='delete'
+                    ORDER BY id ASC
+                    """,
+                    (batch_id,),
+                )
+                rows = cursor.fetchall()
+            expert_ids: set[int] = set()
+            for row in rows:
+                source_record_id = int(row["source_record_id"])
+                expert_id = row.get("expert_id")
+                if expert_id is None or int(expert_id) != source_record_id:
+                    raise RuntimeError("CDC 专家删除 Task 的 source_record_id/expert_id 不一致")
+                if source_record_id < 1:
+                    raise RuntimeError("CDC 专家删除 Task 包含非法专家 ID")
+                expert_ids.add(source_record_id)
+            return frozenset(expert_ids)
+        finally:
+            connection.close()
+
     def claim_source_sync_tasks(
         self,
         batch_id: int,
