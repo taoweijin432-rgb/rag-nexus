@@ -1,14 +1,20 @@
 """P4.8 单任务 Preparation Dispatcher 测试。
 
 覆盖：四种 scope 路由、education→profile、task_id/batch_id/data_version 注入、
-当前事实只读一次且仅调用目标 Handler、无效任务/token/lease 异常向上传播、
+当前事实只读一次且仅调用目标 Handler、无效任务/token 异常向上传播、
 父删除及空 desired 不被改写、策略版本校验、无任务状态/checkpoint 写入。
+
+P4 验收修复后 Dispatcher 不再判断 ``lease_until``：真正的 lease 有效性由外层
+:class:`PreparationCoordinator` 调用 Repository 续租以 Index MySQL
+``CURRENT_TIMESTAMP(6)`` + ``attempt_token`` + rowcount fencing 权威判定。
+故本文件不再测试 lease 过期 / naive now / 非 datetime now（这些属 Coordinator 职责，
+见 ``tests/test_expert_index_preparation_coordinator.py``）。
 全部使用 Fake source + 真实 ChunkFactory（策略版本 1.3），不连接 MySQL/Milvus。
 """
 
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
@@ -26,17 +32,23 @@ from expert_index.models import (
     SourceSyncTask,
     impact_scope_from_target,
 )
-from expert_index.preparation_dispatcher import prepare_claimed_source_sync_task
+from expert_index.preparation_dispatcher import (
+    build_prepared_chunk_set,
+    prepare_claimed_source_sync_task,
+    read_scoped_facts,
+)
 from expert_index.source import ExpertNotFoundError
 from expert_index.validators import ChunkValidationError
 
 CREATED = datetime(2026, 8, 13, 15, 0, tzinfo=timezone.utc)
 UPDATED = datetime(2026, 8, 20, 10, 0, tzinfo=timezone.utc)
-NOW = datetime(2026, 8, 24, 12, 0, tzinfo=timezone.utc)
-LEASE_EXPIRY = NOW + timedelta(hours=1)
-EXPIRED_LEASE = NOW - timedelta(hours=1)
+# P4 验收修复后 Dispatcher 不再解读 lease_until；保留 LEASE_EXPIRY 仅供 _task 默认填充，
+# 任意非空 datetime 均可通过（真正的 lease 判定在 Coordinator + Repository）。
+LEASE_EXPIRY = datetime(2026, 8, 24, 13, 0, tzinfo=timezone.utc)
 TOKEN = "tok-claim-001"
 TASK_TS = datetime(2026, 8, 21, 9, 0, tzinfo=timezone.utc)
+# P4.3 把专家删除标记时间传到 Handler；语义上属来源事件时间，与 Dispatcher lease 无关。
+NOW_FALLBACK = datetime(2026, 8, 24, 12, 0, tzinfo=timezone.utc)
 DEDUPE = "a" * 64
 
 
@@ -166,9 +178,7 @@ class TestFourScopeRouting:
         source = _FakeSource(facts)
         task = _task(target_type="expert", source_table="experts",
                      source_record_id=880001)
-        result = prepare_claimed_source_sync_task(
-            task, TOKEN, source, _factory(), now=NOW,
-        )
+        result = prepare_claimed_source_sync_task(task, TOKEN, source, _factory())
         assert isinstance(result, PreparedChunkSet)
         assert result.impact_scope.scope_type == "expert"
         # 当前事实只读一次
@@ -186,9 +196,7 @@ class TestFourScopeRouting:
         source = _FakeSource(facts)
         task = _task(target_type="profile", source_table="experts",
                      source_record_id=880001)
-        result = prepare_claimed_source_sync_task(
-            task, TOKEN, source, _factory(), now=NOW,
-        )
+        result = prepare_claimed_source_sync_task(task, TOKEN, source, _factory())
         assert result.impact_scope.scope_type == "profile"
         assert all(c.chunk_type == "profile_summary" for c in result.desired_chunks)
         assert len(source.read_calls) == 1
@@ -202,9 +210,7 @@ class TestFourScopeRouting:
         source = _FakeSource(facts)
         task = _task(target_type="employment", source_table="experts_work_experience",
                      source_record_id=9201)
-        result = prepare_claimed_source_sync_task(
-            task, TOKEN, source, _factory(), now=NOW,
-        )
+        result = prepare_claimed_source_sync_task(task, TOKEN, source, _factory())
         assert result.impact_scope.scope_type == "employment"
         assert all(c.chunk_type == "employment" for c in result.desired_chunks)
         assert all(c.source_field_id == "9201" for c in result.desired_chunks)
@@ -219,9 +225,7 @@ class TestFourScopeRouting:
         source = _FakeSource(facts)
         task = _task(target_type="project", source_table="experts_project_experience",
                      source_record_id=9301)
-        result = prepare_claimed_source_sync_task(
-            task, TOKEN, source, _factory(), now=NOW,
-        )
+        result = prepare_claimed_source_sync_task(task, TOKEN, source, _factory())
         assert result.impact_scope.scope_type == "project"
         assert all(c.chunk_type == "project" for c in result.desired_chunks)
         assert all(c.source_field_id == "9301" for c in result.desired_chunks)
@@ -236,9 +240,7 @@ class TestFourScopeRouting:
         source = _FakeSource(facts)
         task = _task(target_type="education", source_table="experts_education_experience",
                      source_record_id=1)
-        result = prepare_claimed_source_sync_task(
-            task, TOKEN, source, _factory(), now=NOW,
-        )
+        result = prepare_claimed_source_sync_task(task, TOKEN, source, _factory())
         assert result.impact_scope.scope_type == "profile"
         assert all(c.chunk_type == "profile_summary" for c in result.desired_chunks)
         # 验证 mapping 已完成：request impact_scope 是 profile
@@ -302,7 +304,7 @@ class TestSingleHandlerDispatch:
         source = _FakeSource(facts)
         task = _task(target_type=target_type, source_table=source_table,
                      source_record_id=record_id)
-        prepare_claimed_source_sync_task(task, TOKEN, source, _factory(), now=NOW)
+        prepare_claimed_source_sync_task(task, TOKEN, source, _factory())
 
         assert calls[scope_type] == 1, f"应只调用 {scope_type} handler 一次"
         others = {k: v for k, v in calls.items() if k != scope_type}
@@ -311,17 +313,20 @@ class TestSingleHandlerDispatch:
 
 
 # ---------------------------------------------------------------------------
-# 无效任务 / token / lease：异常向上传播
+# 无效任务 / token：异常向上传播
+#
+# P4 验收修复后 Dispatcher 不再校验 lease_until（lease 有效性由 Coordinator + Repository
+# 以 MySQL CURRENT_TIMESTAMP(6) 权威判定），故不再测试 lease 过期 / naive now。
 # ---------------------------------------------------------------------------
 
 
-class TestInvalidTaskTokenLease:
+class TestInvalidTaskToken:
     def test_non_source_sync_task_rejected(self):
         with pytest.raises(TypeError, match="必须是 SourceSyncTask"):
             prepare_claimed_source_sync_task(
                 "not a task", TOKEN, _FakeSource(ScopedCurrentFacts(
                     scope=impact_scope_from_target(target_type="expert", expert_id=1),
-                    expert=_expert())), _factory(), now=NOW,
+                    expert=_expert())), _factory(),
             )
 
     def test_non_processing_status_rejected(self):
@@ -331,7 +336,7 @@ class TestInvalidTaskTokenLease:
             prepare_claimed_source_sync_task(
                 task, TOKEN, _FakeSource(ScopedCurrentFacts(
                     scope=impact_scope_from_target(target_type="expert", expert_id=880001),
-                    expert=_expert())), _factory(), now=NOW,
+                    expert=_expert())), _factory(),
             )
 
     def test_blank_token_rejected(self):
@@ -340,7 +345,7 @@ class TestInvalidTaskTokenLease:
             prepare_claimed_source_sync_task(
                 task, "   ", _FakeSource(ScopedCurrentFacts(
                     scope=impact_scope_from_target(target_type="expert", expert_id=880001),
-                    expert=_expert())), _factory(), now=NOW,
+                    expert=_expert())), _factory(),
             )
 
     def test_token_too_long_rejected(self):
@@ -349,7 +354,7 @@ class TestInvalidTaskTokenLease:
             prepare_claimed_source_sync_task(
                 task, "x" * 65, _FakeSource(ScopedCurrentFacts(
                     scope=impact_scope_from_target(target_type="expert", expert_id=880001),
-                    expert=_expert())), _factory(), now=NOW,
+                    expert=_expert())), _factory(),
             )
 
     def test_token_mismatch_rejected(self):
@@ -358,52 +363,8 @@ class TestInvalidTaskTokenLease:
             prepare_claimed_source_sync_task(
                 task, "wrong-token", _FakeSource(ScopedCurrentFacts(
                     scope=impact_scope_from_target(target_type="expert", expert_id=880001),
-                    expert=_expert())), _factory(), now=NOW,
-            )
-
-    def test_expired_lease_rejected(self):
-        task = _task(target_type="expert", source_table="experts",
-                     source_record_id=880001, lease_until=EXPIRED_LEASE)
-        with pytest.raises(ValueError, match="lease 已过期"):
-            prepare_claimed_source_sync_task(
-                task, TOKEN, _FakeSource(ScopedCurrentFacts(
-                    scope=impact_scope_from_target(target_type="expert", expert_id=880001),
-                    expert=_expert())), _factory(), now=NOW,
-            )
-
-    def test_lease_boundary_expired(self):
-        # lease_until == now 视为过期
-        task = _task(target_type="expert", source_table="experts",
-                     source_record_id=880001, lease_until=NOW)
-        with pytest.raises(ValueError, match="lease 已过期"):
-            prepare_claimed_source_sync_task(
-                task, TOKEN, _FakeSource(ScopedCurrentFacts(
-                    scope=impact_scope_from_target(target_type="expert", expert_id=880001),
-                    expert=_expert())), _factory(), now=NOW,
-            )
-
-    def test_naive_now_rejected_against_aware_lease(self):
-        task = _task(target_type="expert", source_table="experts",
-                     source_record_id=880001)
-        with pytest.raises(ValueError, match="时区感知"):
-            prepare_claimed_source_sync_task(
-                task, TOKEN, _FakeSource(ScopedCurrentFacts(
-                    scope=impact_scope_from_target(target_type="expert", expert_id=880001),
                     expert=_expert())), _factory(),
-                now=datetime(2026, 8, 24, 12, 0),  # noqa: DTZ001 - 故意 naive
             )
-
-    def test_default_now_uses_utc(self):
-        # 不传 now 时用 datetime.now(utc)；用足够远的未来 lease 确保真实 now 未过期
-        far_future_lease = datetime(2099, 1, 1, tzinfo=timezone.utc)
-        task = _task(target_type="expert", source_table="experts",
-                     source_record_id=880001, lease_until=far_future_lease)
-        source = _FakeSource(ScopedCurrentFacts(
-            scope=impact_scope_from_target(target_type="expert", expert_id=880001),
-            expert=_expert(), employments=(), projects=(), educations=(),
-        ))
-        result = prepare_claimed_source_sync_task(task, TOKEN, source, _factory())
-        assert result.impact_scope.scope_type == "expert"
 
 
 # ---------------------------------------------------------------------------
@@ -419,7 +380,7 @@ class TestPolicyVersion:
             prepare_claimed_source_sync_task(
                 task, TOKEN, _FakeSource(ScopedCurrentFacts(
                     scope=impact_scope_from_target(target_type="expert", expert_id=880001),
-                    expert=_expert())), _factory(), now=NOW,
+                    expert=_expert())), _factory(),
             )
 
     def test_mismatched_policy_version_rejected(self):
@@ -429,7 +390,7 @@ class TestPolicyVersion:
             prepare_claimed_source_sync_task(
                 task, TOKEN, _FakeSource(ScopedCurrentFacts(
                     scope=impact_scope_from_target(target_type="expert", expert_id=880001),
-                    expert=_expert())), _factory(), now=NOW,
+                    expert=_expert())), _factory(),
             )
 
     def test_uses_injected_factory_policy_not_constant(self):
@@ -444,7 +405,7 @@ class TestPolicyVersion:
             scope=impact_scope_from_target(target_type="expert", expert_id=880001),
             expert=_expert(), employments=(), projects=(), educations=(),
         ))
-        result = prepare_claimed_source_sync_task(task, TOKEN, source, custom_factory, now=NOW)
+        result = prepare_claimed_source_sync_task(task, TOKEN, source, custom_factory)
         assert result.impact_scope.scope_type == "expert"
 
         # 同一 task 用默认 Factory（policy 1.3）应被拒绝
@@ -452,7 +413,7 @@ class TestPolicyVersion:
             prepare_claimed_source_sync_task(task, TOKEN,
                 _FakeSource(ScopedCurrentFacts(
                     scope=impact_scope_from_target(target_type="expert", expert_id=880001),
-                    expert=_expert())), _factory(), now=NOW)
+                    expert=_expert())), _factory())
 
 
 # ---------------------------------------------------------------------------
@@ -469,7 +430,7 @@ class TestExceptionPropagation:
             prepare_claimed_source_sync_task(
                 task, TOKEN, _FakeSource(ScopedCurrentFacts(
                     scope=impact_scope_from_target(target_type="expert", expert_id=880001),
-                    expert=_expert())), _factory(), now=NOW,
+                    expert=_expert())), _factory(),
             )
 
     def test_source_exception_propagates(self):
@@ -477,7 +438,7 @@ class TestExceptionPropagation:
                      source_record_id=880001)
         source = _ThrowingSource(RuntimeError("source boom"))
         with pytest.raises(RuntimeError, match="source boom"):
-            prepare_claimed_source_sync_task(task, TOKEN, source, _factory(), now=NOW)
+            prepare_claimed_source_sync_task(task, TOKEN, source, _factory())
         assert source.read_calls == 1
 
     def test_scope_mismatch_rejected(self):
@@ -491,7 +452,7 @@ class TestExceptionPropagation:
         )
         source = _FakeSource(mismatch_facts)
         with pytest.raises(ValueError, match="scope 不一致"):
-            prepare_claimed_source_sync_task(task, TOKEN, source, _factory(), now=NOW)
+            prepare_claimed_source_sync_task(task, TOKEN, source, _factory())
 
     def test_handler_exception_propagates_unwrapped(self, monkeypatch):
         import expert_index.scope_handlers as sh
@@ -507,7 +468,7 @@ class TestExceptionPropagation:
             expert=_expert(), employments=(), projects=(), educations=(),
         ))
         with pytest.raises(ChunkValidationError, match="handler 故意失败"):
-            prepare_claimed_source_sync_task(task, TOKEN, source, _factory(), now=NOW)
+            prepare_claimed_source_sync_task(task, TOKEN, source, _factory())
 
     def test_physical_missing_propagates_expert_not_found(self):
         # P4.3 物理行不存在独出 ExpertNotFoundError
@@ -515,7 +476,7 @@ class TestExceptionPropagation:
                      source_record_id=880001)
         source = _ThrowingSource(ExpertNotFoundError("专家 880001 物理不存在"))
         with pytest.raises(ExpertNotFoundError, match="物理不存在"):
-            prepare_claimed_source_sync_task(task, TOKEN, source, _factory(), now=NOW)
+            prepare_claimed_source_sync_task(task, TOKEN, source, _factory())
 
     def test_ownership_mismatch_propagates_value_error(self):
         # P4.3 子表-父专家归属不一致独出 ValueError
@@ -523,7 +484,7 @@ class TestExceptionPropagation:
                      source_record_id=9201)
         source = _ThrowingSource(ValueError("employment 触发行 expert_id=999 与请求 880001 不一致"))
         with pytest.raises(ValueError, match="不一致"):
-            prepare_claimed_source_sync_task(task, TOKEN, source, _factory(), now=NOW)
+            prepare_claimed_source_sync_task(task, TOKEN, source, _factory())
 
     def test_timing_rollback_propagates_value_error(self):
         # P4.3 当前事实比候选旧独出 ValueError（事件比当前事实更新）
@@ -531,7 +492,7 @@ class TestExceptionPropagation:
                      source_record_id=880001)
         source = _ThrowingSource(ValueError("experts.updated_at 当前 X 早于候选 Y，事件比当前事实更新"))
         with pytest.raises(ValueError, match="事件比当前事实更新"):
-            prepare_claimed_source_sync_task(task, TOKEN, source, _factory(), now=NOW)
+            prepare_claimed_source_sync_task(task, TOKEN, source, _factory())
 
     def test_chunk_validation_error_propagates(self):
         # Handler 内 validate_chunks 独出 ChunkValidationError
@@ -539,17 +500,7 @@ class TestExceptionPropagation:
                      source_record_id=880001)
         source = _ThrowingSource(ChunkValidationError("v=demo", "validate 失败"))
         with pytest.raises(ChunkValidationError, match="validate 失败"):
-            prepare_claimed_source_sync_task(task, TOKEN, source, _factory(), now=NOW)
-
-    def test_non_datetime_now_rejected(self):
-        task = _task(target_type="expert", source_table="experts",
-                     source_record_id=880001)
-        with pytest.raises(TypeError, match="now 必须是 datetime"):
-            prepare_claimed_source_sync_task(
-                task, TOKEN, _FakeSource(ScopedCurrentFacts(
-                    scope=impact_scope_from_target(target_type="expert", expert_id=880001),
-                    expert=_expert())), _factory(), now="2026-08-24",  # type: ignore[arg-type]
-            )
+            prepare_claimed_source_sync_task(task, TOKEN, source, _factory())
 
 
 # ---------------------------------------------------------------------------
@@ -562,14 +513,12 @@ class TestPreservesHandlerResult:
         # 父专家删除：Handler 返回 expert 空 desired，Dispatcher 原样返回
         facts = ScopedCurrentFacts(
             scope=impact_scope_from_target(target_type="expert", expert_id=880001),
-            expert=_expert(deleted_at=NOW),  # P4.3 已删除专家子表为空
+            expert=_expert(deleted_at=NOW_FALLBACK),  # P4.3 已删除专家子表为空
         )
         source = _FakeSource(facts)
         task = _task(target_type="expert", source_table="experts",
                      source_record_id=880001)
-        result = prepare_claimed_source_sync_task(
-            task, TOKEN, source, _factory(), now=NOW,
-        )
+        result = prepare_claimed_source_sync_task(task, TOKEN, source, _factory())
         assert result.impact_scope.scope_type == "expert"
         assert result.is_empty
         assert result.desired_chunks == ()
@@ -583,15 +532,13 @@ class TestPreservesHandlerResult:
             employments=(EmploymentSource(
                 id=9201, expert_id=880001, company_name="X", position_title="Y",
                 start_date=None, end_date=None, work_description=None, is_employed=None,
-                updated_at=UPDATED, created_at=CREATED, deleted_at=NOW,
+                updated_at=UPDATED, created_at=CREATED, deleted_at=NOW_FALLBACK,
             ),),
         )
         source = _FakeSource(facts)
         task = _task(target_type="employment", source_table="experts_work_experience",
                      source_record_id=9201)
-        result = prepare_claimed_source_sync_task(
-            task, TOKEN, source, _factory(), now=NOW,
-        )
+        result = prepare_claimed_source_sync_task(task, TOKEN, source, _factory())
         assert result.impact_scope.scope_type == "employment"
         assert result.desired_chunks == ()
 
@@ -601,19 +548,60 @@ class TestPreservesHandlerResult:
         facts = ScopedCurrentFacts(
             scope=impact_scope_from_target(
                 target_type="employment", expert_id=880001, source_field_id="9201"),
-            expert=_expert(deleted_at=NOW),
+            expert=_expert(deleted_at=NOW_FALLBACK),
             employments=(_employment(),),
         )
         source = _FakeSource(facts)
         task = _task(target_type="employment", source_table="experts_work_experience",
                      source_record_id=9201)
-        result = prepare_claimed_source_sync_task(
-            task, TOKEN, source, _factory(), now=NOW,
-        )
+        result = prepare_claimed_source_sync_task(task, TOKEN, source, _factory())
         # 升级为 expert scope + 空 desired，保留原范围类型语义
         assert result.impact_scope.scope_type == "expert"
         assert result.is_empty
         assert result.desired_chunks == ()
+
+
+# ---------------------------------------------------------------------------
+# 拆分函数：read_scoped_facts / build_prepared_chunk_set
+# ---------------------------------------------------------------------------
+
+
+class TestSplitHelpers:
+    def test_read_scoped_facts_does_not_build(self):
+        # read_scoped_facts 只读取事实，不调 Factory，不构造 Chunk
+        facts = ScopedCurrentFacts(
+            scope=impact_scope_from_target(target_type="expert", expert_id=880001),
+            expert=_expert(), employments=(), projects=(), educations=(),
+        )
+        source = _FakeSource(facts)
+        task = _task(target_type="expert", source_table="experts",
+                     source_record_id=880001)
+        out = read_scoped_facts(task, source)
+        assert out is facts
+        assert len(source.read_calls) == 1
+
+    def test_read_scoped_facts_rejects_scope_mismatch(self):
+        task = _task(target_type="expert", source_table="experts",
+                     source_record_id=880001)
+        mismatch = ScopedCurrentFacts(
+            scope=impact_scope_from_target(target_type="profile", expert_id=880001),
+            expert=_expert(),
+        )
+        source = _FakeSource(mismatch)
+        with pytest.raises(ValueError, match="scope 不一致"):
+            read_scoped_facts(task, source)
+
+    def test_build_prepared_chunk_set_uses_facts_directly(self):
+        # build_prepared_chunk_set 不再读取事实，直接用传入 facts 走 Handler
+        facts = ScopedCurrentFacts(
+            scope=impact_scope_from_target(target_type="expert", expert_id=880001),
+            expert=_expert(), employments=(), projects=(), educations=(),
+        )
+        task = _task(target_type="expert", source_table="experts",
+                     source_record_id=880001)
+        # source 未传给 build，证明不读取事实
+        result = build_prepared_chunk_set(task, facts, _factory())
+        assert result.impact_scope.scope_type == "expert"
 
 
 # ---------------------------------------------------------------------------
@@ -644,13 +632,23 @@ class TestNoStateWrites:
         leaked = {m for f in forbidden for m in imported_modules if f in m}
         assert not leaked, f"Dispatcher 不得 import 状态/下游模块: {leaked}"
 
-    def test_dispatcher_only_exports_one_public_function(self):
+    def test_dispatcher_exports_three_helpers(self):
+        # P4 验收修复后 Dispatcher 拆出 read_scoped_facts / build_prepared_chunk_set
+        # 供外层 Coordinator 在阶段推进间穿插使用。__all__ 按字母序。
         import expert_index.preparation_dispatcher as mod
-        assert mod.__all__ == ["prepare_claimed_source_sync_task"]
-        # 模块内定义的函数只有这个
+        assert mod.__all__ == [
+            "build_prepared_chunk_set",
+            "prepare_claimed_source_sync_task",
+            "read_scoped_facts",
+        ]
         defined = [n for n, v in vars(mod).items()
                    if callable(v) and getattr(v, "__module__", "") == mod.__name__]
-        assert defined == ["_validate_token", "prepare_claimed_source_sync_task"]
+        assert set(defined) == {
+            "_validate_token",
+            "prepare_claimed_source_sync_task",
+            "read_scoped_facts",
+            "build_prepared_chunk_set",
+        }
 
     def test_fake_source_records_single_read(self):
         # 证明 source 只被读一次，无重复读取
@@ -661,7 +659,7 @@ class TestNoStateWrites:
         source = _FakeSource(facts)
         task = _task(target_type="expert", source_table="experts",
                      source_record_id=880001)
-        prepare_claimed_source_sync_task(task, TOKEN, source, _factory(), now=NOW)
+        prepare_claimed_source_sync_task(task, TOKEN, source, _factory())
         assert len(source.read_calls) == 1
 
 
@@ -679,7 +677,7 @@ class TestDataVersionInjection:
         source = _FakeSource(facts)
         task = _task(target_type="expert", source_table="experts",
                      source_record_id=880001, batch_id=999)
-        result = prepare_claimed_source_sync_task(task, TOKEN, source, _factory(), now=NOW)
+        result = prepare_claimed_source_sync_task(task, TOKEN, source, _factory())
         assert result.data_version == "999"
         assert result.batch_id == 999
         assert result.task_id == 701

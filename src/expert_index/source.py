@@ -537,12 +537,15 @@ class MySQLSourceAdapter:
 
         if scope_type == "expert":
             expert = self._load_expert_row_by_id(cursor, scope.expert_id)
+            # 专家任务时序只与中间表扫描时间 experts.updated_at 比较，
+            # 不与正式来源时间 experts_updated_at 比较。
             self._assert_current_not_older_than_candidate(
-                expert.updated_at, request.trigger_source_updated_at,
+                expert.scan_updated_at, request.trigger_source_updated_at,
                 "experts.updated_at",
             )
             if expert.deleted_at is not None:
-                # 已删除专家：只返回生命周期，子表为空（不触发子表读取）。
+                # 已删除专家：扫描时间不回退即返回 expert scope 空 desired，
+                # 不与 source_updated_at 比较以避免误报事实版本回退。
                 return ScopedCurrentFacts(scope=scope, expert=expert)
             employments = self._load_employments(cursor, scope.expert_id)
             projects = self._load_projects(cursor, scope.expert_id)
@@ -566,9 +569,10 @@ class MySQLSourceAdapter:
                     "experts_education_experience.updated_at",
                 )
             else:
-                # profile 自身触发：校验专家主档时序。
+                # profile 自身触发：校验专家主档中间表扫描时间，
+                # 不使用正式来源时间 experts_updated_at。
                 self._assert_current_not_older_than_candidate(
-                    expert.updated_at, request.trigger_source_updated_at,
+                    expert.scan_updated_at, request.trigger_source_updated_at,
                     "experts.updated_at",
                 )
             if expert.deleted_at is not None:
@@ -642,17 +646,18 @@ class MySQLSourceAdapter:
     def _load_expert_row_by_id(cursor: Any, expert_id: int) -> ExpertSource:
         """按主键读取专家主档，不过滤 ``experts_deleted_at``。
 
-        与 :meth:`_load_profile` 不同：Full Build 路径要求专家有效（deleted_at 为空），
-        因此 ``_load_profile`` 过滤并抛 ``ExpertNotFoundError``；P4.3 路径需要区分物理
-        不存在与逻辑删除，故读取全部行（含 deleted_at 非空）由调用方判断。
+        与 :meth:`_load_profile` 不同：Full Build 路径要求专家有效（deleted_at 为空）
+        且只关心正式来源时间；P4.3 路径需要同时保留中间表扫描时间 ``experts.updated_at``
+        （事件时序校验）、正式来源时间 ``experts_updated_at``（Profile source_version）
+        与生命周期标记 ``experts_deleted_at`` 三种语义，故读取全部行并由调用方判断。
         """
 
         cursor.execute(
             """
             SELECT id, serial_number, company, job_status, job_name,
                    contact_status, doubtful_flag, abroad_flag, background,
-                   work_years, experts_updated_at AS updated_at, created_at,
-                   experts_deleted_at AS deleted_at
+                   work_years, updated_at, experts_updated_at, created_at,
+                   experts_deleted_at
             FROM experts
             WHERE id = %s
             """,
@@ -672,9 +677,10 @@ class MySQLSourceAdapter:
             abroad_flag=row.get("abroad_flag"),
             background=row.get("background"),
             work_years=float(row["work_years"]) if row.get("work_years") is not None else None,
-            updated_at=row.get("updated_at"),
+            updated_at=row.get("experts_updated_at"),
             created_at=row.get("created_at"),
-            deleted_at=row.get("deleted_at"),
+            deleted_at=row.get("experts_deleted_at"),
+            scan_updated_at=row.get("updated_at"),
         )
 
     @staticmethod

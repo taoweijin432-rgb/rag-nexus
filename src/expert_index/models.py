@@ -517,6 +517,9 @@ class ExpertSource:
 
     业务字段保持真实列名；``updated_at/deleted_at`` 分别是 Source SQL 对
     ``experts_updated_at/experts_deleted_at`` 的显式别名。本模型不包含姓名和联系方式。
+
+    ``scan_updated_at`` 是中间表扫描时间 ``experts.updated_at``，仅用于 P4 定向读取的
+    事件时序校验；不进入 Normalize、三 Hash 或 Contract，不影响 Full Build golden。
     """
 
     id: int  # experts.id：专家主键，与三张经历表的 expert_id 关联。
@@ -532,6 +535,7 @@ class ExpertSource:
     updated_at: datetime | None  # experts_updated_at 的别名；表达正式来源版本时间。
     created_at: datetime | None  # experts.created_at：源记录创建时间。
     deleted_at: datetime | None  # experts_deleted_at 的别名；有效 Profile 事实读取结果恒为 None。
+    scan_updated_at: datetime | None = None  # experts.updated_at 中间表扫描时间；P4 时序校验专用。
 
 
 @dataclass(frozen=True)

@@ -142,12 +142,15 @@ def _expert_row(
     expert_id: int = 100, *, deleted_at: datetime | None = None,
     updated_at: datetime | None = UPDATED,
 ) -> dict[str, Any]:
+    # _load_expert_row_by_id 现在读取显式列：updated_at（中间表扫描时间）/
+    # experts_updated_at（正式来源时间）/ experts_deleted_at（删除标记）。
     return {
         "id": expert_id, "serial_number": f"S{expert_id}", "company": "ACME",
         "job_status": "active", "job_name": "Engineer", "contact_status": "normal",
         "doubtful_flag": "normal", "abroad_flag": 1, "background": "bio",
-        "work_years": 5.0, "updated_at": updated_at, "created_at": CREATED,
-        "deleted_at": deleted_at,
+        "work_years": 5.0, "updated_at": updated_at,
+        "experts_updated_at": updated_at, "created_at": CREATED,
+        "experts_deleted_at": deleted_at,
     }
 
 

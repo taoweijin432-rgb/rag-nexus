@@ -157,13 +157,20 @@ class SourceMappingTest(unittest.TestCase):
         self.assertIsNone(normalize_abroad_flag(0))
 
     def test_source_model_names_match_mysql_columns(self) -> None:
-        """Source 层不得再用 role/description 等派生别名隐藏源列。"""
+        """Source 层不得再用 role/description 等派生别名隐藏源列。
+
+        P4 验收修复把专家主档的两套时间拆开：``updated_at`` =
+        ``experts_updated_at``（正式来源时间，Profile source_version 用），
+        ``scan_updated_at`` = ``experts.updated_at``（中间表扫描时间，P4 事件
+        时序校验用），``deleted_at`` = ``experts_deleted_at``。
+        """
 
         self.assertEqual(
             {
                 "id", "serial_number", "company", "job_name", "background",
                 "job_status", "contact_status", "doubtful_flag", "abroad_flag",
                 "work_years", "updated_at", "created_at", "deleted_at",
+                "scan_updated_at",
             },
             {item.name for item in fields(ExpertSource)},
         )
