@@ -20,7 +20,7 @@ P5.2 ``ScopeConsumer`` 接成单一闭环，按 P5.3/P5.4 恢复规则安全推�
   token**；捕获 ``SourceSyncTaskLeaseConflictError`` 后立即停止，旧 token 绝不覆盖
   新 attempt。
 - **Artifact 同 identity 同 hash 重放复用**；同 identity 不同 hash 冲突立即
-  ``mark_source_sync_task_rejected(error_stage="artifact")``，**禁止调用 Consumer**。
+  ``mark_source_sync_task_rejected_with_dlq(error_stage="artifact")``，**禁止调用 Consumer**。
 - **阶段幂等推进**：
   - ``validated``：Builder 或 Artifact 恢复 → put_or_verify → contract_ready →
     handed_off；
@@ -33,8 +33,8 @@ P5.2 ``ScopeConsumer`` 接成单一闭环，按 P5.3/P5.4 恢复规则安全推�
   任何不一致 → 确定性 ``rejected(error_stage="receipt")``。
 - **committed → ``finalize_source_sync_task_success``**（单事务原子落定
   completed/success）；rejected 或 non-retryable failed →
-  ``mark_source_sync_task_rejected``；retryable failed →
-  ``mark_source_sync_task_retryable``。Consumer/Artifact 异常按确定性与瞬时分类，
+  ``mark_source_sync_task_rejected_with_dlq``；retryable failed →
+  ``mark_source_sync_task_retryable_with_dlq``。Consumer/Artifact 异常按确定性与瞬时分类，
   记录正确 ``error_stage``。
 - **result_code 由 Receipt 计数确定性推导**，零写入区分依据是进入时的原始阶段
   （frozen #2）：首次从 ``validated`` 进入且三 Hash 全同记 ``no_action_unchanged``；
@@ -215,6 +215,32 @@ class TaskRepositoryPort(Protocol):
         safe_error_message: str | None = None,
     ) -> SourceSyncTask: ...
 
+    def mark_source_sync_task_rejected_with_dlq(
+        self,
+        task_id: int,
+        attempt_token: str,
+        *,
+        error_stage: str,
+        error_code: str,
+        error_type: str | None = None,
+        safe_error_message: str | None = None,
+        artifact_id: int | None = None,
+    ) -> SourceSyncTask: ...
+
+    def mark_source_sync_task_retryable_with_dlq(
+        self,
+        task_id: int,
+        attempt_token: str,
+        *,
+        error_stage: str,
+        error_code: str,
+        max_attempts: int,
+        retry_delay_seconds: int,
+        error_type: str | None = None,
+        safe_error_message: str | None = None,
+        artifact_id: int | None = None,
+    ) -> SourceSyncTask: ...
+
 
 @runtime_checkable
 class ArtifactRepositoryPort(Protocol):
@@ -286,7 +312,7 @@ class HandoffOrchestrator:
     此参数为 ``ScopeConsumer`` 使用的 sink 一致类型）。
 
     ``max_attempts`` 与 ``retry_delay_seconds`` 是显式参数（不猜全局默认），用于
-    ``mark_source_sync_task_retryable``。
+    ``mark_source_sync_task_retryable_with_dlq``。
     """
 
     def __init__(
@@ -856,7 +882,13 @@ class HandoffOrchestrator:
         safe_error_message: str | None,
     ) -> HandoffOrchestrationResult:
         try:
-            self._task_repo.mark_source_sync_task_rejected(
+            # P6.1 生产 Repository 将 Task 与 DLQ 放在同一事务；旧 Fake 继续走兼容接口。
+            mark_rejected = getattr(
+                self._task_repo, "mark_source_sync_task_rejected_with_dlq", None
+            )
+            if not callable(mark_rejected):
+                mark_rejected = self._task_repo.mark_source_sync_task_rejected
+            mark_rejected(
                 task.task_id,
                 attempt_token,
                 error_stage=error_stage,
@@ -883,7 +915,13 @@ class HandoffOrchestrator:
         safe_error_message: str | None,
     ) -> HandoffOrchestrationResult:
         try:
-            updated = self._task_repo.mark_source_sync_task_retryable(
+            # 兼容尚未升级的测试 Fake；正式 MySQL Repository 使用原子 DLQ 版本。
+            mark_retryable = getattr(
+                self._task_repo, "mark_source_sync_task_retryable_with_dlq", None
+            )
+            if not callable(mark_retryable):
+                mark_retryable = self._task_repo.mark_source_sync_task_retryable
+            updated = mark_retryable(
                 task.task_id,
                 attempt_token,
                 error_stage=error_stage,

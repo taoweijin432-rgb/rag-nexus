@@ -721,6 +721,177 @@ class MySQLSourceSyncTaskRepository:
         finally:
             connection.close()
 
+    def mark_source_sync_task_rejected_with_dlq(
+        self,
+        task_id: int,
+        attempt_token: str,
+        *,
+        error_stage: str,
+        error_code: str,
+        error_type: str | None = None,
+        safe_error_message: str | None = None,
+        artifact_id: int | None = None,
+    ) -> SourceSyncTask:
+        """在同一 Index MySQL 事务内写入 dead Task 和 DLQ 失败证据。"""
+
+        return self._mark_source_sync_task_failure_with_dlq(
+            task_id,
+            attempt_token,
+            error_stage=error_stage,
+            error_code=error_code,
+            error_type=error_type,
+            safe_error_message=safe_error_message,
+            force_dead=True,
+            max_attempts=0,
+            retry_delay_seconds=1,
+            artifact_id=artifact_id,
+        )
+
+    def mark_source_sync_task_retryable_with_dlq(
+        self,
+        task_id: int,
+        attempt_token: str,
+        *,
+        error_stage: str,
+        error_code: str,
+        max_attempts: int,
+        retry_delay_seconds: int,
+        error_type: str | None = None,
+        safe_error_message: str | None = None,
+        artifact_id: int | None = None,
+    ) -> SourceSyncTask:
+        """原子退回 pending；达到上限时同时写 dead Task 和 DLQ。"""
+
+        return self._mark_source_sync_task_failure_with_dlq(
+            task_id,
+            attempt_token,
+            error_stage=error_stage,
+            error_code=error_code,
+            error_type=error_type,
+            safe_error_message=safe_error_message,
+            force_dead=False,
+            max_attempts=max_attempts,
+            retry_delay_seconds=retry_delay_seconds,
+            artifact_id=artifact_id,
+        )
+
+    def _mark_source_sync_task_failure_with_dlq(
+        self,
+        task_id: int,
+        attempt_token: str,
+        *,
+        error_stage: str,
+        error_code: str,
+        error_type: str | None,
+        safe_error_message: str | None,
+        force_dead: bool,
+        max_attempts: int,
+        retry_delay_seconds: int,
+        artifact_id: int | None,
+    ) -> SourceSyncTask:
+        """执行带租约校验的失败写回，DLQ 插入与 Task 更新共享一个事务。"""
+
+        _validate_positive_integer("task_id", task_id)
+        _validate_attempt_token(attempt_token)
+        _validate_error_stage(error_stage)
+        _validate_safe_identifier("error_code", error_code, max_length=64)
+        _validate_optional_safe_identifier("error_type", error_type, max_length=128)
+        _validate_safe_error_message(safe_error_message)
+        if not force_dead and (
+            isinstance(max_attempts, bool) or not isinstance(max_attempts, int) or max_attempts < 0
+        ):
+            raise ValueError("max_attempts 必须是非负整数")
+        if (
+            isinstance(retry_delay_seconds, bool)
+            or not isinstance(retry_delay_seconds, int)
+            or retry_delay_seconds < 1
+        ):
+            raise ValueError("retry_delay_seconds 必须是正整数")
+        if artifact_id is not None:
+            _validate_positive_integer("artifact_id", artifact_id)
+        connection = pymysql.connect(**self.config.as_kwargs())
+        try:
+            with connection.cursor() as cursor:
+                locked_row = _lock_source_sync_task(cursor, task_id)
+                _require_active_task_attempt(
+                    locked_row, task_id=task_id, attempt_token=attempt_token
+                )
+                should_dead = force_dead or int(locked_row["retry_count"]) >= max_attempts
+                if should_dead:
+                    # 015 将把此唯一性从 task_id 扩展为 (task_id, retry_count)，支持追加历史。
+                    cursor.execute(
+                        """
+                        INSERT INTO expert_index_sync_dead_letter(
+                            task_id, batch_id, source_table, source_record_id, expert_id,
+                            failure_stage, reason_code, reason_message, retry_count, artifact_id
+                        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                        """,
+                        (
+                            task_id,
+                            locked_row["batch_id"],
+                            locked_row["source_table"],
+                            locked_row["source_record_id"],
+                            locked_row["expert_id"],
+                            error_stage,
+                            error_code,
+                            safe_error_message,
+                            locked_row["retry_count"],
+                            artifact_id,
+                        ),
+                    )
+                    cursor.execute(
+                        """
+                        UPDATE expert_index_sync_task
+                        SET sync_status='dead', attempt_token=NULL, lease_until=NULL,
+                            next_retry_at=NULL, error_stage=%s, error_code=%s,
+                            error_type=%s, error_message=%s, result_code=NULL,
+                            completed_at=CURRENT_TIMESTAMP(6)
+                        WHERE id=%s AND sync_status='processing'
+                          AND attempt_token=%s AND lease_until > CURRENT_TIMESTAMP(6)
+                        """,
+                        (
+                            error_stage,
+                            error_code,
+                            error_type,
+                            safe_error_message,
+                            task_id,
+                            attempt_token,
+                        ),
+                    )
+                else:
+                    cursor.execute(
+                        """
+                        UPDATE expert_index_sync_task
+                        SET sync_status='pending', attempt_token=NULL, lease_until=NULL,
+                            next_retry_at=TIMESTAMPADD(SECOND, %s, CURRENT_TIMESTAMP(6)),
+                            error_stage=%s, error_code=%s, error_type=%s,
+                            error_message=%s, result_code=NULL, completed_at=NULL
+                        WHERE id=%s AND sync_status='processing'
+                          AND attempt_token=%s AND lease_until > CURRENT_TIMESTAMP(6)
+                        """,
+                        (
+                            retry_delay_seconds,
+                            error_stage,
+                            error_code,
+                            error_type,
+                            safe_error_message,
+                            task_id,
+                            attempt_token,
+                        ),
+                    )
+                if cursor.rowcount != 1:
+                    raise SourceSyncTaskLeaseConflictError(
+                        f"任务 {task_id} 的 attempt lease 已变化"
+                    )
+                task = _select_source_sync_task(cursor, task_id)
+            connection.commit()
+            return task
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+
     def mark_source_sync_task_success(
         self,
         task_id: int,
