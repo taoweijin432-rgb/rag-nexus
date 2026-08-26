@@ -3,14 +3,26 @@
 本包只定义上游可依赖的协议边界，不依赖 Canal SDK，也不执行消费或确认。
 """
 
+from .parser import (
+    CanalBatchDecoder,
+    CanalClientAdapter,
+    CanalConnectorPort,
+    CanalDeleteEvent,
+    CanalParseIssue,
+    CanalParserError,
+    CanalParseResult,
+    parse_canal_batch,
+)
 from .protocol import (
     CANAL_DESTINATION,
     CANAL_SUBSCRIPTION,
     CanalBatch,
     CanalClientPort,
+    CanalColumn,
     CanalEntry,
     CanalProtocolBaseline,
     CanalProtocolNotFrozenError,
+    CanalRowData,
 )
 from .replay import (
     CanalReplaySafetyError,
@@ -25,14 +37,24 @@ __all__ = [
     "CANAL_DESTINATION",
     "CANAL_SUBSCRIPTION",
     "CanalBatch",
+    "CanalBatchDecoder",
+    "CanalClientAdapter",
     "CanalClientPort",
+    "CanalColumn",
+    "CanalConnectorPort",
+    "CanalDeleteEvent",
     "CanalEntry",
+    "CanalParseIssue",
+    "CanalParseResult",
+    "CanalParserError",
     "CanalProtocolBaseline",
     "CanalProtocolNotFrozenError",
     "CanalReplaySafetyError",
+    "CanalRowData",
     "FakeCanalClient",
     "ReplayDelete",
     "ReplayResult",
+    "parse_canal_batch",
     "replay_batch",
     "replay_next_batch",
 ]

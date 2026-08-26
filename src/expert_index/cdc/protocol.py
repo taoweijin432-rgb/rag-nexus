@@ -1,13 +1,14 @@
-"""Canal P7.0/P7.1 协议边界。
+"""Canal P7.0/P7.3 协议边界。
 
-领域层只依赖这些无 SDK 类型的模型和端口。真实 Offset、DELETE Before Image
-和 ack 重投行为未确认前，生产契约保持 ``production_ready=False``，禁止调用确认接口。
+领域层只依赖这些无 SDK 类型的模型和端口。RowData 的列值只允许在 Parser 边界短暂存在，
+真实 Offset canonical identity 和 ack 重投行为未确认前，生产契约保持
+``production_ready=False``。
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Protocol
+from typing import Any, Protocol
 
 CANAL_SERVER_VERSION = "1.1.8"
 CANAL_DESTINATION = "company_expert"
@@ -22,8 +23,24 @@ class CanalProtocolNotFrozenError(RuntimeError):
 
 
 @dataclass(frozen=True)
+class CanalColumn:
+    """Canal RowData 的单列值；Parser 只提取允许的定位列。"""
+
+    name: str
+    value: Any = None
+
+
+@dataclass(frozen=True)
+class CanalRowData:
+    """一行变更的 Before/After Image 临时表达，不得持久化。"""
+
+    before: tuple[CanalColumn, ...] = ()
+    after: tuple[CanalColumn, ...] = ()
+
+
+@dataclass(frozen=True)
 class CanalEntry:
-    """已脱敏的 Canal Entry 边界摘要，不保存行值或完整 Payload。"""
+    """Canal Entry 边界模型；未解析时可只携带脱敏列名。"""
 
     entry_type: str
     source_schema: str
@@ -35,6 +52,7 @@ class CanalEntry:
     execute_time: int | None
     before_columns: tuple[str, ...] = ()
     after_columns: tuple[str, ...] = ()
+    rows: tuple[CanalRowData, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -43,6 +61,7 @@ class CanalBatch:
 
     batch_id: int
     entries: tuple[CanalEntry, ...]
+    destination: str | None = None
 
     @property
     def is_empty(self) -> bool:
@@ -96,7 +115,9 @@ __all__ = [
     "CANAL_SUBSCRIPTION",
     "CanalBatch",
     "CanalClientPort",
+    "CanalColumn",
     "CanalEntry",
     "CanalProtocolBaseline",
     "CanalProtocolNotFrozenError",
+    "CanalRowData",
 ]
