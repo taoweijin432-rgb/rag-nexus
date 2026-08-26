@@ -15,10 +15,9 @@
 --   - 不创建或删除表，不写业务数据。
 --
 -- 幂等性：
---   - 通过 information_schema.CHECK_CONSTRAINTS 读取当前 CHECK 谓词，若已包含
---     'receipt'（4 个新增值的唯一代表）即视为已升级，直接跳过；
---   - 升级动作先 DROP CHECK 再 ADD CONSTRAINT，两者各自独立条件执行，重复运行
---     安全；
+--   - 通过 information_schema.CHECK_CONSTRAINTS 区分目标约束、旧约束和约束缺失；
+--   - 已是目标约束时跳过；旧约束执行 DROP+ADD；约束缺失时直接 ADD；
+--   - 若上次在 DROP 后、ADD 前中断，重跑会识别为“约束缺失”并补建；
 --   - 表不存在（012 尚未部署）时下游 ALTER 会报错中止，符合“部署顺序
 --     012 → 013 → 014 固定、失败应可见”的要求，本迁移不静默建表或兜底。
 --
@@ -27,13 +26,20 @@
 --          → 014_expand_expert_sync_task_error_stages.sql
 -- 不要修改已提交的 sql/012；本迁移是独立、可重放的后置扩展。
 
--- 1) 升级判定：仅当约束存在且谓词不含 'receipt' 时才需要升级。
-SET @expert_index_p5_need_upgrade = (
+-- 1) 读取约束存在性和目标版本状态。
+SET @expert_index_p5_constraint_exists = (
+    SELECT COUNT(*)
+    FROM information_schema.CHECK_CONSTRAINTS
+    WHERE CONSTRAINT_SCHEMA = DATABASE()
+      AND TABLE_NAME = 'expert_index_sync_task'
+      AND CONSTRAINT_NAME = 'chk_expert_sync_task_error_stage'
+);
+
+SET @expert_index_p5_constraint_current = (
     SELECT
         CASE
-            WHEN COUNT(*) = 0 THEN 0
-            WHEN MAX(CHECK_CLAUSE) LIKE '%receipt%' THEN 0
-            ELSE 1
+            WHEN COUNT(*) = 1 AND MAX(CHECK_CLAUSE) LIKE '%receipt%' THEN 1
+            ELSE 0
         END
     FROM information_schema.CHECK_CONSTRAINTS
     WHERE CONSTRAINT_SCHEMA = DATABASE()
@@ -41,10 +47,18 @@ SET @expert_index_p5_need_upgrade = (
       AND CONSTRAINT_NAME = 'chk_expert_sync_task_error_stage'
 );
 
+SET @expert_index_p5_need_drop = (
+    @expert_index_p5_constraint_exists = 1
+    AND @expert_index_p5_constraint_current = 0
+);
+SET @expert_index_p5_need_add = (
+    @expert_index_p5_constraint_current = 0
+);
+
 -- 2) 卸载旧 CHECK（仅当需要升级时执行）。MySQL 8.0.16+ 使用 DROP CHECK 语法。
 SET @expert_index_p5_ddl = (
     SELECT IF(
-        (@expert_index_p5_need_upgrade = 1),
+        (@expert_index_p5_need_drop = 1),
         'ALTER TABLE expert_index_sync_task DROP CHECK chk_expert_sync_task_error_stage',
         'SELECT 1'
     )
@@ -56,7 +70,7 @@ DEALLOCATE PREPARE expert_index_p5_stmt;
 -- 3) 重新建立 CHECK，保留原有 9 个值并补齐 4 个 P5 阶段。
 SET @expert_index_p5_ddl = (
     SELECT IF(
-        (@expert_index_p5_need_upgrade = 1),
+        (@expert_index_p5_need_add = 1),
         'ALTER TABLE expert_index_sync_task ADD CONSTRAINT chk_expert_sync_task_error_stage CHECK (error_stage IS NULL OR error_stage IN (''source'', ''parse'', ''pii'', ''chunk_builder'', ''generation'', ''validation'', ''embedding'', ''milvus'', ''checkpoint'', ''artifact'', ''handoff'', ''scope_consumer'', ''receipt''))',
         'SELECT 1'
     )

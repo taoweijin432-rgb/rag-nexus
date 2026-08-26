@@ -789,7 +789,8 @@ class TestReceiptInvariants:
         # 文档化字段集
         assert field_names == {
             "request_id", "task_id", "batch_id", "attempt_token", "payload_hash",
-            "impact_scope", "status", "result_code", "desired_count",
+            "impact_scope", "status", "result_code", "desired_results",
+            "stale_vector_doc_ids", "desired_count",
             "embedding_count", "metadata_only_count", "disable_count",
             "unchanged_count", "retryable", "error_type", "error_message",
         }
@@ -841,8 +842,10 @@ class TestModuleBoundary:
         import expert_index.handoff as mod
 
         assert set(mod.__all__) == {
+            "DesiredResultCode",
             "HandoffReceiptStatus",
             "ScopeHandoffBuilder",
+            "ScopeDesiredItemResult",
             "ScopeHandoffReceipt",
             "ScopeHandoffRequest",
         }

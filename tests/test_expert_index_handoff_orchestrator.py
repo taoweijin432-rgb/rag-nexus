@@ -18,10 +18,13 @@ from __future__ import annotations
 
 import ast
 import json
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+
+import pytest
 
 from expert_index.chunk_builder import ChunkFactory
 from expert_index.config import DatabaseConfig, Settings
@@ -44,6 +47,7 @@ from expert_index.repositories.artifact import (
     ArtifactPayloadConflictError,
     ContractArtifact,
 )
+from expert_index.repositories.scope_fence import ScopeFenceDecision
 from expert_index.repositories.sync_task import (
     SourceSyncTaskLeaseConflictError,
     SourceSyncTaskStageConflictError,
@@ -225,10 +229,17 @@ class FakeTaskRepo:
     # checkpoint / work-item 写入计数（用于断言零双写）
     checkpoint_writes: int = 0
     workitem_writes: int = 0
+    renew_calls: list[tuple[int, str, int]] = field(default_factory=list)
 
     def get_source_sync_task(self, task_id: int) -> SourceSyncTask | None:
         if self.state.task_id != task_id:
             return None
+        return self.state
+
+    def renew_source_sync_task_lease(
+        self, task_id: int, attempt_token: str, *, lease_seconds: int,
+    ) -> SourceSyncTask:
+        self.renew_calls.append((task_id, attempt_token, lease_seconds))
         return self.state
 
     def advance_source_sync_task_stage(
@@ -406,15 +417,30 @@ def _orchestrator(
     task_repo: FakeTaskRepo,
     artifact_repo: FakeArtifactRepo,
     consumer: FakeConsumer,
+    *,
+    scope_fence=None,
 ) -> HandoffOrchestrator:
     return HandoffOrchestrator(
         task_repo=task_repo,
         artifact_repo=artifact_repo,
         builder=ScopeHandoffBuilder("Asia/Shanghai"),
         consumer=consumer,
+        scope_fence=scope_fence or FakeScopeFence(),
+        lease_seconds=120,
         max_attempts=2,
         retry_delay_seconds=60,
     )
+
+
+class FakeScopeFence:
+    """测试用专家级执行栅栏，默认判定请求仍是最新。"""
+
+    def __init__(self, *, superseded: bool = False) -> None:
+        self.superseded = superseded
+
+    @contextmanager
+    def hold(self, task, attempt_token, scope, *, timeout_seconds):
+        yield ScopeFenceDecision(superseded=self.superseded)
 
 
 def _committed_receipt_factory(result_code: str = "scope_committed"):
@@ -429,6 +455,10 @@ def _committed_receipt_factory(result_code: str = "scope_committed"):
             impact_scope=request.impact_scope,
             status="committed",
             result_code=result_code,
+            desired_results=tuple(
+                (contract.vector_doc_id, "embedded")
+                for contract in request.contracts
+            ),
             desired_count=len(request.contracts),
             embedding_count=len(request.contracts),
         )
@@ -447,6 +477,10 @@ def _unchanged_committed_receipt_factory():
             impact_scope=request.impact_scope,
             status="committed",
             result_code="scope_committed",
+            desired_results=tuple(
+                (contract.vector_doc_id, "unchanged_skipped")
+                for contract in request.contracts
+            ),
             desired_count=len(request.contracts),
             embedding_count=0,
             metadata_only_count=0,
@@ -527,6 +561,60 @@ class TestCommittedClosedLoop:
         assert task_repo.finalize_calls[0][:3] == (task.task_id, TOKEN, "embedded")
         assert task_repo.rejected_calls == []
         assert task_repo.retryable_calls == []
+
+    def test_validated_without_artifact_rebuilds_current_facts_once(self):
+        """新 attempt 接管 validated 空窗时只在缺少 Artifact 后调用 P4 重建。"""
+
+        task, _, artifact_repo, _, orch = self._setup("validated")
+        calls: list[int] = []
+
+        result = orch.process(
+            task.task_id,
+            TOKEN,
+            prepare_if_missing=lambda: (
+                calls.append(task.task_id) or _expert_prepared(task.expert_id)
+            ),
+        )
+
+        assert result.final_status == "success"
+        assert calls == [task.task_id]
+        assert len(artifact_repo.put_calls) == 1
+
+    def test_validated_with_artifact_does_not_rebuild_current_facts(self):
+        """已有 Artifact 时只重放稳定 Payload，不访问来源事实。"""
+
+        task, _, artifact_repo, _, orch = self._setup("validated")
+        request = ScopeHandoffBuilder("Asia/Shanghai").build(
+            task, TOKEN, _expert_prepared(task.expert_id),
+        )
+        _seed_artifact(artifact_repo, task.task_id, request)
+
+        result = orch.process(
+            task.task_id,
+            TOKEN,
+            prepare_if_missing=lambda: pytest.fail("已有 Artifact 不应重建"),
+        )
+
+        assert result.final_status == "success"
+
+    def test_newer_overlapping_task_supersedes_without_consumer_call(self):
+        """专家级栅栏发现更晚重叠任务时，旧 Artifact 不得写下游。"""
+
+        task, task_repo, artifact_repo, consumer, _ = self._setup("validated")
+        orch = _orchestrator(
+            task_repo,
+            artifact_repo,
+            consumer,
+            scope_fence=FakeScopeFence(superseded=True),
+        )
+
+        result = orch.process(
+            task.task_id, TOKEN, _expert_prepared(task.expert_id),
+        )
+
+        assert result.result_code == "superseded"
+        assert consumer.process_calls == []
+        assert task_repo.finalize_calls[0][2] == "superseded"
 
     def test_contract_ready_committed(self):
         task, task_repo, artifact_repo, consumer, orch = self._setup("contract_ready")
@@ -659,6 +747,22 @@ class TestHandedOffCrashReplayFinalSuccess:
 
 
 class TestRejectedAndFailed:
+    def test_consumer_exception_text_is_not_persisted(self):
+        """下游异常可能携带正文，任务错误字段只能保存固定安全摘要。"""
+
+        secret = "secret-profile-text"
+        task = _task()
+        task_repo = FakeTaskRepo(state=task)
+        consumer = FakeConsumer(raise_on_process=RuntimeError(secret))
+        orch = _orchestrator(task_repo, FakeArtifactRepo(), consumer)
+
+        result = orch.process(task.task_id, TOKEN, _expert_prepared(task.expert_id))
+
+        assert result.final_status == "pending"
+        persisted = task_repo.retryable_calls[0]
+        assert secret not in persisted["safe_error_message"]
+        assert persisted["error_type"] == "RuntimeError"
+
     def test_rejected_receipt(self):
         task = _task()
         task_repo = FakeTaskRepo(state=task)
@@ -863,6 +967,30 @@ class TestReceiptValidation:
         task_repo, _, _, orch = self._setup_handed_off(_make)
         result = orch.process(701, TOKEN, _expert_prepared())
         assert result.final_status == "dead"
+        assert task_repo.rejected_calls[0]["error_stage"] == "receipt"
+
+    def test_committed_without_item_evidence_is_rejected(self):
+        """只有汇总计数、缺少逐项 desired 证据时不得落定 success。"""
+
+        def _make(request):
+            return ScopeHandoffReceipt(
+                request_id=request.request_id,
+                task_id=request.task_id,
+                batch_id=request.batch_id,
+                attempt_token=request.attempt_token,
+                payload_hash=request.payload_hash,
+                impact_scope=request.impact_scope,
+                status="committed",
+                result_code="scope_committed",
+                desired_count=len(request.contracts),
+                embedding_count=len(request.contracts),
+            )
+
+        task_repo, _, consumer, orch = self._setup_handed_off(_make)
+        result = orch.process(701, TOKEN, _expert_prepared())
+
+        assert result.final_status == "dead"
+        assert consumer.process_calls
         assert task_repo.rejected_calls[0]["error_stage"] == "receipt"
 
 

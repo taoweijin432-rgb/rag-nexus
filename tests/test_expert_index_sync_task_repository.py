@@ -1219,7 +1219,7 @@ def test_claim_frontier_processing_lease_valid_returns_empty(
 def test_claim_frontier_pending_due_claims_only_frontier(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """队头 pending 且 next_retry_at 已到：只领取该队头任务。"""
+    """队头 pending 退避到期后作为一次重试领取并增加 retry_count。"""
 
     past_retry = datetime(2026, 8, 21, 9, 0, tzinfo=timezone.utc)
     now = datetime(2026, 8, 21, 10, 0, tzinfo=timezone.utc)
@@ -1261,6 +1261,9 @@ def test_claim_frontier_pending_due_claims_only_frontier(
     )
 
     assert [task.task_id for task in tasks] == [5]
+    update_sql, update_params = cursor.executed[3]
+    assert "retry_count=retry_count+%s" in update_sql
+    assert update_params[2] == 1
     assert connection.commit_count == 1
 
 

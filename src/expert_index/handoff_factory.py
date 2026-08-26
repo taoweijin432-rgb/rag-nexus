@@ -56,6 +56,7 @@ from .handoff_orchestrator import HandoffOrchestrator
 from .models import IncrementalImpactScope
 from .preparation_coordinator import PreparationCoordinator
 from .repositories.artifact import MySQLArtifactRepository
+from .repositories.scope_fence import MySQLScopeExecutionFence
 from .repositories.sync_task import MySQLSourceSyncTaskRepository
 from .scanner import IncrementalScanDisabledError
 from .source import MySQLSourceAdapter
@@ -181,6 +182,7 @@ def build_incremental_handoff_runtime(
     chunk_factory = ChunkFactory(settings)
     task_repo = MySQLSourceSyncTaskRepository(settings.index_db)
     artifact_repo = MySQLArtifactRepository(settings.index_db)
+    scope_fence = MySQLScopeExecutionFence(settings.index_db)
     builder = ScopeHandoffBuilder(settings.timezone)
 
     # 7) PreparationCoordinator（P4 外层协调器）：复用同一 task_repo/source/chunk_factory；
@@ -215,6 +217,8 @@ def build_incremental_handoff_runtime(
         artifact_repo=artifact_repo,
         builder=builder,
         consumer=scope_consumer,  # type: ignore[arg-type]
+        scope_fence=scope_fence,
+        lease_seconds=settings.incremental_scan.lease_seconds,
         max_attempts=max_attempts,
         retry_delay_seconds=retry_delay_seconds,
     )

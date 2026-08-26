@@ -196,6 +196,28 @@ class TestSuccessPath:
         coord.prepare(_task(), TOKEN)
         assert len(source.read_calls) == 1
 
+    @pytest.mark.parametrize(
+        ("start_stage", "expected_advances"),
+        [
+            ("source_read", ["normalized", "chunk_built", "validated"]),
+            ("normalized", ["chunk_built", "validated"]),
+            ("chunk_built", ["validated"]),
+            ("validated", []),
+        ],
+    )
+    def test_artifact_before_crash_rebuilds_from_current_stage(
+        self, start_stage, expected_advances,
+    ):
+        """恢复任务重读当前事实，并只补齐当前阶段之后的节点。"""
+
+        repo = FakeRepo()
+        result = _coordinator(repo).prepare(
+            _task(processing_stage=start_stage), TOKEN,
+        )
+
+        assert result.task_id == 701
+        assert repo.stages_reached == expected_advances
+
 
 # ---------------------------------------------------------------------------
 # 读取失败不得推进 source_read

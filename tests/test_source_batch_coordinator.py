@@ -105,7 +105,9 @@ class FakeOrchestrator:
     script: dict = field(default_factory=dict)  # task_id -> result 或异常
     calls: list = field(default_factory=list)
 
-    def process(self, task_id, attempt_token, prepared):
+    def process(
+        self, task_id, attempt_token, prepared=None, *, prepare_if_missing=None,
+    ):
         self.calls.append((task_id, attempt_token, prepared is not None))
         entry = self.script.get(task_id)
         if entry is None:
@@ -341,8 +343,8 @@ def test_recovery_stage_skips_prepare(stage):
     assert prep.calls == []
     # 但调用了 orchestrator
     assert len(orch.calls) == 1
-    # 占位 prepared 已构造（非 None）传给 process
-    assert orch.calls[0][2] is True
+    # Artifact 恢复不再构造占位 PreparedChunkSet。
+    assert orch.calls[0][2] is False
 
 
 # ---------------------------------------------------------------------------
@@ -443,8 +445,8 @@ def test_source_lease_conflict_mid_batch_stops():
         1: HandoffResultStub(final_status="success", terminal=True),
     })
     checkpoint = FakeCheckpointManager()
-    # 第 1 次成功（首次续租），第 2 次成功（task1 前），第 3 次（task2 前）抛异常
-    source_state = FakeSourceStateRepository(scan=_scan(candidate_count=2), renew_fail_on_call=3)
+    # task1 执行前后均续租；第 5 次（task2 前）抛异常。
+    source_state = FakeSourceStateRepository(scan=_scan(candidate_count=2), renew_fail_on_call=5)
     task_repo = FakeTaskRepository(claim_queue=[(_task(task_id=1),), (_task(task_id=2),)])
 
     coord = _coordinator(prep, orch, checkpoint, source_state, task_repo)
@@ -493,19 +495,26 @@ def test_contradictory_terminal_fail_closed():
     assert result.error == "unknown_outcome"
 
 
-def test_prepare_exception_fail_closed():
-    """prepare 抛 StageConflict（中间阶段崩溃恢复）→ fail-closed 停止。"""
-    prep = FakePreparationCoordinator(returns=SourceSyncTaskStageConflictError("不能从 chunk_built 推进"))
+@pytest.mark.parametrize("stage", ["source_read", "normalized", "chunk_built"])
+def test_p4_intermediate_stage_rebuilds_current_facts(stage):
+    """Artifact 前中间阶段由 P4 重建后继续交付，不再永久卡住。"""
+
+    prep = FakePreparationCoordinator(returns=_prepared())
     orch = FakeOrchestrator()
-    checkpoint = FakeCheckpointManager()
-    source_state = FakeSourceStateRepository(scan=_scan(candidate_count=1))
-    task_repo = FakeTaskRepository(claim_queue=[(_task(task_id=1, stage="chunk_built"),)])
+    coord = _coordinator(
+        prep,
+        orch,
+        FakeCheckpointManager(return_value=CommitResultStub(skipped_count=0)),
+        FakeSourceStateRepository(scan=_scan(candidate_count=1)),
+        FakeTaskRepository(claim_queue=[(_task(task_id=1, stage=stage),)]),
+    )
 
-    coord = _coordinator(prep, orch, checkpoint, source_state, task_repo)
-    result = coord.run_claimed_source_batch("experts", 100, "owner-1", checkpoint_lock_version=7)
+    result = coord.run_claimed_source_batch(
+        "experts", 100, "owner-1", checkpoint_lock_version=7,
+    )
 
-    assert result.error == "SourceSyncTaskStageConflictError"
-    assert result.checkpoint_committed is False
+    assert result.success_count == 1
+    assert prep.calls == [(1, stage, "tok-001")]
 
 
 # ---------------------------------------------------------------------------
@@ -623,6 +632,24 @@ def test_missing_batch_source_scan_raises():
     coord = _coordinator(prep, orch, checkpoint, source_state, task_repo)
     with pytest.raises(ValueError, match="Batch Source 不存在"):
         coord.run_claimed_source_batch("experts", 100, "owner-1", checkpoint_lock_version=7)
+
+
+def test_task_claim_limit_must_remain_one():
+    """串行协调器必须在访问 Repository 前拒绝多条领取。"""
+
+    coord = _coordinator(
+        FakePreparationCoordinator(returns=_prepared()),
+        FakeOrchestrator(),
+        FakeCheckpointManager(),
+        FakeSourceStateRepository(scan=_scan()),
+        FakeTaskRepository(),
+    )
+
+    with pytest.raises(ValueError, match="必须固定为 1"):
+        coord.run_claimed_source_batch(
+            "experts", 100, "owner-1", checkpoint_lock_version=7,
+            task_claim_limit=2,
+        )
 
 
 # ---------------------------------------------------------------------------

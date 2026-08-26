@@ -34,6 +34,7 @@ Consumer 回执）。``handed_off`` 崩溃恢复用例直接从 handed_off 进�
 from __future__ import annotations
 
 import hashlib
+from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 
@@ -54,6 +55,7 @@ from expert_index.repositories.artifact import (
     ArtifactPayloadConflictError,
     ContractArtifact,
 )
+from expert_index.repositories.scope_fence import ScopeFenceDecision
 from expert_index.repositories.sync_task import (
     SourceSyncTaskLeaseConflictError,
     SourceSyncTaskStageConflictError,
@@ -437,8 +439,17 @@ def _build_orchestrator(store: FakeVectorStore, task_repo: FakeTaskRepo,
     return HandoffOrchestrator(
         task_repo=task_repo, artifact_repo=artifact_repo,
         builder=ScopeHandoffBuilder("Asia/Shanghai"), consumer=consumer,  # type: ignore[arg-type]
+        scope_fence=_FakeScopeFence(), lease_seconds=120,
         max_attempts=max_attempts, retry_delay_seconds=retry_delay,
     )
+
+
+class _FakeScopeFence:
+    """E2E 使用的进程内栅栏替身。"""
+
+    @contextmanager
+    def hold(self, task, attempt_token, scope, *, timeout_seconds):
+        yield ScopeFenceDecision(superseded=False)
 
 
 def _scope_key(scope: IncrementalImpactScope) -> str:
@@ -773,14 +784,8 @@ class TestTransientFailureReplay:
         task_repo.fail_finalize_with_lease = False
         store.fail_upsert = None  # 恢复
         orch = _build_orchestrator(store, task_repo, artifact_repo)
-        # handed_off 起重放只从 Artifact 恢复，不使用 prepared 内容；传一个占位
-        # PreparedChunkSet 满足 process 的类型要求（与正式恢复语义一致）。
-        placeholder = PreparedChunkSet(
-            task_id=task.task_id, batch_id=task.batch_id, data_version="8",
-            impact_scope=task_repo.state and _employment_facts(700001, 21307).scope,
-            desired_chunks=(),
-        )
-        result2 = orch.process(task.task_id, new_token, placeholder)
+        # handed_off 起只从 Artifact 恢复，不再传占位 PreparedChunkSet。
+        result2 = orch.process(task.task_id, new_token)
         assert result2.final_status == "success"
         assert task_repo.finalize_calls
         # 关键：第二次从 validated 起复用已存 Artifact，store 不新增、artifact_id 与

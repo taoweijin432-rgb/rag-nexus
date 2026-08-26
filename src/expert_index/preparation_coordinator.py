@@ -11,9 +11,9 @@
   与本机时间比较，不给 naive DATETIME 猜测或强行附加时区。
 - 复用现有 ``renew_source_sync_task_lease`` 与 ``advance_source_sync_task_stage`` 两个
   Repository 方法；不新增第二套 lease API，不修改 MySQL schema。
-- 阶段严格单调相邻推进：``candidate → source_read → normalized → chunk_built →
-  validated``；不回退、不跳级。``contract_ready``/``handed_off``/``completed`` 属于
-  P5，P4 不推进，也不调用 ``mark_source_sync_task_success``。
+- 首次执行和 Artifact 前恢复都重读 MySQL 当前事实并重建内存结果；阶段只补齐当前阶段
+  之后的相邻节点，绝不回退。``contract_ready``/``handed_off``/``completed`` 属于 P5，
+  P4 不推进，也不调用 ``mark_source_sync_task_success``。
 - 每次 renew 和 stage 更新都携带 ``task_id`` + 当前 ``attempt_token``；任一冲突
   （lease 已变、token 失配、阶段错位）立即传播异常，**不再读取事实、不再构建、
   不再推进、不返回部分结果**。
@@ -41,6 +41,17 @@ __all__ = ["PreparationCoordinator", "TaskRepositoryPort"]
 #: 续租默认 lease 秒数。与 P3 扫描/claim 默认对齐，仅作为传给 Repository 的建议值；
 #: 真正的 lease 有效性仍由 Repository 以 MySQL CURRENT_TIMESTAMP(6) 判定。
 DEFAULT_LEASE_SECONDS = 120
+
+_PREPARATION_STAGES = (
+    "candidate",
+    "source_read",
+    "normalized",
+    "chunk_built",
+    "validated",
+)
+_PREPARATION_STAGE_INDEX = {
+    stage: index for index, stage in enumerate(_PREPARATION_STAGES)
+}
 
 
 class TaskRepositoryPort(Protocol):
@@ -106,17 +117,16 @@ class PreparationCoordinator:
         :param task: P3 已领取任务模型（``sync_status == 'processing'``）。
         :param attempt_token: 调用方持有的本次认领令牌，必须与 ``task.attempt_token`` 一致。
 
-        执行序（阶段严格单调相邻：candidate → source_read → normalized →
-        chunk_built → validated）：
+        执行序（首次或 Artifact 前恢复均从当前事实重建）：
         1. 内存层校验 task 是 SourceSyncTask、状态 processing、token 匹配。
         2. 续租（Repository 以 MySQL CURRENT_TIMESTAMP(6) + token + rowcount 权威判定）。
         3. 读取当前事实（纯读取，不构建）；读取异常立即停止，不推进 source_read。
-        4. 推进 ``source_read``（candidate → source_read）；失败立即停止。
+        4. 当前仍为 ``candidate`` 时推进 ``source_read``；恢复任务不回退阶段。
         5. 续租。
         6. 调用 ``build_prepared_chunk_set`` 完成 Normalize/Build/Validate；任一失败
            异常立即向上传播，**阶段最多停留在 source_read**（不提前写 normalized）。
         7. 续租。
-        8. 依次相邻推进 ``normalized`` → ``chunk_built`` → ``validated``（P4 终态）。
+        8. 从当前阶段起依次补齐 ``normalized`` → ``chunk_built`` → ``validated``。
         9. 返回 :class:`PreparedChunkSet`。
 
         注：``build_prepared_chunk_set`` 当前尚未拆成三个独立步骤，本次在它完整成功
@@ -134,9 +144,14 @@ class PreparationCoordinator:
             raise ValueError("attempt_token 必须是非空字符串")
         if task.attempt_token is None or task.attempt_token != attempt_token:
             raise ValueError("attempt_token 与任务当前令牌不一致，调用方不再持有有效 lease")
+        if task.processing_stage not in _PREPARATION_STAGE_INDEX:
+            raise ValueError(
+                f"P4 无法从 {task.processing_stage!r} 阶段准备当前事实"
+            )
 
         task_id = task.task_id
         token = attempt_token
+        current_stage = task.processing_stage
 
         # 2) 续租：以 Index MySQL CURRENT_TIMESTAMP(6) 为权威。返回的最新任务作为
         #    后续阶段推进的身份上下文；不解读其 lease_until 的时区或与本机时间比较。
@@ -151,10 +166,12 @@ class PreparationCoordinator:
         #    不推进 source_read，不构建 Chunk。
         facts = read_scoped_facts(task, self._source)
 
-        # 4) 推进 source_read（candidate → source_read）。
-        self._repo.advance_source_sync_task_stage(
-            task_id, token, next_stage="source_read",
-        )
+        # 4) 首次任务推进 source_read；恢复任务保留已完成阶段，只重读当前事实。
+        if current_stage == "candidate":
+            self._repo.advance_source_sync_task_stage(
+                task_id, token, next_stage="source_read",
+            )
+            current_stage = "source_read"
 
         # 5) 续租：以 Index MySQL CURRENT_TIMESTAMP(6) 为权威，为后续构建与阶段
         #    推进续住 lease。
@@ -172,17 +189,15 @@ class PreparationCoordinator:
             task_id, token, lease_seconds=self._lease_seconds,
         )
 
-        # 8) 依次相邻推进 normalized → chunk_built → validated（P4 终态）。
-        #    build_prepared_chunk_set 已完整成功，故三阶段连续推进；不推进
-        #    contract_ready/handed_off/completed（属 P5）。
-        self._repo.advance_source_sync_task_stage(
-            task_id, token, next_stage="normalized",
-        )
-        self._repo.advance_source_sync_task_stage(
-            task_id, token, next_stage="chunk_built",
-        )
-        self._repo.advance_source_sync_task_stage(
-            task_id, token, next_stage="validated",
-        )
+        # 8) 只补齐当前阶段之后的节点。构建成功前不前移；恢复时也不回退或重复写
+        #    较早阶段，确保 Repository 的相邻推进约束始终成立。
+        current_index = _PREPARATION_STAGE_INDEX[current_stage]
+        for next_stage in ("normalized", "chunk_built", "validated"):
+            if current_index < _PREPARATION_STAGE_INDEX[next_stage]:
+                self._repo.advance_source_sync_task_stage(
+                    task_id, token, next_stage=next_stage,
+                )
+                current_stage = next_stage
+                current_index = _PREPARATION_STAGE_INDEX[current_stage]
 
         return prepared

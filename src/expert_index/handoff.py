@@ -43,6 +43,13 @@ HandoffReceiptStatus = Literal["committed", "rejected", "failed"]
 """回执终态。committed 表示范围已收敛成功；rejected 表示确定性拒绝（不可重试）；
 failed 表示可重试的下游/基础设施失败。"""
 
+DesiredResultCode = Literal[
+    "embedded",
+    "metadata_updated",
+    "unchanged_skipped",
+    "targets_disabled",
+]
+
 _REQUEST_ID_PREFIX = "handoff"
 _SHA256_HEX_LEN = 64
 _MAX_ERROR_MESSAGE_LEN = 512
@@ -185,6 +192,25 @@ class ScopeHandoffRequest:
 
 
 @dataclass(frozen=True)
+class ScopeDesiredItemResult:
+    """单个 desired vector_doc_id 的确定性收敛结果。"""
+
+    vector_doc_id: str
+    result_code: DesiredResultCode
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.vector_doc_id, str) or not self.vector_doc_id.strip():
+            raise ValueError("desired result vector_doc_id 必须是非空字符串")
+        if self.result_code not in {
+            "embedded",
+            "metadata_updated",
+            "unchanged_skipped",
+            "targets_disabled",
+        }:
+            raise ValueError(f"不支持的 desired result_code: {self.result_code!r}")
+
+
+@dataclass(frozen=True)
 class ScopeHandoffReceipt:
     """范围级下游回执。
 
@@ -201,6 +227,8 @@ class ScopeHandoffReceipt:
     impact_scope: IncrementalImpactScope
     status: HandoffReceiptStatus
     result_code: str
+    desired_results: tuple[ScopeDesiredItemResult, ...] = ()
+    stale_vector_doc_ids: tuple[str, ...] = ()
     desired_count: int = 0
     embedding_count: int = 0
     metadata_only_count: int = 0
@@ -231,8 +259,33 @@ class ScopeHandoffReceipt:
             raise ValueError("result_code 必须是非空字符串")
         if len(self.result_code) > _MAX_RESULT_CODE_LEN:
             raise ValueError("result_code 过长")
+        self._normalize_evidence()
         self._validate_counts()
         self._validate_error_fields()
+
+    def _normalize_evidence(self) -> None:
+        """冻结逐项 desired 结果和 stale 下线 ID，并拒绝重复证据。"""
+
+        normalized: list[ScopeDesiredItemResult] = []
+        for item in tuple(self.desired_results):
+            if isinstance(item, ScopeDesiredItemResult):
+                normalized.append(item)
+            elif isinstance(item, tuple) and len(item) == 2:
+                normalized.append(ScopeDesiredItemResult(item[0], item[1]))
+            else:
+                raise TypeError("desired_results 必须包含 ScopeDesiredItemResult")
+        desired_results = tuple(normalized)
+        stale_ids = tuple(self.stale_vector_doc_ids)
+        if len({item.vector_doc_id for item in desired_results}) != len(desired_results):
+            raise ValueError("desired_results 包含重复 vector_doc_id")
+        if any(not isinstance(value, str) or not value.strip() for value in stale_ids):
+            raise ValueError("stale_vector_doc_ids 必须全部是非空字符串")
+        if len(set(stale_ids)) != len(stale_ids):
+            raise ValueError("stale_vector_doc_ids 包含重复值")
+        if {item.vector_doc_id for item in desired_results} & set(stale_ids):
+            raise ValueError("desired 与 stale 证据不得包含相同 vector_doc_id")
+        object.__setattr__(self, "desired_results", desired_results)
+        object.__setattr__(self, "stale_vector_doc_ids", stale_ids)
 
     def _validate_counts(self) -> None:
         """计数必须是非负整数（拒绝 bool），disable 独立不参与收敛等式。"""
@@ -400,7 +453,9 @@ class ScopeHandoffBuilder:
 
 
 __all__ = [
+    "DesiredResultCode",
     "HandoffReceiptStatus",
+    "ScopeDesiredItemResult",
     "ScopeHandoffBuilder",
     "ScopeHandoffReceipt",
     "ScopeHandoffRequest",

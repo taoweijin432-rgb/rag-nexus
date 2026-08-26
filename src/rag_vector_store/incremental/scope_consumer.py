@@ -116,6 +116,8 @@ class ScopeReceiptSink(Protocol):
         impact_scope: ScopeView,
         status: str,
         result_code: str,
+        desired_results: tuple[tuple[str, str], ...],
+        stale_vector_doc_ids: tuple[str, ...],
         desired_count: int,
         embedding_count: int,
         metadata_only_count: int,
@@ -398,6 +400,7 @@ class ScopeConsumer:
                 error_type=block.error_type,
                 error_message=block.error_message,
                 counts=block.counts,
+                desired_results=desired_results,
                 retryable=block.retryable,
             )
 
@@ -433,6 +436,7 @@ class ScopeConsumer:
                 error_type=ERROR_CODE_SCOPE_STALE_DISABLE_FAILED,
                 error_message=stale_error[0],
                 counts=counts,
+                desired_results=desired_results,
                 disable_count=desired_disable_count,  # 只保留已成功的 desired disable，不计失败的 stale
                 retryable=stale_error[1],
             )
@@ -441,6 +445,8 @@ class ScopeConsumer:
             status="committed",
             result_code="scope_committed",
             counts=counts,
+            desired_results=desired_results,
+            stale_vector_doc_ids=tuple(stale_ids),
             disable_count=desired_disable_count + stale_success_count,
         )
 
@@ -549,12 +555,19 @@ class ScopeConsumer:
         error_type: str | None = None,
         error_message: str | None = None,
         counts: _Counts | None = None,
+        desired_results: list[ExecutionResult] | None = None,
+        stale_vector_doc_ids: tuple[str, ...] = (),
         disable_count: int = 0,
         retryable: bool = False,
     ) -> Any:
         """组装上游 Receipt（identity/token/payload_hash/scope 原样回填）。"""
 
         counts = counts or _Counts()
+        item_results = tuple(
+            (result.vector_doc_id, result.result_code)
+            for result in (desired_results or [])
+            if result.status in {"committed", "skipped"}
+        )
         return self._receipt_sink.make_receipt(
             request_id=request.request_id,
             task_id=request.task_id,
@@ -564,6 +577,8 @@ class ScopeConsumer:
             impact_scope=request.impact_scope,
             status=status,
             result_code=result_code,
+            desired_results=item_results,
+            stale_vector_doc_ids=stale_vector_doc_ids,
             desired_count=len(request.contracts),
             embedding_count=counts.embedding,
             metadata_only_count=counts.metadata_only,

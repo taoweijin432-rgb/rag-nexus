@@ -95,6 +95,7 @@ SOURCE_SYNC_ERROR_STAGES = frozenset(
 # mixed_mutation: 单任务内同时存在多种写入效果（embed+metadata-only 或 embed+disable 等）；
 # no_action_unchanged: 三 Hash 全同，零写入（计入 skipped_count）；
 # recovered_unchanged: 幂等重放确认已收敛（不计 skipped_count）；
+# superseded: 已有更晚重叠范围任务，旧请求未调用下游并安全收尾；
 # expert_deleted: 专家删除双时间，空 desired 全专家下线（零 Embedding，不计 skipped）；
 # no_chunkable_content: 非删除但零 chunk 可构建（不计 skipped）。
 TASK_RESULT_CODES = frozenset(
@@ -105,6 +106,7 @@ TASK_RESULT_CODES = frozenset(
         "mixed_mutation",
         "no_action_unchanged",
         "recovered_unchanged",
+        "superseded",
         "expert_deleted",
         "no_chunkable_content",
     }

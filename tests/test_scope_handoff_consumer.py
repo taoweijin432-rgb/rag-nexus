@@ -546,6 +546,10 @@ class TestStaleDownsize:
         assert base.vector_doc_id not in disabled
         assert stale_vid in disabled
         assert receipt.disable_count == 1
+        assert receipt.stale_vector_doc_ids == (stale_vid,)
+        assert [item.vector_doc_id for item in receipt.desired_results] == [
+            base.vector_doc_id
+        ]
 
 
 # ---------------------------------------------------------------------------

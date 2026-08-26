@@ -58,6 +58,8 @@ task/batch/token 重建当前 Request identity，并重新校验重建 Request �
 from __future__ import annotations
 
 import json
+from collections.abc import Callable
+from contextlib import AbstractContextManager
 from dataclasses import dataclass
 from typing import Any, Protocol, runtime_checkable
 
@@ -67,6 +69,10 @@ from .repositories.artifact import (
     ArtifactPayloadConflictError,
     ArtifactPayloadValidationError,
     ContractArtifact,
+)
+from .repositories.scope_fence import (
+    ScopeFenceDecision,
+    ScopeFenceUnavailableError,
 )
 from .repositories.sync_task import (
     SourceSyncTaskLeaseConflictError,
@@ -78,6 +84,7 @@ __all__ = [
     "HandoffOrchestrationResult",
     "HandoffOrchestrator",
     "ReceiptValidationError",
+    "ScopeFencePort",
     "TaskRepositoryPort",
 ]
 
@@ -149,6 +156,14 @@ class TaskRepositoryPort(Protocol):
     """
 
     def get_source_sync_task(self, task_id: int) -> SourceSyncTask | None: ...
+
+    def renew_source_sync_task_lease(
+        self,
+        task_id: int,
+        attempt_token: str,
+        *,
+        lease_seconds: int,
+    ) -> SourceSyncTask: ...
 
     def advance_source_sync_task_stage(
         self,
@@ -233,6 +248,20 @@ class ScopeConsumerPort(Protocol):
     def process(self, request: ScopeHandoffRequest) -> ScopeHandoffReceipt: ...
 
 
+@runtime_checkable
+class ScopeFencePort(Protocol):
+    """在下游调用期间串行化同一专家，并判断旧重叠请求。"""
+
+    def hold(
+        self,
+        task: SourceSyncTask,
+        attempt_token: str,
+        scope: Any,
+        *,
+        timeout_seconds: int,
+    ) -> AbstractContextManager[ScopeFenceDecision]: ...
+
+
 @dataclass(frozen=True)
 class HandoffOrchestrationResult:
     """编排一次执行的结构化结果。
@@ -267,6 +296,8 @@ class HandoffOrchestrator:
         artifact_repo: ArtifactRepositoryPort,
         builder: ScopeHandoffBuilder,
         consumer: ScopeConsumerPort,
+        scope_fence: ScopeFencePort,
+        lease_seconds: int,
         max_attempts: int,
         retry_delay_seconds: int,
     ) -> None:
@@ -274,26 +305,40 @@ class HandoffOrchestrator:
             raise ValueError("max_attempts 必须是非负整数")
         if isinstance(retry_delay_seconds, bool) or not isinstance(retry_delay_seconds, int) or retry_delay_seconds < 1:
             raise ValueError("retry_delay_seconds 必须是正整数")
+        if isinstance(lease_seconds, bool) or not isinstance(lease_seconds, int) or lease_seconds < 1:
+            raise ValueError("lease_seconds 必须是正整数")
         self._task_repo = task_repo
         self._artifact_repo = artifact_repo
         self._builder = builder
         self._consumer = consumer
+        self._scope_fence = scope_fence
+        self._lease_seconds = lease_seconds
         self._max_attempts = max_attempts
         self._retry_delay_seconds = retry_delay_seconds
 
-    def process(self, task_id: int, attempt_token: str, prepared: PreparedChunkSet) -> HandoffOrchestrationResult:
+    def process(
+        self,
+        task_id: int,
+        attempt_token: str,
+        prepared: PreparedChunkSet | None = None,
+        *,
+        prepare_if_missing: Callable[[], PreparedChunkSet] | None = None,
+    ) -> HandoffOrchestrationResult:
         """对单个已领取任务执行 Handoff 编排闭环。
 
-        ``prepared`` 仅在 ``validated`` 且无 Artifact 时被 Builder 使用；其余阶段
-        只从 Artifact 恢复 Request。所有写操作携带 ``attempt_token`` fencing。
+        ``prepared`` 仅在 ``validated`` 且无 Artifact 时被 Builder 使用。恢复调用可传
+        ``prepare_if_missing``，仅在确认 Artifact 不存在后重读当前事实；已有 Artifact
+        的阶段只恢复稳定 Request。所有写操作携带 ``attempt_token`` fencing。
         """
 
         if not isinstance(task_id, int) or isinstance(task_id, bool) or task_id < 1:
             raise ValueError("task_id 必须是正整数")
         if not isinstance(attempt_token, str) or not attempt_token.strip():
             raise ValueError("attempt_token 必须是非空字符串")
-        if not isinstance(prepared, PreparedChunkSet):
-            raise TypeError("prepared 必须是 PreparedChunkSet")
+        if prepared is not None and not isinstance(prepared, PreparedChunkSet):
+            raise TypeError("prepared 必须是 PreparedChunkSet 或 None")
+        if prepare_if_missing is not None and not callable(prepare_if_missing):
+            raise TypeError("prepare_if_missing 必须可调用")
 
         current = self._task_repo.get_source_sync_task(task_id)
         if current is None:
@@ -325,7 +370,13 @@ class HandoffOrchestrator:
 
         stage = current.processing_stage
         if stage == "validated":
-            return self._from_validated(current, attempt_token, prepared, entry_stage=stage)
+            return self._from_validated(
+                current,
+                attempt_token,
+                prepared,
+                prepare_if_missing=prepare_if_missing,
+                entry_stage=stage,
+            )
         if stage == "contract_ready":
             return self._from_contract_ready_or_handed_off(
                 current, attempt_token, is_handed_off=False, entry_stage=stage
@@ -351,8 +402,9 @@ class HandoffOrchestrator:
         self,
         task: SourceSyncTask,
         attempt_token: str,
-        prepared: PreparedChunkSet,
+        prepared: PreparedChunkSet | None,
         *,
+        prepare_if_missing: Callable[[], PreparedChunkSet] | None,
         entry_stage: str,
     ) -> HandoffOrchestrationResult:
         """validated：优先复用已存 Artifact，无则经 Builder 构建后 put_or_verify。"""
@@ -372,14 +424,21 @@ class HandoffOrchestrator:
                     attempt_token,
                     error_stage="artifact",
                     error_code=_ERROR_CODE_ARTIFACT_BUILD,
-                    safe_error_message=_single_line_truncate(verify_error),
+                    error_type="ArtifactIntegrityError",
+                    safe_error_message="Artifact 完整性校验失败",
                 )
             return self._persist_and_advance_to_contract_ready(
                 task, attempt_token, request, entry_stage=entry_stage
             )
 
-        # 无 Artifact：经 Builder 构建（首次或新 attempt 重建当前事实后）。
+        # 无 Artifact：首次调用使用传入结果；崩溃恢复只在此刻重读当前事实。
         try:
+            if prepared is None:
+                if prepare_if_missing is None:
+                    raise ValueError("validated 且无 Artifact 时缺少当前事实准备入口")
+                prepared = prepare_if_missing()
+            if not isinstance(prepared, PreparedChunkSet):
+                raise TypeError("当前事实准备入口必须返回 PreparedChunkSet")
             request = self._builder.build(task, attempt_token, prepared)
         except (ValueError, TypeError) as error:
             # Builder 契约/身份校验失败：确定性 rejected。
@@ -388,7 +447,8 @@ class HandoffOrchestrator:
                 attempt_token,
                 error_stage="handoff",
                 error_code=_ERROR_CODE_ARTIFACT_BUILD,
-                safe_error_message=_single_line_truncate(str(error)),
+                error_type=type(error).__name__,
+                safe_error_message="Handoff 请求构建校验失败",
             )
         return self._persist_and_advance_to_contract_ready(
             task, attempt_token, request, entry_stage=entry_stage
@@ -426,7 +486,8 @@ class HandoffOrchestrator:
                 attempt_token,
                 error_stage="artifact",
                 error_code=_ERROR_CODE_ARTIFACT_BUILD,
-                safe_error_message=_single_line_truncate(verify_error),
+                error_type="ArtifactIntegrityError",
+                safe_error_message="Artifact 完整性校验失败",
             )
         if not is_handed_off:
             # contract_ready：推进到 handed_off 后执行 Consumer。
@@ -467,7 +528,8 @@ class HandoffOrchestrator:
                 attempt_token,
                 error_stage="artifact",
                 error_code=_ERROR_CODE_ARTIFACT_PUT,
-                safe_error_message=_single_line_truncate(str(error)),
+                error_type=type(error).__name__,
+                safe_error_message="Artifact identity/hash 冲突",
             )
         except ArtifactPayloadValidationError as error:
             # payload 白名单/格式非法：确定性 rejected。
@@ -476,7 +538,8 @@ class HandoffOrchestrator:
                 attempt_token,
                 error_stage="artifact",
                 error_code=_ERROR_CODE_ARTIFACT_PUT,
-                safe_error_message=_single_line_truncate(str(error)),
+                error_type=type(error).__name__,
+                safe_error_message="Artifact Payload 校验失败",
             )
         except (ValueError, TypeError) as error:
             # 参数校验非法：确定性 rejected。
@@ -485,7 +548,8 @@ class HandoffOrchestrator:
                 attempt_token,
                 error_stage="artifact",
                 error_code=_ERROR_CODE_ARTIFACT_PUT,
-                safe_error_message=_single_line_truncate(str(error)),
+                error_type=type(error).__name__,
+                safe_error_message="Artifact 写入参数校验失败",
             )
         except Exception as error:  # noqa: BLE001 - 基础设施失败统一转可重试
             return self._retryable(
@@ -493,7 +557,8 @@ class HandoffOrchestrator:
                 attempt_token,
                 error_stage="artifact",
                 error_code=_ERROR_CODE_ARTIFACT_PUT,
-                safe_error_message=_single_line_truncate(f"Artifact 写入基础设施失败：{error}"),
+                error_type=type(error).__name__,
+                safe_error_message="Artifact 写入基础设施失败",
             )
 
         # 推进 contract_ready（validated 必经阶段）。
@@ -520,24 +585,61 @@ class HandoffOrchestrator:
     ) -> HandoffOrchestrationResult:
         """调用 ScopeConsumer，校验 Receipt，按终态落定任务。"""
 
+        # 下游调用前先续租；随后在专家级 MySQL 栅栏内完成顺序判定、调用、再次
+        # 续租和终态落定，避免旧 Artifact 晚到覆盖同专家的新状态。
         try:
-            receipt = self._consumer.process(request)
-        except (ValueError, TypeError) as error:
-            # 确定性契约/范围/状态非法：rejected。
-            return self._reject(
+            self._task_repo.renew_source_sync_task_lease(
+                task.task_id,
+                attempt_token,
+                lease_seconds=self._lease_seconds,
+            )
+            with self._scope_fence.hold(
                 task,
                 attempt_token,
-                error_stage="scope_consumer",
-                error_code=_ERROR_CODE_CONSUMER,
-                safe_error_message=_single_line_truncate(str(error)),
+                request.impact_scope,
+                timeout_seconds=max(1, self._lease_seconds // 3),
+            ) as fence:
+                if fence.superseded:
+                    return self._mark_superseded(task, attempt_token, artifact)
+                try:
+                    receipt = self._consumer.process(request)
+                except (ValueError, TypeError) as error:
+                    return self._reject(
+                        task,
+                        attempt_token,
+                        error_stage="scope_consumer",
+                        error_code=_ERROR_CODE_CONSUMER,
+                        error_type=type(error).__name__,
+                        safe_error_message="下游范围请求校验失败",
+                    )
+                except Exception as error:  # noqa: BLE001 - 下游瞬时失败统一可重试
+                    return self._retryable(
+                        task,
+                        attempt_token,
+                        error_stage="scope_consumer",
+                        error_code=_ERROR_CODE_CONSUMER,
+                        error_type=type(error).__name__,
+                        safe_error_message="下游范围调用瞬时失败",
+                    )
+                self._task_repo.renew_source_sync_task_lease(
+                    task.task_id,
+                    attempt_token,
+                    lease_seconds=self._lease_seconds,
+                )
+        except SourceSyncTaskLeaseConflictError:
+            return HandoffOrchestrationResult(
+                final_status="processing",
+                terminal=False,
+                result_code=None,
+                error_stage="fencing",
             )
-        except Exception as error:  # noqa: BLE001 - 向量/网络/下游瞬时失败统一可重试
+        except ScopeFenceUnavailableError:
             return self._retryable(
                 task,
                 attempt_token,
-                error_stage="scope_consumer",
-                error_code=_ERROR_CODE_CONSUMER,
-                safe_error_message=_single_line_truncate(f"Consumer 调用瞬时失败：{error}"),
+                error_stage="handoff",
+                error_code=_ERROR_CODE_FENCING,
+                safe_error_message="专家级执行栅栏获取超时",
             )
 
         # 严格校验 Receipt 与当前 Request 一致。
@@ -549,7 +651,8 @@ class HandoffOrchestrator:
                 attempt_token,
                 error_stage="receipt",
                 error_code=_ERROR_CODE_RECEIPT_INVALID,
-                safe_error_message=_single_line_truncate(str(error)),
+                error_type=type(error).__name__,
+                safe_error_message="下游回执与当前请求不一致",
             )
 
         if receipt.status == "committed":
@@ -559,9 +662,9 @@ class HandoffOrchestrator:
                 task,
                 attempt_token,
                 error_stage="scope_consumer",
-                error_code=receipt.result_code,
-                error_type=receipt.error_type,
-                safe_error_message=receipt.error_message,
+                error_code=_ERROR_CODE_CONSUMER,
+                error_type="DownstreamRejected",
+                safe_error_message="下游确定性拒绝范围请求",
             )
         # failed：按 retryable 决定 retryable / rejected。
         if receipt.retryable:
@@ -569,17 +672,47 @@ class HandoffOrchestrator:
                 task,
                 attempt_token,
                 error_stage="scope_consumer",
-                error_code=receipt.result_code,
-                error_type=receipt.error_type,
-                safe_error_message=receipt.error_message,
+                error_code=_ERROR_CODE_CONSUMER,
+                error_type="DownstreamRetryableFailure",
+                safe_error_message="下游范围调用返回可重试失败",
             )
         return self._reject(
             task,
             attempt_token,
             error_stage="scope_consumer",
-            error_code=receipt.result_code,
-            error_type=receipt.error_type,
-            safe_error_message=receipt.error_message,
+            error_code=_ERROR_CODE_CONSUMER,
+            error_type="DownstreamNonRetryableFailure",
+            safe_error_message="下游范围调用返回不可重试失败",
+        )
+
+    def _mark_superseded(
+        self,
+        task: SourceSyncTask,
+        attempt_token: str,
+        artifact: ContractArtifact,
+    ) -> HandoffOrchestrationResult:
+        """不调用下游，原子落定已被更晚重叠任务取代的旧请求。"""
+
+        try:
+            self._task_repo.finalize_source_sync_task_success(
+                task.task_id,
+                attempt_token,
+                task_result_code="superseded",
+                artifact_id=artifact.artifact_id,
+                artifact_payload_hash=artifact.payload_hash,
+            )
+        except (SourceSyncTaskLeaseConflictError, SourceSyncTaskStageConflictError):
+            return HandoffOrchestrationResult(
+                final_status="processing",
+                terminal=False,
+                result_code=None,
+                error_stage="fencing",
+            )
+        return HandoffOrchestrationResult(
+            final_status="success",
+            terminal=True,
+            result_code="superseded",
+            error_stage=None,
         )
 
     # ------------------------------------------------------------------
@@ -648,12 +781,31 @@ class HandoffOrchestrator:
             raise ReceiptValidationError("payload_hash 不一致")
         if receipt.impact_scope != request.impact_scope:
             raise ReceiptValidationError("impact_scope 不一致")
+        expected_ids = tuple(contract.vector_doc_id for contract in request.contracts)
+        evidence_ids = tuple(item.vector_doc_id for item in receipt.desired_results)
+        if any(vector_doc_id not in set(expected_ids) for vector_doc_id in evidence_ids):
+            raise ReceiptValidationError("desired 回执包含请求范围外 vector_doc_id")
         if receipt.status not in ("committed", "rejected", "failed"):
             raise ReceiptValidationError(f"未知回执状态: {receipt.status!r}")
         # committed 不得带错误；rejected/failed 必须带错误。
         if receipt.status == "committed":
             if receipt.error_type is not None or receipt.error_message is not None:
                 raise ReceiptValidationError("committed 回执不得携带错误字段")
+            if evidence_ids != expected_ids:
+                raise ReceiptValidationError("committed 回执未按请求顺序完整覆盖 desired IDs")
+            result_codes = tuple(item.result_code for item in receipt.desired_results)
+            if receipt.embedding_count != result_codes.count("embedded"):
+                raise ReceiptValidationError("embedding_count 与逐项证据不一致")
+            if receipt.metadata_only_count != result_codes.count("metadata_updated"):
+                raise ReceiptValidationError("metadata_only_count 与逐项证据不一致")
+            if receipt.unchanged_count != result_codes.count("unchanged_skipped"):
+                raise ReceiptValidationError("unchanged_count 与逐项证据不一致")
+            expected_disable_count = (
+                result_codes.count("targets_disabled")
+                + len(receipt.stale_vector_doc_ids)
+            )
+            if receipt.disable_count != expected_disable_count:
+                raise ReceiptValidationError("disable_count 与 desired/stale 证据不一致")
         else:
             if receipt.error_type is None or receipt.error_message is None:
                 raise ReceiptValidationError(f"{receipt.status} 回执必须携带 error_type/error_message")
@@ -783,7 +935,8 @@ class HandoffOrchestrator:
                     attempt_token,
                     error_stage="handoff",
                     error_code=_ERROR_CODE_UNSUPPORTED_STAGE,
-                    safe_error_message=_single_line_truncate(str(error)),
+                    error_type=type(error).__name__,
+                    safe_error_message="任务处理阶段推进冲突",
                 ),
             )
         return _AdvanceOutcome(failure=None)

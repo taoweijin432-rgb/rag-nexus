@@ -86,6 +86,15 @@ class TestExpandErrorStagesMigration:
         assert re.search(r"\bADD\s+INDEX\b", sql_text, re.IGNORECASE) is None, "禁止新增索引"
         assert re.search(r"\bADD\s+UNIQUE\b", sql_text, re.IGNORECASE) is None, "禁止新增唯一键"
 
+    def test_missing_constraint_is_recreated_on_rerun(self, sql_text: str) -> None:
+        """DROP 成功而 ADD 中断后，下一次必须按约束缺失路径重新 ADD。"""
+
+        assert "@expert_index_p5_constraint_exists" in sql_text
+        assert "@expert_index_p5_constraint_current" in sql_text
+        assert "@expert_index_p5_need_drop" in sql_text
+        assert "@expert_index_p5_need_add" in sql_text
+        assert "@expert_index_p5_constraint_current = 0" in sql_text
+
     def test_values_match_model_error_stages(self, sql_text: str) -> None:
         # 与 expert_index/models.py 的 SOURCE_SYNC_ERROR_STAGES 保持一致。
         from expert_index.models import SOURCE_SYNC_ERROR_STAGES

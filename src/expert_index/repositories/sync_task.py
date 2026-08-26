@@ -184,8 +184,8 @@ class MySQLSourceSyncTaskRepository:
 
         队头状态语义：
 
-        - ``pending`` 且 ``next_retry_at`` 已到或为空：允许领取（首次 attempt，
-          ``retry_count`` 不增加）；
+        - ``pending`` 且 ``next_retry_at`` 为空：允许首次领取，``retry_count`` 不增加；
+        - ``pending`` 且 ``next_retry_at`` 已到：允许重试领取，``retry_count += 1``；
         - ``pending`` 且 ``next_retry_at`` 未到：**返回空**，不领取更晚任务
           （等待退避到期）；
         - ``processing`` 且 lease 已过期：允许回收（``retry_count += 1``）；
@@ -201,9 +201,10 @@ class MySQLSourceSyncTaskRepository:
         正在退避或 lease 未过期的 task）。P5.7 正式调用固定 ``limit=1``，多领取
         路径仅在接口兼容场景出现。
 
-        每条领取任务获得新的 ``attempt_token``；回收过期 processing 时增加
-        ``retry_count``，不改变已完成的处理阶段。方法只访问本地 Index MySQL，
-        使用 ``CURRENT_TIMESTAMP(6)`` 权威时间与 ``FOR UPDATE SKIP LOCKED``。
+        每条领取任务获得新的 ``attempt_token``；退避到期的 pending 和过期 processing
+        都表示开始一次重试，因此增加 ``retry_count``，且不改变已完成的处理阶段。
+        方法只访问本地 Index MySQL，使用 ``CURRENT_TIMESTAMP(6)`` 权威时间与
+        ``FOR UPDATE SKIP LOCKED``。
         """
 
         _validate_positive_integer("batch_id", batch_id)
@@ -325,7 +326,7 @@ class MySQLSourceSyncTaskRepository:
 
         next_retry_at = locked.get("next_retry_at")
         lease_until = locked.get("lease_until")
-        reclaim = False
+        retry_attempt = False
         if status == "pending":
             if next_retry_at is not None:
                 cursor.execute(
@@ -336,8 +337,9 @@ class MySQLSourceSyncTaskRepository:
                 db_now = now_row["now"] if now_row is not None else None
                 if db_now is not None and next_retry_at > db_now:
                     return ("stop",)
+                retry_attempt = True
         else:  # processing
-            reclaim = True
+            retry_attempt = True
             cursor.execute(
                 "SELECT CURRENT_TIMESTAMP(6) AS now",
                 (),
@@ -363,7 +365,7 @@ class MySQLSourceSyncTaskRepository:
             (
                 attempt_token,
                 lease_seconds,
-                1 if reclaim else 0,
+                1 if retry_attempt else 0,
                 frontier_id,
                 status,
             ),
@@ -621,8 +623,8 @@ class MySQLSourceSyncTaskRepository:
         ``retry_delay_seconds`` 决定 next_retry_at 退避时长。
 
         - retry_count < max_attempts：写 sync_status='pending'、设置
-          next_retry_at、清理 token/lease、保留 error 摘要，不增加 retry_count
-          （重试计入由下次 claim 回收时按现有逻辑处理）。completed_at 保持 NULL。
+          next_retry_at、清理 token/lease、保留 error 摘要，不增加 retry_count；
+          退避到期后重新 claim 时才原子增加一次。completed_at 保持 NULL。
         - retry_count >= max_attempts：写 sync_status='dead'、清理 token/lease、
           next_retry_at=NULL、写 completed_at，进入确定性终态。
 

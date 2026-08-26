@@ -38,13 +38,10 @@
 
 - ``candidate``：P3 新建任务固定 ``candidate/pending``，经
   :meth:`PreparationCoordinator.prepare` 推进到 ``validated``。
-- ``validated``/``contract_ready``/``handed_off``：直接经
-  :meth:`HandoffOrchestrator.process` 从 Artifact 恢复（不重新 prepare）。
-- ``source_read``/``normalized``/``chunk_built``：P4 中间阶段崩溃恢复不在
-  :meth:`PreparationCoordinator.prepare` 的邻接推进能力内（其内部固定从
-  ``candidate`` 顺序推进），prepare 抛
-  :class:`SourceSyncTaskStageConflictError` 由 Coordinator fail-closed 捕获并
-  停止本批——这是受控首期已知缺口，不自行绕过。
+- ``source_read``/``normalized``/``chunk_built``：重读 MySQL 当前事实并从已完成阶段
+  继续补齐到 ``validated``。
+- ``validated``：优先恢复已有 Artifact；只有 Artifact 不存在时才调用 P4 重建入口。
+- ``contract_ready``/``handed_off``：只从 Artifact 恢复，不重新读取来源事实。
 """
 
 from __future__ import annotations
@@ -52,7 +49,6 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from .handoff_orchestrator import HandoffOrchestrationResult
-from .models import PreparedChunkSet
 from .preparation_coordinator import PreparationCoordinator
 
 __all__ = [
@@ -82,12 +78,12 @@ class SourceBatchRunResult:
     error: str | None  # 稳定异常类名（无业务正文）
 
 
-# 已在 HandoffOrchestrator 支持的崩溃恢复阶段。
-_HANDOFF_RECOVERY_STAGES = frozenset({"validated", "contract_ready", "handed_off"})
-# P4 PreparationCoordinator 推进的起点阶段（新任务固定从这里开始）。
-_P4_PREPARE_STAGE = "candidate"
-# 占位 impact_scope 的 expert_id（仅构造合法 expert 范围占位，不参与实际构建）。
-_PLACEHOLDER_EXPERT_ID = 1
+# Artifact 前允许重读当前事实并恢复的 P4 阶段。
+_P4_PREPARATION_STAGES = frozenset(
+    {"candidate", "source_read", "normalized", "chunk_built"}
+)
+# 只允许从 Artifact 恢复的 P5 阶段。
+_HANDOFF_RECOVERY_STAGES = frozenset({"contract_ready", "handed_off"})
 
 # 终态映射（来自 HandoffOrchestrationResult.final_status）。
 _TERMINAL_SUCCESS = "success"
@@ -162,6 +158,13 @@ class SourceBatchCoordinator:
         :param task_claim_limit: 单次 claim 的 task 数，首期固定 ``1``（串行）。
         :return: :class:`SourceBatchRunResult`（内存计数，无新 DB 字段）。
         """
+
+        if (
+            isinstance(task_claim_limit, bool)
+            or not isinstance(task_claim_limit, int)
+            or task_claim_limit != 1
+        ):
+            raise ValueError("task_claim_limit 首期必须固定为 1")
 
         # 1) 读取并校验 BatchSourceScan：Coordinator 不创建 Batch Source，只读。
         scan = self._source_state.get_batch_source_scan(batch_id, source_table)
@@ -253,29 +256,51 @@ class SourceBatchCoordinator:
             #    handed_off → P5 orchestrator 恢复；其余 P4 中间阶段 prepare 会抛
             #    StageConflict → fail-closed 停止。
             try:
-                if task.processing_stage == _P4_PREPARE_STAGE:
+                if task.processing_stage in _P4_PREPARATION_STAGES:
                     prepared = self._prepare.prepare(task, task.attempt_token)
+                    self._source_state.renew_source_lease(
+                        source_table,
+                        lease_owner,
+                        lease_seconds=self._source_lease_seconds,
+                    )
                     result = self._orchestrator.process(
                         task.task_id, task.attempt_token, prepared
+                    )
+                elif task.processing_stage == "validated":
+                    # Orchestrator 先查 Artifact；仅在不存在时调用 P4 当前事实重建。
+                    self._source_state.renew_source_lease(
+                        source_table,
+                        lease_owner,
+                        lease_seconds=self._source_lease_seconds,
+                    )
+                    result = self._orchestrator.process(
+                        task.task_id,
+                        task.attempt_token,
+                        prepare_if_missing=lambda task=task: self._prepare.prepare(
+                            task, task.attempt_token
+                        ),
                     )
                 elif task.processing_stage in _HANDOFF_RECOVERY_STAGES:
-                    # 崩溃恢复：按现有 Orchestrator 恢复规则处理，不重新 prepare。
-                    # orchestrator.process 在 validated+已有 Artifact、contract_ready、
-                    # handed_off 三个恢复路径**都不使用** ``prepared``（只从 Artifact
-                    # 重建 Request）。但 ``process`` 签名要求非 None 且做 isinstance 校验，
-                    # 故传入一个合法空 desired 的占位（绝不参与实际构建）。
-                    # 已知首期缺口：validated + 无 Artifact 的极小崩溃窗口下 orchestrator
-                    # 会经 Builder 用此占位重建，可能产生空 desired——该路径由 Receipt
-                    # 校验 fail-closed 兜底，不绕过 fencing，留待后续补齐。
-                    prepared = _recovery_placeholder_prepared()
+                    # contract_ready/handed_off 必须仅使用已持久化 Artifact。
+                    self._source_state.renew_source_lease(
+                        source_table,
+                        lease_owner,
+                        lease_seconds=self._source_lease_seconds,
+                    )
                     result = self._orchestrator.process(
-                        task.task_id, task.attempt_token, prepared
+                        task.task_id, task.attempt_token
                     )
                 else:
-                    # source_read/normalized/chunk_built 等 P4 中间阶段崩溃恢复不在
-                    # 首期受控能力内：fail-closed 立即停止。
+                    # completed/未知阶段不属于 processing 可执行范围。
                     stop_reason = "SourceSyncTaskStageConflictError"
                     break
+                # 外部 Consumer 返回后再次确认 Source lease，失效时停止当前 Worker；
+                # Task 自身结果已经由 attempt fencing 决定，新 Worker可幂等接管。
+                self._source_state.renew_source_lease(
+                    source_table,
+                    lease_owner,
+                    lease_seconds=self._source_lease_seconds,
+                )
             except Exception as error:  # noqa: BLE001
                 # prepare/orchestrator 抛异常（StageConflict/LeaseConflict/未知）
                 # 统一按 fail-closed 停止，记录稳定异常类名。
@@ -398,7 +423,7 @@ def _classify_outcome(result: HandoffOrchestrationResult) -> str:
         return "success"
     if status == _TERMINAL_DEAD and terminal:
         return "dead"
-    if status == _RETRYABLE_PENDING:
+    if status == _RETRYABLE_PENDING and not terminal:
         # retryable 退回：pending + terminal=False（按 orchestrator 语义）。
         return "retryable"
     if status == _LEASE_CONFLICT_PROCESSING and not terminal:
@@ -406,37 +431,3 @@ def _classify_outcome(result: HandoffOrchestrationResult) -> str:
         return "lease_conflict"
     # 矛盾组合（如 success + not terminal）或未知 final_status：fail-closed。
     return "unknown"
-
-
-def _recovery_placeholder_prepared() -> PreparedChunkSet:
-    """为崩溃恢复路径构造占位 :class:`PreparedChunkSet`。
-
-    orchestrator.process 在 ``validated``+已有 Artifact、``contract_ready``、
-    ``handed_off`` 三个恢复路径**都不使用** ``prepared``（只从 Artifact 重建
-    Request）；但 ``process`` 签名要求非 None 且做 ``isinstance`` 校验，故构造一个
-    满足模型约束的空 desired 占位。使用 expert 范围（跨三类，无需绑定具体
-    source_table/source_field_id），空 ``desired_chunks`` 合法（合法清空语义）。
-    ``task_id``/``batch_id`` 取占位常量（恢复路径不读取这两个字段）。
-
-    已知首期缺口：validated + 无 Artifact 的极小崩溃窗口下 orchestrator 会经
-    Builder 用此占位重建，可能产生空 desired，由 Receipt 校验 fail-closed 兜底，
-    不绕过 fencing，留待后续补齐真实准备恢复。
-    """
-
-    # 局部导入避免顶层循环依赖；用 expert 范围避免耦合具体来源表字段约束。
-    from .models import IncrementalImpactScope
-
-    scope = IncrementalImpactScope(
-        scope_type="expert",
-        expert_id=_PLACEHOLDER_EXPERT_ID,
-        chunk_type=None,
-        source_table=None,
-        source_field_id=None,
-    )
-    return PreparedChunkSet(
-        task_id=_PLACEHOLDER_EXPERT_ID,
-        batch_id=_PLACEHOLDER_EXPERT_ID,
-        data_version="recovery",
-        impact_scope=scope,
-        desired_chunks=(),
-    )
