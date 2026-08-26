@@ -87,6 +87,34 @@ SOURCE_SYNC_ERROR_STAGES = frozenset(
     }
 )
 
+# P5.6 任务终态 result_code 冻结枚举。只表示已完成效果，不记录自由文本；
+# 由 Receipt 计数确定性推导，供 finalize_source_sync_task_success 落定任务。
+# embedded: 新写入或 content_hash 变化触发 Embedding；
+# metadata_updated: 仅非内容字段变化，保留原向量；
+# disabled: 逻辑下线（eligibility 跳过或 stale 子块），保留实体设 is_active=false；
+# mixed_mutation: 单任务内同时存在多种写入效果（embed+metadata-only 或 embed+disable 等）；
+# no_action_unchanged: 三 Hash 全同，零写入（计入 skipped_count）；
+# recovered_unchanged: 幂等重放确认已收敛（不计 skipped_count）；
+# expert_deleted: 专家删除双时间，空 desired 全专家下线（零 Embedding，不计 skipped）；
+# no_chunkable_content: 非删除但零 chunk 可构建（不计 skipped）。
+TASK_RESULT_CODES = frozenset(
+    {
+        "embedded",
+        "metadata_updated",
+        "disabled",
+        "mixed_mutation",
+        "no_action_unchanged",
+        "recovered_unchanged",
+        "expert_deleted",
+        "no_chunkable_content",
+    }
+)
+
+# 真正无写入（no-write）的 result_code 集合，CheckpointManager 据此重算 skipped_count。
+# recovered_unchanged 属幂等重放已收敛，语义上无动作但不是“本次零写入”，故不计 skipped。
+# expert_deleted/no_chunkable_content 是 P4 阶段零写入的业务终态，不在本集合内。
+NO_WRITE_RESULT_CODES = frozenset({"no_action_unchanged"})
+
 _SHA256_HEX_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 
 

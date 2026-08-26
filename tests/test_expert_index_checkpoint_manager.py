@@ -179,7 +179,7 @@ def _success_tasks() -> list[dict[str, Any]]:
             "id": 801,
             "processing_stage": "completed",
             "sync_status": "success",
-            "result_code": "downstream_applied",
+            "result_code": "embedded",
             "attempt_token": None,
             "lease_until": None,
             "completed_at": SUCCESS_TIME,
@@ -188,7 +188,7 @@ def _success_tasks() -> list[dict[str, Any]]:
             "id": 802,
             "processing_stage": "completed",
             "sync_status": "success",
-            "result_code": "hash_unchanged",
+            "result_code": "metadata_updated",
             "attempt_token": None,
             "lease_until": None,
             "completed_at": SUCCESS_TIME,
@@ -259,7 +259,7 @@ def test_try_commit_source_batch_atomically_closes_all_state(
     assert ["FOR UPDATE" in sql for sql, _ in cursor.executed[:4]] == [True] * 4
     assert "ORDER BY id ASC FOR UPDATE" in cursor.executed[3][0]
     assert "status='success'" in cursor.executed[4][0]
-    assert cursor.executed[4][1] == (1001, BATCH_ID, SOURCE_TABLE, 0)
+    assert cursor.executed[4][1] == (0, 1001, BATCH_ID, SOURCE_TABLE, 0)
     assert cursor.executed[5][1] == (
         UPPER_TIME,
         902,
@@ -337,6 +337,7 @@ def test_try_commit_source_batch_rejects_task_count_mismatch(
     [
         {"result_code": None},
         {"result_code": "contains spaces"},
+        {"result_code": "downstream_applied"},
         {"processing_stage": "handed_off"},
         {"completed_at": None},
         {"attempt_token": "stale-attempt", "lease_until": LEASE_UNTIL},
@@ -390,24 +391,30 @@ def test_try_commit_source_batch_requires_sealed_fixed_range(
     assert connection.rollback_count == 1
 
 
-def test_try_commit_source_batch_rejects_invalid_skipped_count(
+def test_try_commit_source_batch_ignores_stored_skipped_count_uses_recomputed_value(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """未冻结分类规则前也不能接受超过候选数的 skipped_count。"""
+    """P5.6 后 Batch Source 行里的旧 skipped_count 不再触发超限校验。
+
+    skipped_count 由 CheckpointManager 按 NO_WRITE_RESULT_CODES 重算，旧值仅作
+    存储字段不参与逻辑判定。本测试用旧值 3（超过 candidate_count=2）确认不再 fail。
+    """
 
     cursor = _commit_cursor(batch_source=_batch_source_row(skipped_count=3))
     connection = ScriptedConnection(cursor)
     _patch_connection(monkeypatch, connection)
 
-    with pytest.raises(SourceBatchCommitConflictError, match="skipped_count"):
-        _manager().try_commit_source_batch(
-            SOURCE_TABLE,
-            BATCH_ID,
-            LEASE_OWNER,
-            checkpoint_lock_version=0,
-        )
+    result = _manager().try_commit_source_batch(
+        SOURCE_TABLE,
+        BATCH_ID,
+        LEASE_OWNER,
+        checkpoint_lock_version=0,
+    )
 
-    assert connection.rollback_count == 1
+    # 现有两个 success 任务的 result_code 都不在 NO_WRITE_RESULT_CODES，重算值=0。
+    assert result.skipped_count == 0
+    assert connection.commit_count == 1
+    assert connection.rollback_count == 0
 
 
 @pytest.mark.parametrize(

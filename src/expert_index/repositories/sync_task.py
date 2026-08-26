@@ -17,12 +17,16 @@ from ..models import (
     CHECKPOINT_SOURCE_TABLES,
     SOURCE_SYNC_ERROR_STAGES,
     SOURCE_SYNC_PROCESSING_STAGE_ORDER,
+    TASK_RESULT_CODES,
     NewSourceSyncTask,
     SourceSyncTask,
 )
 
 MAX_SOURCE_SYNC_TASK_CLAIM_SIZE = 500
 _SAFE_IDENTIFIER_PATTERN = re.compile(r"^[A-Za-z0-9_.-]+$")
+# P5.6 原子落定接受的合法数据库阶段：Artifact 已持久化且下游已回执。
+# 不接受 validated（Artifact 可能尚未持久化，须先经 P5.3B artifact 路径）。
+_FINALIZABLE_STAGES = frozenset({"contract_ready", "handed_off"})
 _TASK_SELECT_COLUMNS = """
     id, dedupe_key, batch_id, event_source,
     source_table, source_record_id, source_updated_at,
@@ -670,6 +674,97 @@ class MySQLSourceSyncTaskRepository:
         finally:
             connection.close()
 
+    def finalize_source_sync_task_success(
+        self,
+        task_id: int,
+        attempt_token: str,
+        *,
+        task_result_code: str,
+        artifact_id: int,
+        artifact_payload_hash: str,
+    ) -> SourceSyncTask:
+        """P5.6 原子落定任务结果。
+
+        在单个 Index MySQL 事务内：锁定 Task、校验 attempt_token/lease、校验
+        Artifact identity/payload_hash、校验阶段属于 ``contract_ready``/``handed_off``、
+        校验 ``task_result_code`` 命中冻结枚举，然后原子写为 ``completed/success``、
+        落定 ``result_code`` 并清除 lease/error。
+
+        不依赖 Milvus 与 MySQL 的跨库原子性（frozen #9）：下游收敛证据由 Artifact
+        + 幂等重放保证；本方法只负责把已验证的回执结果稳定写到任务行。
+
+        Artifact 与 Task 必须在同一 connection/cursor/事务内锁定校验（frozen #8），
+        因此本方法内联查询 ``expert_index_sync_artifact``，不调用 Artifact Repository
+        的方法（避免跨 connection 锁定）。
+        """
+
+        _validate_positive_integer("task_id", task_id)
+        _validate_attempt_token(attempt_token)
+        if task_result_code not in TASK_RESULT_CODES:
+            raise ValueError(
+                f"task_result_code 必须是冻结枚举成员: {task_result_code!r}"
+            )
+        _validate_positive_integer("artifact_id", artifact_id)
+        _validate_payload_hash_hex(artifact_payload_hash)
+        connection = pymysql.connect(**self.config.as_kwargs())
+        try:
+            with connection.cursor() as cursor:
+                locked_row = _lock_source_sync_task(cursor, task_id)
+                _require_active_task_attempt(
+                    locked_row,
+                    task_id=task_id,
+                    attempt_token=attempt_token,
+                )
+                current_stage = str(locked_row["processing_stage"])
+                if current_stage not in _FINALIZABLE_STAGES:
+                    raise SourceSyncTaskStageConflictError(
+                        f"任务 {task_id} 只有 contract_ready/handed_off 阶段可以 finalize"
+                    )
+                # 同事务内锁定并校验 Artifact，避免跨 connection 锁。
+                cursor.execute(
+                    "SELECT id, payload_hash FROM expert_index_sync_artifact "
+                    "WHERE id=%s AND task_id=%s "
+                    "AND artifact_type='contract_payload' "
+                    "FOR UPDATE",
+                    (artifact_id, task_id),
+                )
+                artifact_row = cursor.fetchone()
+                if artifact_row is None:
+                    raise SourceSyncTaskStageConflictError(
+                        f"任务 {task_id} 缺少匹配的 contract_payload Artifact {artifact_id}"
+                    )
+                if str(artifact_row["payload_hash"]) != artifact_payload_hash:
+                    raise SourceSyncTaskStageConflictError(
+                        f"任务 {task_id} 的 Artifact payload_hash 与传入值不一致"
+                    )
+                cursor.execute(
+                    """
+                    UPDATE expert_index_sync_task
+                    SET processing_stage='completed', sync_status='success',
+                        attempt_token=NULL, lease_until=NULL,
+                        next_retry_at=NULL, error_stage=NULL,
+                        error_code=NULL, error_type=NULL, error_message=NULL,
+                        result_code=%s, completed_at=CURRENT_TIMESTAMP(6)
+                    WHERE id=%s AND sync_status='processing'
+                      AND processing_stage IN ('contract_ready', 'handed_off')
+                      AND attempt_token=%s
+                      AND lease_until > CURRENT_TIMESTAMP(6)
+                    """,
+                    (task_result_code, task_id, attempt_token),
+                )
+                if cursor.rowcount != 1:
+                    raise SourceSyncTaskLeaseConflictError(
+                        f"任务 {task_id} 的阶段或 attempt lease 已变化"
+                    )
+                task = _select_source_sync_task(cursor, task_id)
+            connection.commit()
+            return task
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+
 
 def _validate_positive_integer(field_name: str, value: int) -> None:
     """校验数据库标识字段为正整数。"""
@@ -761,6 +856,17 @@ def _validate_safe_identifier(field_name: str, value: str, *, max_length: int) -
         raise ValueError(
             f"{field_name} 必须是长度不超过 {max_length} 的安全机器标识"
         )
+
+
+def _validate_payload_hash_hex(payload_hash: str) -> None:
+    """校验 payload_hash 是 64 位小写 SHA-256 十六进制。"""
+
+    if (
+        not isinstance(payload_hash, str)
+        or len(payload_hash) != 64
+        or any(character not in "0123456789abcdef" for character in payload_hash)
+    ):
+        raise ValueError("payload_hash 必须是 64 位小写 SHA-256 十六进制")
 
 
 def _validate_optional_safe_identifier(

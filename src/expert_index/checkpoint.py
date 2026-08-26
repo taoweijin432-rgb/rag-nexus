@@ -6,16 +6,19 @@
 
 from __future__ import annotations
 
-import re
 from dataclasses import dataclass
 from typing import Any
 
 import pymysql
 
 from .config import DatabaseConfig, require_index_database
-from .models import CHECKPOINT_SOURCE_TABLES, SourceCheckpoint, SourceScanCursor
-
-_SAFE_RESULT_CODE_PATTERN = re.compile(r"^[A-Za-z0-9_.-]+$")
+from .models import (
+    CHECKPOINT_SOURCE_TABLES,
+    NO_WRITE_RESULT_CODES,
+    TASK_RESULT_CODES,
+    SourceCheckpoint,
+    SourceScanCursor,
+)
 
 
 class SourceBatchCommitConflictError(RuntimeError):
@@ -101,16 +104,28 @@ class CheckpointManager:
                     record_id=int(checkpoint_row["last_id"]),
                 )
                 candidate_count = int(batch_source_row["candidate_count"])
-                skipped_count = int(batch_source_row["skipped_count"])
-                if not 0 <= skipped_count <= candidate_count:
-                    raise SourceBatchCommitConflictError(
-                        "Batch Source skipped_count 超出候选范围"
-                    )
-
                 _validate_task_success_evidence(
                     task_rows,
                     candidate_count=candidate_count,
                 )
+                # P5.6 §4：skipped_count 不在每个 Task 成功时独立 +1，避免事务提交后
+                # 重试造成重复计数。由 CheckpointManager 在锁定全部成功任务时按冻结的
+                # NO_WRITE_RESULT_CODES 重新统计，与 success_count/candidate_count
+                # 一起原子写 Batch Source。Batch Source 行里的旧 skipped_count 不参与
+                # （frozen #5），只校验重算值不超出候选范围。recovered_unchanged 属
+                # 幂等重放已收敛，不计 skipped（frozen #4）。expert_deleted/
+                # no_chunkable_content 是 P4 阶段零写入的业务终态，不在
+                # NO_WRITE_RESULT_CODES 内（frozen #6）。
+                skipped_count = sum(
+                    1
+                    for row in task_rows
+                    if str(row["sync_status"]) == "success"
+                    and str(row.get("result_code") or "") in NO_WRITE_RESULT_CODES
+                )
+                if not 0 <= skipped_count <= candidate_count:
+                    raise SourceBatchCommitConflictError(
+                        "Batch Source skipped_count 超出候选范围"
+                    )
                 if _is_already_committed(
                     checkpoint_row,
                     batch_source_row,
@@ -154,7 +169,8 @@ class CheckpointManager:
                     """
                     UPDATE expert_index_batch_source
                     SET status='success', success_count=candidate_count,
-                        failed_count=0, finished_at=CURRENT_TIMESTAMP(6)
+                        skipped_count=%s, failed_count=0,
+                        finished_at=CURRENT_TIMESTAMP(6)
                     WHERE id=%s AND batch_id=%s AND source_table=%s
                       AND status='running'
                       AND cursor_updated_at=upper_bound_updated_at
@@ -162,6 +178,7 @@ class CheckpointManager:
                       AND checkpoint_lock_version=%s
                     """,
                     (
+                        skipped_count,
                         int(batch_source_row["id"]),
                         batch_id,
                         source_table,
@@ -312,9 +329,11 @@ def _validate_task_success_evidence(
         result_code = row.get("result_code")
         if (
             not isinstance(result_code, str)
-            or _SAFE_RESULT_CODE_PATTERN.fullmatch(result_code) is None
+            or result_code not in TASK_RESULT_CODES
         ):
-            raise SourceBatchNotReadyError("success 任务缺少可靠 result_code 证据")
+            raise SourceBatchNotReadyError(
+                "success 任务缺少可靠 result_code 证据"
+            )
         if row.get("attempt_token") is not None or row.get("lease_until") is not None:
             raise SourceBatchNotReadyError("success 任务仍残留 attempt lease")
     if incomplete_statuses:

@@ -8,8 +8,8 @@
     - Artifact 首写、同 hash 重放、不同 hash 冲突（Consumer 调用次数 0）；
     - fencing 失效（token 不一致 / lease 冲突）；
     - Receipt identity/token/scope/payload_hash 不一致；
-    - 崩溃后重放（Consumer 成功但 mark_success 前崩，第二次重放最终 success）；
-    - 只有 committed 调用 mark_source_sync_task_success；
+    - 崩溃后重放（Consumer 成功但 finalize 前崩，第二次重放最终 success）；
+    - 只有 committed 调用 finalize_source_sync_task_success；
     - 零 checkpoint、零 Work Item 双写；
     - 结构断言：不 import V15 Work Item/Batch/CheckpointManager/物理删除。
 """
@@ -215,10 +215,12 @@ class FakeTaskRepo:
 
     state: SourceSyncTask
     success_calls: list[tuple[int, str, str]] = field(default_factory=list)
+    finalize_calls: list[tuple[int, str, str, int, str]] = field(default_factory=list)
     rejected_calls: list[dict[str, Any]] = field(default_factory=list)
     retryable_calls: list[dict[str, Any]] = field(default_factory=list)
     advance_calls: list[tuple[int, str, str]] = field(default_factory=list)
     fail_success_with_lease: bool = False
+    fail_finalize_with_lease: bool = False
     fail_advance_with_lease: bool = False
     # checkpoint / work-item 写入计数（用于断言零双写）
     checkpoint_writes: int = 0
@@ -261,6 +263,23 @@ class FakeTaskRepo:
             self.state,
             processing_stage="completed", sync_status="success",
             attempt_token=None, lease_until=None, result_code=result_code,
+            completed_at=TASK_UPDATED,
+        )
+        return self.state
+
+    def finalize_source_sync_task_success(
+        self, task_id: int, attempt_token: str, *,
+        task_result_code: str, artifact_id: int, artifact_payload_hash: str,
+    ) -> SourceSyncTask:
+        if self.fail_finalize_with_lease:
+            raise SourceSyncTaskLeaseConflictError("test: lease lost on finalize")
+        self.finalize_calls.append(
+            (task_id, attempt_token, task_result_code, artifact_id, artifact_payload_hash),
+        )
+        self.state = _replace(
+            self.state,
+            processing_stage="completed", sync_status="success",
+            attempt_token=None, lease_until=None, result_code=task_result_code,
             completed_at=TASK_UPDATED,
         )
         return self.state
@@ -416,6 +435,27 @@ def _committed_receipt_factory(result_code: str = "scope_committed"):
     return _make
 
 
+def _unchanged_committed_receipt_factory():
+    def _make(request: ScopeHandoffRequest) -> ScopeHandoffReceipt:
+        # 三 Hash 全同、零写入：embedding/metadata_only/disable 全 0，unchanged==desired。
+        return ScopeHandoffReceipt(
+            request_id=request.request_id,
+            task_id=request.task_id,
+            batch_id=request.batch_id,
+            attempt_token=request.attempt_token,
+            payload_hash=request.payload_hash,
+            impact_scope=request.impact_scope,
+            status="committed",
+            result_code="scope_committed",
+            desired_count=len(request.contracts),
+            embedding_count=0,
+            metadata_only_count=0,
+            disable_count=0,
+            unchanged_count=len(request.contracts),
+        )
+    return _make
+
+
 def _rejected_receipt_factory(result_code="scope_desired_rejected"):
     def _make(request: ScopeHandoffRequest) -> ScopeHandoffReceipt:
         return ScopeHandoffReceipt(
@@ -475,16 +515,16 @@ class TestCommittedClosedLoop:
         result = orch.process(task.task_id, TOKEN, _expert_prepared(task.expert_id))
         assert result.final_status == "success"
         assert result.terminal is True
-        assert result.result_code == "scope_committed"
+        assert result.result_code == "embedded"
         # Artifact 首写
         assert len(artifact_repo.put_calls) == 1
         # 阶段推进：contract_ready, handed_off（validated 起两步）
         advance_stages = [c[2] for c in task_repo.advance_calls]
         assert advance_stages == ["contract_ready", "handed_off"]
-        # Consumer 调一次，success 调一次
+        # Consumer 调一次，finalize 调一次
         assert len(consumer.process_calls) == 1
-        assert len(task_repo.success_calls) == 1
-        assert task_repo.success_calls[0] == (task.task_id, TOKEN, "scope_committed")
+        assert len(task_repo.finalize_calls) == 1
+        assert task_repo.finalize_calls[0][:3] == (task.task_id, TOKEN, "embedded")
         assert task_repo.rejected_calls == []
         assert task_repo.retryable_calls == []
 
@@ -514,7 +554,108 @@ class TestCommittedClosedLoop:
         assert task_repo.advance_calls == []
         assert len(artifact_repo.put_calls) == 0
         assert len(consumer.process_calls) == 1
-        assert len(task_repo.success_calls) == 1
+        assert len(task_repo.finalize_calls) == 1
+
+
+class TestZeroWriteResultCodeByEntryStage:
+    """零写入收敛的 result_code 依据进入阶段区分（frozen #2）。"""
+
+    def _setup(self, stage="validated"):
+        task = _task(processing_stage=stage)
+        task_repo = FakeTaskRepo(state=task)
+        artifact_repo = FakeArtifactRepo()
+        consumer = FakeConsumer(receipt_factory=_unchanged_committed_receipt_factory())
+        orch = _orchestrator(task_repo, artifact_repo, consumer)
+        return task, task_repo, artifact_repo, orch
+
+    def test_validated_first_run_zero_write_is_no_action_unchanged(self):
+        """首次从 validated 进入且三 Hash 全同 → no_action_unchanged。"""
+        task, task_repo, _artifact_repo, orch = self._setup("validated")
+        result = orch.process(task.task_id, TOKEN, _expert_prepared(task.expert_id))
+        assert result.final_status == "success"
+        assert result.result_code == "no_action_unchanged"
+        assert task_repo.finalize_calls[0][:3] == (
+            task.task_id, TOKEN, "no_action_unchanged",
+        )
+
+    def test_contract_ready_recovery_zero_write_is_recovered_unchanged(self):
+        """从 contract_ready 恢复重放三 Hash 全同 → recovered_unchanged。"""
+        task, task_repo, artifact_repo, orch = self._setup("contract_ready")
+        request = ScopeHandoffBuilder("Asia/Shanghai").build(
+            task, TOKEN, _expert_prepared(task.expert_id))
+        _seed_artifact(artifact_repo, task.task_id, request)
+        result = orch.process(task.task_id, TOKEN, _expert_prepared(task.expert_id))
+        assert result.final_status == "success"
+        assert result.result_code == "recovered_unchanged"
+        assert task_repo.finalize_calls[0][:3] == (
+            task.task_id, TOKEN, "recovered_unchanged",
+        )
+
+    def test_handed_off_recovery_zero_write_is_recovered_unchanged(self):
+        """从 handed_off 恢复重放三 Hash 全同 → recovered_unchanged。"""
+        task, task_repo, artifact_repo, orch = self._setup("handed_off")
+        request = ScopeHandoffBuilder("Asia/Shanghai").build(
+            task, TOKEN, _expert_prepared(task.expert_id))
+        _seed_artifact(artifact_repo, task.task_id, request)
+        result = orch.process(task.task_id, TOKEN, _expert_prepared(task.expert_id))
+        assert result.final_status == "success"
+        assert result.result_code == "recovered_unchanged"
+        assert task_repo.finalize_calls[0][:3] == (
+            task.task_id, TOKEN, "recovered_unchanged",
+        )
+
+    def test_recovered_unchanged_not_counted_as_skipped(self):
+        """recovered_unchanged 不在 NO_WRITE_RESULT_CODES，不计 skipped_count。"""
+        from expert_index.models import NO_WRITE_RESULT_CODES
+
+        assert "recovered_unchanged" not in NO_WRITE_RESULT_CODES
+        assert "no_action_unchanged" in NO_WRITE_RESULT_CODES
+
+
+class TestHandedOffCrashReplayFinalSuccess:
+    """handed_off 后崩溃重放最终 success，且 handed_off 本身不能被当成功。"""
+
+    def test_handed_off_crash_then_replay_completes_success(self):
+        # 第一次从 validated 走到 handed_off 后，finalize 前崩溃（模拟 lease 丢失）。
+        task = _task(processing_stage="validated")
+        task_repo = FakeTaskRepo(state=task)
+        artifact_repo = FakeArtifactRepo()
+        consumer = FakeConsumer(receipt_factory=_committed_receipt_factory())
+        orch = _orchestrator(task_repo, artifact_repo, consumer)
+        # 模拟 finalize 崩溃：finalize 阶段 lease 丢失，任务停在 handed_off。
+        task_repo.fail_finalize_with_lease = True
+        first = orch.process(task.task_id, TOKEN, _expert_prepared(task.expert_id))
+        assert first.final_status == "processing"
+        assert first.terminal is False
+        assert task_repo.state.processing_stage == "handed_off"
+        # 崩溃恢复：新 attempt 从 handed_off 重放，finalize 成功。
+        task_repo.fail_finalize_with_lease = False
+        new_token = "tok-claim-002"
+        task_repo.state = _task(
+            processing_stage="handed_off", attempt_token=new_token,
+        )
+        request = ScopeHandoffBuilder("Asia/Shanghai").build(
+            task_repo.state, new_token, _expert_prepared(task.expert_id))
+        _seed_artifact(artifact_repo, task.task_id, request)
+        result2 = orch.process(task.task_id, new_token, _expert_prepared(task.expert_id))
+        assert result2.final_status == "success"
+        assert result2.terminal is True
+        assert result2.result_code == "embedded"
+
+    def test_handed_off_alone_is_not_success_for_checkpoint(self):
+        """handed_off 表示已进入下游交付，不代表成功；Checkpoint 只接受 completed/success。"""
+        from expert_index.models import SOURCE_SYNC_PROCESSING_STAGES
+
+        task = _task(processing_stage="handed_off")
+        task_repo = FakeTaskRepo(state=task)
+        artifact_repo = FakeArtifactRepo()
+        consumer = FakeConsumer(receipt_factory=_committed_receipt_factory())
+        _orchestrator(task_repo, artifact_repo, consumer)
+        # 未执行 Consumer 前，任务停在 handed_off，不应被 Checkpoint 视为 success。
+        assert task_repo.state.processing_stage == "handed_off"
+        assert task_repo.state.sync_status != "success"
+        assert "handed_off" in SOURCE_SYNC_PROCESSING_STAGES
+        assert "completed" in SOURCE_SYNC_PROCESSING_STAGES
 
 
 class TestRejectedAndFailed:
@@ -527,7 +668,7 @@ class TestRejectedAndFailed:
         result = orch.process(task.task_id, TOKEN, _expert_prepared(task.expert_id))
         assert result.final_status == "dead"
         assert result.terminal is True
-        assert task_repo.rejected_calls and task_repo.success_calls == []
+        assert task_repo.rejected_calls and task_repo.finalize_calls == []
         assert task_repo.rejected_calls[0]["error_stage"] == "scope_consumer"
 
     def test_retryable_failed(self):
@@ -538,7 +679,7 @@ class TestRejectedAndFailed:
         result = orch.process(task.task_id, TOKEN, _expert_prepared(task.expert_id))
         assert result.final_status == "pending"
         assert result.terminal is False
-        assert task_repo.retryable_calls and task_repo.success_calls == []
+        assert task_repo.retryable_calls and task_repo.finalize_calls == []
         assert task_repo.retryable_calls[0]["error_stage"] == "scope_consumer"
         assert task_repo.retryable_calls[0]["max_attempts"] == 2
 
@@ -566,18 +707,18 @@ class TestRejectedAndFailed:
 class TestArtifactLifecycle:
     def test_first_write_then_replay_same_hash(self):
         task = _task()
-        task_repo = FakeTaskRepo(state=task, fail_success_with_lease=True)
+        task_repo = FakeTaskRepo(state=task, fail_finalize_with_lease=True)
         artifact_repo = FakeArtifactRepo()
         consumer = FakeConsumer(receipt_factory=_committed_receipt_factory())
         orch = _orchestrator(task_repo, artifact_repo, consumer)
-        # 首次：validated 构建 + 写 Artifact + 推进 handed_off + Consumer 成功，但 mark_success lease 失败。
+        # 首次：validated 构建 + 写 Artifact + 推进 handed_off + Consumer 成功，但 finalize lease 失败。
         r1 = orch.process(task.task_id, TOKEN, _expert_prepared(task.expert_id))
         assert r1.terminal is False  # success 未落定
         first_hash = artifact_repo.put_calls[0]["payload_hash"]
         assert len(artifact_repo.put_calls) == 1
         assert len(consumer.process_calls) == 1
-        # 崩溃恢复：mark_success 修复，task 仍 handed_off，用同一 artifact 重放。
-        task_repo.fail_success_with_lease = False
+        # 崩溃恢复：finalize 修复，task 仍 handed_off，用同一 artifact 重放。
+        task_repo.fail_finalize_with_lease = False
         r2 = orch.process(task.task_id, TOKEN, _expert_prepared(task.expert_id))
         assert r2.final_status == "success"
         # handed_off 起重放：不重新 Builder、不重新 put（已恢复）、不推进阶段，直接重放 Consumer。
@@ -627,7 +768,7 @@ class TestFencing:
         assert result.terminal is False
         assert result.final_status == "processing"
         assert consumer.process_calls == []
-        assert task_repo.success_calls == []
+        assert task_repo.finalize_calls == []
 
     def test_lease_lost_on_advance_no_further_writes(self):
         task = _task()
@@ -639,11 +780,11 @@ class TestFencing:
         assert result.terminal is False
         assert result.error_stage == "fencing"
         assert consumer.process_calls == []
-        assert task_repo.success_calls == []
+        assert task_repo.finalize_calls == []
 
     def test_lease_lost_on_success_keeps_processing(self):
         task = _task(processing_stage="handed_off")
-        task_repo = FakeTaskRepo(state=task, fail_success_with_lease=True)
+        task_repo = FakeTaskRepo(state=task, fail_finalize_with_lease=True)
         consumer = FakeConsumer(receipt_factory=_committed_receipt_factory())
         artifact_repo = FakeArtifactRepo()
         request = ScopeHandoffBuilder("Asia/Shanghai").build(
@@ -727,9 +868,9 @@ class TestReceiptValidation:
 
 class TestCrashReplay:
     def test_consumer_success_but_mark_crash_then_replay_success(self):
-        # 第一阶段：handed_off，Consumer 返回 committed，但 mark_success 抛 lease 失败
+        # 第一阶段：handed_off，Consumer 返回 committed，但 finalize 抛 lease 失败
         task = _task(processing_stage="handed_off")
-        task_repo = FakeTaskRepo(state=task, fail_success_with_lease=True)
+        task_repo = FakeTaskRepo(state=task, fail_finalize_with_lease=True)
         artifact_repo = FakeArtifactRepo()
         consumer = FakeConsumer(receipt_factory=_committed_receipt_factory())
         request = ScopeHandoffBuilder("Asia/Shanghai").build(
@@ -739,14 +880,14 @@ class TestCrashReplay:
         r1 = orch.process(task.task_id, TOKEN, _expert_prepared(task.expert_id))
         assert r1.terminal is False  # success 未落定
         assert len(consumer.process_calls) == 1
-        # 崩溃恢复：模拟 mark_success 修复，task 仍 handed_off，重放
-        task_repo.fail_success_with_lease = False
+        # 崩溃恢复：模拟 finalize 修复，task 仍 handed_off，重放
+        task_repo.fail_finalize_with_lease = False
         r2 = orch.process(task.task_id, TOKEN, _expert_prepared(task.expert_id))
         assert r2.final_status == "success"
         assert r2.terminal is True
         # 总共 Consumer 调 2 次（重放幂等：主路径因三 Hash 自然收敛）
         assert len(consumer.process_calls) == 2
-        assert len(task_repo.success_calls) == 1  # 只有第二次落定
+        assert len(task_repo.finalize_calls) == 1  # 只有第二次落定
 
 
 class TestZeroDoubleWrite:
@@ -760,13 +901,13 @@ class TestZeroDoubleWrite:
         assert task_repo.workitem_writes == 0
 
     def test_committed_is_only_path_to_success(self):
-        # 验证只有 committed 才调 mark_success
+        # 验证只有 committed 才调 finalize
         task = _task()
         task_repo = FakeTaskRepo(state=task)
         consumer = FakeConsumer(receipt_factory=_rejected_receipt_factory())
         orch = _orchestrator(task_repo, FakeArtifactRepo(), consumer)
         orch.process(task.task_id, TOKEN, _expert_prepared(task.expert_id))
-        assert task_repo.success_calls == []
+        assert task_repo.finalize_calls == []
         assert task_repo.rejected_calls
 
 
@@ -792,6 +933,7 @@ class TestUnsupportedStage:
         assert result.terminal is True
         assert consumer.process_calls == []
         assert task_repo.success_calls == []
+        assert task_repo.finalize_calls == []
 
 
 class TestStructural:

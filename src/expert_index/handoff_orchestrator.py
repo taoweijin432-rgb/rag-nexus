@@ -27,16 +27,23 @@ P5.2 ``ScopeConsumer`` 接成单一闭环，按 P5.3/P5.4 恢复规则安全推�
   - ``contract_ready``：只从 Artifact 恢复 Request → handed_off；
   - ``handed_off``：只从 Artifact 恢复，**不回退阶段、不重新构建**，直接重放
     Consumer。
+- ``handed_off`` 表示已进入下游交付过程，**不代表成功**；只有
+  ``completed/success`` 才允许 Checkpoint 推进水位。
 - **Receipt identity/token/scope/payload_hash 必须与当前 Request 完全一致**，
   任何不一致 → 确定性 ``rejected(error_stage="receipt")``。
-- **committed → ``mark_source_sync_task_success``**；rejected 或 non-retryable failed
-  → ``mark_source_sync_task_rejected``；retryable failed →
+- **committed → ``finalize_source_sync_task_success``**（单事务原子落定
+  completed/success）；rejected 或 non-retryable failed →
+  ``mark_source_sync_task_rejected``；retryable failed →
   ``mark_source_sync_task_retryable``。Consumer/Artifact 异常按确定性与瞬时分类，
   记录正确 ``error_stage``。
+- **result_code 由 Receipt 计数确定性推导**，零写入区分依据是进入时的原始阶段
+  （frozen #2）：首次从 ``validated`` 进入且三 Hash 全同记 ``no_action_unchanged``；
+  从 ``contract_ready``/``handed_off`` 恢复重放三 Hash 全同记
+  ``recovered_unchanged``（不计 skipped_count）。
 - **不直接推进 checkpoint**；P3 继续以任务成功状态驱动水位。
 - **不使用 V15 Work Item/Batch**，不物理删除。
 - **不声称单事务原子闭环**：``advance_source_sync_task_stage`` 与
-  ``mark_source_sync_task_success`` 分两次提交存在崩溃窗口，本编排器依赖按同一
+  ``finalize_source_sync_task_success`` 分两次提交存在崩溃窗口，本编排器依赖按同一
   Artifact 重放恢复，不绕过 ``advance`` 的相邻阶段守卫，也不把 ``handed_off`` 当
   成功。
 
@@ -87,6 +94,48 @@ _ERROR_CODE_FENCING = "fencing_lost"
 _ERROR_CODE_UNSUPPORTED_STAGE = "unsupported_stage"
 
 
+def _task_result_code_from_receipt(
+    receipt: ScopeHandoffReceipt,
+    *,
+    entry_stage: str,
+) -> str:
+    """把下游 Receipt 的计数确定性映射为任务终态 result_code（frozen #2/#3）。
+
+    committed 收敛成功接受 embedded/metadata_updated/disabled/mixed_mutation/
+    no_action_unchanged/recovered_unchanged；expert_deleted/no_chunkable_content
+    由 P4 任务阶段在零写入路径单独落定，不经过本映射。
+
+    零写入区分依据是 Orchestrator 进入时的原始阶段（frozen #2），不是 finalize
+    时的当前阶段，也不是 desired_count：首次从 validated 进入且三 Hash 全同记
+    no_action_unchanged；从 contract_ready/handed_off 恢复进入且三 Hash 全同记
+    recovered_unchanged（幂等重放已收敛，不计 skipped_count）。
+    """
+    if receipt.embedding_count > 0 and (
+        receipt.metadata_only_count > 0 or receipt.disable_count > 0
+    ):
+        return "mixed_mutation"
+    if receipt.embedding_count > 0:
+        return "embedded"
+    if receipt.metadata_only_count > 0:
+        return "metadata_updated"
+    if receipt.disable_count > 0:
+        return "disabled"
+    if receipt.unchanged_count == receipt.desired_count and receipt.desired_count > 0:
+        # 零写入收敛：是否“首次无写入”取决于进入阶段，而非 desired_count。
+        # validated 首次执行三 Hash 全同 → no_action_unchanged（计入 skipped_count）。
+        # contract_ready/handed_off 恢复重放三 Hash 全同 → recovered_unchanged
+        # （幂等已收敛，不计 skipped_count）。
+        if entry_stage == "validated":
+            return "no_action_unchanged"
+        return "recovered_unchanged"
+    # 空 desired（如专家删除空范围）经 P4 走 expert_deleted，不进入本映射；此分支
+    # 仅为防御性兜底，语义上属幂等重放已收敛。
+    if receipt.desired_count == 0:
+        return "recovered_unchanged"
+    # 多效果混合但无 embed 主导，统一记 mixed_mutation。
+    return "mixed_mutation"
+
+
 class ReceiptValidationError(RuntimeError):
     """回执与当前 Request 的 identity/token/scope/payload_hash 不一致。"""
 
@@ -115,6 +164,16 @@ class TaskRepositoryPort(Protocol):
         attempt_token: str,
         *,
         result_code: str,
+    ) -> SourceSyncTask: ...
+
+    def finalize_source_sync_task_success(
+        self,
+        task_id: int,
+        attempt_token: str,
+        *,
+        task_result_code: str,
+        artifact_id: int,
+        artifact_payload_hash: str,
     ) -> SourceSyncTask: ...
 
     def mark_source_sync_task_rejected(
@@ -266,11 +325,15 @@ class HandoffOrchestrator:
 
         stage = current.processing_stage
         if stage == "validated":
-            return self._from_validated(current, attempt_token, prepared)
+            return self._from_validated(current, attempt_token, prepared, entry_stage=stage)
         if stage == "contract_ready":
-            return self._from_contract_ready_or_handed_off(current, attempt_token, is_handed_off=False)
+            return self._from_contract_ready_or_handed_off(
+                current, attempt_token, is_handed_off=False, entry_stage=stage
+            )
         if stage == "handed_off":
-            return self._from_contract_ready_or_handed_off(current, attempt_token, is_handed_off=True)
+            return self._from_contract_ready_or_handed_off(
+                current, attempt_token, is_handed_off=True, entry_stage=stage
+            )
         # 其他阶段（candidate/source_read/normalized/chunk_built/completed）不在 P5.3B
         # 编排范围，fail-closed deterministic rejected。
         return self._reject(
@@ -289,6 +352,8 @@ class HandoffOrchestrator:
         task: SourceSyncTask,
         attempt_token: str,
         prepared: PreparedChunkSet,
+        *,
+        entry_stage: str,
     ) -> HandoffOrchestrationResult:
         """validated：优先复用已存 Artifact，无则经 Builder 构建后 put_or_verify。"""
 
@@ -309,7 +374,9 @@ class HandoffOrchestrator:
                     error_code=_ERROR_CODE_ARTIFACT_BUILD,
                     safe_error_message=_single_line_truncate(verify_error),
                 )
-            return self._persist_and_advance_to_contract_ready(task, attempt_token, request, existing)
+            return self._persist_and_advance_to_contract_ready(
+                task, attempt_token, request, entry_stage=entry_stage
+            )
 
         # 无 Artifact：经 Builder 构建（首次或新 attempt 重建当前事实后）。
         try:
@@ -323,7 +390,9 @@ class HandoffOrchestrator:
                 error_code=_ERROR_CODE_ARTIFACT_BUILD,
                 safe_error_message=_single_line_truncate(str(error)),
             )
-        return self._persist_and_advance_to_contract_ready(task, attempt_token, request, None)
+        return self._persist_and_advance_to_contract_ready(
+            task, attempt_token, request, entry_stage=entry_stage
+        )
 
     def _from_contract_ready_or_handed_off(
         self,
@@ -331,6 +400,7 @@ class HandoffOrchestrator:
         attempt_token: str,
         *,
         is_handed_off: bool,
+        entry_stage: str,
     ) -> HandoffOrchestrationResult:
         """contract_ready / handed_off：只从 Artifact 恢复，不回退、不重新构建。"""
 
@@ -364,7 +434,7 @@ class HandoffOrchestrator:
             if advance_result.failure is not None:
                 return advance_result.failure
         # handed_off：直接重放 Consumer（不回退阶段、不重建）。
-        return self._run_consumer(task, attempt_token, request)
+        return self._run_consumer(task, attempt_token, request, artifact, entry_stage=entry_stage)
 
     # ------------------------------------------------------------------
     # Artifact 持久化 + contract_ready 推进
@@ -374,31 +444,22 @@ class HandoffOrchestrator:
         task: SourceSyncTask,
         attempt_token: str,
         request: ScopeHandoffRequest,
-        existing: ContractArtifact | None,
+        *,
+        entry_stage: str,
     ) -> HandoffOrchestrationResult:
         """put_or_verify → advance contract_ready → advance handed_off → Consumer。"""
 
         payload_json = self._serialize_payload(request)
         try:
-            if existing is not None:
-                # 已存在 Artifact：内容已通过重建校验，fenced put_or_verify 复用/校验。
-                self._artifact_repo.put_or_verify_contract_artifact(
-                    task.task_id,
-                    attempt_token,
-                    artifact_type=_ARTIFACT_TYPE,
-                    artifact_version=_ARTIFACT_VERSION,
-                    payload_json=payload_json,
-                    payload_hash=request.payload_hash,
-                )
-            else:
-                self._artifact_repo.put_or_verify_contract_artifact(
-                    task.task_id,
-                    attempt_token,
-                    artifact_type=_ARTIFACT_TYPE,
-                    artifact_version=_ARTIFACT_VERSION,
-                    payload_json=payload_json,
-                    payload_hash=request.payload_hash,
-                )
+            # 无论已存与否，都经 fenced put_or_verify：已存在则复用/校验，不存在则写入。
+            artifact = self._artifact_repo.put_or_verify_contract_artifact(
+                task.task_id,
+                attempt_token,
+                artifact_type=_ARTIFACT_TYPE,
+                artifact_version=_ARTIFACT_VERSION,
+                payload_json=payload_json,
+                payload_hash=request.payload_hash,
+            )
         except ArtifactPayloadConflictError as error:
             # 同 identity 不同 hash：确定性 rejected，禁止调用 Consumer。
             return self._reject(
@@ -443,7 +504,7 @@ class HandoffOrchestrator:
         advance2 = self._safe_advance(task, attempt_token, "handed_off")
         if advance2.failure is not None:
             return advance2.failure
-        return self._run_consumer(task, attempt_token, request)
+        return self._run_consumer(task, attempt_token, request, artifact, entry_stage=entry_stage)
 
     # ------------------------------------------------------------------
     # Consumer 执行 + Receipt 校验 + 状态落定
@@ -453,6 +514,9 @@ class HandoffOrchestrator:
         task: SourceSyncTask,
         attempt_token: str,
         request: ScopeHandoffRequest,
+        artifact: ContractArtifact,
+        *,
+        entry_stage: str,
     ) -> HandoffOrchestrationResult:
         """调用 ScopeConsumer，校验 Receipt，按终态落定任务。"""
 
@@ -489,7 +553,7 @@ class HandoffOrchestrator:
             )
 
         if receipt.status == "committed":
-            return self._mark_success(task, attempt_token, receipt.result_code)
+            return self._mark_success(task, attempt_token, receipt, artifact, entry_stage=entry_stage)
         if receipt.status == "rejected":
             return self._reject(
                 task,
@@ -603,11 +667,19 @@ class HandoffOrchestrator:
         self,
         task: SourceSyncTask,
         attempt_token: str,
-        result_code: str,
+        receipt: ScopeHandoffReceipt,
+        artifact: ContractArtifact,
+        *,
+        entry_stage: str,
     ) -> HandoffOrchestrationResult:
+        task_result_code = _task_result_code_from_receipt(receipt, entry_stage=entry_stage)
         try:
-            self._task_repo.mark_source_sync_task_success(
-                task.task_id, attempt_token, result_code=result_code,
+            self._task_repo.finalize_source_sync_task_success(
+                task.task_id,
+                attempt_token,
+                task_result_code=task_result_code,
+                artifact_id=artifact.artifact_id,
+                artifact_payload_hash=artifact.payload_hash,
             )
         except SourceSyncTaskLeaseConflictError:
             return HandoffOrchestrationResult(
@@ -618,7 +690,7 @@ class HandoffOrchestrator:
                 final_status="processing", terminal=False, result_code=None, error_stage="fencing",
             )
         return HandoffOrchestrationResult(
-            final_status="success", terminal=True, result_code=result_code, error_stage=None,
+            final_status="success", terminal=True, result_code=task_result_code, error_stage=None,
         )
 
     def _reject(

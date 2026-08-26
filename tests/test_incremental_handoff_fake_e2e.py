@@ -170,10 +170,12 @@ class FakeTaskRepo:
     state: SourceSyncTask
     renew_calls: list = field(default_factory=list)
     success_calls: list = field(default_factory=list)
+    finalize_calls: list = field(default_factory=list)
     rejected_calls: list = field(default_factory=list)
     retryable_calls: list = field(default_factory=list)
     advance_calls: list = field(default_factory=list)
     fail_success_with_lease: bool = False
+    fail_finalize_with_lease: bool = False
     fail_advance_with_lease: bool = False
     fail_renew_with_lease: bool = False
 
@@ -225,6 +227,19 @@ class FakeTaskRepo:
         self.state = replace(self.state, processing_stage="completed", sync_status="success",
                              attempt_token=None, lease_until=None,
                              result_code=result_code, completed_at=TASK_UPDATED)
+        return self.state
+
+    def finalize_source_sync_task_success(self, task_id, attempt_token, *,
+                                          task_result_code, artifact_id,
+                                          artifact_payload_hash):
+        if self.fail_finalize_with_lease:
+            raise SourceSyncTaskLeaseConflictError("test: lease lost on finalize")
+        if self.state.task_id != task_id or self.state.attempt_token != attempt_token:
+            raise SourceSyncTaskLeaseConflictError("test: token 不一致")
+        self.finalize_calls.append((task_id, attempt_token, task_result_code))
+        self.state = replace(self.state, processing_stage="completed", sync_status="success",
+                             attempt_token=None, lease_until=None,
+                             result_code=task_result_code, completed_at=TASK_UPDATED)
         return self.state
 
     def mark_source_sync_task_rejected(self, task_id, attempt_token, *,
@@ -496,7 +511,7 @@ class TestNewEmploymentChunk:
         assert len(store.upsert_calls) == 1
         assert store.embed_count == 1
         assert store.update_calls == []
-        assert task_repo.success_calls and not task_repo.rejected_calls
+        assert task_repo.finalize_calls and not task_repo.rejected_calls
         # 主成功路径链路真实性断言：
         # 1) Coordinator 续租被调用（prepare 至少 renew 多次：读事实前、构建前后）。
         assert len(task_repo.renew_calls) >= 3
@@ -726,7 +741,7 @@ class TestExpertDeletionScanNewerThanSourceVersion:
         assert stages[:5] == ["source_read", "normalized", "chunk_built",
                               "validated", "contract_ready"]
         assert len(task_repo.renew_calls) >= 3
-        assert task_repo.success_calls and not task_repo.rejected_calls
+        assert task_repo.finalize_calls and not task_repo.rejected_calls
 
 
 class TestTransientFailureReplay:
@@ -743,7 +758,7 @@ class TestTransientFailureReplay:
         # 第一次：transient failure → retryable。Artifact 在 validated 阶段写入一次。
         result1 = _run(task.task_id, task_repo, artifact_repo, store, source, factory)
         assert result1.final_status == "pending"
-        assert task_repo.retryable_calls and not task_repo.success_calls
+        assert task_repo.retryable_calls and not task_repo.finalize_calls
         first_artifact = artifact_repo.store.get((task.task_id, ARTIFACT_TYPE, ARTIFACT_VERSION))
         assert first_artifact is not None
         first_artifact_id = first_artifact.artifact_id
@@ -755,7 +770,7 @@ class TestTransientFailureReplay:
         # 从 Artifact 恢复 Request，不重复运行 P4。
         new_token = "tok-e2e-002"
         task_repo.state = _task(processing_stage="handed_off", attempt_token=new_token)
-        task_repo.fail_success_with_lease = False
+        task_repo.fail_finalize_with_lease = False
         store.fail_upsert = None  # 恢复
         orch = _build_orchestrator(store, task_repo, artifact_repo)
         # handed_off 起重放只从 Artifact 恢复，不使用 prepared 内容；传一个占位
@@ -767,7 +782,7 @@ class TestTransientFailureReplay:
         )
         result2 = orch.process(task.task_id, new_token, placeholder)
         assert result2.final_status == "success"
-        assert task_repo.success_calls
+        assert task_repo.finalize_calls
         # 关键：第二次从 validated 起复用已存 Artifact，store 不新增、artifact_id 与
         # payload_hash 保持不变（put_or_verify 仍被 fenced 调用但命中同 hash 复用路径）。
         assert len(artifact_repo.store) == 1
@@ -780,7 +795,7 @@ class TestTransientFailureReplay:
 class TestArtifactSameHashReuse:
     def test_artifact_same_hash_reused_on_replay(self):
         task = _task(target_type="employment", source_record_id=21307)
-        task_repo = FakeTaskRepo(state=task, fail_success_with_lease=True)
+        task_repo = FakeTaskRepo(state=task, fail_finalize_with_lease=True)
         artifact_repo = FakeArtifactRepo()
         store = FakeVectorStore()
         source = FakeSourceAdapter()
@@ -797,9 +812,9 @@ class TestArtifactSameHashReuse:
         assert len(artifact_repo.put_calls) == 1
         assert store.embed_count == 1
 
-        # 崩溃恢复：mark_success 修复，task 仍 handed_off，同 hash 重放。
+        # 崩溃恢复：finalize 修复，task 仍 handed_off，同 hash 重放。
         # handed_off 起重放直接进入 P5，不重复运行 P4（与正式恢复语义一致）。
-        task_repo.fail_success_with_lease = False
+        task_repo.fail_finalize_with_lease = False
         task_repo.state = _task(processing_stage="handed_off")
         orch = _build_orchestrator(store, task_repo, artifact_repo)
         # handed_off 起重放只从 Artifact 恢复，不使用 prepared 内容。
