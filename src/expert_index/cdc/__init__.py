@@ -3,6 +3,17 @@
 本包只定义上游可依赖的协议边界，不依赖 Canal SDK，也不执行消费或确认。
 """
 
+from .ingest import (
+    CdcBatchPersistencePort,
+    CdcBatchReceiver,
+    CdcBatchReceiveResult,
+    CdcEventIdentityProvider,
+    CdcIngestError,
+    CdcPersistenceConflictError,
+    CdcTaskPlan,
+    CdcTaskReceipt,
+    CdcTaskReceiptStatus,
+)
 from .parser import (
     CanalBatchDecoder,
     CanalClientAdapter,
@@ -51,6 +62,15 @@ __all__ = [
     "CanalProtocolNotFrozenError",
     "CanalReplaySafetyError",
     "CanalRowData",
+    "CdcBatchPersistencePort",
+    "CdcBatchReceiveResult",
+    "CdcBatchReceiver",
+    "CdcEventIdentityProvider",
+    "CdcIngestError",
+    "CdcPersistenceConflictError",
+    "CdcTaskPlan",
+    "CdcTaskReceipt",
+    "CdcTaskReceiptStatus",
     "FakeCanalClient",
     "ReplayDelete",
     "ReplayResult",
