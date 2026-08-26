@@ -86,6 +86,12 @@ class TestExpandErrorStagesMigration:
         assert re.search(r"\bADD\s+INDEX\b", sql_text, re.IGNORECASE) is None, "禁止新增索引"
         assert re.search(r"\bADD\s+UNIQUE\b", sql_text, re.IGNORECASE) is None, "禁止新增唯一键"
 
+    def test_resolves_check_table_through_table_constraints(self, sql_text: str) -> None:
+        """约束查询必须通过 TABLE_CONSTRAINTS 获取表名，适配 MySQL 元数据结构。"""
+
+        assert "information_schema.TABLE_CONSTRAINTS" in sql_text
+        assert "tc.TABLE_NAME = 'expert_index_sync_task'" in sql_text
+
     def test_missing_constraint_is_recreated_on_rerun(self, sql_text: str) -> None:
         """DROP 成功而 ADD 中断后，下一次必须按约束缺失路径重新 ADD。"""
 

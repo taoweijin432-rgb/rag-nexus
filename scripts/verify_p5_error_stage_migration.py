@@ -49,9 +49,13 @@ def _constraint_clause(cursor: Any) -> str:
     cursor.execute(
         """
         SELECT CHECK_CLAUSE
-        FROM information_schema.CHECK_CONSTRAINTS
-        WHERE CONSTRAINT_SCHEMA=%s AND TABLE_NAME='expert_index_sync_task'
-          AND CONSTRAINT_NAME=%s
+        FROM information_schema.CHECK_CONSTRAINTS cc
+        INNER JOIN information_schema.TABLE_CONSTRAINTS tc
+          ON tc.CONSTRAINT_SCHEMA=cc.CONSTRAINT_SCHEMA
+         AND tc.CONSTRAINT_NAME=cc.CONSTRAINT_NAME
+         AND tc.CONSTRAINT_TYPE='CHECK'
+        WHERE cc.CONSTRAINT_SCHEMA=%s AND tc.TABLE_NAME='expert_index_sync_task'
+          AND cc.CONSTRAINT_NAME=%s
         """,
         (TEST_SCHEMA, CONSTRAINT_NAME),
     )
@@ -59,7 +63,12 @@ def _constraint_clause(cursor: Any) -> str:
     if len(rows) != 1:
         raise AssertionError(f"目标 CHECK 数量必须为 1，实际为 {len(rows)}")
     clause = str(rows[0]["CHECK_CLAUSE"])
-    missing = {stage for stage in EXPECTED_STAGES if f"'{stage}'" not in clause}
+    # MySQL 8 may render literals as ``_utf8mb4'stage'`` (and escape the quote
+    # in the client representation).  The verifier only needs to prove every
+    # frozen stage is present in the target predicate, so compare normalized
+    # tokens instead of depending on one server/client rendering.
+    normalized_clause = clause.casefold()
+    missing = {stage for stage in EXPECTED_STAGES if stage.casefold() not in normalized_clause}
     if missing:
         raise AssertionError(f"目标 CHECK 缺少 error_stage: {sorted(missing)}")
     return clause

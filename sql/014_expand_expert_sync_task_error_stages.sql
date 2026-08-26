@@ -29,10 +29,14 @@
 -- 1) 读取约束存在性和目标版本状态。
 SET @expert_index_p5_constraint_exists = (
     SELECT COUNT(*)
-    FROM information_schema.CHECK_CONSTRAINTS
-    WHERE CONSTRAINT_SCHEMA = DATABASE()
-      AND TABLE_NAME = 'expert_index_sync_task'
-      AND CONSTRAINT_NAME = 'chk_expert_sync_task_error_stage'
+    FROM information_schema.CHECK_CONSTRAINTS cc
+    INNER JOIN information_schema.TABLE_CONSTRAINTS tc
+      ON tc.CONSTRAINT_SCHEMA = cc.CONSTRAINT_SCHEMA
+     AND tc.CONSTRAINT_NAME = cc.CONSTRAINT_NAME
+     AND tc.CONSTRAINT_TYPE = 'CHECK'
+    WHERE cc.CONSTRAINT_SCHEMA = DATABASE()
+      AND tc.TABLE_NAME = 'expert_index_sync_task'
+      AND cc.CONSTRAINT_NAME = 'chk_expert_sync_task_error_stage'
 );
 
 SET @expert_index_p5_constraint_current = (
@@ -41,10 +45,14 @@ SET @expert_index_p5_constraint_current = (
             WHEN COUNT(*) = 1 AND MAX(CHECK_CLAUSE) LIKE '%receipt%' THEN 1
             ELSE 0
         END
-    FROM information_schema.CHECK_CONSTRAINTS
-    WHERE CONSTRAINT_SCHEMA = DATABASE()
-      AND TABLE_NAME = 'expert_index_sync_task'
-      AND CONSTRAINT_NAME = 'chk_expert_sync_task_error_stage'
+    FROM information_schema.CHECK_CONSTRAINTS cc
+    INNER JOIN information_schema.TABLE_CONSTRAINTS tc
+      ON tc.CONSTRAINT_SCHEMA = cc.CONSTRAINT_SCHEMA
+     AND tc.CONSTRAINT_NAME = cc.CONSTRAINT_NAME
+     AND tc.CONSTRAINT_TYPE = 'CHECK'
+    WHERE cc.CONSTRAINT_SCHEMA = DATABASE()
+      AND tc.TABLE_NAME = 'expert_index_sync_task'
+      AND cc.CONSTRAINT_NAME = 'chk_expert_sync_task_error_stage'
 );
 
 SET @expert_index_p5_need_drop = (

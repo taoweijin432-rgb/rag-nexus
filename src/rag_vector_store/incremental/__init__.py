@@ -94,6 +94,7 @@ from .repository import (
 )
 from .scope_consumer import (
     ScopeConsumer,
+    ScopeHandoffReceiptView,
     ScopeHandoffRequestView,
     ScopeReceiptSink,
     ScopeVectorStatePort,
@@ -153,6 +154,7 @@ __all__ = [
     "MySQLV15VectorizationRepository",
     "PreRejectedInput",
     "ScopeConsumer",
+    "ScopeHandoffReceiptView",
     "ScopeHandoffRequestView",
     "ScopeReceiptSink",
     "ScopeVectorStatePort",

@@ -45,7 +45,7 @@ Receipt 计数：
 
 from __future__ import annotations
 
-from typing import Any, Protocol, runtime_checkable
+from typing import Protocol, runtime_checkable
 
 from expert_contracts import ExpertChunkEmbeddingInput
 
@@ -98,6 +98,35 @@ class ScopeHandoffRequestView(Protocol):
     contracts: tuple[ExpertChunkEmbeddingInput, ...]
 
 
+@runtime_checkable
+class ScopeHandoffReceiptView(Protocol):
+    """范围交付回执的下游输出视图。
+
+    该协议只声明上游编排需要核验的字段，不绑定 ``expert_index`` 的具体模型；
+    生产 Receipt 由注入的 sink 构造，测试可使用同结构 Fake。各计数必须能由
+    下游逐项结果确定性重算，失败时不得伪造 committed。
+    """
+
+    request_id: str
+    task_id: int
+    batch_id: int
+    attempt_token: str
+    payload_hash: str
+    impact_scope: ScopeView
+    status: str
+    result_code: str
+    desired_results: tuple[tuple[str, str], ...]
+    stale_vector_doc_ids: tuple[str, ...]
+    desired_count: int
+    embedding_count: int
+    metadata_only_count: int
+    disable_count: int
+    unchanged_count: int
+    retryable: bool
+    error_type: str | None
+    error_message: str | None
+
+
 class ScopeReceiptSink(Protocol):
     """接收 Receipt 字段并返回上游真实 ``ScopeHandoffReceipt`` 的工厂。
 
@@ -126,7 +155,7 @@ class ScopeReceiptSink(Protocol):
         retryable: bool,
         error_type: str | None,
         error_message: str | None,
-    ) -> Any:
+    ) -> ScopeHandoffReceiptView:
         """按字段组装并返回上游 Receipt 实例。"""
         ...
 
@@ -340,7 +369,7 @@ class ScopeConsumer:
         self._state_port = state_port
         self._receipt_sink = receipt_sink
 
-    def process(self, request: ScopeHandoffRequestView) -> Any:
+    def process(self, request: ScopeHandoffRequestView) -> ScopeHandoffReceiptView:
         """执行范围收敛：查询 active → 收敛 desired → 下线 stale → 返回 Receipt。"""
 
         scope = request.impact_scope
@@ -559,7 +588,7 @@ class ScopeConsumer:
         stale_vector_doc_ids: tuple[str, ...] = (),
         disable_count: int = 0,
         retryable: bool = False,
-    ) -> Any:
+    ) -> ScopeHandoffReceiptView:
         """组装上游 Receipt（identity/token/payload_hash/scope 原样回填）。"""
 
         counts = counts or _Counts()
@@ -638,6 +667,7 @@ class _DesiredBlock:
 
 __all__ = [
     "ScopeConsumer",
+    "ScopeHandoffReceiptView",
     "ScopeHandoffRequestView",
     "ScopeReceiptSink",
     "ScopeVectorStatePort",
