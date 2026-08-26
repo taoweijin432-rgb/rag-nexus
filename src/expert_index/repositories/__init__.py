@@ -14,6 +14,7 @@ from .batch import (
 )
 from .batch_item import BatchItemSummary, MySQLBatchItemRepository
 from .build_lock import ConcurrentBuildError, MySQLBuildLockRepository
+from .cdc_event import MySQLCdcBatchPersistence
 from .dead_letter import (
     DeadLetterConflictError,
     DeadLetterRequeueResult,
@@ -49,6 +50,7 @@ __all__ = [
     "MySQLBatchItemRepository",
     "MySQLBatchRepository",
     "MySQLBuildLockRepository",
+    "MySQLCdcBatchPersistence",
     "MySQLDeadLetterRepository",
     "MySQLSourceStateRepository",
     "MySQLSourceSyncTaskRepository",

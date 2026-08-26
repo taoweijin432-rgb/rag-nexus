@@ -67,6 +67,30 @@ class _Persistence:
         return tuple(receipts)
 
 
+class _Client:
+    """记录单轮消费的 fetch/rollback/ack 行为。"""
+
+    def __init__(self, batch: CanalBatch) -> None:
+        self.batch = batch
+        self.rollback_ids: list[int] = []
+        self.ack_ids: list[int] = []
+
+    def fetch_without_ack(self, _batch_size: int) -> CanalBatch:
+        """返回固定 batch。"""
+
+        return self.batch
+
+    def rollback(self, batch_id: int) -> None:
+        """记录回滚，不改变测试输入。"""
+
+        self.rollback_ids.append(batch_id)
+
+    def ack(self, batch_id: int) -> None:
+        """记录确认调用，断言业务链路不会调用它。"""
+
+        self.ack_ids.append(batch_id)
+
+
 def test_receiver_builds_cdc_delete_task_plan_without_source_time() -> None:
     """DELETE 计划使用 CDC 身份和空 source_updated_at，不猜 Poll 时间。"""
 
@@ -127,6 +151,36 @@ def test_receiver_does_not_persist_malformed_batch() -> None:
     assert result.rollback_required is True
     assert result.plans == ()
     assert persistence.calls == []
+
+
+def test_consume_once_rolls_back_malformed_batch_without_ack() -> None:
+    """单轮消费遇到畸形 batch 时回滚 Canal，成功路径不在 P7.4 ACK。"""
+
+    valid = _delete_batch()
+    malformed_entry = valid.entries[1]
+    malformed = CanalEntry(
+        malformed_entry.entry_type,
+        malformed_entry.source_schema,
+        malformed_entry.source_table,
+        malformed_entry.operation_type,
+        malformed_entry.logfile_name,
+        malformed_entry.logfile_offset,
+        malformed_entry.server_id,
+        malformed_entry.execute_time,
+    )
+    client = _Client(CanalBatch(7, (valid.entries[0], malformed, valid.entries[2]), CANAL_DESTINATION))
+    receiver = CdcBatchReceiver(identity_provider=lambda _event: "event-1", policy_version="p7.4")
+
+    result = receiver.consume_once(
+        client,
+        batch_size=100,
+        local_batch_id=88,
+        persistence=_Persistence(),
+    )
+
+    assert result.rollback_required is True
+    assert client.rollback_ids == [7]
+    assert client.ack_ids == []
 
 
 def test_parser_identity_is_not_created_implicitly() -> None:

@@ -25,6 +25,7 @@ CONTROL_TABLE_MIGRATION = (
 INCREMENTAL_SCAN_INDEX_MIGRATION = (
     PROJECT_ROOT / "sql" / "013_add_incremental_scan_lookup_index.sql"
 )
+CDC_INGEST_IDENTITY_MIGRATION = PROJECT_ROOT / "sql" / "017_add_cdc_ingest_identity.sql"
 
 VECTOR_STAT_FIELDS = {
     "vector_sync_expert_count",
@@ -600,3 +601,27 @@ def test_incremental_scan_index_migration_only_changes_local_batch_source_index(
         "milvus",
     ):
         assert forbidden_target not in executable_sql.lower()
+
+
+def test_cdc_ingest_identity_migration_is_additive_and_source_safe() -> None:
+    """017 只补齐本地 CDC 身份字段和索引，并可通过信息架构检查重复执行。"""
+
+    migration = _read(CDC_INGEST_IDENTITY_MIGRATION)
+    executable_sql = "\n".join(
+        line for line in migration.splitlines() if not line.lstrip().startswith("--")
+    )
+    for field in ("cdc_event_id", "local_batch_id", "task_id", "policy_version", "binlog_server_id"):
+        assert f"COLUMN_NAME = '{field}'" in migration
+    assert "uk_expert_cdc_event_id" in migration
+    assert "idx_expert_cdc_event_task" in migration
+    assert "FROM information_schema.COLUMNS" in migration
+    assert "FROM information_schema.STATISTICS" in migration
+    assert "ALTER TABLE expert_index_cdc_event" in executable_sql
+    for source_table in (
+        "experts",
+        "experts_work_experience",
+        "experts_project_experience",
+        "experts_education_experience",
+    ):
+        assert re.search(rf"ALTER\s+TABLE\s+{source_table}(?:\s|$)", executable_sql, re.IGNORECASE) is None
+    assert "INSERT INTO" not in executable_sql.upper()

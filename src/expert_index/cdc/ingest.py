@@ -15,7 +15,7 @@ from typing import Literal, Protocol
 
 from ..models import NewSourceSyncTask
 from .parser import CanalDeleteEvent, CanalParseIssue, parse_canal_batch
-from .protocol import CanalBatch
+from .protocol import CanalBatch, CanalClientPort
 
 CdcTaskReceiptStatus = Literal["created", "reused_pending", "reused_success"]
 _TARGET_TYPES = {
@@ -130,6 +130,40 @@ class CdcBatchReceiver:
             ignored_count=parsed.ignored_count,
             issues=parsed.issues,
         )
+
+    def consume_once(
+        self,
+        client: CanalClientPort,
+        *,
+        batch_size: int,
+        local_batch_id: int,
+        persistence: CdcBatchPersistencePort,
+    ) -> CdcBatchReceiveResult:
+        """消费一个未确认 batch；失败或畸形输入回滚，成功只落库不 ACK。"""
+
+        batch = client.fetch_without_ack(batch_size)
+        if batch.is_empty:
+            return self.receive(
+                batch,
+                local_batch_id=local_batch_id,
+                persistence=persistence,
+            )
+        rollback_started = False
+        try:
+            result = self.receive(
+                batch,
+                local_batch_id=local_batch_id,
+                persistence=persistence,
+            )
+            if result.rollback_required:
+                rollback_started = True
+                client.rollback(batch.batch_id)
+            return result
+        except Exception:
+            # Index 事务失败、身份冲突或解析异常都不能确认 Canal 位点。
+            if not rollback_started:
+                client.rollback(batch.batch_id)
+            raise
 
     def _build_plan(self, event: CanalDeleteEvent, *, local_batch_id: int) -> CdcTaskPlan:
         """把 DELETE 定位事件映射为 CDC Task，不读取来源正文或推断时间。"""
