@@ -12,6 +12,14 @@ from .protocol import (
     CanalProtocolBaseline,
     CanalProtocolNotFrozenError,
 )
+from .replay import (
+    CanalReplaySafetyError,
+    FakeCanalClient,
+    ReplayDelete,
+    ReplayResult,
+    replay_batch,
+    replay_next_batch,
+)
 
 __all__ = [
     "CANAL_DESTINATION",
@@ -21,4 +29,10 @@ __all__ = [
     "CanalEntry",
     "CanalProtocolBaseline",
     "CanalProtocolNotFrozenError",
+    "CanalReplaySafetyError",
+    "FakeCanalClient",
+    "ReplayDelete",
+    "ReplayResult",
+    "replay_batch",
+    "replay_next_batch",
 ]

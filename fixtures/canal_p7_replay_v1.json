@@ -1,0 +1,48 @@
+{
+  "contract": "canal_p7_replay_v1",
+  "production_ready": false,
+  "cases": [
+    {
+      "name": "empty_batch",
+      "batch_id": -1,
+      "entries": [],
+      "expected": {"accepted_deletes": 0, "ignored": 0, "duplicates": 0, "malformed": 0, "rollback": false}
+    },
+    {
+      "name": "update_ignored",
+      "batch_id": 10,
+      "entries": [
+        {"entry_type": "ROWDATA", "schema": "expert", "table": "experts_work_experience", "operation_type": "UPDATE", "logfile_name": "binlog.000012", "logfile_offset": 100, "server_id": 1, "execute_time": 1, "before_columns": ["id", "expert_id"], "after_columns": ["id", "expert_id"]}
+      ],
+      "expected": {"accepted_deletes": 0, "ignored": 1, "duplicates": 0, "malformed": 0, "rollback": false}
+    },
+    {
+      "name": "four_table_deletes",
+      "batch_id": 11,
+      "entries": [
+        {"entry_type": "ROWDATA", "schema": "expert", "table": "experts", "operation_type": "DELETE", "logfile_name": "binlog.000012", "logfile_offset": 201, "server_id": 1, "execute_time": 1, "before_columns": ["id"], "after_columns": []},
+        {"entry_type": "ROWDATA", "schema": "expert", "table": "experts_work_experience", "operation_type": "DELETE", "logfile_name": "binlog.000012", "logfile_offset": 202, "server_id": 1, "execute_time": 1, "before_columns": ["id", "expert_id"], "after_columns": []},
+        {"entry_type": "ROWDATA", "schema": "expert", "table": "experts_project_experience", "operation_type": "DELETE", "logfile_name": "binlog.000012", "logfile_offset": 203, "server_id": 1, "execute_time": 1, "before_columns": ["id", "expert_id"], "after_columns": []},
+        {"entry_type": "ROWDATA", "schema": "expert", "table": "experts_education_experience", "operation_type": "DELETE", "logfile_name": "binlog.000012", "logfile_offset": 204, "server_id": 1, "execute_time": 1, "before_columns": ["id", "expert_id"], "after_columns": []}
+      ],
+      "expected": {"accepted_deletes": 4, "ignored": 0, "duplicates": 0, "malformed": 0, "rollback": false}
+    },
+    {
+      "name": "malformed_delete",
+      "batch_id": 12,
+      "entries": [
+        {"entry_type": "ROWDATA", "schema": "expert", "table": "experts_work_experience", "operation_type": "DELETE", "logfile_name": "binlog.000012", "logfile_offset": 301, "server_id": 1, "execute_time": 1, "before_columns": ["expert_id"], "after_columns": []}
+      ],
+      "expected": {"accepted_deletes": 0, "ignored": 0, "duplicates": 0, "malformed": 1, "rollback": true}
+    },
+    {
+      "name": "duplicate_delete",
+      "batch_id": 13,
+      "entries": [
+        {"entry_type": "ROWDATA", "schema": "expert", "table": "experts", "operation_type": "DELETE", "logfile_name": "binlog.000012", "logfile_offset": 401, "server_id": 1, "execute_time": 1, "before_columns": ["id"], "after_columns": []},
+        {"entry_type": "ROWDATA", "schema": "expert", "table": "experts", "operation_type": "DELETE", "logfile_name": "binlog.000012", "logfile_offset": 401, "server_id": 1, "execute_time": 1, "before_columns": ["id"], "after_columns": []}
+      ],
+      "expected": {"accepted_deletes": 1, "ignored": 0, "duplicates": 1, "malformed": 0, "rollback": false}
+    }
+  ]
+}

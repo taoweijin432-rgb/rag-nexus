@@ -10,16 +10,105 @@
   },
   "source_connected": true,
   "probe": {
-    "batch_id": -1,
-    "entry_count": 0,
+    "batch_id": 1,
+    "entry_count": 6,
     "ack_called": false
+  },
+  "real_batch": {
+    "batch_id": 1,
+    "entry_count": 6,
+    "entries": [
+      {
+        "index": 0,
+        "entry_type": "TRANSACTIONBEGIN",
+        "schema": "",
+        "table": "",
+        "logfile_name": "binlog.000012",
+        "logfile_offset": 76094197,
+        "execute_time": 1787747052000,
+        "server_id": 1
+      },
+      {
+        "index": 1,
+        "entry_type": "ROWDATA",
+        "schema": "expert",
+        "table": "experts_work_experience",
+        "operation_type": "INSERT",
+        "logfile_name": "binlog.000012",
+        "logfile_offset": 76094382,
+        "execute_time": 1787747052000,
+        "server_id": 1,
+        "before_columns": [],
+        "after_columns": [
+          "id", "experience_id", "company_name", "start_date", "end_date",
+          "position_title", "work_description", "experts_work_experience_updated_at",
+          "experts_work_experience_deleted_at", "expert_id", "is_employed", "created_at",
+          "updated_at", "deleted_at"
+        ]
+      },
+      {
+        "index": 2,
+        "entry_type": "TRANSACTIONEND",
+        "schema": "",
+        "table": "",
+        "logfile_name": "binlog.000012",
+        "logfile_offset": 76094536,
+        "execute_time": 1787747052000,
+        "server_id": 1
+      },
+      {
+        "index": 3,
+        "entry_type": "TRANSACTIONBEGIN",
+        "schema": "",
+        "table": "",
+        "logfile_name": "binlog.000012",
+        "logfile_offset": 76094646,
+        "execute_time": 1787747052000,
+        "server_id": 1
+      },
+      {
+        "index": 4,
+        "entry_type": "ROWDATA",
+        "schema": "expert",
+        "table": "experts_work_experience",
+        "operation_type": "DELETE",
+        "logfile_name": "binlog.000012",
+        "logfile_offset": 76094823,
+        "execute_time": 1787747052000,
+        "server_id": 1,
+        "before_columns": [
+          "id", "experience_id", "company_name", "start_date", "end_date",
+          "position_title", "work_description", "experts_work_experience_updated_at",
+          "experts_work_experience_deleted_at", "expert_id", "is_employed", "created_at",
+          "updated_at", "deleted_at"
+        ],
+        "after_columns": []
+      },
+      {
+        "index": 5,
+        "entry_type": "TRANSACTIONEND",
+        "schema": "",
+        "table": "",
+        "logfile_name": "binlog.000012",
+        "logfile_offset": 76094977,
+        "execute_time": 1787747052000,
+        "server_id": 1
+      }
+    ]
+  },
+  "observed": {
+    "offset_fields": ["logfile_name", "logfile_offset", "server_id", "execute_time"],
+    "delete_before_image_tables": ["experts_work_experience"],
+    "delete_before_image_columns_include": ["id", "expert_id"],
+    "ack_called": false,
+    "source_test_row_removed": true
   },
   "production_ready": false,
   "unresolved": [
     "batch_id_lifecycle_and_restart_redelivery",
-    "transport_offset_canonical_fields",
+    "transport_offset_ordering_and_identity",
     "source_mysql_binlog_runtime_values",
-    "delete_before_image_id_and_expert_id"
+    "delete_before_image_for_all_four_tables"
   ],
-  "note": "空 batch 只证明连接和订阅，不构成真实 DELETE RowData 或生产 Offset 冻结。"
+  "note": "已捕获一条脱敏真实 batch；证明 INSERT/DELETE RowData 和 header Offset 字段可读，但未确认 ack 重投、全表 Before Image 及生产 Checkpoint 语义。"
 }

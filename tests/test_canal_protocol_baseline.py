@@ -39,17 +39,24 @@ def _baseline() -> CanalProtocolBaseline:
     )
 
 
-def test_local_canal_baseline_is_partial_and_read_only() -> None:
-    """本机已确认连接订阅，但空 batch 不得伪装成生产协议冻结。"""
+def test_local_canal_baseline_records_real_batch_but_remains_partial() -> None:
+    """真实 batch 已记录到基线，但未确认重投语义时仍不得开启生产 CDC。"""
 
     baseline = _baseline()
     assert baseline.destination == CANAL_DESTINATION
     assert baseline.server_version == "1.1.8"
     assert baseline.source_connected is True
-    assert baseline.probe_batch_id == -1
-    assert baseline.probe_entry_count == 0
+    assert baseline.probe_batch_id == 1
+    assert baseline.probe_entry_count == 6
     assert baseline.ack_called is False
     assert baseline.production_ready is False
 
     with pytest.raises(CanalProtocolNotFrozenError):
         baseline.require_production_ready()
+
+    payload = json.loads(
+        (ROOT / "fixtures/canal_protocol_baseline_v1.json").read_text(encoding="utf-8")
+    )
+    real_delete = payload["real_batch"]["entries"][4]
+    assert real_delete["operation_type"] == "DELETE"
+    assert {"id", "expert_id"}.issubset(real_delete["before_columns"])
