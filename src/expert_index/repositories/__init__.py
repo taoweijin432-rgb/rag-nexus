@@ -14,6 +14,11 @@ from .batch import (
 )
 from .batch_item import BatchItemSummary, MySQLBatchItemRepository
 from .build_lock import ConcurrentBuildError, MySQLBuildLockRepository
+from .dead_letter import (
+    DeadLetterConflictError,
+    DeadLetterRequeueResult,
+    MySQLDeadLetterRepository,
+)
 from .source_state import (
     BatchSourceCursorConflictError,
     BatchSourceRecoveryConflictError,
@@ -37,11 +42,14 @@ __all__ = [
     "BatchSourceRecoveryConflictError",
     "ConcurrentBuildError",
     "ContractArtifact",
+    "DeadLetterConflictError",
+    "DeadLetterRequeueResult",
     "FullBatchCheckpoint",
     "MySQLArtifactRepository",
     "MySQLBatchItemRepository",
     "MySQLBatchRepository",
     "MySQLBuildLockRepository",
+    "MySQLDeadLetterRepository",
     "MySQLSourceStateRepository",
     "MySQLSourceSyncTaskRepository",
     "SourceCheckpointNotInitializedError",

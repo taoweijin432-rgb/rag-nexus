@@ -87,6 +87,10 @@ SOURCE_SYNC_ERROR_STAGES = frozenset(
     }
 )
 
+DEAD_LETTER_RESOLUTION_STATUSES = frozenset(
+    {"pending", "requeued", "resolved", "ignored"}
+)
+
 # P5.6 任务终态 result_code 冻结枚举。只表示已完成效果，不记录自由文本；
 # 由 Receipt 计数确定性推导，供 finalize_source_sync_task_success 落定任务。
 # embedded: 新写入或 content_hash 变化触发 Embedding；
@@ -260,6 +264,84 @@ class SourceSyncTask:
             ("next_retry_at", self.next_retry_at),
             ("started_at", self.started_at),
             ("completed_at", self.completed_at),
+        ):
+            if value is not None and not isinstance(value, datetime):
+                raise TypeError(f"{field_name} 必须是 datetime 或 None")
+
+
+@dataclass(frozen=True)
+class DeadLetterRecord:
+    """一条 DLQ 失败审计记录，不包含来源正文、Chunk、Metadata 或向量。"""
+
+    dead_letter_id: int
+    task_id: int
+    batch_id: int
+    source_table: str
+    source_record_id: int
+    expert_id: int | None
+    failure_stage: str
+    reason_code: str
+    reason_message: str | None
+    retry_count: int
+    artifact_id: int | None
+    resolution_status: str
+    resolution_note: str | None
+    resolution_operator: str | None
+    resolution_request_id: str | None
+    resolution_version: int
+    resolved_at: datetime | None
+    created_at: datetime
+    updated_at: datetime
+
+    def __post_init__(self) -> None:
+        """校验 DLQ 定位、审计状态和乐观锁字段。"""
+
+        for field_name, value in (
+            ("dead_letter_id", self.dead_letter_id),
+            ("task_id", self.task_id),
+            ("batch_id", self.batch_id),
+            ("source_record_id", self.source_record_id),
+        ):
+            _validate_positive_integer(field_name, value)
+        if self.expert_id is not None:
+            _validate_positive_integer("expert_id", self.expert_id)
+        if self.artifact_id is not None:
+            _validate_positive_integer("artifact_id", self.artifact_id)
+        if self.source_table not in CHECKPOINT_SOURCE_TABLES:
+            raise ValueError(f"不支持的 DLQ 来源表: {self.source_table}")
+        if self.failure_stage not in SOURCE_SYNC_ERROR_STAGES:
+            raise ValueError(f"不支持的 DLQ 失败阶段: {self.failure_stage}")
+        if self.resolution_status not in DEAD_LETTER_RESOLUTION_STATUSES:
+            raise ValueError(f"不支持的 DLQ 处置状态: {self.resolution_status}")
+        if (
+            isinstance(self.retry_count, bool)
+            or not isinstance(self.retry_count, int)
+            or self.retry_count < 0
+        ):
+            raise ValueError("retry_count 必须是非负整数")
+        if (
+            isinstance(self.resolution_version, bool)
+            or not isinstance(self.resolution_version, int)
+            or self.resolution_version < 0
+        ):
+            raise ValueError("resolution_version 必须是非负整数")
+        for field_name, value, max_length in (
+            ("reason_code", self.reason_code, 64),
+            ("reason_message", self.reason_message, 512),
+            ("resolution_note", self.resolution_note, 512),
+            ("resolution_operator", self.resolution_operator, 128),
+            ("resolution_request_id", self.resolution_request_id, 128),
+        ):
+            if field_name == "reason_code":
+                _validate_optional_text(
+                    field_name, value, max_length=max_length, allow_none=False
+                )
+            elif value is not None:
+                _validate_optional_text(field_name, value, max_length=max_length)
+        for field_name, value in (
+            ("created_at", self.created_at),
+            ("updated_at", self.updated_at),
+            ("resolved_at", self.resolved_at),
         ):
             if value is not None and not isinstance(value, datetime):
                 raise TypeError(f"{field_name} 必须是 datetime 或 None")
