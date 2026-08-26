@@ -72,6 +72,19 @@ class IncrementalScanConfig:
             raise ValueError("incremental lease_seconds 必须是正整数")
 
 
+@dataclass(frozen=True)
+class CdcRuntimeConfig:
+    """控制真实 Canal 消费入口；默认关闭且不隐式推导协议参数。"""
+
+    enabled: bool = False
+
+    def __post_init__(self) -> None:
+        """拒绝非布尔开关，防止含义不明确的配置开启真实 ACK。"""
+
+        if not isinstance(self.enabled, bool):
+            raise TypeError("cdc enabled 必须是布尔值")
+
+
 def load_env_file(path: Path | None = None) -> None:
     """加载简单 ``KEY=value`` 文件，但不覆盖部署环境已经注入的变量。"""
 
@@ -156,6 +169,7 @@ class Settings:
     incremental_scan: IncrementalScanConfig = field(
         default_factory=IncrementalScanConfig
     )
+    cdc_runtime: CdcRuntimeConfig = field(default_factory=CdcRuntimeConfig)
 
     @classmethod
     def from_env(cls, env: Mapping[str, str] | None = None) -> Settings:
@@ -213,10 +227,17 @@ class Settings:
                 minimum=1,
             ),
         )
+        cdc_runtime = CdcRuntimeConfig(
+            enabled=_parse_boolean(
+                "CDC_ENABLED",
+                values.get("CDC_ENABLED", "0"),
+            )
+        )
         return cls(
             source_db=source,
             index_db=index,
             incremental_scan=incremental_scan,
+            cdc_runtime=cdc_runtime,
         )
 
     def validate_index_write_boundary(self) -> None:

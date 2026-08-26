@@ -2,11 +2,17 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from typing import Self
 
 import pytest
 
-from expert_index.cdc import CanalDeleteEvent, CdcTaskPlan, CdcTaskReceipt
+from expert_index.cdc import (
+    CanalDeleteEvent,
+    CdcPersistenceConflictError,
+    CdcTaskPlan,
+    CdcTaskReceipt,
+)
 from expert_index.config import DatabaseBoundaryError, DatabaseConfig, DatabaseRole
 from expert_index.models import NewSourceSyncTask
 from expert_index.repositories.cdc_event import MySQLCdcBatchPersistence
@@ -173,6 +179,32 @@ def test_cdc_persistence_reuses_event_and_task_on_replay(monkeypatch: pytest.Mon
     assert second == (CdcTaskReceipt("event-1", 501, "reused_pending"),)
     assert connection.commits == 2
     assert connection.rollbacks == 0
+
+
+def test_cdc_persistence_rejects_same_position_with_different_locator(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """相同 position 若对应不同业务定位必须回滚，不能覆盖既有 Event。"""
+
+    connection = _Connection()
+    monkeypatch.setattr(
+        "expert_index.repositories.cdc_event.pymysql.connect",
+        lambda **_kwargs: connection,
+    )
+    repository = MySQLCdcBatchPersistence(_index_config())
+    original = _plan()
+    repository.persist_batch([original])
+    conflicting = replace(
+        original,
+        event=replace(original.event, source_record_id=902),
+        task=replace(original.task, source_record_id=902),
+    )
+
+    with pytest.raises(CdcPersistenceConflictError):
+        repository.persist_batch([conflicting])
+
+    assert connection.commits == 1
+    assert connection.rollbacks == 1
 
 
 def test_cdc_persistence_rejects_non_index_role() -> None:

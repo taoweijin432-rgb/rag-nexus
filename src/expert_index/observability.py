@@ -20,6 +20,7 @@ _SAFE_LABELS = frozenset(
         "error_code",
         "result_code",
         "artifact_reused",
+        "cdc_status",
     }
 )
 
@@ -76,6 +77,24 @@ class IncrementalMetrics:
         ):
             self.increment(metric_name, value)
 
+    def record_cdc_batch(self, batch_result) -> None:
+        """记录 CDC 单轮终态和任务数，不采集 batch、Event 或 Before Image。"""
+
+        status = str(batch_result.status)
+        if status not in {"empty", "rolled_back", "not_ready", "acked"}:
+            raise MetricsInputError("未知 CDC batch 状态")
+        labels = {"cdc_status": status}
+        self.increment("cdc_batch", labels=labels)
+        self.increment("cdc_task", batch_result.task_count, labels=labels)
+        checkpoint = batch_result.checkpoint
+        if checkpoint is not None:
+            metric_name = (
+                "cdc_checkpoint_replayed"
+                if checkpoint.already_applied
+                else "cdc_checkpoint_committed"
+            )
+            self.increment(metric_name)
+
 
 @dataclass(frozen=True)
 class DeliveryGateReport:
@@ -122,6 +141,37 @@ def evaluate_delivery_gate(
     return DeliveryGateReport(ready=not blockers, blockers=tuple(blockers))
 
 
+def evaluate_cdc_delivery_gate(
+    *,
+    required_migrations: tuple[str, ...],
+    applied_migrations: tuple[str, ...],
+    source_index_isolated: bool,
+    fixtures_passed: bool,
+    failure_recovery_passed: bool,
+    protocol_frozen: bool,
+    cdc_enabled: bool,
+) -> DeliveryGateReport:
+    """检查 P7 代码交付和真实 CDC 启用条件，并要求交付时保持关闭。"""
+
+    blockers: list[str] = []
+    applied = set(applied_migrations)
+    missing = tuple(migration for migration in required_migrations if migration not in applied)
+    if missing:
+        blockers.append("missing_migrations:" + ",".join(missing))
+    if not source_index_isolated:
+        blockers.append("source_index_not_isolated")
+    if not fixtures_passed:
+        blockers.append("cdc_fixtures_not_passed")
+    if not failure_recovery_passed:
+        blockers.append("cdc_failure_recovery_not_passed")
+    if not protocol_frozen:
+        blockers.append("canal_production_protocol_not_frozen")
+    # P7 交付只证明实现可回放；正式启用必须由 P9 独立授权。
+    if cdc_enabled:
+        blockers.append("cdc_must_remain_disabled_until_P9")
+    return DeliveryGateReport(ready=not blockers, blockers=tuple(blockers))
+
+
 def _normalize_labels(labels: Mapping[str, object]) -> tuple[tuple[str, str], ...]:
     """限制指标标签集合和值为无正文安全标识。"""
 
@@ -144,4 +194,10 @@ def _metric_key(metric_name: str, labels: tuple[tuple[str, str], ...]) -> str:
     return metric_name + "{" + ",".join(f"{key}={value}" for key, value in labels) + "}"
 
 
-__all__ = ["DeliveryGateReport", "IncrementalMetrics", "MetricsInputError", "evaluate_delivery_gate"]
+__all__ = [
+    "DeliveryGateReport",
+    "IncrementalMetrics",
+    "MetricsInputError",
+    "evaluate_cdc_delivery_gate",
+    "evaluate_delivery_gate",
+]

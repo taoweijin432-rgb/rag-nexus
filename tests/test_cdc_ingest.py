@@ -114,16 +114,22 @@ def test_receiver_builds_cdc_delete_task_plan_without_source_time() -> None:
 
 
 def test_receiver_reuses_same_task_for_replayed_event() -> None:
-    """同一显式 CDC 身份重复投递时不生成新的任务身份。"""
+    """同一显式 CDC 身份连续重投三次时始终复用同一任务。"""
 
     persistence = _Persistence()
     receiver = CdcBatchReceiver(identity_provider=lambda _event: "event-1", policy_version="p7.4")
 
     first = receiver.receive(_delete_batch(), local_batch_id=88, persistence=persistence)
     second = receiver.receive(_delete_batch(), local_batch_id=89, persistence=persistence)
+    third = receiver.receive(_delete_batch(), local_batch_id=90, persistence=persistence)
 
-    assert first.receipts[0].task_id == second.receipts[0].task_id
-    assert second.receipts[0].status == "reused_pending"
+    assert {first.receipts[0].task_id, second.receipts[0].task_id, third.receipts[0].task_id} == {
+        501
+    }
+    assert (second.receipts[0].status, third.receipts[0].status) == (
+        "reused_pending",
+        "reused_pending",
+    )
     assert first.plans[0].task.dedupe_key == second.plans[0].task.dedupe_key
 
 

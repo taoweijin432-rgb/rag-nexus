@@ -12,6 +12,7 @@ from expert_index.cdc import (
     CanalProtocolBaseline,
     CanalProtocolNotFrozenError,
 )
+from expert_index.config import Settings
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -60,3 +61,21 @@ def test_local_canal_baseline_records_real_batch_but_remains_partial() -> None:
     real_delete = payload["real_batch"]["entries"][4]
     assert real_delete["operation_type"] == "DELETE"
     assert {"id", "expert_id"}.issubset(real_delete["before_columns"])
+
+
+def test_cdc_runtime_defaults_to_disabled_and_rejects_ambiguous_switch() -> None:
+    """正式配置缺省关闭 CDC，且不能用含义模糊的文本绕过门禁。"""
+
+    environment = {
+        "SOURCE_DB_PASSWORD": "source-secret",
+        "INDEX_DB_HOST": "127.0.0.1",
+        "INDEX_DB_PORT": "3306",
+        "INDEX_DB_USER": "index-writer",
+        "INDEX_DB_PASSWORD": "index-secret",
+        "INDEX_DB_NAME": "expert_index",
+    }
+    assert Settings.from_env(environment).cdc_runtime.enabled is False
+
+    environment["CDC_ENABLED"] = "maybe"
+    with pytest.raises(ValueError, match="CDC_ENABLED"):
+        Settings.from_env(environment)

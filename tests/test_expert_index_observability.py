@@ -9,6 +9,7 @@ import pytest
 from expert_index.observability import (
     IncrementalMetrics,
     MetricsInputError,
+    evaluate_cdc_delivery_gate,
     evaluate_delivery_gate,
 )
 
@@ -49,3 +50,45 @@ def test_delivery_gate_stays_closed_until_all_facts_are_ready() -> None:
     )
     assert report.ready is False
     assert report.blockers == ("missing_migrations:016",)
+
+
+def test_cdc_delivery_gate_separates_code_delivery_from_production_activation() -> None:
+    """迁移和回放通过后，真实协议未冻结仍必须阻止 CDC 启用。"""
+
+    report = evaluate_cdc_delivery_gate(
+        required_migrations=("017", "018"),
+        applied_migrations=("017", "018"),
+        source_index_isolated=True,
+        fixtures_passed=True,
+        failure_recovery_passed=True,
+        protocol_frozen=False,
+        cdc_enabled=False,
+    )
+
+    assert report.ready is False
+    assert report.blockers == ("canal_production_protocol_not_frozen",)
+
+    ready_report = evaluate_cdc_delivery_gate(
+        required_migrations=("017", "018"),
+        applied_migrations=("017", "018"),
+        source_index_isolated=True,
+        fixtures_passed=True,
+        failure_recovery_passed=True,
+        protocol_frozen=True,
+        cdc_enabled=False,
+    )
+    assert ready_report.ready is True
+
+
+def test_cdc_metrics_only_expose_safe_status_and_counts() -> None:
+    """CDC 指标不输出 batch ID、Event 身份或业务字段。"""
+
+    metrics = IncrementalMetrics()
+    metrics.record_cdc_batch(
+        SimpleNamespace(status="not_ready", task_count=2, checkpoint=None)
+    )
+
+    assert metrics.snapshot() == {
+        "cdc_batch{cdc_status=not_ready}": 1,
+        "cdc_task{cdc_status=not_ready}": 2,
+    }
