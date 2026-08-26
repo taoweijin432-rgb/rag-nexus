@@ -3,6 +3,11 @@
 本包只定义上游可依赖的协议边界，不依赖 Canal SDK，也不执行消费或确认。
 """
 
+from .delete_scope import (
+    CdcDeleteSourcePort,
+    prepare_cdc_delete_batch,
+    prepare_cdc_delete_task,
+)
 from .ingest import (
     CdcBatchPersistencePort,
     CdcBatchReceiver,
@@ -65,6 +70,7 @@ __all__ = [
     "CdcBatchPersistencePort",
     "CdcBatchReceiveResult",
     "CdcBatchReceiver",
+    "CdcDeleteSourcePort",
     "CdcEventIdentityProvider",
     "CdcIngestError",
     "CdcPersistenceConflictError",
@@ -75,6 +81,8 @@ __all__ = [
     "ReplayDelete",
     "ReplayResult",
     "parse_canal_batch",
+    "prepare_cdc_delete_batch",
+    "prepare_cdc_delete_task",
     "replay_batch",
     "replay_next_batch",
 ]

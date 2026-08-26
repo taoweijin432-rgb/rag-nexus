@@ -25,6 +25,7 @@ from .models import (
     ScopedCurrentFacts,
     SourceChangeCandidate,
     SourceScanCursor,
+    impact_scope_from_target,
 )
 
 # 第一版把分页大小限制在 1000 以内，防止调用方误传过大 limit，一次读取过多候选。
@@ -519,6 +520,50 @@ class MySQLSourceAdapter:
             with connection.cursor() as cursor:
                 self._begin_consistent_read(cursor)
                 facts = self._read_scoped_facts(cursor, request)
+            connection.rollback()
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+        return facts
+
+    def read_cdc_education_delete_facts(
+        self,
+        expert_id: int,
+    ) -> ScopedCurrentFacts | None:
+        """重读教育物理删除后的专家与剩余教育事实。
+
+        CDC DELETE 的触发行已经物理消失，因此本入口不查询或重建该教育行，只在同一个
+        只读一致性快照中读取父专家和当前有效教育。父专家也已物理删除时返回 ``None``，
+        由 P7.5 提升为 expert scope 空 desired；逻辑删除父专家仍返回生命周期事实。
+        """
+
+        if isinstance(expert_id, bool) or not isinstance(expert_id, int) or expert_id < 1:
+            raise ValueError("expert_id 必须是正整数")
+        connection = pymysql.connect(**self.config.as_kwargs(autocommit=False))
+        try:
+            with connection.cursor() as cursor:
+                self._begin_consistent_read(cursor)
+                scope = impact_scope_from_target(
+                    target_type="profile",
+                    expert_id=expert_id,
+                )
+                try:
+                    expert = self._load_expert_row_by_id(cursor, expert_id)
+                except ExpertNotFoundError:
+                    facts = None
+                else:
+                    educations = (
+                        ()
+                        if expert.deleted_at is not None
+                        else tuple(self._load_educations(cursor, expert_id))
+                    )
+                    facts = ScopedCurrentFacts(
+                        scope=scope,
+                        expert=expert,
+                        educations=educations,
+                    )
             connection.rollback()
         except Exception:
             connection.rollback()

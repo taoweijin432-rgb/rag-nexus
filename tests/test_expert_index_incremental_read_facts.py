@@ -472,6 +472,43 @@ class TestPhysicalMissingAndLogicalDeletion:
         assert facts.employments[0].deleted_at == del_ts
 
 
+class TestCdcEducationDeleteRead:
+    """教育物理删除只重读父专家与删除后的剩余教育。"""
+
+    def test_reads_parent_and_remaining_education_without_trigger_row(self, monkeypatch):
+        cursor = ScriptedCursor().add(key="FROM experts", one=_expert_row(100))
+        cursor.add(
+            key="FROM experts_education_experience",
+            rows=[_education_row(7001), _education_row(7002)],
+        )
+        connection = ScriptedConnection(cursor)
+        _patch_connect(monkeypatch, connection)
+
+        facts = _adapter().read_cdc_education_delete_facts(100)
+
+        assert facts is not None
+        assert facts.scope.scope_type == "profile"
+        assert [row.id for row in facts.educations] == [7001, 7002]
+        education_sql = next(
+            sql for sql, _ in cursor.executed if "FROM experts_education_experience" in sql
+        )
+        assert "WHERE expert_id = %s AND deleted_at IS NULL" in education_sql
+        _assert_readonly_txn(cursor, connection)
+
+    def test_missing_parent_returns_none_without_reading_education(self, monkeypatch):
+        cursor = ScriptedCursor().add(key="FROM experts", one=None)
+        connection = ScriptedConnection(cursor)
+        _patch_connect(monkeypatch, connection)
+
+        facts = _adapter().read_cdc_education_delete_facts(100)
+
+        assert facts is None
+        assert not any(
+            "FROM experts_education_experience" in sql for sql, _ in cursor.executed
+        )
+        _assert_readonly_txn(cursor, connection)
+
+
 # ===========================================================================
 # 子表-父专家归属校验
 # ===========================================================================
