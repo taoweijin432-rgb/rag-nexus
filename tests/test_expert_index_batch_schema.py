@@ -26,6 +26,9 @@ INCREMENTAL_SCAN_INDEX_MIGRATION = (
     PROJECT_ROOT / "sql" / "013_add_incremental_scan_lookup_index.sql"
 )
 CDC_INGEST_IDENTITY_MIGRATION = PROJECT_ROOT / "sql" / "017_add_cdc_ingest_identity.sql"
+CDC_BUSINESS_CHECKPOINT_MIGRATION = (
+    PROJECT_ROOT / "sql" / "018_add_cdc_business_checkpoint.sql"
+)
 
 VECTOR_STAT_FIELDS = {
     "vector_sync_expert_count",
@@ -625,3 +628,34 @@ def test_cdc_ingest_identity_migration_is_additive_and_source_safe() -> None:
     ):
         assert re.search(rf"ALTER\s+TABLE\s+{source_table}(?:\s|$)", executable_sql, re.IGNORECASE) is None
     assert "INSERT INTO" not in executable_sql.upper()
+
+
+def test_cdc_business_checkpoint_migration_is_idempotent_and_source_safe() -> None:
+    """018 只创建 Index CDC 业务水位，不修改来源表或向量表。"""
+
+    migration = _read(CDC_BUSINESS_CHECKPOINT_MIGRATION)
+    executable_sql = "\n".join(
+        line for line in migration.splitlines() if not line.lstrip().startswith("--")
+    )
+    assert "CREATE TABLE IF NOT EXISTS expert_index_cdc_checkpoint" in migration
+    for field in (
+        "destination",
+        "binlog_server_id",
+        "binlog_file",
+        "binlog_position",
+        "last_local_batch_id",
+        "lock_version",
+        "last_success_at",
+    ):
+        assert field in migration
+    assert "PRIMARY KEY (destination)" in migration
+    assert "ALTER TABLE" not in executable_sql.upper()
+    for forbidden_target in (
+        "expert_chunk",
+        "experts_work_experience",
+        "experts_project_experience",
+        "experts_education_experience",
+        "rag_vector_store",
+        "milvus",
+    ):
+        assert forbidden_target not in executable_sql.lower()

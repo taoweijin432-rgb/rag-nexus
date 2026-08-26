@@ -202,6 +202,91 @@ class MySQLSourceSyncTaskRepository:
         finally:
             connection.close()
 
+    def claim_cdc_source_sync_task(
+        self,
+        task_id: int,
+        *,
+        lease_seconds: int,
+    ) -> SourceSyncTask | None:
+        """按 Event 回执关联的精确 ID 领取一个 CDC DELETE Task。
+
+        方法不跳过请求的 Task：终态、退避未到或其他 Worker 持有有效
+        lease 时返回 ``None``。过期 processing 和退避到期 pending 作为新
+        重试认领并增加 ``retry_count``。
+        """
+
+        _validate_positive_integer("task_id", task_id)
+        _validate_lease_seconds(lease_seconds)
+        connection = pymysql.connect(**self.config.as_kwargs())
+        try:
+            with connection.cursor() as cursor:
+                locked = _lock_source_sync_task(cursor, task_id)
+                if locked.get("event_source") != "cdc" or locked.get("operation_type") != "delete":
+                    raise SourceSyncTaskStageConflictError(
+                        f"任务 {task_id} 不是 CDC DELETE Task"
+                    )
+                status = str(locked["sync_status"])
+                if status in {"success", "dead"}:
+                    connection.commit()
+                    return None
+                if status not in {"pending", "processing"}:
+                    raise SourceSyncTaskStageConflictError(
+                        f"任务 {task_id} 处于 {status} 状态，不能领取"
+                    )
+
+                retry_attempt = False
+                if status == "pending":
+                    next_retry_at = locked.get("next_retry_at")
+                    if next_retry_at is not None:
+                        cursor.execute("SELECT CURRENT_TIMESTAMP(6) AS now", ())
+                        now_row = cursor.fetchone()
+                        db_now = now_row["now"] if now_row is not None else None
+                        if db_now is None or next_retry_at > db_now:
+                            connection.commit()
+                            return None
+                        retry_attempt = True
+                else:
+                    if bool(locked.get("lease_is_active")):
+                        connection.commit()
+                        return None
+                    retry_attempt = True
+
+                attempt_token = self.attempt_token_factory()
+                _validate_attempt_token(attempt_token)
+                cursor.execute(
+                    """
+                    UPDATE expert_index_sync_task
+                    SET sync_status='processing', attempt_token=%s,
+                        lease_until=TIMESTAMPADD(
+                            SECOND, %s, CURRENT_TIMESTAMP(6)
+                        ),
+                        retry_count=retry_count+%s,
+                        started_at=CURRENT_TIMESTAMP(6), completed_at=NULL
+                    WHERE id=%s AND sync_status=%s
+                    """,
+                    (
+                        attempt_token,
+                        lease_seconds,
+                        1 if retry_attempt else 0,
+                        task_id,
+                        status,
+                    ),
+                )
+                if cursor.rowcount != 1:
+                    raise SourceSyncTaskLeaseConflictError(
+                        f"任务 {task_id} 在 CDC 领取期间状态已变化"
+                    )
+                task = _select_source_sync_task(cursor, task_id)
+                if task.attempt_token != attempt_token or task.sync_status != "processing":
+                    raise RuntimeError("CDC Task 领取后回读身份不一致")
+            connection.commit()
+            return task
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+
     def claim_source_sync_tasks(
         self,
         batch_id: int,

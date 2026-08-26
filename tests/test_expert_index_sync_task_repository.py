@@ -386,6 +386,65 @@ def test_list_cdc_expert_delete_ids_rejects_inconsistent_identity(
     assert connection.closed is True
 
 
+def test_claim_cdc_source_sync_task_claims_exact_pending_task(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """按 Event 回执领取时只更新指定 CDC Task 并生成新 token。"""
+
+    locked = _task_row(
+        event_source="cdc",
+        operation_type="delete",
+        source_updated_at=None,
+        lease_is_active=0,
+    )
+    claimed = dict(locked)
+    claimed.update(
+        sync_status="processing",
+        attempt_token="cdc-token-801",
+        lease_until=datetime(2026, 8, 21, 10, 3, tzinfo=timezone.utc),
+    )
+    claimed.pop("lease_is_active")
+    cursor = RecordingCursor(ones=[locked, claimed], rowcounts=[0, 1, 0])
+    connection = RecordingConnection(cursor)
+    _patch_connection(monkeypatch, connection)
+
+    task = _repository_with_tokens("cdc-token-801").claim_cdc_source_sync_task(
+        801,
+        lease_seconds=180,
+    )
+
+    assert task is not None and task.attempt_token == "cdc-token-801"
+    update_sql, update_params = cursor.executed[1]
+    assert "WHERE id=%s AND sync_status=%s" in update_sql
+    assert update_params is not None and update_params[-2:] == (801, "pending")
+    assert connection.commit_count == 1 and connection.rollback_count == 0
+
+
+def test_claim_cdc_source_sync_task_does_not_steal_active_lease(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """其他 Worker 持有有效 lease 时返回 None，不覆盖 attempt_token。"""
+
+    locked = _task_row(
+        event_source="cdc",
+        operation_type="delete",
+        source_updated_at=None,
+        sync_status="processing",
+        attempt_token="other-worker",
+        lease_until=datetime(2026, 8, 21, 10, 3, tzinfo=timezone.utc),
+        lease_is_active=1,
+    )
+    cursor = RecordingCursor(one=locked)
+    connection = RecordingConnection(cursor)
+    _patch_connection(monkeypatch, connection)
+
+    task = _repository().claim_cdc_source_sync_task(801, lease_seconds=180)
+
+    assert task is None
+    assert len(cursor.executed) == 1
+    assert connection.commit_count == 1 and connection.rollback_count == 0
+
+
 def test_claim_source_sync_tasks_uses_skip_locked_and_fences_each_attempt(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
