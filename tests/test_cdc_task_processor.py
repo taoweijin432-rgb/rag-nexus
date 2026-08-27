@@ -10,7 +10,12 @@ import pytest
 
 from expert_index.cdc import CdcDeleteTaskProcessor
 from expert_index.handoff_orchestrator import HandoffOrchestrationResult
-from expert_index.models import PreparedChunkSet, ScopedCurrentFacts, SourceSyncTask
+from expert_index.models import (
+    PreparedChunkSet,
+    ScopedCurrentFacts,
+    SourceSyncTask,
+    impact_scope_from_target,
+)
 
 NOW = datetime(2026, 8, 26, tzinfo=timezone.utc)
 TOKEN = "cdc-attempt-1"
@@ -173,6 +178,35 @@ def test_candidate_delete_advances_to_validated_and_hands_off_empty_scope() -> N
     assert prepared.is_empty is True
     assert repository.advanced == ["source_read", "normalized", "chunk_built", "validated"]
     assert source.calls == []
+    assert result.final_status == "success"
+
+
+def test_candidate_update_reuses_p4_preparation_coordinator(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """非删除 CDC Task 走现有 P4 Coordinator，而不是 DELETE 专用范围准备器。"""
+
+    task = replace(_task(), operation_type="update")
+    prepared = PreparedChunkSet(
+        task_id=task.task_id,
+        batch_id=task.batch_id,
+        data_version=str(task.batch_id),
+        impact_scope=impact_scope_from_target(
+            target_type="employment",
+            expert_id=task.expert_id,
+            source_field_id=str(task.source_record_id),
+        ),
+        desired_chunks=(),
+    )
+    monkeypatch.setattr(
+        "expert_index.cdc.task_processor.PreparationCoordinator.prepare",
+        lambda *_args, **_kwargs: prepared,
+    )
+
+    processor, _repository, _source, orchestrator = _processor(task)
+    result = processor.process_claimed(task, TOKEN)
+
+    assert orchestrator.calls[0][0] is prepared
     assert result.final_status == "success"
 
 

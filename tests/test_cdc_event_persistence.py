@@ -90,9 +90,9 @@ class _Cursor:
                 "row_index": params[6],
                 "source_schema": params[9],
                 "source_table": params[10],
-                "operation_type": "delete",
-                "source_record_id": params[11],
-                "expert_id": params[12],
+                "operation_type": params[11],
+                "source_record_id": params[12],
+                "expert_id": params[13],
                 "binlog_server_id": params[7],
             }
             self.lastrowid = 11
@@ -110,9 +110,9 @@ class _Cursor:
                     "source_record_id": params[3],
                     "source_updated_at": None,
                     "expert_id": params[4],
-                    "operation_type": "delete",
-                    "target_type": params[5],
-                    "policy_version": params[6],
+                    "operation_type": params[5],
+                    "target_type": params[6],
+                    "policy_version": params[7],
                 }
                 self.lastrowid = 501
         elif (

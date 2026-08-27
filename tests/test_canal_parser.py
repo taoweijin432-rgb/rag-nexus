@@ -84,8 +84,8 @@ def test_parser_extracts_only_delete_locator(table: str, record_id: int, expert_
     assert result.rollback_required is False
 
 
-def test_parser_ignores_updates_and_fails_closed_on_missing_locator() -> None:
-    """UPDATE 只计数；缺少 DELETE 定位列时整批要求 rollback。"""
+def test_parser_fails_closed_on_missing_change_rows_and_locator() -> None:
+    """缺少变更 RowData 或 DELETE 定位列时整批要求 rollback。"""
 
     update = CanalEntry(
         "ROWDATA", "expert", "experts_work_experience", "UPDATE", "binlog.000012", 201, 1, 1
@@ -115,10 +115,42 @@ def test_parser_ignores_updates_and_fails_closed_on_missing_locator() -> None:
         )
     )
 
-    assert result.ignored_count == 1
-    assert len(result.issues) == 1
-    assert result.issues[0].code == "missing_delete_locator"
+    assert result.ignored_count == 0
+    assert [issue.code for issue in result.issues] == [
+        "missing_row_data",
+        "missing_delete_locator",
+    ]
     assert result.rollback_required is True
+
+
+def test_parser_emits_insert_update_delete_with_common_locator() -> None:
+    """统一事件解析器按操作类型提取四表主键和专家归属。"""
+
+    insert = CanalEntry(
+        "ROWDATA", "expert", "experts_work_experience", "INSERT",
+        "binlog.000012", 301, 1, 1,
+        rows=(CanalRowData(after=(CanalColumn("id", "21"), CanalColumn("expert_id", "7"))),),
+    )
+    update = CanalEntry(
+        "ROWDATA", "expert", "experts", "UPDATE",
+        "binlog.000012", 302, 1, 1,
+        rows=(CanalRowData(
+            before=(CanalColumn("id", 8),),
+            after=(CanalColumn("id", 8), CanalColumn("job_status", "active")),
+        ),),
+    )
+    batch = CanalBatch(
+        11,
+        (_transaction_marker("TRANSACTIONBEGIN", 300), insert, update,
+         _transaction_marker("TRANSACTIONEND", 303)),
+        CANAL_DESTINATION,
+    )
+
+    result = parse_canal_batch(batch)
+
+    assert [event.operation_type for event in result.events] == ["insert", "update"]
+    assert [(event.source_record_id, event.expert_id) for event in result.events] == [(21, 7), (8, 8)]
+    assert result.delete_events == ()
 
 
 class _Connector:

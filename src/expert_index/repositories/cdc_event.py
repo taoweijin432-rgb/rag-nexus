@@ -144,7 +144,7 @@ def _insert_or_verify_event(cursor: Any, plan: CdcTaskPlan) -> tuple[int, str, i
                 source_record_id, expert_id, status
             ) VALUES (
                 %s, %s, NULL, %s, %s, %s, %s, %s, %s,
-                %s, %s, %s, 'delete', %s, %s, 'pending'
+                %s, %s, %s, %s, %s, %s, 'pending'
             )
             """,
             (
@@ -159,6 +159,7 @@ def _insert_or_verify_event(cursor: Any, plan: CdcTaskPlan) -> tuple[int, str, i
                 event_time,
                 event.source_schema,
                 event.source_table,
+                event.operation_type,
                 event.source_record_id,
                 event.expert_id,
             ),
@@ -202,7 +203,7 @@ def _verify_event_identity(existing: dict[str, Any], plan: CdcTaskPlan) -> None:
         "row_index": event.row_index,
         "source_schema": event.source_schema,
         "source_table": event.source_table,
-        "operation_type": "delete",
+        "operation_type": event.operation_type,
         "source_record_id": event.source_record_id,
         "expert_id": event.expert_id,
         "binlog_server_id": event.server_id,
@@ -241,7 +242,7 @@ def _insert_or_verify_task(cursor: Any, plan: CdcTaskPlan) -> int:
             expert_id, operation_type, target_type,
             processing_stage, sync_status, retry_count, policy_version
         ) VALUES (
-            %s, %s, 'cdc', %s, %s, NULL, %s, 'delete', %s,
+            %s, %s, 'cdc', %s, %s, NULL, %s, %s, %s,
             'candidate', 'pending', 0, %s
         )
         ON DUPLICATE KEY UPDATE id=LAST_INSERT_ID(id)
@@ -252,6 +253,7 @@ def _insert_or_verify_task(cursor: Any, plan: CdcTaskPlan) -> int:
             task.source_table,
             task.source_record_id,
             task.expert_id,
+            task.operation_type,
             task.target_type,
             task.policy_version,
         ),
@@ -285,7 +287,7 @@ def _verify_task_identity(row: dict[str, Any], task: NewSourceSyncTask) -> None:
         "source_record_id": task.source_record_id,
         "source_updated_at": None,
         "expert_id": task.expert_id,
-        "operation_type": "delete",
+        "operation_type": task.operation_type,
         "target_type": task.target_type,
         "policy_version": task.policy_version,
     }

@@ -55,6 +55,12 @@ class FakeCanalClient(CanalClientPort):
         self.rollback_count = 0
         self.ack_count = 0
 
+    def connect(self) -> None:
+        """Fake Client 无外部连接，保留真实 Client 的生命周期接口。"""
+
+    def disconnect(self) -> None:
+        """Fake Client 无外部资源需要释放。"""
+
     def fetch_without_ack(self, batch_size: int) -> CanalBatch:
         """返回当前 batch；空队列返回 Canal 的空 batch 表达。"""
 

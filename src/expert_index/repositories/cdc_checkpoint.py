@@ -142,7 +142,7 @@ def _validate_requested_events(
             raise CdcCheckpointConflictError("CDC Event 不可变身份与提交请求不一致")
         if (
             row.get("task_event_source") != "cdc"
-            or row.get("task_operation_type") != "delete"
+            or row.get("task_operation_type") not in {"insert", "update", "delete"}
             or row.get("task_processing_stage") != "completed"
             or row.get("task_sync_status") != "success"
         ):

@@ -113,6 +113,38 @@ def test_receiver_builds_cdc_delete_task_plan_without_source_time() -> None:
     assert result.rollback_required is False
 
 
+def test_receiver_creates_task_for_insert_and_update() -> None:
+    """INSERT/UPDATE 事件进入同一 CDC Task 计划并保留操作类型。"""
+
+    begin = CanalEntry("TRANSACTIONBEGIN", "", "", None, "binlog.000012", 10, 1, 1)
+    insert = CanalEntry(
+        "ROWDATA", "expert", "experts", "INSERT", "binlog.000012", 20, 1, 1,
+        rows=(CanalRowData(after=(CanalColumn("id", "101"),)),),
+    )
+    update = CanalEntry(
+        "ROWDATA", "expert", "experts_work_experience", "UPDATE", "binlog.000012", 21, 1, 1,
+        rows=(CanalRowData(
+            before=(CanalColumn("id", "901"), CanalColumn("expert_id", "101")),
+            after=(CanalColumn("id", "901"), CanalColumn("expert_id", "101")),
+        ),),
+    )
+    end = CanalEntry("TRANSACTIONEND", "", "", None, "binlog.000012", 30, 1, 1)
+    persistence = _Persistence()
+    receiver = CdcBatchReceiver(
+        identity_provider=lambda event: f"{event.logfile_name}:{event.logfile_offset}:{event.row_index}",
+        policy_version="p7.4-test",
+    )
+
+    result = receiver.receive(
+        CanalBatch(8, (begin, insert, update, end), CANAL_DESTINATION),
+        local_batch_id=88,
+        persistence=persistence,
+    )
+
+    assert [plan.task.operation_type for plan in result.plans] == ["insert", "update"]
+    assert [plan.task.target_type for plan in result.plans] == ["expert", "employment"]
+
+
 def test_receiver_reuses_same_task_for_replayed_event() -> None:
     """同一显式 CDC 身份连续重投三次时始终复用同一任务。"""
 

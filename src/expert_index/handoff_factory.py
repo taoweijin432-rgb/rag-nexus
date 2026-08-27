@@ -33,7 +33,7 @@
 - :class:`HandoffOrchestrator`：P5.3B 编排闭环（只接 ``validated`` 主路径，
   ``contract_ready``/``handed_off`` 仅供崩溃恢复）；
 - :class:`CdcDeleteTaskProcessor`：P7.6 复用同一 Task Repository、Source、
-  ChunkFactory 和 HandoffOrchestrator 处理已领取的 CDC DELETE Task。
+  ChunkFactory 和 HandoffOrchestrator 处理已领取的 CDC Task。
 
 Receipt sink 是一个把 :class:`ScopeHandoffReceipt` 构造器适配为
 ``make_receipt(**kwargs)`` 的薄包装，只做 ``impact_scope`` 类型校验与构造，不做任何
@@ -80,7 +80,7 @@ class IncrementalHandoffRuntime:
        后进程中断），由 :meth:`HandoffOrchestrator.process` 从已有 Artifact 重建
        Request，不重新调用 Coordinator/Builder。
 
-    已领取的 CDC DELETE Task 调用
+    已领取的 CDC Task 调用
     :meth:`CdcDeleteTaskProcessor.process_claimed`，由它复用同一 Handoff
     编排器；不经过 Poll 的 ``PreparationCoordinator``。
 
@@ -231,7 +231,7 @@ def build_incremental_handoff_runtime(
         retry_delay_seconds=retry_delay_seconds,
     )
 
-    # 11) P7.6 CDC DELETE：复用同一 Handoff/P6 失败恢复，不提交 CDC Checkpoint，
+    # 11) P7.6 CDC Task：复用同一 Handoff/P6 失败恢复，不提交 CDC Checkpoint，
     #     也不调用 Canal ACK。
     cdc_delete_processor = CdcDeleteTaskProcessor(
         task_repository=task_repo,

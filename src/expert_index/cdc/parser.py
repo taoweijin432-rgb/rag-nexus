@@ -1,7 +1,7 @@
-"""P7.3 Canal Client 适配端口和严格 DELETE Parser。
+"""Canal Client 适配端口和四表统一变更 Parser。
 
 适配器负责隔离 Canal SDK；Parser 只接受已转换的领域模型，校验来源、事务 Entry、Offset
-和 DELETE Before Image。INSERT/UPDATE 只返回 ignored 计数，不能进入 CDC Task。
+和四表定位字段。行值只在 Parser 边界提取主键，绝不进入任务或持久化模型。
 """
 
 from __future__ import annotations
@@ -19,7 +19,7 @@ from .protocol import (
 )
 
 _ROW_DATA = "ROWDATA"
-_DELETE_COLUMNS = {
+_LOCATOR_COLUMNS = {
     "experts": frozenset({"id"}),
     "experts_work_experience": frozenset({"id", "expert_id"}),
     "experts_project_experience": frozenset({"id", "expert_id"}),
@@ -102,8 +102,8 @@ class CanalClientAdapter(CanalClientPort):
 
 
 @dataclass(frozen=True)
-class CanalDeleteEvent:
-    """从 DELETE Before Image 提取的最小定位事件，不保存其他列值。"""
+class CanalChangeEvent:
+    """从一行 INSERT/UPDATE/DELETE Image 提取的最小定位事件。"""
 
     source_schema: str
     source_table: str
@@ -115,6 +115,17 @@ class CanalDeleteEvent:
     execute_time: int | None
     entry_index: int
     row_index: int
+    operation_type: str = "delete"
+
+    @property
+    def is_delete(self) -> bool:
+        """判断事件是否为物理删除。"""
+
+        return self.operation_type == "delete"
+
+
+# 保留旧名称，兼容 P7.4/P7.5 调用方；新代码应使用 CanalChangeEvent。
+CanalDeleteEvent = CanalChangeEvent
 
 
 @dataclass(frozen=True)
@@ -128,11 +139,18 @@ class CanalParseIssue:
 
 @dataclass(frozen=True)
 class CanalParseResult:
-    """一个 batch 的 DELETE 事件、忽略计数和安全失败摘要。"""
+    """一个 batch 的统一变更事件、兼容 DELETE 视图和安全失败摘要。"""
 
-    delete_events: tuple[CanalDeleteEvent, ...]
+    delete_events: tuple[CanalChangeEvent, ...]
     ignored_count: int
     issues: tuple[CanalParseIssue, ...]
+    change_events: tuple[CanalChangeEvent, ...] = ()
+
+    @property
+    def events(self) -> tuple[CanalChangeEvent, ...]:
+        """返回所有可进入任务编排的 INSERT/UPDATE/DELETE 事件。"""
+
+        return self.change_events or self.delete_events
 
     @property
     def rollback_required(self) -> bool:
@@ -142,14 +160,15 @@ class CanalParseResult:
 
 
 def parse_canal_batch(batch: CanalBatch) -> CanalParseResult:
-    """严格解析 batch，只接受四表 DELETE 并提取 id/expert_id。"""
+    """严格解析 batch，提取四表 INSERT/UPDATE/DELETE 的 id/expert_id。"""
 
     if batch.is_empty:
         return CanalParseResult((), 0, ())
     if batch.destination != CANAL_DESTINATION:
         raise CanalParserError("Canal destination 缺失或不匹配")
 
-    delete_events: list[CanalDeleteEvent] = []
+    delete_events: list[CanalChangeEvent] = []
+    change_events: list[CanalChangeEvent] = []
     issues: list[CanalParseIssue] = []
     ignored_count = 0
     transaction_open = False
@@ -179,32 +198,38 @@ def parse_canal_batch(batch: CanalBatch) -> CanalParseResult:
             continue
 
         operation = (entry.operation_type or "").upper()
-        if operation in {"INSERT", "UPDATE"}:
-            ignored_count += 1
-            continue
-        if operation != "DELETE":
+        if operation not in {"INSERT", "UPDATE", "DELETE"}:
             issues.append(CanalParseIssue("unsupported_operation", entry_index))
             continue
-        if entry.source_schema != "expert" or entry.source_table not in _DELETE_COLUMNS:
+        if entry.source_schema != "expert" or entry.source_table not in _LOCATOR_COLUMNS:
             issues.append(CanalParseIssue("unsupported_source", entry_index))
             continue
         if not entry.rows:
+            # 三种操作都必须携带 RowData；缺失时回滚，避免把真实变更静默当作已处理。
             issues.append(CanalParseIssue("missing_row_data", entry_index))
             continue
 
         for row_index, row in enumerate(entry.rows):
             before = _columns_to_values(row.before)
+            after = _columns_to_values(row.after)
             if before is None:
                 issues.append(CanalParseIssue("duplicate_before_column", entry_index, row_index))
                 continue
-            if row.after:
+            if after is None:
+                issues.append(CanalParseIssue("duplicate_after_column", entry_index, row_index))
+                continue
+            if operation == "DELETE" and after:
                 issues.append(CanalParseIssue("delete_after_image_not_empty", entry_index, row_index))
                 continue
-            required = _DELETE_COLUMNS[entry.source_table]
-            if not required.issubset(before):
-                issues.append(CanalParseIssue("missing_delete_locator", entry_index, row_index))
+            image = before if operation == "DELETE" else {**before, **after}
+            required = _LOCATOR_COLUMNS[entry.source_table]
+            if not required.issubset(image):
+                issue_code = (
+                    "missing_delete_locator" if operation == "DELETE" else "missing_change_locator"
+                )
+                issues.append(CanalParseIssue(issue_code, entry_index, row_index))
                 continue
-            source_record_id = _positive_int(before.get("id"))
+            source_record_id = _positive_int(image.get("id"))
             if source_record_id is None:
                 issues.append(CanalParseIssue("invalid_source_record_id", entry_index, row_index))
                 continue
@@ -212,28 +237,32 @@ def parse_canal_batch(batch: CanalBatch) -> CanalParseResult:
             if entry.source_table == "experts":
                 expert_id = source_record_id
             else:
-                expert_id = _positive_int(before.get("expert_id"))
+                expert_id = _positive_int(image.get("expert_id"))
                 if expert_id is None:
                     issues.append(CanalParseIssue("invalid_expert_id", entry_index, row_index))
                     continue
-            delete_events.append(
-                CanalDeleteEvent(
-                    source_schema=entry.source_schema,
-                    source_table=entry.source_table,
-                    source_record_id=source_record_id,
-                    expert_id=expert_id,
-                    logfile_name=entry.logfile_name or "",
-                    logfile_offset=entry.logfile_offset or 0,
-                    server_id=entry.server_id,
-                    execute_time=entry.execute_time,
-                    entry_index=entry_index,
-                    row_index=row_index,
-                )
+            event = CanalChangeEvent(
+                source_schema=entry.source_schema,
+                source_table=entry.source_table,
+                source_record_id=source_record_id,
+                expert_id=expert_id,
+                logfile_name=entry.logfile_name or "",
+                logfile_offset=entry.logfile_offset or 0,
+                server_id=entry.server_id,
+                execute_time=entry.execute_time,
+                entry_index=entry_index,
+                row_index=row_index,
+                operation_type=operation.lower(),
             )
+            change_events.append(event)
+            if event.is_delete:
+                delete_events.append(event)
 
     if transaction_open:
         issues.append(CanalParseIssue("unclosed_transaction", len(batch.entries) - 1))
-    return CanalParseResult(tuple(delete_events), ignored_count, tuple(issues))
+    return CanalParseResult(
+        tuple(delete_events), ignored_count, tuple(issues), tuple(change_events)
+    )
 
 
 def _columns_to_values(columns: tuple[Any, ...]) -> dict[str, Any] | None:
@@ -288,6 +317,7 @@ def _require_batch_id(batch_id: int) -> None:
 
 __all__ = [
     "CanalBatchDecoder",
+    "CanalChangeEvent",
     "CanalClientAdapter",
     "CanalConnectorPort",
     "CanalDeleteEvent",

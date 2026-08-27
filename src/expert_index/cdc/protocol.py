@@ -73,6 +73,12 @@ class CanalBatch:
 class CanalClientPort(Protocol):
     """Canal Client 的最小端口，隔离 Canal SDK 和领域编排。"""
 
+    def connect(self) -> None:
+        """建立连接并注册订阅；由运行时入口调用。"""
+
+    def disconnect(self) -> None:
+        """释放连接资源，不改变已确认位点。"""
+
     def fetch_without_ack(self, batch_size: int) -> CanalBatch:
         """读取一个 batch，但不改变 Canal 确认位点。"""
 

@@ -14,7 +14,7 @@ from dataclasses import dataclass
 from typing import Literal, Protocol
 
 from ..models import NewSourceSyncTask
-from .parser import CanalDeleteEvent, CanalParseIssue, parse_canal_batch
+from .parser import CanalChangeEvent, CanalParseIssue, parse_canal_batch
 from .protocol import CanalBatch, CanalClientPort
 
 CdcTaskReceiptStatus = Literal["created", "reused_pending", "reused_success"]
@@ -34,15 +34,15 @@ class CdcPersistenceConflictError(RuntimeError):
     """表示相同 CDC 身份对应了不一致的不可变事件内容。"""
 
 
-CdcEventIdentityProvider = Callable[[CanalDeleteEvent], str]
+CdcEventIdentityProvider = Callable[[CanalChangeEvent], str]
 
 
 @dataclass(frozen=True)
 class CdcTaskPlan:
-    """一个 DELETE 对应的 CDC 身份、事件定位和标准任务创建计划。"""
+    """一个 CDC 变更对应的身份、事件定位和标准任务创建计划。"""
 
     cdc_event_id: str
-    event: CanalDeleteEvent
+    event: CanalChangeEvent
     task: NewSourceSyncTask
 
 
@@ -80,7 +80,7 @@ class CdcBatchPersistencePort(Protocol):
 
 
 class CdcBatchReceiver:
-    """把已解析的 Canal DELETE batch 转成标准 CDC Task 计划。"""
+    """把已解析的 Canal 变更 batch 转成标准 CDC Task 计划。"""
 
     def __init__(
         self,
@@ -118,7 +118,7 @@ class CdcBatchReceiver:
 
         plans = tuple(
             self._build_plan(event, local_batch_id=local_batch_id)
-            for event in parsed.delete_events
+            for event in parsed.events
         )
         receipts = persistence.persist_batch(plans) if plans else ()
         receipts = tuple(receipts)
@@ -165,8 +165,8 @@ class CdcBatchReceiver:
                 client.rollback(batch.batch_id)
             raise
 
-    def _build_plan(self, event: CanalDeleteEvent, *, local_batch_id: int) -> CdcTaskPlan:
-        """把 DELETE 定位事件映射为 CDC Task，不读取来源正文或推断时间。"""
+    def _build_plan(self, event: CanalChangeEvent, *, local_batch_id: int) -> CdcTaskPlan:
+        """把变更定位事件映射为 CDC Task，不读取来源正文或推断时间。"""
 
         cdc_event_id = self.identity_provider(event)
         if not isinstance(cdc_event_id, str) or not cdc_event_id.strip():
@@ -183,7 +183,7 @@ class CdcBatchReceiver:
             source_record_id=event.source_record_id,
             source_updated_at=None,
             expert_id=event.expert_id,
-            operation_type="delete",
+            operation_type=event.operation_type,
             target_type=target_type,
             policy_version=self.policy_version,
         )
@@ -192,7 +192,7 @@ class CdcBatchReceiver:
 
 def _task_dedupe_key(
     cdc_event_id: str,
-    event: CanalDeleteEvent,
+    event: CanalChangeEvent,
     policy_version: str,
     target_type: str,
 ) -> str:
@@ -200,6 +200,7 @@ def _task_dedupe_key(
 
     identity = {
         "cdc_event_id": cdc_event_id,
+        "operation_type": event.operation_type,
         "policy_version": policy_version,
         "scope": {
             "source_table": event.source_table,
