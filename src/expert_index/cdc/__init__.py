@@ -71,6 +71,15 @@ from .task_processor import (
     CdcDeleteTaskRepositoryPort,
     CdcHandoffOrchestratorPort,
 )
+from .worker import (
+    CdcRuntimePort,
+    CdcWorker,
+    CdcWorkerConfig,
+    CdcWorkerSummary,
+    LocalBatchIdProvider,
+    install_signal_handlers,
+    run_cdc_worker,
+)
 
 __all__ = [
     "CANAL_DESTINATION",
@@ -115,21 +124,28 @@ __all__ = [
     "CdcHandoffOrchestratorPort",
     "CdcIngestError",
     "CdcPersistenceConflictError",
+    "CdcRuntimePort",
     "CdcTaskPlan",
     "CdcTaskReceipt",
     "CdcTaskReceiptStatus",
     "CdcTaskRepositoryPort",
+    "CdcWorker",
+    "CdcWorkerConfig",
+    "CdcWorkerSummary",
     "FakeCanalClient",
+    "LocalBatchIdProvider",
     "ReplayDelete",
     "ReplayResult",
     "build_cdc_batch_commit_request",
     "build_real_canal_client",
     "decode_canal_message",
+    "install_signal_handlers",
     "parse_canal_batch",
     "prepare_cdc_delete_batch",
     "prepare_cdc_delete_task",
     "replay_batch",
     "replay_next_batch",
+    "run_cdc_worker",
 ]
 
 
