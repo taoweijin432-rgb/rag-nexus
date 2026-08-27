@@ -16,6 +16,7 @@ from pathlib import Path
 
 from .config import Settings
 from .incremental_runtime import build_incremental_runtime
+from .incremental_worker import IncrementalWorker, IncrementalWorkerConfig
 from .pipeline import ExpertIndexPipeline
 from .schema_initializer import MySQLSchemaInitializer
 
@@ -106,6 +107,18 @@ def build_parser() -> argparse.ArgumentParser:
     incremental_once.add_argument("--retry-delay-seconds", type=int, required=True)
     incremental_once.add_argument("--task-lease-seconds", type=int, required=True)
 
+    incremental_worker = sub.add_parser(
+        "incremental-worker",
+        help="常驻执行普通 Poll 增量；按间隔扫描四张来源表",
+    )
+    incremental_worker.add_argument("--worker-id", required=True)
+    incremental_worker.add_argument("--interval-seconds", type=float, default=60.0)
+    incremental_worker.add_argument("--error-sleep-seconds", type=float, default=30.0)
+    incremental_worker.add_argument("--max-attempts", type=int, required=True)
+    incremental_worker.add_argument("--retry-delay-seconds", type=int, required=True)
+    incremental_worker.add_argument("--task-lease-seconds", type=int, required=True)
+    incremental_worker.add_argument("--max-cycles", type=int)
+
     return parser
 
 
@@ -158,6 +171,23 @@ def main(argv: list[str] | None = None) -> None:
             task_lease_seconds=args.task_lease_seconds,
         ).run_once(args.worker_id, cycle_id=args.cycle_id)
         print(json.dumps(result.to_summary(), ensure_ascii=False, sort_keys=True))
+    elif args.command == "incremental-worker":
+        runtime = build_incremental_runtime(
+            settings,
+            max_attempts=args.max_attempts,
+            retry_delay_seconds=args.retry_delay_seconds,
+            task_lease_seconds=args.task_lease_seconds,
+        )
+        result = IncrementalWorker(
+            runtime,
+            args.worker_id,
+            config=IncrementalWorkerConfig(
+                interval_seconds=args.interval_seconds,
+                error_sleep_seconds=args.error_sleep_seconds,
+                max_cycles=args.max_cycles,
+            ),
+        ).run()
+        print(json.dumps(asdict(result), ensure_ascii=False, sort_keys=True))
 
 
 def _build_pipeline(settings: Settings) -> ExpertIndexPipeline:
