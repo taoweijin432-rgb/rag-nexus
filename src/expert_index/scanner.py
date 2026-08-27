@@ -180,6 +180,8 @@ class IncrementalScanResult:
     page_count: int
     scheduled_candidate_count: int
     lease_released: bool
+    # 保留扫描期间的 owner，供总编排入口继续使用同一来源 lease 执行批次。
+    lease_owner: str | None = None
 
 
 @dataclass(frozen=True)
@@ -298,6 +300,7 @@ class IncrementalSourceScanService:
                     page_count=0,
                     scheduled_candidate_count=0,
                     lease_released=True,
+                    lease_owner=lease_owner,
                 )
             assert upper_bound is not None
             scan = self.source_state_repository.create_incremental_batch_source_scan(
@@ -379,6 +382,7 @@ class IncrementalSourceScanService:
             page_count=page_count,
             scheduled_candidate_count=scheduled_candidate_count,
             lease_released=False,
+            lease_owner=lease_owner,
         )
 
 

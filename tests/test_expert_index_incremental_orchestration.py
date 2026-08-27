@@ -254,7 +254,7 @@ def test_coordinator_does_not_expose_task_processing_or_checkpoint_commit() -> N
 
 
 def test_formal_cli_does_not_expose_incremental_scan_before_p5() -> None:
-    """可靠任务回执接入前，正式 CLI 不能开放候选扫描或自动提交命令。"""
+    """正式 CLI 只提供显式参数的一次性入口，不开放常驻后台命令。"""
 
     parser = build_parser()
     subparsers = next(
@@ -265,3 +265,4 @@ def test_formal_cli_does_not_expose_incremental_scan_before_p5() -> None:
 
     assert "scan-incremental" not in subparsers.choices
     assert "run-incremental" not in subparsers.choices
+    assert "incremental-once" in subparsers.choices
