@@ -420,6 +420,36 @@ def test_claim_cdc_source_sync_task_claims_exact_pending_task(
     assert connection.commit_count == 1 and connection.rollback_count == 0
 
 
+def test_claim_cdc_source_sync_task_accepts_update_task(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """统一 CDC 编排允许领取 UPDATE Task，仍使用同一 lease/fencing 逻辑。"""
+
+    locked = _task_row(
+        event_source="cdc",
+        operation_type="update",
+        source_updated_at=None,
+        lease_is_active=0,
+    )
+    claimed = dict(locked)
+    claimed.update(
+        sync_status="processing",
+        attempt_token="cdc-token-update",
+        lease_until=datetime(2026, 8, 21, 10, 3, tzinfo=timezone.utc),
+    )
+    claimed.pop("lease_is_active")
+    cursor = RecordingCursor(ones=[locked, claimed], rowcounts=[0, 1, 0])
+    connection = RecordingConnection(cursor)
+    _patch_connection(monkeypatch, connection)
+
+    task = _repository_with_tokens("cdc-token-update").claim_cdc_source_sync_task(
+        801,
+        lease_seconds=180,
+    )
+
+    assert task is not None and task.operation_type == "update"
+
+
 def test_claim_cdc_source_sync_task_does_not_steal_active_lease(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

@@ -208,7 +208,7 @@ class MySQLSourceSyncTaskRepository:
         *,
         lease_seconds: int,
     ) -> SourceSyncTask | None:
-        """按 Event 回执关联的精确 ID 领取一个 CDC DELETE Task。
+        """按 Event 回执关联的精确 ID 领取一个 CDC Task。
 
         方法不跳过请求的 Task：终态、退避未到或其他 Worker 持有有效
         lease 时返回 ``None``。过期 processing 和退避到期 pending 作为新
@@ -221,9 +221,13 @@ class MySQLSourceSyncTaskRepository:
         try:
             with connection.cursor() as cursor:
                 locked = _lock_source_sync_task(cursor, task_id)
-                if locked.get("event_source") != "cdc" or locked.get("operation_type") != "delete":
+                if locked.get("event_source") != "cdc" or locked.get("operation_type") not in {
+                    "insert",
+                    "update",
+                    "delete",
+                }:
                     raise SourceSyncTaskStageConflictError(
-                        f"任务 {task_id} 不是 CDC DELETE Task"
+                        f"任务 {task_id} 不是 CDC INSERT/UPDATE/DELETE Task"
                     )
                 status = str(locked["sync_status"])
                 if status in {"success", "dead"}:
