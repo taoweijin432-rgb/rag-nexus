@@ -6,10 +6,10 @@ resolution-markers = [
     "python_full_version >= '3.14' and sys_platform == 'emscripten'",
     "python_full_version >= '3.14' and sys_platform != 'emscripten' and sys_platform != 'win32'",
     "python_full_version >= '3.12' and python_full_version < '3.14' and sys_platform == 'win32'",
-    "python_full_version == '3.11.*' and sys_platform == 'win32'",
     "python_full_version >= '3.12' and python_full_version < '3.14' and sys_platform == 'emscripten'",
-    "python_full_version == '3.11.*' and sys_platform == 'emscripten'",
     "python_full_version >= '3.12' and python_full_version < '3.14' and sys_platform != 'emscripten' and sys_platform != 'win32'",
+    "python_full_version == '3.11.*' and sys_platform == 'win32'",
+    "python_full_version == '3.11.*' and sys_platform == 'emscripten'",
     "python_full_version == '3.11.*' and sys_platform != 'emscripten' and sys_platform != 'win32'",
     "python_full_version < '3.11'",
 ]
@@ -31,6 +31,12 @@ sdist = { url = "https://files.pythonhosted.org/packages/70/d2/47e8bc06fe2a06d3f
 wheels = [
     { url = "https://files.pythonhosted.org/packages/e4/d8/767faeda872075724b95dd675466a645f1b92aadcdcf2d1429dcfd76c176/cachetools-7.1.7-py3-none-any.whl", hash = "sha256:ef98ef375ad188819ef2f9b3645e3987f4b8c5b7550e436ad998c2de78296df0", size = 16830, upload-time = "2026-08-01T21:20:38.977Z" },
 ]
+
+[[package]]
+name = "canal-python"
+version = "0.4"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/8e/e9/1abe23716a6e9890f6b2a344d8bee7dcd4acb16e127cc33b880d4a9b0d78/canal-python-0.4.tar.gz", hash = "sha256:5881c17fe648f6917e1c65335b6cea7a3316d21d2a91cac3a74aeaed72926b29", size = 12336, upload-time = "2019-08-22T06:13:01.822Z" }
 
 [[package]]
 name = "certifi"
@@ -621,10 +627,10 @@ resolution-markers = [
     "python_full_version >= '3.14' and sys_platform == 'emscripten'",
     "python_full_version >= '3.14' and sys_platform != 'emscripten' and sys_platform != 'win32'",
     "python_full_version >= '3.12' and python_full_version < '3.14' and sys_platform == 'win32'",
-    "python_full_version == '3.11.*' and sys_platform == 'win32'",
     "python_full_version >= '3.12' and python_full_version < '3.14' and sys_platform == 'emscripten'",
-    "python_full_version == '3.11.*' and sys_platform == 'emscripten'",
     "python_full_version >= '3.12' and python_full_version < '3.14' and sys_platform != 'emscripten' and sys_platform != 'win32'",
+    "python_full_version == '3.11.*' and sys_platform == 'win32'",
+    "python_full_version == '3.11.*' and sys_platform == 'emscripten'",
     "python_full_version == '3.11.*' and sys_platform != 'emscripten' and sys_platform != 'win32'",
 ]
 dependencies = [
@@ -928,6 +934,11 @@ dependencies = [
     { name = "pymysql" },
 ]
 
+[package.optional-dependencies]
+cdc = [
+    { name = "canal-python" },
+]
+
 [package.dev-dependencies]
 dev = [
     { name = "pytest" },
@@ -936,10 +947,12 @@ dev = [
 
 [package.metadata]
 requires-dist = [
+    { name = "canal-python", marker = "extra == 'cdc'", specifier = "==0.4" },
     { name = "pydantic", specifier = ">=2.7,<3.0" },
     { name = "pymilvus", specifier = ">=2.4,<3.0" },
     { name = "pymysql", specifier = ">=1.1,<2.0" },
 ]
+provides-extras = ["cdc"]
 
 [package.metadata.requires-dev]
 dev = [

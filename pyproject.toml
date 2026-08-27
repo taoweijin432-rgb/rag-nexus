@@ -13,6 +13,10 @@ dependencies = [
     "pymilvus>=2.4,<3.0",
 ]
 
+[project.optional-dependencies]
+# CDC 运行时才需要；普通 Poll/全量构建不强制安装旧版 Canal SDK。
+cdc = ["canal-python==0.4"]
+
 [dependency-groups]
 dev = [
     "pytest>=8.0,<9.0",

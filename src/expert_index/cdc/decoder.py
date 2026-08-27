@@ -134,10 +134,7 @@ def _parse_row_change(raw: object) -> object:
 
     if raw is None or not isinstance(raw, (bytes, bytearray, memoryview)):
         return raw or {}
-    try:
-        from canal.protocol import CanalEntry as SdkCanalEntry  # type: ignore[import-not-found]
-    except ImportError as exc:
-        raise CanalDecodeError("当前 SDK 无法导入 CanalEntry protobuf") from exc
+    SdkCanalEntry = _load_sdk_entry_protocol()
     change = SdkCanalEntry.RowChange()
     try:
         change.ParseFromString(bytes(raw))
@@ -151,16 +148,32 @@ def _parse_entry(raw: object) -> object:
 
     if not isinstance(raw, (bytes, bytearray, memoryview)):
         return raw
-    try:
-        from canal.protocol import CanalEntry as SdkCanalEntry  # type: ignore[import-not-found]
-    except ImportError as exc:
-        raise CanalDecodeError("当前 SDK 无法导入 CanalEntry protobuf") from exc
+    SdkCanalEntry = _load_sdk_entry_protocol()
     entry = SdkCanalEntry.Entry()
     try:
         entry.ParseFromString(bytes(raw))
     except Exception as exc:
         raise CanalDecodeError("Canal Entry protobuf 解码失败") from exc
     return entry
+
+
+def _load_sdk_entry_protocol() -> object:
+    """加载 canal-python 0.4 的 EntryProtocol protobuf 模块。"""
+
+    try:
+        from canal.protocol import EntryProtocol_pb2
+
+        return EntryProtocol_pb2
+    except (ImportError, TypeError, ValueError, AttributeError):
+        try:
+            from canal.protocol import CanalEntry
+
+            return CanalEntry
+        except (ImportError, TypeError, ValueError, AttributeError) as exc:
+            raise CanalDecodeError(
+                "当前 Canal SDK 无法导入 EntryProtocol protobuf；请在进程启动前设置 "
+                "PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION=python"
+            ) from exc
 
 
 def _field(obj: object, *names: str, default: object = None) -> object:

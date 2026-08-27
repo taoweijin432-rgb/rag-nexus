@@ -69,19 +69,13 @@ class CanalPythonConnector(CanalConnectorPort):
         method = getattr(self._client, "connect", None)
         if not callable(method):
             raise CanalSdkUnavailableError("Canal SDK Client 缺少 connect 方法")
-        # canal-python 通常在构造函数接收 endpoint，connect() 无参；保留参数化
-        # 连接回退以兼容自定义 Client，但不把连接参数写入领域模型。
+        # canal-python 0.4 的 endpoint 在 connect(host, port) 接收；先传入显式
+        # endpoint，失败后才兼容无参或关键字连接实现，避免误连本机默认端口。
         try:
-            method()
+            method(host=self.host, port=self.port)
         except TypeError:
             try:
-                method(
-                    host=self.host,
-                    port=self.port,
-                    destination=self.destination,
-                    username=self.username,
-                    password=self.password,
-                )
+                method()
             except TypeError:
                 method(self.host, self.port)
 
@@ -99,12 +93,21 @@ class CanalPythonConnector(CanalConnectorPort):
         if not callable(method):
             raise CanalSdkUnavailableError("Canal SDK Client 缺少 subscribe 方法")
         try:
-            method(subscription)
+            # canal-python 0.4 使用 bytes 参数，并在 subscribe 中保存 destination
+            # 供后续 get/ack/rollback 使用；不能把订阅表达式误传为 client_id。
+            method(
+                client_id=b"1001",
+                destination=self.destination.encode("utf-8"),
+                filter=subscription.encode("utf-8"),
+            )
         except TypeError:
             try:
                 method(client_filter=subscription)
             except TypeError:
-                method(filter=subscription)
+                try:
+                    method(filter=subscription)
+                except TypeError:
+                    method(subscription)
 
     def get_without_ack(self, batch_size: int) -> object:
         """读取一个未确认 batch，兼容 SDK 的 get/get_without_ack 命名。"""
