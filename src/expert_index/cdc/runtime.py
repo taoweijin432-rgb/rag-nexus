@@ -1,6 +1,6 @@
 """CDC 真实 Client 到现有任务编排的组装入口。
 
-该模块只负责依赖组装和单 batch 调用，不创建批次、不初始化 Checkpoint，也不改变
+该模块只负责依赖组装和 Canal 会话生命周期，不创建批次、不初始化 Checkpoint，也不改变
 Source/Milvus。业务处理顺序由 :class:`CdcBatchCoordinator` 统一保证。
 """
 
@@ -69,25 +69,47 @@ def build_cdc_protocol_baseline(settings: Settings) -> CanalProtocolBaseline:
     )
 
 
-@dataclass(frozen=True)
+@dataclass
 class CdcRuntime:
     """持有真实 Canal Client 与既有 CDC/P4/P5/P6 编排器。"""
 
     client: CanalClientPort
     coordinator: CdcBatchCoordinator
+    _connected: bool = False
+
+    def start(self) -> None:
+        """建立并保留一个 Canal 会话，供 Worker 连续轮询复用。"""
+
+        if self._connected:
+            return
+        self.client.connect()
+        self._connected = True
+
+    def stop(self) -> None:
+        """释放 Canal 会话；重复调用不会产生额外断开请求。"""
+
+        if not self._connected:
+            return
+        try:
+            self.client.disconnect()
+        finally:
+            self._connected = False
 
     def consume_once(self, *, batch_size: int, local_batch_id: int) -> CdcBatchRunResult:
         """读取并处理一个 batch；成功后由 Coordinator 按顺序 ACK。"""
 
-        self.client.connect()
+        self.start()
         try:
             return self.coordinator.consume_once(
                 self.client,
                 batch_size=batch_size,
                 local_batch_id=local_batch_id,
             )
-        finally:
-            self.client.disconnect()
+        except Exception:
+            # 传输或业务异常后丢弃当前会话，下一轮重新握手和订阅；未确认 batch
+            # 的 rollback 仍由 Coordinator/Adapter 在异常边界内负责。
+            self.stop()
+            raise
 
 
 def build_cdc_runtime(

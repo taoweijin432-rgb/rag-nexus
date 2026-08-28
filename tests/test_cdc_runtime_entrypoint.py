@@ -6,6 +6,8 @@ from expert_index.cdc import (
     CANAL_DESTINATION,
     CANAL_SUBSCRIPTION,
     CanalChangeEvent,
+    CdcBatchRunResult,
+    CdcRuntime,
     build_cdc_event_id,
     build_cdc_protocol_baseline,
 )
@@ -85,3 +87,33 @@ def test_cli_exposes_cdc_worker_command() -> None:
     assert args.command == "cdc-worker"
     assert args.batch_size == 100
     assert args.task_lease_seconds == 180
+
+
+def test_runtime_reuses_canal_session_until_stopped() -> None:
+    """连续消费只订阅一次，异常时才释放会话。"""
+
+    calls: list[str] = []
+
+    class Client:
+        def connect(self) -> None:
+            calls.append("connect")
+
+        def disconnect(self) -> None:
+            calls.append("disconnect")
+
+    class Coordinator:
+        def consume_once(self, client: object, *, batch_size: int, local_batch_id: int) -> CdcBatchRunResult:
+            assert isinstance(client, Client)
+            assert batch_size == 10
+            assert local_batch_id > 0
+            calls.append("consume")
+            return CdcBatchRunResult("empty", -1, local_batch_id, 0)
+
+    runtime = CdcRuntime(Client(), Coordinator())
+    runtime.start()
+    runtime.consume_once(batch_size=10, local_batch_id=1)
+    runtime.consume_once(batch_size=10, local_batch_id=2)
+    runtime.stop()
+    runtime.stop()
+
+    assert calls == ["connect", "consume", "consume", "disconnect"]

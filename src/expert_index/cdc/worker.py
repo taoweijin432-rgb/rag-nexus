@@ -243,17 +243,25 @@ def run_cdc_worker(
     stop_event: threading.Event | None = None,
     install_signals: bool = True,
 ) -> CdcWorkerSummary:
-    """作为服务进程入口运行 Worker；运行时组装仍由部署层显式完成。"""
+    """作为服务进程入口运行 Worker，并管理可选运行时会话生命周期。"""
 
     event = stop_event or threading.Event()
     if install_signals:
         install_signal_handlers(event)
-    return CdcWorker(
-        runtime,
-        local_batch_id_provider,
-        config=config,
-        stop_event=event,
-    ).run()
+    start = getattr(runtime, "start", None)
+    stop = getattr(runtime, "stop", None)
+    if callable(start):
+        start()
+    try:
+        return CdcWorker(
+            runtime,
+            local_batch_id_provider,
+            config=config,
+            stop_event=event,
+        ).run()
+    finally:
+        if callable(stop):
+            stop()
 
 
 __all__ = [
