@@ -1,6 +1,7 @@
 """CDC 事件稳定身份生成。
 
-事件身份只使用 Canal Header 和行序号，不包含业务正文、Before/After Image 或 PII。
+事件身份只使用 Canal Header 的稳定位点和行序号，不包含批次内 entry_index、
+业务正文、Before/After Image 或 PII。
 同一 Binlog 事件在重投、重连和进程重启后会得到相同的 ``cdc_event_id``。
 """
 
@@ -25,7 +26,6 @@ def build_cdc_event_id(event: CanalChangeEvent) -> str:
         "server_id": event.server_id,
         "logfile_name": event.logfile_name,
         "logfile_offset": event.logfile_offset,
-        "entry_index": event.entry_index,
         "row_index": event.row_index,
     }
     serialized = json.dumps(identity, sort_keys=True, separators=(",", ":"))

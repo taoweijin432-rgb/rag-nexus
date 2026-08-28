@@ -420,10 +420,10 @@ def test_claim_cdc_source_sync_task_claims_exact_pending_task(
     assert connection.commit_count == 1 and connection.rollback_count == 0
 
 
-def test_claim_cdc_source_sync_task_accepts_update_task(
+def test_claim_cdc_source_sync_task_rejects_update_task(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """统一 CDC 编排允许领取 UPDATE Task，仍使用同一 lease/fencing 逻辑。"""
+    """CDC 领取边界只允许 source_updated_at 为空的物理 DELETE Task。"""
 
     locked = _task_row(
         event_source="cdc",
@@ -431,23 +431,17 @@ def test_claim_cdc_source_sync_task_accepts_update_task(
         source_updated_at=None,
         lease_is_active=0,
     )
-    claimed = dict(locked)
-    claimed.update(
-        sync_status="processing",
-        attempt_token="cdc-token-update",
-        lease_until=datetime(2026, 8, 21, 10, 3, tzinfo=timezone.utc),
-    )
-    claimed.pop("lease_is_active")
-    cursor = RecordingCursor(ones=[locked, claimed], rowcounts=[0, 1, 0])
+    cursor = RecordingCursor(ones=[locked])
     connection = RecordingConnection(cursor)
     _patch_connection(monkeypatch, connection)
 
-    task = _repository_with_tokens("cdc-token-update").claim_cdc_source_sync_task(
-        801,
-        lease_seconds=180,
-    )
+    with pytest.raises(SourceSyncTaskStageConflictError, match="物理 DELETE"):
+        _repository_with_tokens("cdc-token-update").claim_cdc_source_sync_task(
+            801,
+            lease_seconds=180,
+        )
 
-    assert task is not None and task.operation_type == "update"
+    assert connection.commit_count == 0 and connection.rollback_count == 1
 
 
 def test_claim_cdc_source_sync_task_does_not_steal_active_lease(

@@ -13,8 +13,14 @@ class _Execution:
 
 
 @dataclass(frozen=True)
+class _ScanCycle:
+    failed_source_count: int = 0
+
+
+@dataclass(frozen=True)
 class _Result:
     execution: _Execution
+    scan_cycle: _ScanCycle = _ScanCycle()
 
 
 class _Runtime:
@@ -67,6 +73,23 @@ def test_worker_retries_runtime_exception() -> None:
     assert summary.successful_cycles == 1
     assert summary.last_error_type == "RuntimeError"
     assert waits == [3, 60]
+
+
+def test_worker_uses_failure_backoff_when_scan_fails() -> None:
+    runtime = _Runtime([_Result(_Execution(), _ScanCycle(1))])
+    waits: list[float] = []
+    worker = IncrementalWorker(
+        runtime,
+        "poll-worker",
+        config=IncrementalWorkerConfig(error_sleep_seconds=3, max_cycles=1),
+        wait=lambda seconds: waits.append(seconds) or False,
+    )
+
+    summary = worker.run()
+
+    assert summary.failed_cycles == 1
+    assert summary.successful_cycles == 0
+    assert waits == [3]
 
 
 @pytest.mark.parametrize("bad_interval", [-1, float("inf"), True])

@@ -213,3 +213,18 @@ def test_cdc_persistence_rejects_non_index_role() -> None:
     source = DatabaseConfig("127.0.0.1", 3306, "source", "", "expert", DatabaseRole.SOURCE)
     with pytest.raises(DatabaseBoundaryError):
         MySQLCdcBatchPersistence(source)
+
+
+def test_cdc_persistence_rejects_non_delete_plan_before_connecting() -> None:
+    """即使绕过 Parser/Receiver，持久化边界也拒绝 CDC UPDATE。"""
+
+    repository = MySQLCdcBatchPersistence(_index_config())
+    plan = _plan()
+    update = replace(
+        plan,
+        event=replace(plan.event, operation_type="update"),
+        task=replace(plan.task, operation_type="update"),
+    )
+
+    with pytest.raises(CdcPersistenceConflictError, match="物理 DELETE"):
+        repository.persist_batch([update])

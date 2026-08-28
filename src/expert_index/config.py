@@ -84,6 +84,7 @@ class CdcRuntimeConfig:
     host: str = "127.0.0.1"
     port: int = 11111
     destination: str = "company_expert"
+    client_id: str = ""
     subscription: str = (
         r"expert\.(experts|experts_work_experience|experts_project_experience|"
         r"experts_education_experience)"
@@ -111,6 +112,14 @@ class CdcRuntimeConfig:
                 raise ValueError(f"{name} 必须位于 1 到 65535 之间")
         if not isinstance(self.destination, str) or not self.destination.strip():
             raise ValueError("CANAL_DESTINATION 必须是非空字符串")
+        if not isinstance(self.client_id, str):
+            raise TypeError("CANAL_CLIENT_ID 必须是字符串")
+        if self.enabled and not self.client_id.strip():
+            raise ValueError("CDC_ENABLED=true 时必须配置 CANAL_CLIENT_ID")
+        if self.client_id and (
+            len(self.client_id) > 64 or any(ord(char) < 32 for char in self.client_id)
+        ):
+            raise ValueError("CANAL_CLIENT_ID 长度不能超过 64 且不能包含控制字符")
         if not isinstance(self.subscription, str) or not self.subscription.strip():
             raise ValueError("CANAL_SUBSCRIPTION 必须是非空字符串")
         if not isinstance(self.server_version, str) or not self.server_version.strip():
@@ -281,6 +290,7 @@ class Settings:
             host=values.get("CANAL_HOST", "127.0.0.1"),
             port=_parse_port("CANAL_PORT", values.get("CANAL_PORT", "11111")),
             destination=values.get("CANAL_DESTINATION", "company_expert"),
+            client_id=values.get("CANAL_CLIENT_ID", ""),
             subscription=values.get(
                 "CANAL_SUBSCRIPTION",
                 (

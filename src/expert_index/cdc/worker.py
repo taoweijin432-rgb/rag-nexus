@@ -16,7 +16,6 @@ from dataclasses import dataclass
 from typing import Protocol
 
 from .finalize import (
-    CdcAckPendingError,
     CdcBatchRunResult,
     CdcCheckpointConflictError,
 )
@@ -87,7 +86,6 @@ class CdcWorker:
     """驱动 CDC 单 batch 编排的可停止常驻循环。"""
 
     _TERMINAL_ERRORS = (
-        CdcAckPendingError,
         CdcCheckpointConflictError,
         CanalProtocolNotFrozenError,
     )

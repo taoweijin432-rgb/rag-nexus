@@ -80,7 +80,7 @@ class CdcBatchPersistencePort(Protocol):
 
 
 class CdcBatchReceiver:
-    """把已解析的 Canal 变更 batch 转成标准 CDC Task 计划。"""
+    """把已解析的 Canal 物理删除转成标准 CDC Task 计划。"""
 
     def __init__(
         self,
@@ -118,7 +118,7 @@ class CdcBatchReceiver:
 
         plans = tuple(
             self._build_plan(event, local_batch_id=local_batch_id)
-            for event in parsed.events
+            for event in parsed.delete_events
         )
         receipts = persistence.persist_batch(plans) if plans else ()
         receipts = tuple(receipts)
@@ -166,8 +166,10 @@ class CdcBatchReceiver:
             raise
 
     def _build_plan(self, event: CanalChangeEvent, *, local_batch_id: int) -> CdcTaskPlan:
-        """把变更定位事件映射为 CDC Task，不读取来源正文或推断时间。"""
+        """把删除定位事件映射为 CDC Task，不读取已删除的来源行。"""
 
+        if not event.is_delete:
+            raise CdcIngestError("CDC 只允许创建物理 DELETE Task")
         cdc_event_id = self.identity_provider(event)
         if not isinstance(cdc_event_id, str) or not cdc_event_id.strip():
             raise CdcIngestError("identity_provider 必须返回非空 cdc_event_id")
@@ -183,7 +185,7 @@ class CdcBatchReceiver:
             source_record_id=event.source_record_id,
             source_updated_at=None,
             expert_id=event.expert_id,
-            operation_type=event.operation_type,
+            operation_type="delete",
             target_type=target_type,
             policy_version=self.policy_version,
         )

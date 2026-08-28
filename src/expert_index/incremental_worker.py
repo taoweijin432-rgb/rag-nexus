@@ -116,7 +116,10 @@ class IncrementalWorker:
                     break
                 continue
 
-            if result.execution.failed_source_count:
+            if (
+                result.scan_cycle.failed_source_count
+                or result.execution.failed_source_count
+            ):
                 failed_cycles += 1
                 if self._wait(self.config.error_sleep_seconds):
                     stop_reason = "stop_requested"

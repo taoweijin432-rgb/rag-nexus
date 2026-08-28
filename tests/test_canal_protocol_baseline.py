@@ -79,3 +79,23 @@ def test_cdc_runtime_defaults_to_disabled_and_rejects_ambiguous_switch() -> None
     environment["CDC_ENABLED"] = "maybe"
     with pytest.raises(ValueError, match="CDC_ENABLED"):
         Settings.from_env(environment)
+
+
+def test_enabled_cdc_requires_stable_client_id() -> None:
+    """开启 CDC 时必须显式配置稳定 client_id，保证 ACK 失败后可重连重投。"""
+
+    environment = {
+        "SOURCE_DB_PASSWORD": "source-secret",
+        "INDEX_DB_HOST": "127.0.0.1",
+        "INDEX_DB_PORT": "3306",
+        "INDEX_DB_USER": "index-writer",
+        "INDEX_DB_PASSWORD": "index-secret",
+        "INDEX_DB_NAME": "expert_index",
+        "CDC_ENABLED": "1",
+    }
+
+    with pytest.raises(ValueError, match="CANAL_CLIENT_ID"):
+        Settings.from_env(environment)
+
+    environment["CANAL_CLIENT_ID"] = "2001"
+    assert Settings.from_env(environment).cdc_runtime.client_id == "2001"

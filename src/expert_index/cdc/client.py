@@ -32,6 +32,7 @@ class CanalPythonConnector(CanalConnectorPort):
         username: str = "",
         password: str = "",
         *,
+        client_id: str = "1001",
         sdk_client: Any | None = None,
         client_factory: Callable[..., Any] | None = None,
     ) -> None:
@@ -43,9 +44,14 @@ class CanalPythonConnector(CanalConnectorPort):
             raise ValueError("port 必须是 1 到 65535 的整数")
         if not isinstance(destination, str) or not destination.strip():
             raise ValueError("destination 必须是非空字符串")
+        if not isinstance(client_id, str) or not client_id.strip():
+            raise ValueError("client_id 必须是非空字符串")
+        if len(client_id) > 64 or any(ord(char) < 32 for char in client_id):
+            raise ValueError("client_id 长度不能超过 64 且不能包含控制字符")
         self.host = host
         self.port = port
         self.destination = destination
+        self.client_id = client_id
         self.username = username
         self.password = password
         if sdk_client is not None and client_factory is not None:
@@ -96,13 +102,13 @@ class CanalPythonConnector(CanalConnectorPort):
         # 覆盖待重投会话。对暴露原始 Connector 的版本直接发送订阅请求，保留
         # Canal 的未确认 batch，不改变消费位点。
         if _supports_raw_canal_protocol(self._client):
-            _subscribe_v04(self._client, subscription, self.destination)
+            _subscribe_v04(self._client, subscription, self.destination, self.client_id)
             return
         try:
             # canal-python 0.4 使用 bytes 参数，并在 subscribe 中保存 destination
             # 供后续 get/ack/rollback 使用；不能把订阅表达式误传为 client_id。
             method(
-                client_id=b"1001",
+                client_id=self.client_id.encode("utf-8"),
                 destination=self.destination.encode("utf-8"),
                 filter=subscription.encode("utf-8"),
             )
@@ -122,7 +128,7 @@ class CanalPythonConnector(CanalConnectorPort):
         # 服务器返回空批次或错误 ACK 时直接抛出 AttributeError。对该版本暴露的
         # 原始 Connector 走兼容实现，仍复用 SDK 的 TCP 连接和 protobuf 定义。
         if _supports_raw_canal_protocol(self._client):
-            return _get_without_ack_v04(self._client, batch_size)
+            return _get_without_ack_v04(self._client, batch_size, self.client_id)
         method = getattr(self._client, "get_without_ack", None)
         if not callable(method):
             method = getattr(self._client, "get", None)
@@ -158,6 +164,7 @@ def build_real_canal_client(
     subscription: str = CANAL_SUBSCRIPTION,
     username: str = "",
     password: str = "",
+    client_id: str = "1001",
     decoder: CanalBatchDecoder,
     sdk_client: Any | None = None,
 ) -> CanalClientPort:
@@ -175,6 +182,7 @@ def build_real_canal_client(
         destination,
         username,
         password,
+        client_id=client_id,
         sdk_client=sdk_client,
     )
     return CanalClientAdapter(
@@ -244,7 +252,7 @@ def _supports_raw_canal_protocol(client: Any) -> bool:
     )
 
 
-def _get_without_ack_v04(client: Any, batch_size: int) -> object:
+def _get_without_ack_v04(client: Any, batch_size: int, client_id: str) -> object:
     """绕过 canal-python 0.4 的错误 ACK 枚举，读取一个未确认 batch。"""
 
     if isinstance(batch_size, bool) or not isinstance(batch_size, int) or batch_size < 1:
@@ -252,12 +260,13 @@ def _get_without_ack_v04(client: Any, batch_size: int) -> object:
     CanalProtocol_pb2 = _load_canal_protocol()
 
     get = CanalProtocol_pb2.Get()
-    get.client_id = getattr(client, "client_id", b"1001")
+    get.client_id = getattr(client, "client_id", client_id.encode("utf-8"))
     get.destination = getattr(client, "destination", b"")
     get.auto_ack = False
     get.fetch_size = batch_size
     get.timeout = -1
-    get.unit = -1
+    # Canal 1.1.8 Java Client 的 getWithoutAck 使用毫秒枚举值 2。
+    get.unit = 2
 
     packet = CanalProtocol_pb2.Packet()
     packet.type = _packet_type(CanalProtocol_pb2, "GET")
@@ -291,11 +300,11 @@ def _get_without_ack_v04(client: Any, batch_size: int) -> object:
     raise RuntimeError(f"Canal GET 返回未知 packet type: {response_type}")
 
 
-def _subscribe_v04(client: Any, subscription: str, destination: str) -> None:
+def _subscribe_v04(client: Any, subscription: str, destination: str, client_id: str) -> None:
     """发送 canal-python 0.4 订阅请求，避免 SDK 隐式 rollback(0)。"""
 
     CanalProtocol_pb2 = _load_canal_protocol()
-    client_id = b"1001"
+    client_id = client_id.encode("utf-8")
     destination_bytes = destination.encode("utf-8")
     client.client_id = client_id
     client.destination = destination_bytes
@@ -322,7 +331,6 @@ def _subscribe_v04(client: Any, subscription: str, destination: str) -> None:
             "Canal SUBSCRIBE 返回错误 ACK: "
             f"error_code={ack.error_code}, error_message={ack.error_message}"
         )
-    print("Subscribe succed")
 
 
 def _decode_entry_protocol(payload: bytes) -> object:

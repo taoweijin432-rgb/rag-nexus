@@ -156,6 +156,8 @@ def test_connector_supports_constructor_endpoint_signature() -> None:
 def test_connector_handles_sdk_ack_packet_without_old_enum_bug(monkeypatch: pytest.MonkeyPatch) -> None:
     """兼容 canal-python 0.4 的 ACK 响应，不触发 ``PacketType.Ack`` 异常。"""
 
+    get_fields: dict[str, object] = {}
+
     class Packet:
         def __init__(self) -> None:
             self.type = 0
@@ -176,6 +178,10 @@ def test_connector_handles_sdk_ack_packet_without_old_enum_bug(monkeypatch: pyte
             pass
 
     class Get:
+        def __setattr__(self, name: str, value: object) -> None:
+            get_fields[name] = value
+            object.__setattr__(self, name, value)
+
         def SerializeToString(self) -> bytes:
             return b"get"
 
@@ -211,10 +217,15 @@ def test_connector_handles_sdk_ack_packet_without_old_enum_bug(monkeypatch: pyte
     )
 
     assert connector.get_without_ack(10) == {"id": 0, "entries": []}
+    assert get_fields["client_id"] == b"1001"
+    assert get_fields["auto_ack"] is False
+    assert get_fields["unit"] == 2
 
 
 def test_legacy_subscribe_does_not_issue_implicit_rollback(monkeypatch: pytest.MonkeyPatch) -> None:
     """旧 SDK 订阅时只发送 SUBSCRIBE，不覆盖 Canal 未确认 batch。"""
+
+    subscription_fields: dict[str, object] = {}
 
     class Packet:
         def __init__(self) -> None:
@@ -236,6 +247,10 @@ def test_legacy_subscribe_does_not_issue_implicit_rollback(monkeypatch: pytest.M
             pass
 
     class Sub:
+        def __setattr__(self, name: str, value: object) -> None:
+            subscription_fields[name] = value
+            object.__setattr__(self, name, value)
+
         def SerializeToString(self) -> bytes:
             return b"subscription"
 
@@ -267,7 +282,13 @@ def test_legacy_subscribe_does_not_issue_implicit_rollback(monkeypatch: pytest.M
             raise AssertionError("不应调用旧 SDK subscribe")
 
     sdk = LegacySdkClient()
-    connector = CanalPythonConnector("canal.example", 11111, sdk_client=sdk)
+    connector = CanalPythonConnector(
+        "canal.example",
+        11111,
+        client_id="2001",
+        sdk_client=sdk,
+    )
     connector.subscribe("expert.*")
 
     assert sdk.connector.writes == 1
+    assert subscription_fields["client_id"] == b"2001"

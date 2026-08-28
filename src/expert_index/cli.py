@@ -247,6 +247,7 @@ def _run_cdc_worker(settings: Settings, args: argparse.Namespace):
         host=config.host,
         port=config.port,
         destination=config.destination,
+        client_id=config.client_id,
         subscription=config.subscription,
         username=config.username,
         password=config.password,

@@ -84,8 +84,8 @@ def test_parser_extracts_only_delete_locator(table: str, record_id: int, expert_
     assert result.rollback_required is False
 
 
-def test_parser_fails_closed_on_missing_change_rows_and_locator() -> None:
-    """缺少变更 RowData 或 DELETE 定位列时整批要求 rollback。"""
+def test_parser_ignores_update_but_fails_closed_on_missing_delete_locator() -> None:
+    """UPDATE 不进入 CDC；DELETE 缺少定位列时整批要求 rollback。"""
 
     update = CanalEntry(
         "ROWDATA", "expert", "experts_work_experience", "UPDATE", "binlog.000012", 201, 1, 1
@@ -115,16 +115,13 @@ def test_parser_fails_closed_on_missing_change_rows_and_locator() -> None:
         )
     )
 
-    assert result.ignored_count == 0
-    assert [issue.code for issue in result.issues] == [
-        "missing_row_data",
-        "missing_delete_locator",
-    ]
+    assert result.ignored_count == 1
+    assert [issue.code for issue in result.issues] == ["missing_delete_locator"]
     assert result.rollback_required is True
 
 
-def test_parser_emits_insert_update_delete_with_common_locator() -> None:
-    """统一事件解析器按操作类型提取四表主键和专家归属。"""
+def test_parser_ignores_insert_and_update() -> None:
+    """INSERT/UPDATE 由 Poll 负责，CDC 只计数后推进 Canal 位点。"""
 
     insert = CanalEntry(
         "ROWDATA", "expert", "experts_work_experience", "INSERT",
@@ -148,9 +145,19 @@ def test_parser_emits_insert_update_delete_with_common_locator() -> None:
 
     result = parse_canal_batch(batch)
 
-    assert [event.operation_type for event in result.events] == ["insert", "update"]
-    assert [(event.source_record_id, event.expert_id) for event in result.events] == [(21, 7), (8, 8)]
     assert result.delete_events == ()
+    assert result.ignored_count == 2
+    assert result.rollback_required is False
+
+
+def test_parser_accepts_delete_without_transaction_markers() -> None:
+    """DELETE 解析不依赖 Canal 是否返回事务边界 Entry。"""
+
+    result = parse_canal_batch(CanalBatch(12, (_entry("experts", record_id=9),), CANAL_DESTINATION))
+
+    assert len(result.delete_events) == 1
+    assert result.delete_events[0].expert_id == 9
+    assert result.rollback_required is False
 
 
 class _Connector:

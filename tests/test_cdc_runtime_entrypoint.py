@@ -24,6 +24,7 @@ def _settings(**cdc_values: object) -> Settings:
 
     config = CdcRuntimeConfig(
         enabled=True,
+        client_id="2001",
         source_connected=True,
         probe_batch_id=1,
         probe_entry_count=13,
@@ -34,8 +35,8 @@ def _settings(**cdc_values: object) -> Settings:
     return Settings(source, index, incremental_scan=IncrementalScanConfig(enabled=True), cdc_runtime=config)
 
 
-def test_event_identity_is_stable_and_row_specific() -> None:
-    """同一 Header/行序号重放得到相同身份，不同行序号不会碰撞。"""
+def test_event_identity_is_stable_across_rebatching_and_row_specific() -> None:
+    """重分批导致 entry_index 变化时身份稳定，不同行序号仍不会碰撞。"""
 
     event = CanalChangeEvent(
         "expert",
@@ -48,9 +49,10 @@ def test_event_identity_is_stable_and_row_specific() -> None:
         1787747052000,
         1,
         0,
-        "insert",
+        "delete",
     )
     assert build_cdc_event_id(event) == build_cdc_event_id(event)
+    assert build_cdc_event_id(event) == build_cdc_event_id(replace(event, entry_index=9))
     assert build_cdc_event_id(event) != build_cdc_event_id(replace(event, row_index=1))
 
 

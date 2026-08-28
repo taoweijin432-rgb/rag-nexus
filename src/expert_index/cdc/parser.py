@@ -1,7 +1,7 @@
-"""Canal Client 适配端口和四表统一变更 Parser。
+"""Canal Client 适配端口和四表物理删除 Parser。
 
-适配器负责隔离 Canal SDK；Parser 只接受已转换的领域模型，校验来源、事务 Entry、Offset
-和四表定位字段。行值只在 Parser 边界提取主键，绝不进入任务或持久化模型。
+适配器负责隔离 Canal SDK；Parser 忽略 INSERT/UPDATE 和事务边界，只从四张来源表
+的 DELETE Before Image 提取主键与专家定位。行值不进入任务或持久化模型。
 """
 
 from __future__ import annotations
@@ -84,32 +84,19 @@ class CanalClientAdapter(CanalClientPort):
         raw = self.connector.get_without_ack(batch_size)
         try:
             batch = self.decoder(raw, self.destination)
-        except Exception as error:  # noqa: BLE001 - 解码失败必须释放 Canal 未确认批次。
+        except Exception:
             batch_id = _extract_batch_id(raw)
             if batch_id is not None and batch_id >= 0:
                 try:
                     self.connector.rollback(batch_id)
-                except Exception as rollback_error:  # noqa: BLE001 - 保留安全失败语义。
+                except Exception as rollback_error:
                     raise CanalParserError("Canal batch 解码失败且 rollback 失败") from rollback_error
-            raise error
+            raise
         if not isinstance(batch, CanalBatch):
             raise CanalParserError("Canal decoder 未返回 CanalBatch")
         if batch.destination != self.destination:
             raise CanalParserError("Canal destination 与配置不一致")
         return batch
-
-
-def _extract_batch_id(raw: object) -> int | None:
-    """从 SDK 原始响应提取 batch id，供解码失败时安全回滚。"""
-
-    if isinstance(raw, Mapping):
-        value = raw.get("id", raw.get("batch_id"))
-    else:
-        value = getattr(raw, "id", getattr(raw, "batch_id", None))
-    try:
-        return None if value is None else int(value)
-    except (TypeError, ValueError):
-        return None
 
     def rollback(self, batch_id: int) -> None:
         """将 batch 回滚到 Canal，交由上层决定何时重试。"""
@@ -124,9 +111,22 @@ def _extract_batch_id(raw: object) -> int | None:
         self.connector.ack(batch_id)
 
 
+def _extract_batch_id(raw: object) -> int | None:
+    """从 SDK 原始响应提取 batch id，供解码失败时安全回滚。"""
+
+    if isinstance(raw, Mapping):
+        value = raw.get("id", raw.get("batch_id"))
+    else:
+        value = getattr(raw, "id", getattr(raw, "batch_id", None))
+    try:
+        return None if value is None else int(value)
+    except (TypeError, ValueError):
+        return None
+
+
 @dataclass(frozen=True)
 class CanalChangeEvent:
-    """从一行 INSERT/UPDATE/DELETE Image 提取的最小定位事件。"""
+    """从一行 DELETE Before Image 提取的最小定位事件。"""
 
     source_schema: str
     source_table: str
@@ -162,18 +162,11 @@ class CanalParseIssue:
 
 @dataclass(frozen=True)
 class CanalParseResult:
-    """一个 batch 的统一变更事件、兼容 DELETE 视图和安全失败摘要。"""
+    """一个 batch 的 DELETE 事件、忽略数和安全失败摘要。"""
 
     delete_events: tuple[CanalChangeEvent, ...]
     ignored_count: int
     issues: tuple[CanalParseIssue, ...]
-    change_events: tuple[CanalChangeEvent, ...] = ()
-
-    @property
-    def events(self) -> tuple[CanalChangeEvent, ...]:
-        """返回所有可进入任务编排的 INSERT/UPDATE/DELETE 事件。"""
-
-        return self.change_events or self.delete_events
 
     @property
     def rollback_required(self) -> bool:
@@ -183,7 +176,7 @@ class CanalParseResult:
 
 
 def parse_canal_batch(batch: CanalBatch) -> CanalParseResult:
-    """严格解析 batch，提取四表 INSERT/UPDATE/DELETE 的 id/expert_id。"""
+    """解析 batch，忽略非删除事件并提取四表 DELETE 的 id/expert_id。"""
 
     if batch.is_empty:
         return CanalParseResult((), 0, ())
@@ -191,44 +184,30 @@ def parse_canal_batch(batch: CanalBatch) -> CanalParseResult:
         raise CanalParserError("Canal destination 缺失或不匹配")
 
     delete_events: list[CanalChangeEvent] = []
-    change_events: list[CanalChangeEvent] = []
     issues: list[CanalParseIssue] = []
     ignored_count = 0
-    transaction_open = False
     for entry_index, entry in enumerate(batch.entries):
-        if entry.entry_type == "TRANSACTIONBEGIN":
-            if not _valid_offset(entry):
-                issues.append(CanalParseIssue("invalid_transaction_offset", entry_index))
-            if transaction_open:
-                issues.append(CanalParseIssue("unexpected_transaction_begin", entry_index))
-            transaction_open = True
-            continue
-        if entry.entry_type == "TRANSACTIONEND":
-            if not _valid_offset(entry):
-                issues.append(CanalParseIssue("invalid_transaction_offset", entry_index))
-            if not transaction_open:
-                issues.append(CanalParseIssue("unexpected_transaction_end", entry_index))
-            transaction_open = False
+        if entry.entry_type in {"TRANSACTIONBEGIN", "TRANSACTIONEND"}:
             continue
         if entry.entry_type != _ROW_DATA:
             issues.append(CanalParseIssue("unsupported_entry_type", entry_index))
-            continue
-        if not transaction_open:
-            issues.append(CanalParseIssue("row_outside_transaction", entry_index))
             continue
         if not _valid_offset(entry):
             issues.append(CanalParseIssue("invalid_row_offset", entry_index))
             continue
 
         operation = (entry.operation_type or "").upper()
-        if operation not in {"INSERT", "UPDATE", "DELETE"}:
+        if operation in {"INSERT", "UPDATE"}:
+            ignored_count += max(1, len(entry.rows))
+            continue
+        if operation != "DELETE":
             issues.append(CanalParseIssue("unsupported_operation", entry_index))
             continue
         if entry.source_schema != "expert" or entry.source_table not in _LOCATOR_COLUMNS:
             issues.append(CanalParseIssue("unsupported_source", entry_index))
             continue
         if not entry.rows:
-            # 三种操作都必须携带 RowData；缺失时回滚，避免把真实变更静默当作已处理。
+            # DELETE 必须携带 Before Image，否则无法安全确定删除范围。
             issues.append(CanalParseIssue("missing_row_data", entry_index))
             continue
 
@@ -244,13 +223,10 @@ def parse_canal_batch(batch: CanalBatch) -> CanalParseResult:
             if operation == "DELETE" and after:
                 issues.append(CanalParseIssue("delete_after_image_not_empty", entry_index, row_index))
                 continue
-            image = before if operation == "DELETE" else {**before, **after}
+            image = before
             required = _LOCATOR_COLUMNS[entry.source_table]
             if not required.issubset(image):
-                issue_code = (
-                    "missing_delete_locator" if operation == "DELETE" else "missing_change_locator"
-                )
-                issues.append(CanalParseIssue(issue_code, entry_index, row_index))
+                issues.append(CanalParseIssue("missing_delete_locator", entry_index, row_index))
                 continue
             source_record_id = _positive_int(image.get("id"))
             if source_record_id is None:
@@ -275,17 +251,11 @@ def parse_canal_batch(batch: CanalBatch) -> CanalParseResult:
                 execute_time=entry.execute_time,
                 entry_index=entry_index,
                 row_index=row_index,
-                operation_type=operation.lower(),
+                operation_type="delete",
             )
-            change_events.append(event)
-            if event.is_delete:
-                delete_events.append(event)
+            delete_events.append(event)
 
-    if transaction_open:
-        issues.append(CanalParseIssue("unclosed_transaction", len(batch.entries) - 1))
-    return CanalParseResult(
-        tuple(delete_events), ignored_count, tuple(issues), tuple(change_events)
-    )
+    return CanalParseResult(tuple(delete_events), ignored_count, tuple(issues))
 
 
 def _columns_to_values(columns: tuple[Any, ...]) -> dict[str, Any] | None:

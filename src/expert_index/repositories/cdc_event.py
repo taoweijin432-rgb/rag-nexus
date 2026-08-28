@@ -35,6 +35,17 @@ class MySQLCdcBatchPersistence(CdcBatchPersistencePort):
         if not plans:
             return ()
 
+        for plan in plans:
+            if (
+                plan.task.event_source != "cdc"
+                or plan.task.operation_type != "delete"
+                or plan.task.source_updated_at is not None
+                or not plan.event.is_delete
+            ):
+                raise CdcPersistenceConflictError(
+                    "CDC 持久化仅接受物理 DELETE 任务"
+                )
+
         connection = pymysql.connect(**self.config.as_kwargs())
         try:
             with connection.cursor() as cursor:

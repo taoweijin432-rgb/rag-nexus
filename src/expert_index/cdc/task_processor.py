@@ -8,7 +8,6 @@ from typing import Protocol
 from ..chunk_builder import ChunkFactory
 from ..handoff_orchestrator import HandoffOrchestrationResult
 from ..models import PreparedChunkSet, SourceSyncTask
-from ..preparation_coordinator import PreparationCoordinator
 from ..repositories.sync_task import (
     SourceSyncTaskLeaseConflictError,
     SourceSyncTaskStageConflictError,
@@ -82,11 +81,7 @@ class CdcHandoffOrchestratorPort(Protocol):
 
 
 class CdcDeleteTaskProcessor:
-    """推进一个已领取 CDC Task，并复用 Artifact/Consumer/Receipt/DLQ。
-
-    DELETE 使用专用范围准备器处理物理删除；INSERT/UPDATE 复用 P4
-    ``PreparationCoordinator`` 重读当前 MySQL 事实，避免维护第二套 Chunk 链路。
-    """
+    """推进一个已领取 CDC DELETE Task，并复用现有 Handoff 闭环。"""
 
     def __init__(
         self,
@@ -200,10 +195,7 @@ class CdcDeleteTaskProcessor:
         task: SourceSyncTask,
         attempt_token: str,
     ) -> PreparedChunkSet:
-        """按任务类型重读当前事实，并单调补齐到 validated。"""
-
-        if task.operation_type != "delete":
-            return self._prepare_current_change(task, attempt_token)
+        """从 DELETE 定位重建目标范围，并单调补齐到 validated。"""
 
         current = self._task_repository.renew_source_sync_task_lease(
             task.task_id,
@@ -235,21 +227,6 @@ class CdcDeleteTaskProcessor:
                 )
                 current_index = _PREPARATION_STAGE_INDEX[current.processing_stage]
         return prepared
-
-    def _prepare_current_change(
-        self,
-        task: SourceSyncTask,
-        attempt_token: str,
-    ) -> PreparedChunkSet:
-        """对 INSERT/UPDATE 复用 P4 Coordinator 完成事实重读和 Chunk 准备。"""
-
-        coordinator = PreparationCoordinator(
-            self._task_repository,  # type: ignore[arg-type]
-            self._source,  # type: ignore[arg-type]
-            self._factory,
-            lease_seconds=self._lease_seconds,
-        )
-        return coordinator.prepare(task, attempt_token)
 
     def _mark_rejected(
         self,
@@ -331,8 +308,10 @@ class CdcDeleteTaskProcessor:
             or task.attempt_token != attempt_token
         ):
             raise ValueError("attempt_token 与 CDC Task 不一致")
-        if task.event_source != "cdc" or task.operation_type not in {"insert", "update", "delete"}:
-            raise ValueError("任务必须是 CDC INSERT/UPDATE/DELETE")
+        if task.event_source != "cdc" or task.operation_type != "delete":
+            raise ValueError("任务必须是 CDC 物理 DELETE")
+        if task.source_updated_at is not None:
+            raise ValueError("CDC 物理 DELETE 的 source_updated_at 必须为空")
         expected_policy = self._factory.settings.chunk_policy_version
         if task.policy_version != expected_policy:
             raise ValueError("CDC Task policy_version 与当前 ChunkFactory 不一致")

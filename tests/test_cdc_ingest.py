@@ -113,8 +113,8 @@ def test_receiver_builds_cdc_delete_task_plan_without_source_time() -> None:
     assert result.rollback_required is False
 
 
-def test_receiver_creates_task_for_insert_and_update() -> None:
-    """INSERT/UPDATE 事件进入同一 CDC Task 计划并保留操作类型。"""
+def test_receiver_ignores_insert_and_update() -> None:
+    """INSERT/UPDATE 由 Poll 处理，CDC 不创建 Event 或 Task。"""
 
     begin = CanalEntry("TRANSACTIONBEGIN", "", "", None, "binlog.000012", 10, 1, 1)
     insert = CanalEntry(
@@ -141,8 +141,11 @@ def test_receiver_creates_task_for_insert_and_update() -> None:
         persistence=persistence,
     )
 
-    assert [plan.task.operation_type for plan in result.plans] == ["insert", "update"]
-    assert [plan.task.target_type for plan in result.plans] == ["expert", "employment"]
+    assert result.plans == ()
+    assert result.receipts == ()
+    assert result.ignored_count == 2
+    assert result.rollback_required is False
+    assert persistence.calls == []
 
 
 def test_receiver_reuses_same_task_for_replayed_event() -> None:

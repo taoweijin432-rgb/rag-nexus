@@ -281,7 +281,7 @@ def test_processor_exception_rolls_back_without_checkpoint_or_ack() -> None:
     checkpoint_repository = _CheckpointRepository()
     client = _Client()
     coordinator = _coordinator(task_repository, checkpoint_repository)
-    coordinator._task_processor = _FailingProcessor()  # noqa: SLF001 - 测试故障注入。
+    coordinator._task_processor = _FailingProcessor()
 
     with pytest.raises(AttributeError, match="downstream method missing"):
         coordinator.consume_once(client, batch_size=100, local_batch_id=88)

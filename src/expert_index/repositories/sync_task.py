@@ -221,13 +221,13 @@ class MySQLSourceSyncTaskRepository:
         try:
             with connection.cursor() as cursor:
                 locked = _lock_source_sync_task(cursor, task_id)
-                if locked.get("event_source") != "cdc" or locked.get("operation_type") not in {
-                    "insert",
-                    "update",
-                    "delete",
-                }:
+                if (
+                    locked.get("event_source") != "cdc"
+                    or locked.get("operation_type") != "delete"
+                    or locked.get("source_updated_at") is not None
+                ):
                     raise SourceSyncTaskStageConflictError(
-                        f"任务 {task_id} 不是 CDC INSERT/UPDATE/DELETE Task"
+                        f"任务 {task_id} 不是 CDC 物理 DELETE Task"
                     )
                 status = str(locked["sync_status"])
                 if status in {"success", "dead"}:
