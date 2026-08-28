@@ -117,9 +117,10 @@ class CdcRuntimeConfig:
         if self.enabled and not self.client_id.strip():
             raise ValueError("CDC_ENABLED=true 时必须配置 CANAL_CLIENT_ID")
         if self.client_id and (
-            len(self.client_id) > 64 or any(ord(char) < 32 for char in self.client_id)
+            not self.client_id.isdecimal()
+            or not 1 <= int(self.client_id) <= 32767
         ):
-            raise ValueError("CANAL_CLIENT_ID 长度不能超过 64 且不能包含控制字符")
+            raise ValueError("CANAL_CLIENT_ID 必须是 1 到 32767 的十进制整数字符串")
         if not isinstance(self.subscription, str) or not self.subscription.strip():
             raise ValueError("CANAL_SUBSCRIPTION 必须是非空字符串")
         if not isinstance(self.server_version, str) or not self.server_version.strip():

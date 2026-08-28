@@ -44,10 +44,12 @@ class CanalPythonConnector(CanalConnectorPort):
             raise ValueError("port 必须是 1 到 65535 的整数")
         if not isinstance(destination, str) or not destination.strip():
             raise ValueError("destination 必须是非空字符串")
-        if not isinstance(client_id, str) or not client_id.strip():
-            raise ValueError("client_id 必须是非空字符串")
-        if len(client_id) > 64 or any(ord(char) < 32 for char in client_id):
-            raise ValueError("client_id 长度不能超过 64 且不能包含控制字符")
+        if (
+            not isinstance(client_id, str)
+            or not client_id.isdecimal()
+            or not 1 <= int(client_id) <= 32767
+        ):
+            raise ValueError("client_id 必须是 1 到 32767 的十进制整数字符串")
         self.host = host
         self.port = port
         self.destination = destination
@@ -98,9 +100,9 @@ class CanalPythonConnector(CanalConnectorPort):
         method = getattr(self._client, "subscribe", None)
         if not callable(method):
             raise CanalSdkUnavailableError("Canal SDK Client 缺少 subscribe 方法")
-        # canal-python 0.4 的 subscribe 会隐式调用 rollback(0)，重新连接时可能
-        # 覆盖待重投会话。对暴露原始 Connector 的版本直接发送订阅请求，保留
-        # Canal 的未确认 batch，不改变消费位点。
+        # canal-python 0.4/Canal 1.1.8 需要先注册 ClientIdentity，再执行
+        # rollback(0) 清理该 destination 的未确认 batch；该操作不会确认位点。
+        # 对暴露原始 Connector 的版本使用兼容实现，避开旧 SDK 的 ACK 枚举错误。
         if _supports_raw_canal_protocol(self._client):
             _subscribe_v04(self._client, subscription, self.destination, self.client_id)
             return
@@ -301,7 +303,7 @@ def _get_without_ack_v04(client: Any, batch_size: int, client_id: str) -> object
 
 
 def _subscribe_v04(client: Any, subscription: str, destination: str, client_id: str) -> None:
-    """发送 canal-python 0.4 订阅请求，避免 SDK 隐式 rollback(0)。"""
+    """按 Canal 1.1.8 会话顺序订阅成功后执行 rollback(0)。"""
 
     CanalProtocol_pb2 = _load_canal_protocol()
     client_id = client_id.encode("utf-8")
@@ -331,6 +333,11 @@ def _subscribe_v04(client: Any, subscription: str, destination: str, client_id: 
             "Canal SUBSCRIBE 返回错误 ACK: "
             f"error_code={ack.error_code}, error_message={ack.error_message}"
         )
+
+    rollback = getattr(client, "rollback", None)
+    if not callable(rollback):
+        raise CanalSdkUnavailableError("Canal SDK Client 缺少 rollback 方法")
+    rollback(0)
 
 
 def _decode_entry_protocol(payload: bytes) -> object:

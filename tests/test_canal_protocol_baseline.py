@@ -99,3 +99,7 @@ def test_enabled_cdc_requires_stable_client_id() -> None:
 
     environment["CANAL_CLIENT_ID"] = "2001"
     assert Settings.from_env(environment).cdc_runtime.client_id == "2001"
+
+    environment["CANAL_CLIENT_ID"] = "32768"
+    with pytest.raises(ValueError, match="1 到 32767"):
+        Settings.from_env(environment)

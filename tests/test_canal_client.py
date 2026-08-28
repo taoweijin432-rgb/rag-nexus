@@ -153,6 +153,14 @@ def test_connector_supports_constructor_endpoint_signature() -> None:
     assert captured == {"host": "canal.example", "port": 11111, "filter": "expert.*"}
 
 
+@pytest.mark.parametrize("client_id", ["", "0", "32768", "client-1", " 2001"])
+def test_connector_rejects_client_id_outside_canal_short_range(client_id: str) -> None:
+    """Canal 1.1.8 会把 client_id 解析为 Java short，配置必须提前拒绝非法值。"""
+
+    with pytest.raises(ValueError, match="1 到 32767"):
+        CanalPythonConnector("canal.example", 11111, client_id=client_id, sdk_client=_SdkClient())
+
+
 def test_connector_handles_sdk_ack_packet_without_old_enum_bug(monkeypatch: pytest.MonkeyPatch) -> None:
     """兼容 canal-python 0.4 的 ACK 响应，不触发 ``PacketType.Ack`` 异常。"""
 
@@ -222,10 +230,13 @@ def test_connector_handles_sdk_ack_packet_without_old_enum_bug(monkeypatch: pyte
     assert get_fields["unit"] == 2
 
 
-def test_legacy_subscribe_does_not_issue_implicit_rollback(monkeypatch: pytest.MonkeyPatch) -> None:
-    """旧 SDK 订阅时只发送 SUBSCRIBE，不覆盖 Canal 未确认 batch。"""
+def test_legacy_subscribe_rolls_back_session_after_subscribe(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """旧 SDK 先订阅注册会话，再 rollback(0) 且不确认任何 batch。"""
 
     subscription_fields: dict[str, object] = {}
+    calls: list[str] = []
 
     class Packet:
         def __init__(self) -> None:
@@ -271,12 +282,21 @@ def test_legacy_subscribe_does_not_issue_implicit_rollback(monkeypatch: pytest.M
 
         def write_with_header(self, _payload: bytes) -> None:
             self.writes += 1
+            calls.append("subscribe")
 
         def read_next_packet(self) -> bytes:
+            calls.append("subscribe_ack")
             return b"response"
 
     class LegacySdkClient:
         connector = RawConnector()
+
+        def __init__(self) -> None:
+            self.rollback_ids: list[int] = []
+
+        def rollback(self, batch_id: int) -> None:
+            self.rollback_ids.append(batch_id)
+            calls.append(f"rollback:{batch_id}")
 
         def subscribe(self, **_kwargs: object) -> None:
             raise AssertionError("不应调用旧 SDK subscribe")
@@ -291,4 +311,6 @@ def test_legacy_subscribe_does_not_issue_implicit_rollback(monkeypatch: pytest.M
     connector.subscribe("expert.*")
 
     assert sdk.connector.writes == 1
+    assert sdk.rollback_ids == [0]
+    assert calls == ["subscribe", "subscribe_ack", "rollback:0"]
     assert subscription_fields["client_id"] == b"2001"
