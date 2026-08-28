@@ -76,8 +76,9 @@ public final class CanalProbe {
     /** 校验 ACK 所需的精确目标，拒绝空 batch、混合表或未声明的事件。 */
     private static void validateAckRequest(Message message, long batchId) throws Exception {
         long expectedBatchId = longEnv("CANAL_PROBE_EXPECTED_BATCH_ID", -1L);
-        String expectedTable = requiredEnv("CANAL_PROBE_EXPECTED_TABLE");
-        List<String> expectedEvents = expectedEvents();
+        List<ExpectedChange> expectedChanges = expectedChanges();
+        String expectedTable = expectedChanges == null ? requiredEnv("CANAL_PROBE_EXPECTED_TABLE") : null;
+        List<String> expectedEvents = expectedChanges == null ? expectedEvents() : List.of();
         int expectedRows = integerEnv("CANAL_PROBE_EXPECTED_ROWS", -1);
         String confirmation = requiredEnv("CANAL_PROBE_ACK_CONFIRM");
         if (!confirmation.equals("I_UNDERSTAND_ACK_TEST")) {
@@ -96,21 +97,85 @@ public final class CanalProbe {
                 continue;
             }
             rowDataEntries++;
-            if (!expectedTable.equals(entry.getHeader().getTableName())) {
+            ExpectedChange expectedChange = expectedChanges == null
+                    ? null
+                    : expectedChanges.size() >= rowDataEntries ? expectedChanges.get(rowDataEntries - 1) : null;
+            if (expectedChange == null && expectedChanges != null) {
+                throw new IllegalStateException("ROWDATA 条目数量超过声明的完整变更清单");
+            }
+            if (expectedChange != null && !expectedChange.table.equals(entry.getHeader().getTableName())) {
+                throw new IllegalStateException("ROWDATA 表不匹配，实际=" + entry.getHeader().getTableName());
+            }
+            if (expectedChange == null && !expectedTable.equals(entry.getHeader().getTableName())) {
                 throw new IllegalStateException("ROWDATA 表不匹配，实际=" + entry.getHeader().getTableName());
             }
             CanalEntry.RowChange rowChange = CanalEntry.RowChange.parseFrom(entry.getStoreValue());
-            if (rowChange.getIsDdl() || rowDataEntries > expectedEvents.size()
-                    || !expectedEvents.get(rowDataEntries - 1).equals(rowChange.getEventType().name())) {
+            String actualEvent = rowChange.getEventType().name();
+            if (rowChange.getIsDdl()
+                    || (expectedChange != null && !expectedChange.event.equals(actualEvent))
+                    || (expectedChange == null && (rowDataEntries > expectedEvents.size()
+                    || !expectedEvents.get(rowDataEntries - 1).equals(actualEvent)))) {
                 throw new IllegalStateException("ROWDATA 事件不匹配，实际=" + rowChange.getEventType());
+            }
+            if (expectedChange != null && expectedChange.rows != rowChange.getRowDatasCount()) {
+                throw new IllegalStateException(
+                        "ROWDATA 行数不匹配，实际=" + rowChange.getRowDatasCount()
+                                + " 期望=" + expectedChange.rows
+                );
             }
             totalRows += rowChange.getRowDatasCount();
         }
-        if (rowDataEntries == 0 || rowDataEntries != expectedEvents.size() || totalRows != expectedRows) {
+        int expectedEntryCount = expectedChanges == null ? expectedEvents.size() : expectedChanges.size();
+        if (rowDataEntries == 0 || rowDataEntries != expectedEntryCount || totalRows != expectedRows) {
             throw new IllegalStateException(
-                    "ROWDATA 结构不匹配，事件数=" + rowDataEntries + " 期望=" + expectedEvents.size()
+                    "ROWDATA 结构不匹配，事件数=" + rowDataEntries + " 期望=" + expectedEntryCount
                             + "，行数=" + totalRows + " 期望=" + expectedRows
             );
+        }
+    }
+
+    /** 读取完整变更清单，格式为 table:event:rows，按 ROWDATA 顺序严格匹配。 */
+    private static List<ExpectedChange> expectedChanges() {
+        String value = System.getenv("CANAL_PROBE_EXPECTED_CHANGES");
+        if (value == null || value.isBlank()) {
+            return null;
+        }
+        return Arrays.stream(value.split(",", -1))
+                .map(String::trim)
+                .map(CanalProbe::parseExpectedChange)
+                .collect(Collectors.toList());
+    }
+
+    /** 解析单项变更声明并校验表名、事件和行数。 */
+    private static ExpectedChange parseExpectedChange(String value) {
+        String[] parts = value.split(":", -1);
+        if (parts.length != 3 || parts[0].isBlank() || parts[1].isBlank()) {
+            throw new IllegalArgumentException(
+                    "CANAL_PROBE_EXPECTED_CHANGES 格式必须是 table:event:rows"
+            );
+        }
+        int rows;
+        try {
+            rows = Integer.parseInt(parts[2]);
+        } catch (NumberFormatException error) {
+            throw new IllegalArgumentException("变更清单行数必须是正整数", error);
+        }
+        if (rows < 1) {
+            throw new IllegalArgumentException("变更清单行数必须是正整数");
+        }
+        return new ExpectedChange(parts[0], parts[1].toUpperCase(Locale.ROOT), rows);
+    }
+
+    /** 表示一条按 ROWDATA 顺序待校验的变更。 */
+    private static final class ExpectedChange {
+        private final String table;
+        private final String event;
+        private final int rows;
+
+        private ExpectedChange(String table, String event, int rows) {
+            this.table = table;
+            this.event = event;
+            this.rows = rows;
         }
     }
 

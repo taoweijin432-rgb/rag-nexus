@@ -48,8 +48,7 @@ CANAL_BATCH_SIZE=10
 ```bash
 export CANAL_PROBE_ACTION=ack
 export CANAL_PROBE_EXPECTED_BATCH_ID=<上一次输出的 batch_id 加 1>
-export CANAL_PROBE_EXPECTED_TABLE=experts_education_experience
-export CANAL_PROBE_EXPECTED_EVENTS=INSERT,DELETE
+export CANAL_PROBE_EXPECTED_CHANGES=experts_education_experience:INSERT:1,experts_education_experience:DELETE:1
 export CANAL_PROBE_EXPECTED_ROWS=2
 export CANAL_PROBE_ACK_CONFIRM=I_UNDERSTAND_ACK_TEST
 java -cp "target/classes:target/dependency/*" \
@@ -59,5 +58,7 @@ java -cp "target/classes:target/dependency/*" \
 ACK 成功后输出 `CANAL_ACK status=success`。完成联调后清理上述 ACK 环境变量，恢复默认
 回滚模式。
 
-单一 ROWDATA 也可使用兼容变量 `CANAL_PROBE_EXPECTED_EVENT=INSERT`；若一个 batch 包含
-多个 ROWDATA，必须使用 `CANAL_PROBE_EXPECTED_EVENTS` 完整声明顺序，不能只声明其中一条。
+单一 ROWDATA 也可使用兼容变量 `CANAL_PROBE_EXPECTED_TABLE`、`CANAL_PROBE_EXPECTED_EVENT`
+和 `CANAL_PROBE_EXPECTED_ROWS`；多个 ROWDATA 应使用 `CANAL_PROBE_EXPECTED_CHANGES` 完整
+声明 `table:event:rows` 顺序，不能只声明其中一条。设置完整清单后不再需要
+`CANAL_PROBE_EXPECTED_TABLE` 或 `CANAL_PROBE_EXPECTED_EVENT`。
