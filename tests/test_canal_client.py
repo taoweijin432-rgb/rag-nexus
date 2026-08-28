@@ -211,3 +211,63 @@ def test_connector_handles_sdk_ack_packet_without_old_enum_bug(monkeypatch: pyte
     )
 
     assert connector.get_without_ack(10) == {"id": 0, "entries": []}
+
+
+def test_legacy_subscribe_does_not_issue_implicit_rollback(monkeypatch: pytest.MonkeyPatch) -> None:
+    """旧 SDK 订阅时只发送 SUBSCRIBE，不覆盖 Canal 未确认 batch。"""
+
+    class Packet:
+        def __init__(self) -> None:
+            self.type = 0
+            self.body = b""
+
+        def SerializeToString(self) -> bytes:
+            return b"request"
+
+        def MergeFromString(self, _payload: bytes) -> None:
+            self.type = 3
+            self.body = b"ack"
+
+    class Ack:
+        error_code = 0
+        error_message = ""
+
+        def MergeFromString(self, _payload: bytes) -> None:
+            pass
+
+    class Sub:
+        def SerializeToString(self) -> bytes:
+            return b"subscription"
+
+    Protocol = SimpleNamespace(
+        Packet=Packet,
+        Ack=Ack,
+        Sub=Sub,
+        SUBSCRIPTION=4,
+        ACK=3,
+    )
+
+    from expert_index.cdc import client as client_module
+
+    monkeypatch.setattr(client_module, "_load_canal_protocol", lambda: Protocol)
+
+    class RawConnector:
+        writes = 0
+
+        def write_with_header(self, _payload: bytes) -> None:
+            self.writes += 1
+
+        def read_next_packet(self) -> bytes:
+            return b"response"
+
+    class LegacySdkClient:
+        connector = RawConnector()
+
+        def subscribe(self, **_kwargs: object) -> None:
+            raise AssertionError("不应调用旧 SDK subscribe")
+
+    sdk = LegacySdkClient()
+    connector = CanalPythonConnector("canal.example", 11111, sdk_client=sdk)
+    connector.subscribe("expert.*")
+
+    assert sdk.connector.writes == 1

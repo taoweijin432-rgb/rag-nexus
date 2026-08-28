@@ -92,6 +92,12 @@ class CanalPythonConnector(CanalConnectorPort):
         method = getattr(self._client, "subscribe", None)
         if not callable(method):
             raise CanalSdkUnavailableError("Canal SDK Client 缺少 subscribe 方法")
+        # canal-python 0.4 的 subscribe 会隐式调用 rollback(0)，重新连接时可能
+        # 覆盖待重投会话。对暴露原始 Connector 的版本直接发送订阅请求，保留
+        # Canal 的未确认 batch，不改变消费位点。
+        if _supports_raw_canal_protocol(self._client):
+            _subscribe_v04(self._client, subscription, self.destination)
+            return
         try:
             # canal-python 0.4 使用 bytes 参数，并在 subscribe 中保存 destination
             # 供后续 get/ack/rollback 使用；不能把订阅表达式误传为 client_id。
@@ -283,6 +289,40 @@ def _get_without_ack_v04(client: Any, batch_size: int) -> object:
             )
         return {"id": 0, "entries": []}
     raise RuntimeError(f"Canal GET 返回未知 packet type: {response_type}")
+
+
+def _subscribe_v04(client: Any, subscription: str, destination: str) -> None:
+    """发送 canal-python 0.4 订阅请求，避免 SDK 隐式 rollback(0)。"""
+
+    CanalProtocol_pb2 = _load_canal_protocol()
+    client_id = b"1001"
+    destination_bytes = destination.encode("utf-8")
+    client.client_id = client_id
+    client.destination = destination_bytes
+
+    sub = CanalProtocol_pb2.Sub()
+    sub.destination = destination_bytes
+    sub.client_id = client_id
+    sub.filter = subscription.encode("utf-8")
+
+    packet = CanalProtocol_pb2.Packet()
+    packet.type = _packet_type(CanalProtocol_pb2, "SUBSCRIPTION")
+    packet.body = sub.SerializeToString()
+    connector = client.connector
+    connector.write_with_header(packet.SerializeToString())
+
+    response = CanalProtocol_pb2.Packet()
+    response.MergeFromString(connector.read_next_packet())
+    if int(response.type) != _packet_type(CanalProtocol_pb2, "ACK"):
+        raise RuntimeError(f"Canal SUBSCRIBE 返回未知 packet type: {int(response.type)}")
+    ack = CanalProtocol_pb2.Ack()
+    ack.MergeFromString(response.body)
+    if ack.error_code > 0:
+        raise RuntimeError(
+            "Canal SUBSCRIBE 返回错误 ACK: "
+            f"error_code={ack.error_code}, error_message={ack.error_message}"
+        )
+    print("Subscribe succed")
 
 
 def _decode_entry_protocol(payload: bytes) -> object:
