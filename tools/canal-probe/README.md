@@ -49,8 +49,8 @@ CANAL_BATCH_SIZE=10
 export CANAL_PROBE_ACTION=ack
 export CANAL_PROBE_EXPECTED_BATCH_ID=<上一次输出的 batch_id 加 1>
 export CANAL_PROBE_EXPECTED_TABLE=experts_education_experience
-export CANAL_PROBE_EXPECTED_EVENT=INSERT
-export CANAL_PROBE_EXPECTED_ROWS=1
+export CANAL_PROBE_EXPECTED_EVENTS=INSERT,DELETE
+export CANAL_PROBE_EXPECTED_ROWS=2
 export CANAL_PROBE_ACK_CONFIRM=I_UNDERSTAND_ACK_TEST
 java -cp "target/classes:target/dependency/*" \
   com.company.expertindex.canalprobe.CanalProbe
@@ -58,3 +58,6 @@ java -cp "target/classes:target/dependency/*" \
 
 ACK 成功后输出 `CANAL_ACK status=success`。完成联调后清理上述 ACK 环境变量，恢复默认
 回滚模式。
+
+单一 ROWDATA 也可使用兼容变量 `CANAL_PROBE_EXPECTED_EVENT=INSERT`；若一个 batch 包含
+多个 ROWDATA，必须使用 `CANAL_PROBE_EXPECTED_EVENTS` 完整声明顺序，不能只声明其中一条。

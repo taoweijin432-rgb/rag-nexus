@@ -6,6 +6,7 @@ import com.alibaba.otter.canal.protocol.CanalEntry;
 import com.alibaba.otter.canal.protocol.Message;
 
 import java.net.InetSocketAddress;
+import java.util.Arrays;
 import java.util.List;
 import java.util.Locale;
 import java.util.Objects;
@@ -76,7 +77,7 @@ public final class CanalProbe {
     private static void validateAckRequest(Message message, long batchId) throws Exception {
         long expectedBatchId = longEnv("CANAL_PROBE_EXPECTED_BATCH_ID", -1L);
         String expectedTable = requiredEnv("CANAL_PROBE_EXPECTED_TABLE");
-        String expectedEvent = requiredEnv("CANAL_PROBE_EXPECTED_EVENT").toUpperCase(Locale.ROOT);
+        List<String> expectedEvents = expectedEvents();
         int expectedRows = integerEnv("CANAL_PROBE_EXPECTED_ROWS", -1);
         String confirmation = requiredEnv("CANAL_PROBE_ACK_CONFIRM");
         if (!confirmation.equals("I_UNDERSTAND_ACK_TEST")) {
@@ -99,17 +100,35 @@ public final class CanalProbe {
                 throw new IllegalStateException("ROWDATA 表不匹配，实际=" + entry.getHeader().getTableName());
             }
             CanalEntry.RowChange rowChange = CanalEntry.RowChange.parseFrom(entry.getStoreValue());
-            if (rowChange.getIsDdl()
-                    || !expectedEvent.equals(rowChange.getEventType().name())) {
+            if (rowChange.getIsDdl() || rowDataEntries > expectedEvents.size()
+                    || !expectedEvents.get(rowDataEntries - 1).equals(rowChange.getEventType().name())) {
                 throw new IllegalStateException("ROWDATA 事件不匹配，实际=" + rowChange.getEventType());
             }
             totalRows += rowChange.getRowDatasCount();
         }
-        if (rowDataEntries == 0 || totalRows != expectedRows) {
+        if (rowDataEntries == 0 || rowDataEntries != expectedEvents.size() || totalRows != expectedRows) {
             throw new IllegalStateException(
-                    "ROWDATA 行数不匹配，实际=" + totalRows + " 期望=" + expectedRows
+                    "ROWDATA 结构不匹配，事件数=" + rowDataEntries + " 期望=" + expectedEvents.size()
+                            + "，行数=" + totalRows + " 期望=" + expectedRows
             );
         }
+    }
+
+    /** 读取按 ROWDATA 顺序声明的事件序列；单事件变量保持向后兼容。 */
+    private static List<String> expectedEvents() {
+        String sequence = System.getenv("CANAL_PROBE_EXPECTED_EVENTS");
+        if (sequence != null && !sequence.isBlank()) {
+            List<String> events = Arrays.stream(sequence.split(",", -1))
+                    .map(String::trim)
+                    .filter(value -> !value.isEmpty())
+                    .map(value -> value.toUpperCase(Locale.ROOT))
+                    .collect(Collectors.toList());
+            if (events.isEmpty()) {
+                throw new IllegalArgumentException("CANAL_PROBE_EXPECTED_EVENTS 不能为空");
+            }
+            return events;
+        }
+        return List.of(requiredEnv("CANAL_PROBE_EXPECTED_EVENT").toUpperCase(Locale.ROOT));
     }
 
     /** 输出不含行值的 batch 摘要，避免把业务正文或 PII 打到终端。 */
