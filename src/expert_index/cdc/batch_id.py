@@ -80,8 +80,9 @@ class MySQLCdcLocalBatchIdProvider:
             )
 
     def _load_max_id(self) -> int:
-        """读取 Event 和业务 Checkpoint 中最大的已使用本地批次号。"""
+        """读取所有 Index 批次来源中的最大编号，避免与 Poll 批次键冲突。"""
 
+        max_ids: list[int] = []
         with self._connection.cursor() as cursor:
             cursor.execute(
                 """
@@ -92,6 +93,7 @@ class MySQLCdcLocalBatchIdProvider:
                 (self.destination,),
             )
             event_row = cursor.fetchone() or {}
+            max_ids.append(int(event_row.get("max_id", 0)))
             cursor.execute(
                 """
                 SELECT COALESCE(last_local_batch_id, 0) AS max_id
@@ -101,7 +103,18 @@ class MySQLCdcLocalBatchIdProvider:
                 (self.destination,),
             )
             checkpoint_row = cursor.fetchone() or {}
-        return max(int(event_row.get("max_id", 0)), int(checkpoint_row.get("max_id", 0)))
+            max_ids.append(int(checkpoint_row.get("max_id", 0)))
+            # Poll 和 CDC 共用 Sync Task 的 batch_id/source 唯一键；同时纳入
+            # 已创建但尚未产生 Task 的全量/增量批次，保证新编号不会碰撞。
+            for table, column in (
+                ("expert_index_batch", "id"),
+                ("expert_index_batch_source", "batch_id"),
+                ("expert_index_sync_task", "batch_id"),
+            ):
+                cursor.execute(f"SELECT COALESCE(MAX({column}), 0) AS max_id FROM {table}")
+                row = cursor.fetchone() or {}
+                max_ids.append(int(row.get("max_id", 0)))
+        return max(max_ids, default=0)
 
 
 def _lock_name(destination: str) -> str:
