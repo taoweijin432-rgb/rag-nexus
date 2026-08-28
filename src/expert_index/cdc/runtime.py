@@ -14,11 +14,59 @@ from ..repositories.cdc_checkpoint import MySQLCdcCheckpointRepository
 from ..repositories.cdc_event import MySQLCdcBatchPersistence
 from .finalize import CdcBatchCoordinator, CdcBatchRunResult
 from .ingest import CdcBatchReceiver, CdcEventIdentityProvider
-from .protocol import CanalClientPort, CanalProtocolBaseline
+from .protocol import (
+    CANAL_DESTINATION,
+    CANAL_SERVER_VERSION,
+    CANAL_SUBSCRIPTION,
+    CanalClientPort,
+    CanalProtocolBaseline,
+)
 
 
 class CdcRuntimeDisabledError(RuntimeError):
     """表示 CDC_ENABLED 未打开，拒绝组装真实消费运行时。"""
+
+
+def build_cdc_protocol_baseline(settings: Settings) -> CanalProtocolBaseline:
+    """将显式部署配置转换为 CDC 协议门禁模型。
+
+    ``production_ready`` 只有在真实 Probe、源连接和 ACK 测试均由部署人员确认后
+    才会成立；本函数不会根据连接成功或默认值自动放行。
+    """
+
+    config = settings.cdc_runtime
+    unresolved: list[str] = []
+    if config.server_version != CANAL_SERVER_VERSION:
+        unresolved.append("canal_server_version_mismatch")
+    if config.server_mode.strip().casefold() != "tcp":
+        unresolved.append("canal_server_mode_unconfirmed")
+    if config.destination != CANAL_DESTINATION:
+        unresolved.append("canal_destination_mismatch")
+    if config.subscription != CANAL_SUBSCRIPTION:
+        unresolved.append("canal_subscription_mismatch")
+    if config.tcp_port != config.port:
+        unresolved.append("canal_port_mismatch")
+    if not config.source_connected:
+        unresolved.append("source_connection_unconfirmed")
+    if config.probe_batch_id < 1 or config.probe_entry_count < 1:
+        unresolved.append("real_probe_batch_unconfirmed")
+    if not config.ack_confirmed:
+        unresolved.append("ack_replay_unconfirmed")
+    if not config.protocol_ready:
+        unresolved.append("protocol_gate_disabled")
+    return CanalProtocolBaseline(
+        server_version=config.server_version,
+        server_mode=config.server_mode,
+        tcp_port=config.tcp_port,
+        destination=config.destination,
+        subscription=config.subscription,
+        source_connected=config.source_connected,
+        probe_batch_id=config.probe_batch_id,
+        probe_entry_count=config.probe_entry_count,
+        ack_called=config.ack_confirmed,
+        production_ready=not unresolved,
+        unresolved=tuple(unresolved),
+    )
 
 
 @dataclass(frozen=True)
@@ -91,4 +139,9 @@ def build_cdc_runtime(
     return CdcRuntime(client=client, coordinator=coordinator)
 
 
-__all__ = ["CdcRuntime", "CdcRuntimeDisabledError", "build_cdc_runtime"]
+__all__ = [
+    "CdcRuntime",
+    "CdcRuntimeDisabledError",
+    "build_cdc_protocol_baseline",
+    "build_cdc_runtime",
+]

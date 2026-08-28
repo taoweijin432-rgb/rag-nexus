@@ -3,13 +3,15 @@
 常用顺序：先 ``init-db``，再用 ``build`` 重建单专家、用 ``build-batch`` 运行全量、
 用 ``resume-batch`` 继续中断批次，或用 ``retry-batch`` 重试 partial 批次失败专家。
 两类构建命令都会以内存方法调用把 Chunk 交给下游向量服务，不再写入或读取
-``expert_chunk``。命令输出只包含数量和状态，不打印 Chunk 正文。
+``expert_chunk``。CDC 入口额外要求真实协议基线和 ACK 测试已配置；命令输出只包含数量
+和状态，不打印 Chunk 正文、CDC Payload 或凭据。
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import os
 from dataclasses import asdict
 from datetime import datetime
 from pathlib import Path
@@ -119,6 +121,19 @@ def build_parser() -> argparse.ArgumentParser:
     incremental_worker.add_argument("--task-lease-seconds", type=int, required=True)
     incremental_worker.add_argument("--max-cycles", type=int)
 
+    cdc_worker = sub.add_parser(
+        "cdc-worker",
+        help="常驻消费真实 Canal batch；业务成功后提交 Checkpoint 并 ACK",
+    )
+    cdc_worker.add_argument("--worker-id", required=True)
+    cdc_worker.add_argument("--batch-size", type=int, default=100)
+    cdc_worker.add_argument("--idle-sleep-seconds", type=float, default=5.0)
+    cdc_worker.add_argument("--error-sleep-seconds", type=float, default=10.0)
+    cdc_worker.add_argument("--max-attempts", type=int, required=True)
+    cdc_worker.add_argument("--retry-delay-seconds", type=int, required=True)
+    cdc_worker.add_argument("--task-lease-seconds", type=int, required=True)
+    cdc_worker.add_argument("--max-cycles", type=int)
+
     return parser
 
 
@@ -126,6 +141,9 @@ def main(argv: list[str] | None = None) -> None:
     """执行命令并打印机器可读 JSON 摘要。"""
 
     args = build_parser().parse_args(argv)
+    if args.command == "cdc-worker":
+        # canal-python 0.4 的 protobuf 生成代码需要 Python 实现；必须在 SDK 导入前设置。
+        os.environ.setdefault("PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION", "python")
     settings = Settings.from_env()
     # 所有正式命令都会创建或更新本地状态；在加载下游组件或连接 MySQL 前先验证边界。
     settings.validate_index_write_boundary()
@@ -188,6 +206,9 @@ def main(argv: list[str] | None = None) -> None:
             ),
         ).run()
         print(json.dumps(asdict(result), ensure_ascii=False, sort_keys=True))
+    elif args.command == "cdc-worker":
+        result = _run_cdc_worker(settings, args)
+        print(json.dumps(asdict(result), ensure_ascii=False, sort_keys=True))
 
 
 def _build_pipeline(settings: Settings) -> ExpertIndexPipeline:
@@ -202,6 +223,61 @@ def _build_pipeline(settings: Settings) -> ExpertIndexPipeline:
         settings,
         vector_sync=ExpertVectorSynchronizer(vector_service),
     )
+
+
+def _run_cdc_worker(settings: Settings, args: argparse.Namespace):
+    """组装并运行真实 CDC Worker，退出时释放 destination 单实例锁。"""
+
+    from .cdc import (
+        CdcWorkerConfig,
+        MySQLCdcLocalBatchIdProvider,
+        build_cdc_event_id,
+        build_cdc_protocol_baseline,
+        build_cdc_runtime,
+        build_real_canal_client,
+        decode_canal_message,
+        run_cdc_worker,
+    )
+
+    config = settings.cdc_runtime
+    baseline = build_cdc_protocol_baseline(settings)
+    # 在构造 Vector/Embedding/Canal Client 前先执行协议门禁，避免半启动服务。
+    baseline.require_production_ready()
+    client = build_real_canal_client(
+        host=config.host,
+        port=config.port,
+        destination=config.destination,
+        subscription=config.subscription,
+        username=config.username,
+        password=config.password,
+        decoder=decode_canal_message,
+    )
+    runtime = build_cdc_runtime(
+        settings,
+        client=client,
+        protocol_baseline=baseline,
+        identity_provider=build_cdc_event_id,
+        max_attempts=args.max_attempts,
+        retry_delay_seconds=args.retry_delay_seconds,
+        task_lease_seconds=args.task_lease_seconds,
+    )
+    batch_ids = MySQLCdcLocalBatchIdProvider(
+        settings.index_db,
+        destination=config.destination,
+    )
+    try:
+        return run_cdc_worker(
+            runtime,
+            batch_ids,
+            config=CdcWorkerConfig(
+                batch_size=args.batch_size,
+                idle_sleep_seconds=args.idle_sleep_seconds,
+                error_sleep_seconds=args.error_sleep_seconds,
+                max_cycles=args.max_cycles,
+            ),
+        )
+    finally:
+        batch_ids.close()
 
 
 if __name__ == "__main__":

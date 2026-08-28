@@ -74,15 +74,61 @@ class IncrementalScanConfig:
 
 @dataclass(frozen=True)
 class CdcRuntimeConfig:
-    """控制真实 Canal 消费入口；默认关闭且不隐式推导协议参数。"""
+    """保存真实 Canal 连接、协议基线和 CDC Worker 参数。
+
+    连接凭据仅从部署环境读取，不会出现在日志或 Worker 摘要中。协议基线必须由
+    Probe/受控 ACK 测试显式确认，未确认时即使连接参数正确也拒绝消费。
+    """
 
     enabled: bool = False
+    host: str = "127.0.0.1"
+    port: int = 11111
+    destination: str = "company_expert"
+    subscription: str = (
+        r"expert\.(experts|experts_work_experience|experts_project_experience|"
+        r"experts_education_experience)"
+    )
+    username: str = ""
+    password: str = ""
+    server_version: str = "1.1.8"
+    server_mode: str = "tcp"
+    tcp_port: int = 11111
+    probe_batch_id: int = 0
+    probe_entry_count: int = 0
+    source_connected: bool = False
+    ack_confirmed: bool = False
+    protocol_ready: bool = False
 
     def __post_init__(self) -> None:
-        """拒绝非布尔开关，防止含义不明确的配置开启真实 ACK。"""
+        """在建立连接前校验 Endpoint 和协议门禁字段。"""
 
         if not isinstance(self.enabled, bool):
             raise TypeError("cdc enabled 必须是布尔值")
+        if not isinstance(self.host, str) or not self.host.strip():
+            raise ValueError("CANAL_HOST 必须是非空字符串")
+        for name, value in (("CANAL_PORT", self.port), ("CANAL_TCP_PORT", self.tcp_port)):
+            if isinstance(value, bool) or not isinstance(value, int) or not 1 <= value <= 65535:
+                raise ValueError(f"{name} 必须位于 1 到 65535 之间")
+        if not isinstance(self.destination, str) or not self.destination.strip():
+            raise ValueError("CANAL_DESTINATION 必须是非空字符串")
+        if not isinstance(self.subscription, str) or not self.subscription.strip():
+            raise ValueError("CANAL_SUBSCRIPTION 必须是非空字符串")
+        if not isinstance(self.server_version, str) or not self.server_version.strip():
+            raise ValueError("CANAL_SERVER_VERSION 必须是非空字符串")
+        if not isinstance(self.server_mode, str) or self.server_mode.strip().casefold() != "tcp":
+            raise ValueError("CANAL_SERVER_MODE 当前只支持 tcp")
+        for name, value in (
+            ("CDC_PROBE_BATCH_ID", self.probe_batch_id),
+            ("CDC_PROBE_ENTRY_COUNT", self.probe_entry_count),
+        ):
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise ValueError(f"{name} 必须是非负整数")
+        if not isinstance(self.ack_confirmed, bool):
+            raise TypeError("CDC_ACK_CONFIRMED 必须是布尔值")
+        if not isinstance(self.source_connected, bool):
+            raise TypeError("CDC_SOURCE_CONNECTED 必须是布尔值")
+        if not isinstance(self.protocol_ready, bool):
+            raise TypeError("CDC_PROTOCOL_READY 必须是布尔值")
 
 
 def load_env_file(path: Path | None = None) -> None:
@@ -231,7 +277,41 @@ class Settings:
             enabled=_parse_boolean(
                 "CDC_ENABLED",
                 values.get("CDC_ENABLED", "0"),
-            )
+            ),
+            host=values.get("CANAL_HOST", "127.0.0.1"),
+            port=_parse_port("CANAL_PORT", values.get("CANAL_PORT", "11111")),
+            destination=values.get("CANAL_DESTINATION", "company_expert"),
+            subscription=values.get(
+                "CANAL_SUBSCRIPTION",
+                (
+                    r"expert\.(experts|experts_work_experience|experts_project_experience|"
+                    r"experts_education_experience)"
+                ),
+            ),
+            username=values.get("CANAL_USERNAME", ""),
+            password=values.get("CANAL_PASSWORD", ""),
+            server_version=values.get("CANAL_SERVER_VERSION", "1.1.8"),
+            server_mode=values.get("CANAL_SERVER_MODE", "tcp"),
+            tcp_port=_parse_port(
+                "CANAL_TCP_PORT", values.get("CANAL_TCP_PORT", "11111")
+            ),
+            probe_batch_id=_parse_integer(
+                "CDC_PROBE_BATCH_ID", values.get("CDC_PROBE_BATCH_ID", "0"), minimum=0
+            ),
+            probe_entry_count=_parse_integer(
+                "CDC_PROBE_ENTRY_COUNT",
+                values.get("CDC_PROBE_ENTRY_COUNT", "0"),
+                minimum=0,
+            ),
+            source_connected=_parse_boolean(
+                "CDC_SOURCE_CONNECTED", values.get("CDC_SOURCE_CONNECTED", "0")
+            ),
+            ack_confirmed=_parse_boolean(
+                "CDC_ACK_CONFIRMED", values.get("CDC_ACK_CONFIRMED", "0")
+            ),
+            protocol_ready=_parse_boolean(
+                "CDC_PROTOCOL_READY", values.get("CDC_PROTOCOL_READY", "0")
+            ),
         )
         return cls(
             source_db=source,

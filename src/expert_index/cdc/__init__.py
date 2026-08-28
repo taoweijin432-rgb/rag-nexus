@@ -3,6 +3,7 @@
 本包只定义上游可依赖的协议边界，不依赖 Canal SDK，也不执行消费或确认。
 """
 
+from .batch_id import CdcWorkerAlreadyRunningError, MySQLCdcLocalBatchIdProvider
 from .client import CanalPythonConnector, CanalSdkUnavailableError, build_real_canal_client
 from .decoder import CanalDecodeError, decode_canal_message
 from .delete_scope import (
@@ -25,6 +26,7 @@ from .finalize import (
     CdcTaskRepositoryPort,
     build_cdc_batch_commit_request,
 )
+from .identity import build_cdc_event_id
 from .ingest import (
     CdcBatchPersistencePort,
     CdcBatchReceiver,
@@ -130,13 +132,16 @@ __all__ = [
     "CdcTaskReceiptStatus",
     "CdcTaskRepositoryPort",
     "CdcWorker",
+    "CdcWorkerAlreadyRunningError",
     "CdcWorkerConfig",
     "CdcWorkerSummary",
     "FakeCanalClient",
     "LocalBatchIdProvider",
+    "MySQLCdcLocalBatchIdProvider",
     "ReplayDelete",
     "ReplayResult",
     "build_cdc_batch_commit_request",
+    "build_cdc_event_id",
     "build_real_canal_client",
     "decode_canal_message",
     "install_signal_handlers",
@@ -152,15 +157,33 @@ __all__ = [
 def __getattr__(name: str):
     """按需加载运行时组装器，避免 Repository 初始化时形成循环导入。"""
 
-    if name in {"CdcRuntime", "CdcRuntimeDisabledError", "build_cdc_runtime"}:
-        from .runtime import CdcRuntime, CdcRuntimeDisabledError, build_cdc_runtime
+    if name in {
+        "CdcRuntime",
+        "CdcRuntimeDisabledError",
+        "build_cdc_protocol_baseline",
+        "build_cdc_runtime",
+    }:
+        from .runtime import (
+            CdcRuntime,
+            CdcRuntimeDisabledError,
+            build_cdc_protocol_baseline,
+            build_cdc_runtime,
+        )
 
         return {
             "CdcRuntime": CdcRuntime,
             "CdcRuntimeDisabledError": CdcRuntimeDisabledError,
+            "build_cdc_protocol_baseline": build_cdc_protocol_baseline,
             "build_cdc_runtime": build_cdc_runtime,
         }[name]
     raise AttributeError(name)
 
 
-__all__.extend(["CdcRuntime", "CdcRuntimeDisabledError", "build_cdc_runtime"])
+__all__.extend(
+    [
+        "CdcRuntime",
+        "CdcRuntimeDisabledError",
+        "build_cdc_protocol_baseline",
+        "build_cdc_runtime",
+    ]
+)
