@@ -435,11 +435,14 @@ def _orchestrator(
 class FakeScopeFence:
     """测试用专家级执行栅栏，默认判定请求仍是最新。"""
 
-    def __init__(self, *, superseded: bool = False) -> None:
+    def __init__(self, *, superseded: bool = False, raise_on_hold: BaseException | None = None) -> None:
         self.superseded = superseded
+        self.raise_on_hold = raise_on_hold
 
     @contextmanager
     def hold(self, task, attempt_token, scope, *, timeout_seconds):
+        if self.raise_on_hold is not None:
+            raise self.raise_on_hold
         yield ScopeFenceDecision(superseded=self.superseded)
 
 
@@ -806,6 +809,30 @@ class TestRejectedAndFailed:
         assert result.terminal is True
         assert task_repo.rejected_calls and task_repo.retryable_calls == []
         assert task_repo.rejected_calls[0]["error_stage"] == "scope_consumer"
+
+    def test_scope_fence_infrastructure_error_is_retryable(self):
+        """交接外围基础设施异常应落为可重试，而不是遗留 processing。"""
+
+        task = _task(processing_stage="handed_off")
+        task_repo = FakeTaskRepo(state=task)
+        artifact_repo = FakeArtifactRepo()
+        request = ScopeHandoffBuilder("Asia/Shanghai").build(
+            task, TOKEN, _expert_prepared(task.expert_id)
+        )
+        _seed_artifact(artifact_repo, task.task_id, request)
+        orch = _orchestrator(
+            task_repo,
+            artifact_repo,
+            FakeConsumer(receipt_factory=_committed_receipt_factory()),
+            scope_fence=FakeScopeFence(raise_on_hold=RuntimeError("infra")),
+        )
+
+        result = orch.process(task.task_id, TOKEN)
+
+        assert result.final_status == "pending"
+        assert result.terminal is False
+        assert task_repo.retryable_calls[0]["error_stage"] == "handoff"
+        assert task_repo.retryable_calls[0]["error_type"] == "RuntimeError"
 
 
 class TestArtifactLifecycle:

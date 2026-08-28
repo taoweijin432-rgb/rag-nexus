@@ -667,6 +667,27 @@ class HandoffOrchestrator:
                 error_code=_ERROR_CODE_FENCING,
                 safe_error_message="专家级执行栅栏获取超时",
             )
+        except (ValueError, TypeError) as error:
+            # 交接外围参数不合法时直接终止，避免无效请求反复占用任务租约。
+            return self._reject(
+                task,
+                attempt_token,
+                error_stage="handoff",
+                error_code=_ERROR_CODE_FENCING,
+                error_type=type(error).__name__,
+                safe_error_message="交接外围参数校验失败",
+            )
+        except Exception as error:  # noqa: BLE001 - 基础设施异常必须留下可重试状态
+            # GET_LOCK、Index MySQL 或其他交接基础设施异常不能让任务永久停在
+            # processing；只保存稳定错误类型，正文不进入任务或 DLQ。
+            return self._retryable(
+                task,
+                attempt_token,
+                error_stage="handoff",
+                error_code=_ERROR_CODE_FENCING,
+                error_type=type(error).__name__,
+                safe_error_message="交接基础设施调用失败",
+            )
 
         # 严格校验 Receipt 与当前 Request 一致。
         try:
