@@ -1,8 +1,12 @@
-# Canal 只读诊断 Client
+# Canal 诊断 Client
 
-该独立 Maven 工程用于确认本机 Canal Server 的真实消息协议。它只读取一个 batch，输出
-不含字段值的元数据摘要，然后执行 `rollback(batch_id)`。程序不会调用 `ack`，不会写四张
-Source 表，也不会推进项目内 CDC Checkpoint。
+该独立 Maven 工程用于确认 Canal Server 的真实消息协议。默认只读取一个 batch，输出
+不含字段值的元数据摘要，然后执行 `rollback(batch_id)`。程序不会写四张 Source 表，也
+不会推进项目内 CDC Checkpoint。
+
+ACK 是显式的受控联调模式，不是默认行为。只有 batch id、表名、事件类型、行数和固定
+确认短语全部匹配时才会调用 `ack(batch_id)`；ACK 调用发生异常时不再自动 rollback，避免
+覆盖 Canal 端可能已经生效的确认结果。
 
 ## 使用条件
 
@@ -35,3 +39,22 @@ CANAL_BATCH_SIZE=10
 
 输出中的 `logfile/offset/server_id` 只用于确认真实 Offset 组成；`before_columns` 和
 `after_columns` 只输出字段名，不输出字段值。若 batch 为空，程序仍会安全退出并断开连接。
+
+## 受保护 ACK 联调
+
+先用默认模式读取并回滚，确认输出中的表、事件和行数后，再将该次输出的 `batch_id + 1`
+作为下一次读取的期望值执行 ACK（Canal 每次 `getWithoutAck` 都会分配新的连接内 batch id）：
+
+```bash
+export CANAL_PROBE_ACTION=ack
+export CANAL_PROBE_EXPECTED_BATCH_ID=<上一次输出的 batch_id 加 1>
+export CANAL_PROBE_EXPECTED_TABLE=experts_education_experience
+export CANAL_PROBE_EXPECTED_EVENT=INSERT
+export CANAL_PROBE_EXPECTED_ROWS=1
+export CANAL_PROBE_ACK_CONFIRM=I_UNDERSTAND_ACK_TEST
+java -cp "target/classes:target/dependency/*" \
+  com.company.expertindex.canalprobe.CanalProbe
+```
+
+ACK 成功后输出 `CANAL_ACK status=success`。完成联调后清理上述 ACK 环境变量，恢复默认
+回滚模式。

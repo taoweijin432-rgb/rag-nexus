@@ -7,21 +7,22 @@ import com.alibaba.otter.canal.protocol.Message;
 
 import java.net.InetSocketAddress;
 import java.util.List;
+import java.util.Locale;
 import java.util.Objects;
 import java.util.stream.Collectors;
 
 /**
- * 只读读取一个 Canal batch，输出协议元数据后回滚 batch。
+ * 读取一个 Canal batch，输出协议元数据；默认回滚，显式 ACK 模式仅用于受控联调。
  *
- * <p>该程序用于确认本机 Canal 的真实消息结构，不执行 ack、不写 Source 表，
- * 也不推进项目内的 CDC Checkpoint。</p>
+ * <p>程序不写 Source 表，也不推进项目内的 CDC Checkpoint。ACK 模式要求同时提供
+ * 精确 batch、表、事件、行数和确认短语，避免误确认未知消息。</p>
  */
 public final class CanalProbe {
     private CanalProbe() {
     }
 
     /**
-     * 连接本机 Canal，读取一个 batch，输出脱敏摘要并回滚消费位置。
+     * 连接 Canal，读取一个 batch，输出脱敏摘要；默认回滚，ACK 模式在校验通过后确认。
      *
      * @param args 未使用；连接参数通过环境变量提供
      * @throws Exception Canal Client 连接或协议解析失败
@@ -37,6 +38,10 @@ public final class CanalProbe {
                 "expert\\.(experts|experts_work_experience|experts_project_experience|experts_education_experience)"
         );
         int batchSize = integerEnv("CANAL_BATCH_SIZE", 10);
+        String action = env("CANAL_PROBE_ACTION", "rollback").toLowerCase(Locale.ROOT);
+        if (!action.equals("rollback") && !action.equals("ack")) {
+            throw new IllegalArgumentException("CANAL_PROBE_ACTION 只能是 rollback 或 ack");
+        }
 
         CanalConnector connector = CanalConnectors.newSingleConnector(
                 new InetSocketAddress(host, port), destination, username, password
@@ -46,16 +51,64 @@ public final class CanalProbe {
             connector.subscribe(subscription);
             Message message = connector.getWithoutAck(batchSize);
             long batchId = message.getId();
+            boolean ackAttempted = false;
             try {
                 printMessage(message, host, port, destination, subscription);
+                if (action.equals("ack")) {
+                    validateAckRequest(message, batchId);
+                    // ACK 调用返回前结果可能已到达 Canal；异常时禁止再 rollback，避免覆盖确认结果。
+                    ackAttempted = true;
+                    connector.ack(batchId);
+                    System.out.printf("CANAL_ACK status=success batch_id=%d%n", batchId);
+                }
             } finally {
-                // 诊断程序永远回滚，确保不会推进 Canal 的确认位点。
-                if (batchId != -1L) {
+                // 默认回滚；校验失败也回滚；ACK 发起后交由 Canal 保持最终状态。
+                if (batchId != -1L && !ackAttempted) {
                     connector.rollback(batchId);
                 }
             }
         } finally {
             connector.disconnect();
+        }
+    }
+
+    /** 校验 ACK 所需的精确目标，拒绝空 batch、混合表或未声明的事件。 */
+    private static void validateAckRequest(Message message, long batchId) throws Exception {
+        long expectedBatchId = longEnv("CANAL_PROBE_EXPECTED_BATCH_ID", -1L);
+        String expectedTable = requiredEnv("CANAL_PROBE_EXPECTED_TABLE");
+        String expectedEvent = requiredEnv("CANAL_PROBE_EXPECTED_EVENT").toUpperCase(Locale.ROOT);
+        int expectedRows = integerEnv("CANAL_PROBE_EXPECTED_ROWS", -1);
+        String confirmation = requiredEnv("CANAL_PROBE_ACK_CONFIRM");
+        if (!confirmation.equals("I_UNDERSTAND_ACK_TEST")) {
+            throw new IllegalArgumentException("CANAL_PROBE_ACK_CONFIRM 不正确，拒绝 ACK");
+        }
+        if (batchId < 0L || batchId != expectedBatchId) {
+            throw new IllegalStateException(
+                    "batch_id 不匹配，实际=" + batchId + " 期望=" + expectedBatchId
+            );
+        }
+
+        int rowDataEntries = 0;
+        int totalRows = 0;
+        for (CanalEntry.Entry entry : message.getEntries()) {
+            if (entry.getEntryType() != CanalEntry.EntryType.ROWDATA) {
+                continue;
+            }
+            rowDataEntries++;
+            if (!expectedTable.equals(entry.getHeader().getTableName())) {
+                throw new IllegalStateException("ROWDATA 表不匹配，实际=" + entry.getHeader().getTableName());
+            }
+            CanalEntry.RowChange rowChange = CanalEntry.RowChange.parseFrom(entry.getStoreValue());
+            if (rowChange.getIsDdl()
+                    || !expectedEvent.equals(rowChange.getEventType().name())) {
+                throw new IllegalStateException("ROWDATA 事件不匹配，实际=" + rowChange.getEventType());
+            }
+            totalRows += rowChange.getRowDatasCount();
+        }
+        if (rowDataEntries == 0 || totalRows != expectedRows) {
+            throw new IllegalStateException(
+                    "ROWDATA 行数不匹配，实际=" + totalRows + " 期望=" + expectedRows
+            );
         }
     }
 
@@ -114,7 +167,7 @@ public final class CanalProbe {
         }
     }
 
-    /** 返回稳定排序的字段名列表，禁止携带列值。 */
+    /** 返回按 Canal 原始顺序排列的字段名列表，禁止携带列值。 */
     private static String columnNames(List<CanalEntry.Column> columns) {
         return columns.stream()
                 .map(CanalEntry.Column::getName)
@@ -126,6 +179,28 @@ public final class CanalProbe {
     private static String env(String name, String defaultValue) {
         String value = System.getenv(name);
         return value == null || value.isBlank() ? defaultValue : value;
+    }
+
+    /** 读取 ACK 必填环境变量，缺失时立即失败。 */
+    private static String requiredEnv(String name) {
+        String value = System.getenv(name);
+        if (value == null || value.isBlank()) {
+            throw new IllegalArgumentException(name + " 是 ACK 模式必填项");
+        }
+        return value;
+    }
+
+    /** 读取长整型环境变量并拒绝非法值。 */
+    private static long longEnv(String name, long defaultValue) {
+        String value = System.getenv(name);
+        if (value == null || value.isBlank()) {
+            return defaultValue;
+        }
+        try {
+            return Long.parseLong(value);
+        } catch (NumberFormatException error) {
+            throw new IllegalArgumentException(name + " 必须是整数", error);
+        }
     }
 
     /** 读取正整数环境变量并拒绝非法值。 */
