@@ -112,6 +112,11 @@ class CanalPythonConnector(CanalConnectorPort):
     def get_without_ack(self, batch_size: int) -> object:
         """读取一个未确认 batch，兼容 SDK 的 get/get_without_ack 命名。"""
 
+        # canal-python 0.4 的 ACK 分支调用了不存在的 ``PacketType.Ack``，导致
+        # 服务器返回空批次或错误 ACK 时直接抛出 AttributeError。对该版本暴露的
+        # 原始 Connector 走兼容实现，仍复用 SDK 的 TCP 连接和 protobuf 定义。
+        if _supports_raw_canal_protocol(self._client):
+            return _get_without_ack_v04(self._client, batch_size)
         method = getattr(self._client, "get_without_ack", None)
         if not callable(method):
             method = getattr(self._client, "get", None)
@@ -222,6 +227,100 @@ def _instantiate_sdk_client(
         return factory(host, port)
     except TypeError:
         return factory()
+
+
+def _supports_raw_canal_protocol(client: Any) -> bool:
+    """判断 SDK 是否暴露 canal-python 0.4 的原始 Connector 能力。"""
+
+    connector = getattr(client, "connector", None)
+    return callable(getattr(connector, "write_with_header", None)) and callable(
+        getattr(connector, "read_next_packet", None)
+    )
+
+
+def _get_without_ack_v04(client: Any, batch_size: int) -> object:
+    """绕过 canal-python 0.4 的错误 ACK 枚举，读取一个未确认 batch。"""
+
+    if isinstance(batch_size, bool) or not isinstance(batch_size, int) or batch_size < 1:
+        raise ValueError("batch_size 必须是正整数")
+    CanalProtocol_pb2 = _load_canal_protocol()
+
+    get = CanalProtocol_pb2.Get()
+    get.client_id = getattr(client, "client_id", b"1001")
+    get.destination = getattr(client, "destination", b"")
+    get.auto_ack = False
+    get.fetch_size = batch_size
+    get.timeout = -1
+    get.unit = -1
+
+    packet = CanalProtocol_pb2.Packet()
+    packet.type = _packet_type(CanalProtocol_pb2, "GET")
+    packet.body = get.SerializeToString()
+    connector = client.connector
+    connector.write_with_header(packet.SerializeToString())
+
+    response = CanalProtocol_pb2.Packet()
+    response.MergeFromString(connector.read_next_packet())
+    response_type = int(response.type)
+    if response_type == _packet_type(CanalProtocol_pb2, "MESSAGES"):
+        messages = CanalProtocol_pb2.Messages()
+        messages.MergeFromString(response.body)
+        message: dict[str, object] = {"id": 0, "entries": []}
+        if messages.batch_id > 0:
+            message["id"] = messages.batch_id
+            entries = message["entries"]
+            assert isinstance(entries, list)
+            for item in messages.messages:
+                entries.append(_decode_entry_protocol(item))
+        return message
+    if response_type == _packet_type(CanalProtocol_pb2, "ACK"):
+        ack = CanalProtocol_pb2.Ack()
+        ack.MergeFromString(response.body)
+        if ack.error_code > 0:
+            raise RuntimeError(
+                "Canal GET 返回错误 ACK: "
+                f"error_code={ack.error_code}, error_message={ack.error_message}"
+            )
+        return {"id": 0, "entries": []}
+    raise RuntimeError(f"Canal GET 返回未知 packet type: {response_type}")
+
+
+def _decode_entry_protocol(payload: bytes) -> object:
+    """将 GET 响应中的 Entry bytes 转成 SDK Entry 对象。"""
+
+    EntryProtocol_pb2 = _load_entry_protocol()
+    entry = EntryProtocol_pb2.Entry()
+    entry.MergeFromString(payload)
+    return entry
+
+
+def _packet_type(protocol: Any, name: str) -> int:
+    """兼容旧 protobuf 的模块常量和 EnumTypeWrapper 两种枚举访问方式。"""
+
+    value = getattr(protocol, name, None)
+    if value is None:
+        value = getattr(protocol.PacketType, name)
+    return int(value)
+
+
+def _load_canal_protocol() -> Any:
+    """加载 Canal 控制协议 protobuf，统一转换导入失败信息。"""
+
+    try:
+        from canal.protocol import CanalProtocol_pb2
+    except (ImportError, TypeError, ValueError, AttributeError) as exc:
+        raise CanalSdkUnavailableError("无法加载 Canal Protocol protobuf 定义") from exc
+    return CanalProtocol_pb2
+
+
+def _load_entry_protocol() -> Any:
+    """加载 Canal Entry protobuf，统一转换导入失败信息。"""
+
+    try:
+        from canal.protocol import EntryProtocol_pb2
+    except (ImportError, TypeError, ValueError, AttributeError) as exc:
+        raise CanalSdkUnavailableError("无法加载 Canal Entry protobuf 定义") from exc
+    return EntryProtocol_pb2
 
 
 __all__ = [

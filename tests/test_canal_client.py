@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
 
 from expert_index.cdc import (
@@ -149,3 +151,63 @@ def test_connector_supports_constructor_endpoint_signature() -> None:
     connector.connect()
     connector.subscribe("expert.*")
     assert captured == {"host": "canal.example", "port": 11111, "filter": "expert.*"}
+
+
+def test_connector_handles_sdk_ack_packet_without_old_enum_bug(monkeypatch: pytest.MonkeyPatch) -> None:
+    """兼容 canal-python 0.4 的 ACK 响应，不触发 ``PacketType.Ack`` 异常。"""
+
+    class Packet:
+        def __init__(self) -> None:
+            self.type = 0
+            self.body = b""
+
+        def SerializeToString(self) -> bytes:
+            return b"request"
+
+        def MergeFromString(self, _payload: bytes) -> None:
+            self.type = 3
+            self.body = b"ack"
+
+    class Ack:
+        error_code = 0
+        error_message = ""
+
+        def MergeFromString(self, _payload: bytes) -> None:
+            pass
+
+    class Get:
+        def SerializeToString(self) -> bytes:
+            return b"get"
+
+    Protocol = SimpleNamespace(
+        Packet=Packet,
+        Ack=Ack,
+        Get=Get,
+        GET=6,
+        MESSAGES=7,
+        ACK=3,
+    )
+
+    from expert_index.cdc import client as client_module
+
+    monkeypatch.setattr(client_module, "_load_canal_protocol", lambda: Protocol)
+
+    class RawConnector:
+        def write_with_header(self, _payload: bytes) -> None:
+            pass
+
+        def read_next_packet(self) -> bytes:
+            return b"response"
+
+    class LegacySdkClient:
+        connector = RawConnector()
+        client_id = b"1001"
+        destination = b"company_expert"
+
+    connector = CanalPythonConnector(
+        "canal.example",
+        11111,
+        sdk_client=LegacySdkClient(),
+    )
+
+    assert connector.get_without_ack(10) == {"id": 0, "entries": []}
