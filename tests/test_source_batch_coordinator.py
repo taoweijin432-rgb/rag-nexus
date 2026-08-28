@@ -143,6 +143,14 @@ class FakeSourceStateRepository:
     scan: BatchSourceScan | None = None
     renew_fail_on_call: int | None = None  # 第 N 次 renew 抛异常（1-based）
     renew_calls: list = field(default_factory=list)
+    ensure_calls: list = field(default_factory=list)
+
+    def ensure_source_lease(self, source_table, lease_owner, *, lease_seconds):
+        self.ensure_calls.append((source_table, lease_owner, lease_seconds))
+        # 在测试替身中把首次确认计入续租序列，保持既有冲突脚本的时序语义。
+        self.renew_calls.append((source_table, lease_owner, lease_seconds))
+        if self.renew_fail_on_call is not None and len(self.renew_calls) == self.renew_fail_on_call:
+            raise SourceLeaseConflictError(f"来源表 {source_table} 的扫描 lease 确认失败")
 
     def renew_source_lease(self, source_table, lease_owner, *, lease_seconds):
         self.renew_calls.append((source_table, lease_owner, lease_seconds))

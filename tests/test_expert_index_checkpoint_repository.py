@@ -295,6 +295,74 @@ def test_renew_source_lease_requires_matching_active_owner(
     assert connection.commit_count == 1
 
 
+def test_ensure_source_lease_renews_current_owner_before_execution(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """执行前确认租约时，同一 owner 可续租而不会误判为冲突。"""
+
+    cursor = ScriptedCursor(
+        one_results=[
+            _checkpoint_row(
+                lease_owner="scanner-attempt-1",
+                lease_until=LEASE_UNTIL,
+                lease_is_active=1,
+            ),
+            _checkpoint_row(
+                lease_owner="scanner-attempt-1",
+                lease_until=EXTENDED_LEASE_UNTIL,
+            ),
+        ],
+        rowcounts=[1, 1, 1],
+    )
+    connection = ScriptedConnection(cursor)
+    _patch_connection(monkeypatch, connection)
+
+    checkpoint = _repository().ensure_source_lease(
+        "experts",
+        "scanner-attempt-1",
+        lease_seconds=120,
+    )
+
+    assert checkpoint.lease_until == EXTENDED_LEASE_UNTIL
+    update_sql, update_params = cursor.executed[1]
+    assert "lease_owner=%s" in update_sql
+    assert "OR lease_owner=%s" in update_sql
+    assert update_params == ("scanner-attempt-1", 120, "experts", "scanner-attempt-1")
+    assert connection.commit_count == 1
+
+
+def test_ensure_source_lease_reclaims_expired_owner(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """前一 Worker 的过期租约可被当前 Worker 原子接管。"""
+
+    cursor = ScriptedCursor(
+        one_results=[
+            _checkpoint_row(
+                lease_owner="old-worker",
+                lease_until=LEASE_UNTIL,
+                lease_is_active=0,
+            ),
+            _checkpoint_row(
+                lease_owner="scanner-attempt-1",
+                lease_until=EXTENDED_LEASE_UNTIL,
+            ),
+        ],
+        rowcounts=[1, 1, 1],
+    )
+    connection = ScriptedConnection(cursor)
+    _patch_connection(monkeypatch, connection)
+
+    checkpoint = _repository().ensure_source_lease(
+        "experts",
+        "scanner-attempt-1",
+        lease_seconds=120,
+    )
+
+    assert checkpoint.lease_owner == "scanner-attempt-1"
+    assert connection.commit_count == 1
+
+
 @pytest.mark.parametrize(
     ("persisted_owner", "lease_is_active"),
     [("new-owner", 1), ("scanner-attempt-1", 0)],

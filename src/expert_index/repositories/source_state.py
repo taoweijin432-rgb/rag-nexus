@@ -218,6 +218,62 @@ class MySQLSourceStateRepository:
         finally:
             connection.close()
 
+    def ensure_source_lease(
+        self,
+        source_table: str,
+        lease_owner: str,
+        *,
+        lease_seconds: int,
+    ) -> SourceCheckpoint:
+        """在来源批次开始执行前确保调用方持有有效扫描租约。
+
+        扫描四张表与串行执行之间可能跨越一个短租约周期。若租约仍由当前
+        owner 持有则直接续租；若租约已过期则在同一行锁内重新认领。有效期内
+        属于其他 owner 的租约不会被覆盖。
+        """
+
+        _validate_source_table(source_table)
+        _validate_lease_owner(lease_owner)
+        _validate_lease_seconds(lease_seconds)
+
+        connection = pymysql.connect(**self.config.as_kwargs())
+        try:
+            with connection.cursor() as cursor:
+                locked_row = _lock_source_checkpoint(cursor, source_table)
+                current_owner = locked_row.get("lease_owner")
+                if bool(locked_row["lease_is_active"]) and current_owner != lease_owner:
+                    raise SourceLeaseConflictError(
+                        f"来源表 {source_table} 的扫描 lease 已被其他 owner 占用"
+                    )
+                cursor.execute(
+                    """
+                    UPDATE expert_index_source_checkpoint
+                    SET lease_owner=%s,
+                        lease_until=TIMESTAMPADD(
+                            SECOND, %s, CURRENT_TIMESTAMP(6)
+                        )
+                    WHERE source_table=%s
+                      AND (
+                          lease_until IS NULL
+                          OR lease_until <= CURRENT_TIMESTAMP(6)
+                          OR lease_owner=%s
+                      )
+                    """,
+                    (lease_owner, lease_seconds, source_table, lease_owner),
+                )
+                if cursor.rowcount != 1:
+                    raise SourceLeaseConflictError(
+                        f"来源表 {source_table} 的扫描 lease 确认失败"
+                    )
+                checkpoint = _read_source_checkpoint(cursor, source_table)
+            connection.commit()
+            return checkpoint
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+
     def release_source_lease(
         self,
         source_table: str,

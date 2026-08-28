@@ -2,12 +2,12 @@
 
 职责边界（严格）：
 
-- 只对“一个已经由 P3 scanner 创建好的 Batch Source”做一次受控执行：续租 source
-  lease → 按 ``limit=1`` 逐条 claim task → P4 prepare 或 P5 orchestrator → 累计
+- 只对“一个已经由 P3 scanner 创建好的 Batch Source”做一次受控执行：确认/续租
+  source lease → 按 ``limit=1`` 逐条 claim task → P4 prepare 或 P5 orchestrator → 累计
   结果 → 满足闸门后调用现有 :class:`CheckpointManager.try_commit_source_batch`。
 - **不创建** Batch Source、不创建 Task、不修改 Task 状态、不修改 Batch/计数、
   不推进 Checkpoint（全部由 P3/P5.3A/P5.6 现有实现权威写入）。
-- 只持有受控执行期的 source lease（``renew_source_lease``），提交成功后由
+- 只持有受控执行期的 source lease（``ensure_source_lease``/续租），提交成功后由
   :class:`CheckpointManager` 释放；未提交不自行释放（留待下次执行/超时）。
 - 不解读 ``task.lease_until`` 的时区或与本机时间比较，全部由 Repository 以
   Index MySQL ``CURRENT_TIMESTAMP(6)`` + ``attempt_token`` + rowcount 权威判定。
@@ -101,7 +101,7 @@ class SourceBatchCoordinator:
     :param orchestrator: P5.3B Handoff 编排闭环（validated/contract_ready/handed_off
         恢复入口）。
     :param checkpoint_manager: P3 Checkpoint 提交器（只调 ``try_commit_source_batch``）。
-    :param source_state_repository: P3 Source lease 续租 + BatchSourceScan 读取。
+    :param source_state_repository: P3 Source lease 确认/续租 + BatchSourceScan 读取。
     :param task_repository: P3 Task 领取（``claim_source_sync_tasks``）；与
         :class:`PreparationCoordinator` 共用同一 Repository 实例。
     :param task_lease_seconds: claim/renew task lease 的建议秒数（真正有效性由
@@ -204,9 +204,10 @@ class SourceBatchCoordinator:
         lease_conflict_count = 0
         stop_reason: str | None = None
 
-        # 2) 续租 source lease（首次进入受控执行期）。冲突 → 立即停止，不处理任何 Task。
+        # 2) 确保 source lease（首次进入受控执行期）。扫描与串行执行之间
+        #    可能跨越租约周期；过期时仅允许原子重新认领，不覆盖其他有效 owner。
         try:
-            self._source_state.renew_source_lease(
+            self._source_state.ensure_source_lease(
                 source_table,
                 lease_owner,
                 lease_seconds=self._source_lease_seconds,
