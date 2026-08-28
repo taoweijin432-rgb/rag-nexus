@@ -6,7 +6,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 
@@ -81,12 +81,35 @@ class CanalClientAdapter(CanalClientPort):
             raise CanalParserError("Canal Client 尚未连接")
         if batch_size < 1:
             raise ValueError("batch_size 必须是正整数")
-        batch = self.decoder(self.connector.get_without_ack(batch_size), self.destination)
+        raw = self.connector.get_without_ack(batch_size)
+        try:
+            batch = self.decoder(raw, self.destination)
+        except Exception as error:  # noqa: BLE001 - 解码失败必须释放 Canal 未确认批次。
+            batch_id = _extract_batch_id(raw)
+            if batch_id is not None and batch_id >= 0:
+                try:
+                    self.connector.rollback(batch_id)
+                except Exception as rollback_error:  # noqa: BLE001 - 保留安全失败语义。
+                    raise CanalParserError("Canal batch 解码失败且 rollback 失败") from rollback_error
+            raise error
         if not isinstance(batch, CanalBatch):
             raise CanalParserError("Canal decoder 未返回 CanalBatch")
         if batch.destination != self.destination:
             raise CanalParserError("Canal destination 与配置不一致")
         return batch
+
+
+def _extract_batch_id(raw: object) -> int | None:
+    """从 SDK 原始响应提取 batch id，供解码失败时安全回滚。"""
+
+    if isinstance(raw, Mapping):
+        value = raw.get("id", raw.get("batch_id"))
+    else:
+        value = getattr(raw, "id", getattr(raw, "batch_id", None))
+    try:
+        return None if value is None else int(value)
+    except (TypeError, ValueError):
+        return None
 
     def rollback(self, batch_id: int) -> None:
         """将 batch 回滚到 Canal，交由上层决定何时重试。"""

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import pytest
+
 from expert_index.cdc import (
     CANAL_DESTINATION,
     CanalBatch,
@@ -58,6 +60,24 @@ def test_real_adapter_wraps_sdk_without_auto_ack() -> None:
     assert sdk.calls[0][0] == "connect"
     assert ("get", 10) in sdk.calls
     assert sdk.calls[-1][0] == "disconnect"
+
+
+def test_adapter_rolls_back_when_decoder_fails() -> None:
+    """解码异常时立即回滚原始 batch，避免未确认消息悬挂。"""
+
+    sdk = _SdkClient()
+    client = build_real_canal_client(
+        host="127.0.0.1",
+        port=11111,
+        sdk_client=sdk,
+        decoder=lambda _raw, _destination: (_ for _ in ()).throw(ValueError("bad payload")),
+    )
+
+    client.connect()
+    with pytest.raises(ValueError, match="bad payload"):
+        client.fetch_without_ack(10)
+
+    assert ("rollback", 1) in sdk.calls
 
 
 def test_decoder_maps_dict_message_to_domain_batch() -> None:

@@ -8,6 +8,7 @@ Canal batch_id 只作为 ACK/rollback 句柄，不能直接复用。
 from __future__ import annotations
 
 import math
+import re
 import signal
 import threading
 from collections.abc import Callable
@@ -79,6 +80,7 @@ class CdcWorkerSummary:
     error_count: int
     stop_reason: str
     last_error_type: str | None = None
+    last_error_message: str | None = None
 
 
 class CdcWorker:
@@ -121,6 +123,7 @@ class CdcWorker:
 
         cycles = empty = acked = rolled_back = not_ready = errors = 0
         last_error_type: str | None = None
+        last_error_message: str | None = None
         stop_reason = "stop_requested"
 
         while not self.stop_event.is_set():
@@ -133,16 +136,19 @@ class CdcWorker:
             except Exception as error:  # noqa: BLE001 - 配置错误必须安全停机。
                 errors += 1
                 last_error_type = type(error).__name__
+                last_error_message = _safe_error_message(error)
                 stop_reason = f"terminal_error:{last_error_type}"
                 break
             if isinstance(local_batch_id, bool) or not isinstance(local_batch_id, int):
                 errors += 1
                 last_error_type = "TypeError"
+                last_error_message = "local_batch_id 必须是正整数"
                 stop_reason = "terminal_error:TypeError"
                 break
             if local_batch_id < 1:
                 errors += 1
                 last_error_type = "ValueError"
+                last_error_message = "local_batch_id 必须是正整数"
                 stop_reason = "terminal_error:ValueError"
                 break
             try:
@@ -152,11 +158,13 @@ class CdcWorker:
                 )
             except self._TERMINAL_ERRORS as error:
                 last_error_type = type(error).__name__
+                last_error_message = _safe_error_message(error)
                 stop_reason = f"terminal_error:{last_error_type}"
                 break
             except Exception as error:  # noqa: BLE001 - Worker 需保护服务进程并退避。
                 errors += 1
                 last_error_type = type(error).__name__
+                last_error_message = _safe_error_message(error)
                 if self._wait(self.config.error_sleep_seconds):
                     stop_reason = "stop_requested"
                     break
@@ -182,6 +190,7 @@ class CdcWorker:
             else:  # 防御未来新增状态，避免无等待的忙循环。
                 errors += 1
                 last_error_type = "UnknownCdcBatchStatus"
+                last_error_message = "Worker 收到未支持的 batch 状态"
                 if self._wait(self.config.error_sleep_seconds):
                     stop_reason = "stop_requested"
                     break
@@ -195,7 +204,22 @@ class CdcWorker:
             error_count=errors,
             stop_reason=stop_reason,
             last_error_type=last_error_type,
+            last_error_message=last_error_message,
         )
+
+
+def _safe_error_message(error: Exception) -> str | None:
+    """返回截断脱敏的错误摘要，不保留 Payload、正文或凭据。"""
+
+    message = " ".join(str(error).split())
+    if not message:
+        return None
+    message = re.sub(
+        r"(?i)(password|passwd|token|api[_-]?key|secret)=\S+",
+        r"\1=<redacted>",
+        message,
+    )
+    return message[:300]
 
 
 def install_signal_handlers(stop_event: threading.Event) -> None:

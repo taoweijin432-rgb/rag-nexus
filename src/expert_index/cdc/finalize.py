@@ -255,8 +255,12 @@ class CdcBatchCoordinator:
                 local_batch_id,
                 len(received.receipts),
             )
-
-        if not self._process_tasks(received):
+        try:
+            tasks_ready = self._process_tasks(received)
+        except Exception:
+            _rollback_or_raise(client, batch.batch_id)
+            raise
+        if not tasks_ready:
             _rollback_or_raise(client, batch.batch_id)
             return CdcBatchRunResult(
                 "not_ready",
@@ -264,9 +268,8 @@ class CdcBatchCoordinator:
                 local_batch_id,
                 len(received.receipts),
             )
-
-        request = build_cdc_batch_commit_request(batch, received)
         try:
+            request = build_cdc_batch_commit_request(batch, received)
             checkpoint = self._checkpoint_repository.commit_applied_batch(request)
         except Exception:
             _rollback_or_raise(client, batch.batch_id)

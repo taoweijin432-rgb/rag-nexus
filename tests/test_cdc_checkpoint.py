@@ -184,6 +184,15 @@ class _Processor:
         return HandoffOrchestrationResult("success", True, "disabled", None)
 
 
+class _FailingProcessor:
+    """模拟下游处理阶段抛出未分类异常。"""
+
+    def process_claimed(
+        self, _task: SourceSyncTask, _attempt_token: str
+    ) -> HandoffOrchestrationResult:
+        raise AttributeError("downstream method missing")
+
+
 class _CheckpointRepository:
     """记录原子提交请求并返回固定水位。"""
 
@@ -260,6 +269,23 @@ def test_dead_task_rolls_back_without_checkpoint_or_ack() -> None:
     )
 
     assert result.status == "not_ready"
+    assert checkpoint_repository.requests == []
+    assert client.acks == []
+    assert client.rollbacks == [7]
+
+
+def test_processor_exception_rolls_back_without_checkpoint_or_ack() -> None:
+    """下游异常必须回滚当前 batch，不能留下未确认悬挂。"""
+
+    task_repository = _TaskRepository(_task())
+    checkpoint_repository = _CheckpointRepository()
+    client = _Client()
+    coordinator = _coordinator(task_repository, checkpoint_repository)
+    coordinator._task_processor = _FailingProcessor()  # noqa: SLF001 - 测试故障注入。
+
+    with pytest.raises(AttributeError, match="downstream method missing"):
+        coordinator.consume_once(client, batch_size=100, local_batch_id=88)
+
     assert checkpoint_repository.requests == []
     assert client.acks == []
     assert client.rollbacks == [7]
