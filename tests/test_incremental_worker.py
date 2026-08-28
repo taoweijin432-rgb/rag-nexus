@@ -55,6 +55,9 @@ def test_worker_runs_cycles_and_uses_failure_backoff() -> None:
     assert summary.stop_reason == "max_cycles"
     assert waits == [5, 2]
     assert all(worker_id == "poll-worker" for worker_id, _ in runtime.calls)
+    cycle_ids = [cycle_id for _, cycle_id in runtime.calls]
+    assert len(set(cycle_ids)) == 2
+    assert all(len(cycle_id) == 32 and cycle_id.isalnum() for cycle_id in cycle_ids)
 
 
 def test_worker_retries_runtime_exception() -> None:

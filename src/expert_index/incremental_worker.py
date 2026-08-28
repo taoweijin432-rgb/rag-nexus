@@ -106,7 +106,10 @@ class IncrementalWorker:
             try:
                 result = self.runtime.run_once(
                     self.worker_id,
-                    cycle_id=f"{self.worker_id}:{uuid.uuid4().hex}",
+                    # Scanner 只接受最长 48 位的安全标识；worker_id 另行传递，
+                    # cycle_id 无需重复拼接它。仅使用 UUID hex 可同时保证唯一、
+                    # 长度固定，且不包含被 Scanner 拒绝的冒号。
+                    cycle_id=uuid.uuid4().hex,
                 )
             except Exception as error:  # noqa: BLE001 - 常驻服务需保护进程并退避。
                 error_count += 1
