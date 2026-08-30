@@ -72,7 +72,7 @@ class CanalPythonConnector(CanalConnectorPort):
             )
 
     def connect(self) -> None:
-        """使用当前 Canal endpoint 建立 SDK 连接。"""
+        """使用当前 Canal endpoint 建立连接，并完成旧 SDK 的显式认证。"""
 
         method = getattr(self._client, "connect", None)
         if not callable(method):
@@ -86,6 +86,17 @@ class CanalPythonConnector(CanalConnectorPort):
                 method()
             except TypeError:
                 method(self.host, self.port)
+
+        # canal-python 0.4 将握手和认证拆成 connect/check_valid 两步。即使 Canal
+        # 未配置 TCP 凭据也必须发送空认证包，否则后续订阅包会落在错误协议阶段。
+        check_valid = getattr(self._client, "check_valid", None)
+        if callable(check_valid):
+            username = self.username.encode("utf-8")
+            password = self.password.encode("utf-8")
+            try:
+                check_valid(username=username, password=password)
+            except TypeError:
+                check_valid(username, password)
 
     def disconnect(self) -> None:
         """断开 SDK 连接。"""

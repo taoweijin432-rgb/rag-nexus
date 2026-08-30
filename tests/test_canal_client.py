@@ -153,6 +153,34 @@ def test_connector_supports_constructor_endpoint_signature() -> None:
     assert captured == {"host": "canal.example", "port": 11111, "filter": "expert.*"}
 
 
+def test_connector_authenticates_after_connect_for_canal_python_v04() -> None:
+    """旧 SDK 握手后必须认证，且 TCP 凭据按其 protobuf 接口编码为 bytes。"""
+
+    calls: list[tuple[str, object]] = []
+
+    class Client:
+        def connect(self, *, host: str, port: int) -> None:
+            calls.append(("connect", (host, port)))
+
+        def check_valid(self, *, username: bytes, password: bytes) -> None:
+            calls.append(("check_valid", (username, password)))
+
+    connector = CanalPythonConnector(
+        "canal.example",
+        11111,
+        username="canal-user",
+        password="canal-password",
+        sdk_client=Client(),
+    )
+
+    connector.connect()
+
+    assert calls == [
+        ("connect", ("canal.example", 11111)),
+        ("check_valid", (b"canal-user", b"canal-password")),
+    ]
+
+
 @pytest.mark.parametrize("client_id", ["", "0", "32768", "client-1", " 2001"])
 def test_connector_rejects_client_id_outside_canal_short_range(client_id: str) -> None:
     """Canal 1.1.8 会把 client_id 解析为 Java short，配置必须提前拒绝非法值。"""
@@ -161,7 +189,9 @@ def test_connector_rejects_client_id_outside_canal_short_range(client_id: str) -
         CanalPythonConnector("canal.example", 11111, client_id=client_id, sdk_client=_SdkClient())
 
 
-def test_connector_handles_sdk_ack_packet_without_old_enum_bug(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_connector_handles_sdk_ack_packet_without_old_enum_bug(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """兼容 canal-python 0.4 的 ACK 响应，不触发 ``PacketType.Ack`` 异常。"""
 
     get_fields: dict[str, object] = {}
