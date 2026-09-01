@@ -22,11 +22,7 @@ from typing import Any
 
 from pymilvus.exceptions import MilvusException
 
-from expert_contracts.models import (
-    ContractPreparedChunk,
-    EmbeddedContractPreparedChunk,
-    ExpertChunkEmbeddingInput,
-)
+from expert_contracts.models import ExpertChunkEmbeddingInput
 
 from ..chunking.contract_ingestion import (
     ContractBatchIngestionService,
@@ -39,12 +35,13 @@ from ..chunking.contract_pipeline import (
     ContractValidator,
     EmbeddingEligibilityError,
 )
+from ..core.expert import ExpertContractAdapter
+from ..core.lifecycle import DomainVectorLifecycleService
 from ..embedding_adapters.company_cloud import CompanyCloudEmbeddingError
 from ..milvus.contract_v15 import MilvusV15RowMapper
 from ..milvus.repository import ContractMilvusRepositoryBase
 from ..model_space import (
     FORMAL_EMBEDDING_MODEL_SPACE_ID,
-    build_model_space_id,
 )
 from .errors import (
     VectorContractError,
@@ -123,6 +120,38 @@ def _guard_errors(func):
             raise VectorMilvusError(_safe_message(error)) from error
 
     return wrapper
+
+
+class _GuardedLifecycleRepository:
+    """把专家 Facade 的底层异常分类边界传给通用生命周期核心。"""
+
+    def __init__(self, repository: Any) -> None:
+        self.repository = repository
+
+    def get_by_vector_doc_id(
+        self,
+        vector_doc_id: str,
+        *,
+        include_embedding: bool = True,
+    ) -> dict[str, object] | None:
+        return _guard_call(
+            self.repository.get_by_vector_doc_id,
+            vector_doc_id,
+            include_embedding=include_embedding,
+        )
+
+    def upsert_batch(self, records: Sequence[Any]) -> Any:
+        return _guard_call(self.repository.upsert_batch, records)
+
+
+class _GuardedLifecycleRowMapper:
+    """把行还原失败归类为 Milvus 错误而非调用方 Contract 错误。"""
+
+    def __init__(self, row_mapper: Any) -> None:
+        self.row_mapper = row_mapper
+
+    def from_row(self, row: dict[str, object]) -> Any:
+        return _guard_call(self.row_mapper.from_row, row)
 
 
 def _dedupe(vector_doc_ids: Sequence[str]) -> list[str]:
@@ -229,6 +258,22 @@ class VectorIngestionService:
         self.row_mapper = row_mapper if row_mapper is not None else MilvusV15RowMapper()
         self.expected_dimension = expected_dimension
         self.formal_model_space_id = formal_model_space_id
+        eligibility_validator = getattr(
+            getattr(ingestion_service, "embedding_worker", None),
+            "eligibility_validator",
+            None,
+        )
+        self._adapter = ExpertContractAdapter(
+            self.validator,
+            eligibility_validator,
+        )
+        self._lifecycle = DomainVectorLifecycleService(
+            _GuardedLifecycleRepository(repository),
+            _GuardedLifecycleRowMapper(self.row_mapper),
+            self._adapter,
+            expected_dimension=self.expected_dimension,
+            formal_model_space_id=self.formal_model_space_id,
+        )
 
     # ------------------------------------------------------------------
     # 1. upsert_chunks
@@ -279,30 +324,11 @@ class VectorIngestionService:
         返回的 ``deleted_count`` 语义为"处理后处于下线状态的数量"。
         """
 
-        cleaned = _dedupe(vector_doc_ids)
-        disabled_count = 0
-        not_found_count = 0
-        for vector_doc_id in cleaned:
-            old_row = _guard_call(
-                self.repository.get_by_vector_doc_id,
-                vector_doc_id,
-                include_embedding=True,
-            )
-            if old_row is None:
-                not_found_count += 1
-                continue
-            old_chunk = _guard_call(self.row_mapper.from_row, old_row)
-            if not old_chunk.is_active:
-                # 幂等重放：目标已处于下线状态，不重复写 Milvus。
-                disabled_count += 1
-                continue
-            new_chunk = old_chunk.model_copy(update={"is_active": False})
-            _guard_call(self.repository.upsert_batch, [new_chunk])
-            disabled_count += 1
+        result = self._lifecycle.disable_vectors(vector_doc_ids)
         return VectorDeletionResult(
-            requested_count=len(cleaned),
-            deleted_count=disabled_count,
-            not_found_count=not_found_count,
+            requested_count=result.requested_count,
+            deleted_count=result.deleted_count,
+            not_found_count=result.not_found_count,
         )
 
     @_guard_errors
@@ -387,120 +413,18 @@ class VectorIngestionService:
             6. model_space/dim 安全门失败 → 该条 ``status=failed``、
                ``recommendation="call_upsert"``，不调用 Embedding、不静默降级。
         """
-
-        items: list[VectorItemResult] = []
-        for chunk in chunks:
-            if not isinstance(chunk, ExpertChunkEmbeddingInput):
-                raise VectorContractError(
-                    "update_metadata 只接受 ExpertChunkEmbeddingInput"
-                )
-            vector_doc_id = chunk.vector_doc_id
-            validated = self.validator.validate(chunk)
-
-            old_row = _guard_call(
-                self.repository.get_by_vector_doc_id,
-                vector_doc_id,
-                include_embedding=True,
-            )
-            if old_row is None:
-                items.append(
-                    _failed_item(
-                        vector_doc_id,
-                        "Milvus 实体不存在，无法复用旧向量",
-                    )
-                )
-                continue
-
-            old_chunk = _guard_call(self.row_mapper.from_row, old_row)
-
-            # metadata-only 安全门：本次输入必须与 existing 实体的
-            # vector_doc_id / content_hash / chunk_text 完全一致，否则属于调用方
-            # 误用（正文/主键已变化，不应走 update_metadata）。任一不一致立即
-            # fail-closed 抛 VectorContractError，不静默降级、不自动修正 hash、
-            # 不重新生成 vector_doc_id、不调用 Embedding。
-            metadata_only_error = self._metadata_only_inconsistency_error(
-                validated,
-                old_chunk,
-            )
-            if metadata_only_error is not None:
-                raise VectorContractError(metadata_only_error)
-
-            gate_error = self._metadata_gate_error(old_chunk)
-            if gate_error is not None:
-                items.append(_failed_item(vector_doc_id, gate_error))
-                continue
-
-            new_chunk = EmbeddedContractPreparedChunk(
-                **validated.model_dump(),
-                embedding=old_chunk.embedding,
-                embedding_dim=old_chunk.embedding_dim,
-                embedding_model_alias=old_chunk.embedding_model_alias,
-                embedding_model_version=old_chunk.embedding_model_version,
-                embedded_at=old_chunk.embedded_at,
-            )
-            _guard_call(self.repository.upsert_batch, [new_chunk])
-            items.append(
+        result = self._lifecycle.update_metadata(chunks)
+        return VectorIngestionResult(
+            results=[
                 VectorItemResult(
-                    vector_doc_id=vector_doc_id,
-                    status="metadata_updated",
+                    vector_doc_id=item.vector_doc_id,
+                    status=item.status,
+                    error_message=item.error_message,
+                    recommendation=item.recommendation,
                 )
-            )
-        return VectorIngestionResult(results=items)
-
-    @staticmethod
-    def _metadata_only_inconsistency_error(
-        validated: ContractPreparedChunk,
-        old_chunk: EmbeddedContractPreparedChunk,
-    ) -> str | None:
-        """校验本次输入是否为 metadata-only 更新，返回失败原因（None 表示通过）。
-
-        ``update_metadata`` 复用旧向量，禁止任何正文 / 主键变化；任一不一致
-        属于调用方误用，应改走 ``upsert_chunks`` 重新 Embedding。
-        """
-
-        if validated.vector_doc_id != old_chunk.vector_doc_id:
-            return (
-                f"update_metadata 只允许 metadata-only 更新；vector_doc_id 不一致 "
-                f"(input={validated.vector_doc_id!r}, "
-                f"existing={old_chunk.vector_doc_id!r})；"
-                "正文/主键变化必须走 upsert_chunks 并重新 Embedding"
-            )
-        if validated.content_hash != old_chunk.content_hash:
-            return (
-                "update_metadata 只允许 metadata-only 更新；content_hash 不一致 "
-                f"(input={validated.content_hash[:12]!r}, "
-                f"existing={old_chunk.content_hash[:12]!r})；"
-                "正文变化必须走 upsert_chunks 并重新 Embedding"
-            )
-        if validated.chunk_text != old_chunk.chunk_text:
-            return (
-                "update_metadata 只允许 metadata-only 更新；chunk_text 不一致；"
-                "正文变化必须走 upsert_chunks 并重新 Embedding"
-            )
-        return None
-
-    def _metadata_gate_error(
-        self,
-        old_chunk: EmbeddedContractPreparedChunk,
-    ) -> str | None:
-        """校验 metadata-only 安全门，返回失败原因（None 表示通过）。"""
-
-        old_space = build_model_space_id(
-            model_alias=old_chunk.embedding_model_alias,
-            dimension=old_chunk.embedding_dim,
-            model_version=old_chunk.embedding_model_version,
+                for item in result.results
+            ]
         )
-        if old_space != self.formal_model_space_id:
-            return (
-                f"旧向量 model_space 不一致: {old_space} != "
-                f"{self.formal_model_space_id}"
-            )
-        if old_chunk.embedding_dim != self.expected_dimension:
-            return (
-                f"旧向量 embedding_dim 不一致: {old_chunk.embedding_dim} != "
-                f"{self.expected_dimension}"
-            )
-        return None
 
     # ------------------------------------------------------------------
     # 5. list_vectors_by_expert
@@ -538,20 +462,6 @@ def _make_item_from_batch_item(item: Any) -> VectorItemResult:
         vector_doc_id=item.vector_doc_id,
         status="skipped",
         error_message=item.skip_reason,
-    )
-
-
-def _failed_item(
-    vector_doc_id: str,
-    message: str,
-) -> VectorItemResult:
-    """构造 metadata-only 安全门失败的公共结果。"""
-
-    return VectorItemResult(
-        vector_doc_id=vector_doc_id,
-        status="failed",
-        error_message=message,
-        recommendation="call_upsert",
     )
 
 

@@ -1,0 +1,177 @@
+"""不绑定业务领域的 Embedding Worker。"""
+
+from __future__ import annotations
+
+import math
+from collections.abc import Callable, Iterable, Sequence
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from numbers import Real
+from typing import Any, Generic, TypeVar
+
+from ..embedding import EmbeddingModel
+from .adapters import VectorContractAdapter
+
+PreparedT = TypeVar("PreparedT")
+EmbeddedT = TypeVar("EmbeddedT")
+InputT = TypeVar("InputT")
+
+
+@dataclass(frozen=True)
+class DomainSkippedVector:
+    """合法但不进入 Embedding 的领域记录。"""
+
+    vector_doc_id: str
+    reason: str
+
+
+@dataclass(frozen=True)
+class DomainEmbeddingResult(Generic[PreparedT, EmbeddedT]):
+    """通用 Worker 输出。"""
+
+    embedded_chunks: list[EmbeddedT]
+    skipped_chunks: list[DomainSkippedVector]
+
+    @property
+    def eligible_count(self) -> int:
+        return len(self.embedded_chunks)
+
+    @property
+    def skipped_count(self) -> int:
+        return len(self.skipped_chunks)
+
+
+class DomainEmbeddingWorker(Generic[InputT, PreparedT, EmbeddedT]):
+    """只依赖领域 Adapter 的批量 Embedding 编排。"""
+
+    def __init__(
+        self,
+        embedding_model: EmbeddingModel,
+        adapter: VectorContractAdapter[InputT, PreparedT, EmbeddedT],
+        *,
+        embedding_model_alias: str | None = None,
+        embedding_model_version: str | None = None,
+        expected_dimension: int = 1024,
+        clock: Callable[[], datetime] | None = None,
+    ) -> None:
+        if isinstance(expected_dimension, bool) or not isinstance(expected_dimension, int):
+            raise ValueError("expected_dimension 必须是正整数")  # noqa: TRY004
+        if expected_dimension < 1:
+            raise ValueError("expected_dimension 必须是正整数")
+        self.embedding_model = embedding_model
+        self.adapter = adapter
+        self.embedding_model_alias = embedding_model_alias or _required_model_text(
+            embedding_model, "model_alias"
+        )
+        self.embedding_model_version = embedding_model_version or _required_model_text(
+            embedding_model, "model_version"
+        )
+        self.expected_dimension = expected_dimension
+        self.clock = clock or _utc_now
+
+    def embed(
+        self,
+        records: Iterable[InputT],
+    ) -> DomainEmbeddingResult[PreparedT, EmbeddedT]:
+        """校验、筛选并批量向量化，只发送领域 Adapter 提供的正文。"""
+
+        eligible: list[PreparedT] = []
+        skipped: list[DomainSkippedVector] = []
+        for record in records:
+            if not self.adapter.is_input(record):
+                raise TypeError("输入记录不属于当前领域 Contract")
+            prepared = self.adapter.validate(record)
+            if not self.adapter.is_prepared(prepared):
+                raise TypeError("Contract Adapter 返回了非法 Prepared Contract")
+            reason = self.adapter.skip_reason(prepared)
+            if reason is None:
+                eligible.append(prepared)
+            else:
+                skipped.append(
+                    DomainSkippedVector(
+                        vector_doc_id=self.adapter.vector_doc_id(prepared),
+                        reason=reason,
+                    )
+                )
+
+        if not eligible:
+            return DomainEmbeddingResult(embedded_chunks=[], skipped_chunks=skipped)
+
+        texts = [self.adapter.chunk_text(record) for record in eligible]
+        raw_embeddings = list(self.embedding_model.embed(texts))
+        if len(raw_embeddings) != len(eligible):
+            raise ValueError("Embedding 返回数量与符合资格的输入记录数量不一致")
+
+        embedded_at = _format_embedded_at(self.clock())
+        embedded: list[EmbeddedT] = []
+        for prepared, raw_embedding in zip(eligible, raw_embeddings):
+            embedding = _validate_embedding(
+                raw_embedding,
+                expected_dimension=self.expected_dimension,
+                vector_doc_id=self.adapter.vector_doc_id(prepared),
+            )
+            item = self.adapter.attach_embedding(
+                prepared,
+                embedding,
+                embedding_model_alias=self.embedding_model_alias,
+                embedding_model_version=self.embedding_model_version,
+                embedded_at=embedded_at,
+            )
+            if not self.adapter.is_embedded(item):
+                raise TypeError("Contract Adapter 返回了非法 Embedded Contract")
+            embedded.append(item)
+        return DomainEmbeddingResult(
+            embedded_chunks=embedded,
+            skipped_chunks=skipped,
+        )
+
+
+def _required_model_text(model: Any, name: str) -> str:
+    value = getattr(model, name, None)
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"Embedding model 缺少合法的 {name}")
+    return value
+
+
+def _validate_embedding(
+    raw_embedding: Sequence[float],
+    *,
+    expected_dimension: int,
+    vector_doc_id: str,
+) -> list[float]:
+    if isinstance(raw_embedding, (str, bytes)):
+        raise TypeError(f"Embedding 返回的向量类型非法: {vector_doc_id}")
+    vector: list[float] = []
+    for value in raw_embedding:
+        if isinstance(value, bool) or not isinstance(value, Real):
+            raise TypeError(f"Embedding 向量元素类型非法: {vector_doc_id}")
+        number = float(value)
+        if not math.isfinite(number):
+            raise ValueError(f"Embedding 向量包含非有限数值: {vector_doc_id}")
+        vector.append(number)
+    if len(vector) != expected_dimension:
+        raise ValueError(
+            f"Embedding dimension mismatch for {vector_doc_id!r}: "
+            f"expected {expected_dimension}, got {len(vector)}"
+        )
+    return vector
+
+
+def _format_embedded_at(value: datetime) -> str:
+    if not isinstance(value, datetime):
+        raise TypeError("clock 必须返回 datetime")
+    aware = value
+    if aware.tzinfo is None or aware.utcoffset() is None:
+        aware = aware.replace(tzinfo=timezone.utc)
+    return aware.isoformat(timespec="microseconds")
+
+
+def _utc_now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+__all__ = [
+    "DomainEmbeddingResult",
+    "DomainEmbeddingWorker",
+    "DomainSkippedVector",
+]

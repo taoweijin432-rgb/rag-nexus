@@ -8,12 +8,10 @@
 from __future__ import annotations
 
 import hashlib
-import math
 import re
-from collections.abc import Callable, Iterable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from numbers import Real
 from typing import Any
 
 from pydantic import ValidationError
@@ -25,6 +23,8 @@ from expert_contracts.models import (
     ExpertChunkEmbeddingInput,
 )
 
+from ..core.embedding import DomainEmbeddingWorker
+from ..core.expert import ExpertContractAdapter
 from ..embedding import EmbeddingModel
 from ..milvus.schemas.contract_v15 import v15_milvus_field_specs
 
@@ -342,6 +342,16 @@ class ContractEmbeddingWorker:
             eligibility_validator or EmbeddingEligibilityValidator()
         )
         self.clock = clock or _utc_now
+        # 专家入口保留原有公开属性和结果模型；实际校验、资格判断、Embedding
+        # 与回填委托给不绑定领域的核心，未来领域只需提供自己的 Adapter。
+        self._domain_worker = DomainEmbeddingWorker(
+            embedding_model,
+            ExpertContractAdapter(self.validator, self.eligibility_validator),
+            embedding_model_alias=self.embedding_model_alias,
+            embedding_model_version=self.embedding_model_version,
+            expected_dimension=self.expected_dimension,
+            clock=self.clock,
+        )
 
     def embed(
         self,
@@ -371,60 +381,16 @@ class ContractEmbeddingWorker:
             - 模型返回数量/维度/有限性在构造输出对象前 fail-closed 校验。
         """
 
-        eligible: list[ContractPreparedChunk] = []
-        skipped: list[SkippedContractChunk] = []
-        for record in records:
-            prepared = self.validator.validate(record)
-            reason = self.eligibility_validator.get_skip_reason(prepared)
-            if reason is None:
-                eligible.append(prepared)
-            else:
-                skipped.append(
-                    SkippedContractChunk(
-                        vector_doc_id=prepared.vector_doc_id, reason=reason
-                    )
-                )
-
-        # 没有 eligible 记录时不触碰外部 Embedding 服务，保证 inactive/不合格
-        # 输入不会产生无意义调用或成本。
-        if not eligible:
-            return ContractEmbeddingResult(
-                embedded_chunks=[],
-                skipped_chunks=skipped,
-            )
-
-        # Embedding 的语义输入严格只有 chunk_text；Metadata、Source、Versions
-        # 在 Milvus 行映射中保存，不能拼接进文本导致向量语义和过滤字段耦合。
-        texts = [record.chunk_text for record in eligible]
-        raw_embeddings = list(self.embedding_model.embed(texts))
-        if len(raw_embeddings) != len(eligible):
-            raise ValueError(
-                "Embedding 返回数量与符合资格的输入记录数量不一致"
-            )
-
-        embedded_at = _format_embedded_at(self.clock())
-        embedded: list[EmbeddedContractPreparedChunk] = []
-        # zip 保持 Reader/模型返回顺序一一对应；数量已在上方检查，避免静默错配。
-        for record, raw_embedding in zip(eligible, raw_embeddings):
-            embedding = _validate_embedding(
-                raw_embedding,
-                expected_dimension=self.expected_dimension,
-                vector_doc_id=record.vector_doc_id,
-            )
-            embedded.append(
-                EmbeddedContractPreparedChunk(
-                    **record.model_dump(),
-                    embedding=embedding,
-                    embedding_dim=len(embedding),
-                    embedding_model_alias=self.embedding_model_alias,
-                    embedding_model_version=self.embedding_model_version,
-                    embedded_at=embedded_at,
-                )
-            )
-
+        result = self._domain_worker.embed(records)
         return ContractEmbeddingResult(
-            embedded_chunks=embedded,
-            skipped_chunks=skipped,
+            embedded_chunks=result.embedded_chunks,
+            skipped_chunks=[
+                SkippedContractChunk(
+                    vector_doc_id=item.vector_doc_id,
+                    reason=item.reason,
+                )
+                for item in result.skipped_chunks
+            ],
         )
 
 
@@ -516,46 +482,6 @@ def compare_contract_output_schema(
     }
 
 
-def _validate_embedding(
-    raw_embedding: Sequence[float],
-    *,
-    expected_dimension: int,
-    vector_doc_id: str,
-) -> list[float]:
-    """校验单条向量的类型、有限性和固定维度。
-
-    模型 API 的响应不视为可信 Contract；这里在构造输出对象前再次拒绝字符串、
-    bool、NaN/Infinity、空向量和错误维度，避免非法值进入 Milvus。
-    """
-
-    if isinstance(raw_embedding, (str, bytes)) or not isinstance(
-        raw_embedding,
-        Sequence,
-    ):
-        raise TypeError(f"vector_doc_id {vector_doc_id!r} 的 embedding 必须是数值序列")
-    if not raw_embedding:
-        raise ValueError(f"vector_doc_id {vector_doc_id!r} 的 embedding 不能为空")
-
-    embedding: list[float] = []
-    for value in raw_embedding:
-        if isinstance(value, bool) or not isinstance(value, Real):
-            raise TypeError(
-                f"vector_doc_id {vector_doc_id!r} 的 embedding 元素必须是数值"
-            )
-        number = float(value)
-        if not math.isfinite(number):
-            raise ValueError(
-                f"vector_doc_id {vector_doc_id!r} 的 embedding 包含 NaN 或 Infinity"
-            )
-        embedding.append(number)
-    if len(embedding) != expected_dimension:
-        raise ValueError(
-            f"vector_doc_id {vector_doc_id!r} 的 embedding dimension 不匹配: "
-            f"expected {expected_dimension}, got {len(embedding)}"
-        )
-    return embedding
-
-
 def _required_model_text(model: EmbeddingModel, attribute: str) -> str:
     """从模型读取非空别名或版本，不猜测正式版本值。"""
 
@@ -563,14 +489,6 @@ def _required_model_text(model: EmbeddingModel, attribute: str) -> str:
     if not isinstance(value, str) or not value.strip():
         raise ValueError(f"必须显式提供 embedding_{attribute}")
     return value.strip()
-
-
-def _format_embedded_at(value: datetime) -> str:
-    """把带时区时间转换为 ISO 8601 字符串。"""
-
-    if value.tzinfo is None or value.utcoffset() is None:
-        raise ValueError("embedded_at 时钟必须返回带时区 datetime")
-    return value.isoformat()
 
 
 def _utc_now() -> datetime:

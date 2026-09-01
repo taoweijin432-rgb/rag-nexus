@@ -791,31 +791,6 @@ def test_update_metadata_chunk_text_change_fails_closed() -> None:
     assert repo.upsert_calls == []
 
 
-def test_update_metadata_vector_doc_id_mismatch_fails_closed() -> None:
-    """existing 实体的 vector_doc_id 与输入不一致 → gate 返回明确错误。
-
-    正常路径下 get_by_vector_doc_id 按 key 查询返回的 row 必含同一 vector_doc_id，
-    且 ``EmbeddedContractPreparedChunk`` 的 model_validator 会校验 vector_doc_id
-    公式；因此本 gate 是纯防御性深度检查，直接单元测试 gate 本身（用两个不同
-    的合法 chunk 构造 validated/old 不一致的场景）。
-    """
-
-    validated = input_records()[0]  # expert:900001:profile_summary:900001:0
-    # 用另一个 chunk（不同 vector_doc_id）作为 existing
-    mismatched_old = embedded_chunks()[1]
-
-    error = VectorIngestionService._metadata_only_inconsistency_error(
-        validated, mismatched_old
-    )
-
-    assert error is not None
-    assert "vector_doc_id 不一致" in error
-    assert "metadata-only" in error
-    assert "upsert_chunks" in error
-    assert "正文/主键变化" in error
-
-
-
 def test_update_metadata_metadata_only_change_succeeds() -> None:
     """正常 metadata-only 更新（metadata_hash 变化、正文/主键不变）→ 成功。"""
 

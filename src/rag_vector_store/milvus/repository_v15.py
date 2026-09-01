@@ -53,6 +53,7 @@ from typing import Any
 
 from expert_contracts.models import EmbeddedContractPreparedChunk
 
+from ..core.expert import ExpertContractAdapter
 from .compatibility import compare_model_space
 from .contract_v15 import MilvusV15RowMapper
 from .indexes import index_specs_v15
@@ -93,6 +94,13 @@ class ContractMilvusV15VectorRepository(ContractMilvusRepositoryBase):
     # 不使用 metadata JSON path（如 metadata["embedding_dim"]）做全库 filter。
     _full_scan_filter = 'vector_doc_id != ""'
     _model_space_fields = ("metadata",)
+    _contract_adapter_cls = ExpertContractAdapter
+    _owner_field = "expert_id"
+    _vector_doc_id_prefix = "expert:"
+    _owner_filter_fn = staticmethod(
+        lambda owner_id: f'metadata["expert_id"] == {int(owner_id)}'
+    )
+    _owner_output_fields = ("vector_doc_id",)
 
     def _model_space_from_row(
         self,

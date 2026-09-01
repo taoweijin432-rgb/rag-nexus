@@ -28,10 +28,9 @@ from __future__ import annotations
 
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
-from typing import Protocol
+from typing import Any, Protocol
 
-from expert_contracts.models import ExpertChunkEmbeddingInput
-
+from ..core.adapters import VectorConsumerContractAdapter
 from ..ingestion.errors import (
     VectorContractError,
     VectorIngestionError,
@@ -95,13 +94,13 @@ class VectorMutationPort(Protocol):
     """
 
     def upsert_chunks(
-        self, chunks: Sequence[ExpertChunkEmbeddingInput]
+        self, chunks: Sequence[Any]
     ) -> VectorIngestionResult:
         """正式 Chunk 向量化并写入 Milvus。"""
         ...
 
     def update_metadata(
-        self, chunks: Sequence[ExpertChunkEmbeddingInput]
+        self, chunks: Sequence[Any]
     ) -> VectorIngestionResult:
         """metadata-only 更新（复用旧向量，零 Embedding）。"""
         ...
@@ -124,7 +123,7 @@ class VectorMutationPort(Protocol):
 class AdaptedContract:
     """适配产物：完整正式契约 + Eligibility 预判（None 表示允许 Embedding）。"""
 
-    contract: ExpertChunkEmbeddingInput
+    contract: Any
     eligibility_skip_reason: str | None = None
 
 
@@ -136,7 +135,7 @@ class ContractUpsertIntent:
     本核心不改写、不重算哈希。
     """
 
-    contract: ExpertChunkEmbeddingInput
+    contract: Any
     eligibility_skip_reason: str | None = None
     stale_vector_doc_ids: tuple[str, ...] = ()
     source_event_id: int | None = None
@@ -213,6 +212,7 @@ def resolve_winner_indices(
     下标映射到其所属的最终胜者下标。兼容入口与核心共用本实现。
     """
 
+
     def _rank(index: int) -> tuple[int, int]:
         event = keys[index][1]
         return (event if event is not None else -1, index)
@@ -230,6 +230,47 @@ def resolve_winner_indices(
         else:
             mapping[index] = best[vector_doc_id]
     return mapping
+
+
+class _AttributeContractAdapter:
+    """默认兼容适配器：只读取标准 Contract 属性，不绑定任何领域类型。"""
+
+    def vector_doc_id(self, value: object) -> str:
+        result = getattr(value, "vector_doc_id", None)
+        if not isinstance(result, str) or not result:
+            raise TypeError("Contract 缺少合法 vector_doc_id")
+        return result
+
+    def content_hash(self, value: object) -> str:
+        return value.content_hash  # type: ignore[attr-defined]
+
+    def metadata_hash(self, value: object) -> str:
+        return value.metadata_hash  # type: ignore[attr-defined]
+
+    def source_hash(self, value: object) -> str | None:
+        source = getattr(value, "source", None)
+        result = getattr(source, "source_hash", None)
+        return result if isinstance(result, str) else None
+
+    def skip_reason(self, value: object) -> str | None:
+        return None
+
+
+class _AdapterEligibilityBinding:
+    """把可选 Eligibility 函数和领域 Adapter 绑定到原有单一回调槽。"""
+
+    def __init__(
+        self,
+        adapter: VectorConsumerContractAdapter,
+        callback: Callable[[Any], str | None] | None,
+    ) -> None:
+        self.adapter = adapter
+        self.callback = callback
+
+    def __call__(self, value: Any) -> str | None:
+        if self.callback is not None:
+            return self.callback(value)
+        return self.adapter.skip_reason(value)
 
 
 def duplicate_superseded_result(
@@ -379,11 +420,24 @@ class ContractConsumerCore:
         *,
         vector_store: VectorMutationPort,
         event_order: SourceEventOrderView | None = None,
-        eligibility_skip_of: Callable[[ExpertChunkEmbeddingInput], str | None] | None = None,
+        eligibility_skip_of: Callable[[Any], str | None] | None = None,
+        contract_adapter: VectorConsumerContractAdapter | None = None,
     ) -> None:
         self._vector_store = vector_store
         self._event_order = event_order
-        self._eligibility_skip_of = eligibility_skip_of
+        self._eligibility_skip_of = (
+            _AdapterEligibilityBinding(contract_adapter, eligibility_skip_of)
+            if contract_adapter is not None
+            else eligibility_skip_of
+        )
+
+    @property
+    def _contract_adapter(self) -> VectorConsumerContractAdapter:
+        """读取本实例绑定的 Adapter；默认使用兼容的属性访问适配器。"""
+
+        callback = self._eligibility_skip_of
+        adapter = getattr(callback, "adapter", None)
+        return adapter if adapter is not None else _AttributeContractAdapter()
 
     # ------------------------------------------------------------------
     # 批量入口
@@ -417,7 +471,7 @@ class ContractConsumerCore:
 
     def process_contracts(
         self,
-        contracts: Sequence[ExpertChunkEmbeddingInput],
+        contracts: Sequence[Any],
         *,
         plan_only: bool = False,
     ) -> list[ExecutionResult]:
@@ -556,7 +610,7 @@ class ContractConsumerCore:
     def _handle_upsert_like(
         self,
         *,
-        contract: ExpertChunkEmbeddingInput,
+        contract: Any,
         op: ConsumerOperation,
         eligibility_skip_reason: str | None,
         stale_ids: tuple[str, ...],
@@ -574,7 +628,8 @@ class ContractConsumerCore:
         查询；普通 upsert 路径两者取默认值自行查询。
         """
 
-        vid = contract.vector_doc_id
+        adapter = self._contract_adapter
+        vid = adapter.vector_doc_id(contract)
         actions.append(CONSUMER_ACTION_ADAPT_UPSERT)
 
         # Eligibility 不通过 → 逻辑下线目标集合（不是 skip、不 Embedding）。
@@ -612,9 +667,9 @@ class ContractConsumerCore:
 
         mode = self._decide_text_mode(
             preloaded_state,
-            contract.content_hash,
-            contract.metadata_hash,
-            contract.source.source_hash,
+            adapter.content_hash(contract),
+            adapter.metadata_hash(contract),
+            adapter.source_hash(contract),
         )
         result = self._execute_text_plan(
             contract=contract,
@@ -637,7 +692,7 @@ class ContractConsumerCore:
         state: _ExistingVectorState | None,
         content_hash: str,
         metadata_hash: str,
-        source_hash: str,
+        source_hash: str | None,
     ) -> str:
         """差分判定：embedding_upsert / metadata_only_update / skip_unchanged。
 
@@ -676,7 +731,7 @@ class ContractConsumerCore:
     def _execute_text_plan(
         self,
         *,
-        contract: ExpertChunkEmbeddingInput,
+        contract: Any,
         mode: str,
         actions: list[str],
         plan_only: bool,
@@ -686,7 +741,7 @@ class ContractConsumerCore:
 
         if plan_only:
             return ExecutionResult(
-                vector_doc_id=contract.vector_doc_id,
+                vector_doc_id=self._contract_adapter.vector_doc_id(contract),
                 operation=op,
                 status="planned",
                 reason="plan_only：仅生成执行计划，未触发任何写入",
@@ -695,7 +750,7 @@ class ContractConsumerCore:
 
         if mode == CONSUMER_ACTION_SKIP_UNCHANGED:
             return ExecutionResult(
-                vector_doc_id=contract.vector_doc_id,
+                vector_doc_id=self._contract_adapter.vector_doc_id(contract),
                 operation=op,
                 status="skipped",
                 result_code=RESULT_CODE_UNCHANGED_SKIPPED,
@@ -709,7 +764,7 @@ class ContractConsumerCore:
                 outcome = self._run_metadata_only(contract)
             except VectorIngestionError as error:
                 return ExecutionResult(
-                    vector_doc_id=contract.vector_doc_id,
+                    vector_doc_id=self._contract_adapter.vector_doc_id(contract),
                     operation=op,
                     status="failed",
                     reason=f"metadata_update_infra_failed：{error}",
@@ -719,7 +774,7 @@ class ContractConsumerCore:
                 )
             if outcome == "updated":
                 return ExecutionResult(
-                    vector_doc_id=contract.vector_doc_id,
+                    vector_doc_id=self._contract_adapter.vector_doc_id(contract),
                     operation=op,
                     status="committed",
                     result_code=RESULT_CODE_METADATA_UPDATED,
@@ -732,7 +787,7 @@ class ContractConsumerCore:
                 # → 确定性拒绝。绝不降级重新 Embedding、绝不复用不匹配旧向量、
                 # 绝不修改 Milvus；retryable=False（非基础设施抖动）。
                 return ExecutionResult(
-                    vector_doc_id=contract.vector_doc_id,
+                    vector_doc_id=self._contract_adapter.vector_doc_id(contract),
                     operation=op,
                     status="rejected",
                     reason=(
@@ -745,7 +800,7 @@ class ContractConsumerCore:
                 )
             # outcome == "inconsistent"：确定性不一致 → rejected。
             return ExecutionResult(
-                vector_doc_id=contract.vector_doc_id,
+                vector_doc_id=self._contract_adapter.vector_doc_id(contract),
                 operation=op,
                 status="rejected",
                 reason="metadata_only_inconsistent：与已存实体的主键/正文/hash 不一致",
@@ -756,7 +811,7 @@ class ContractConsumerCore:
         actions.append(CONSUMER_ACTION_EMBEDDING_UPSERT)
         return self._run_embedding_upsert(contract=contract, actions=tuple(actions), op=op)
 
-    def _run_metadata_only(self, contract: ExpertChunkEmbeddingInput) -> str:
+    def _run_metadata_only(self, contract: Any) -> str:
         """调用 update_metadata；返回 updated / gate_blocked / inconsistent。
 
         两类失败严格区分（对齐 VectorIngestionService 的分层语义）：
@@ -783,7 +838,7 @@ class ContractConsumerCore:
     def _run_embedding_upsert(
         self,
         *,
-        contract: ExpertChunkEmbeddingInput,
+        contract: Any,
         actions: tuple[str, ...],
         op: ConsumerOperation,
     ) -> ExecutionResult:
@@ -793,7 +848,7 @@ class ContractConsumerCore:
             result = self._vector_store.upsert_chunks([contract])
         except VectorContractError as error:
             return ExecutionResult(
-                vector_doc_id=contract.vector_doc_id,
+                vector_doc_id=self._contract_adapter.vector_doc_id(contract),
                 operation=op,
                 status="rejected",
                 reason=f"upsert_contract_failed：{error}",
@@ -802,7 +857,7 @@ class ContractConsumerCore:
             )
         except VectorIngestionError as error:
             return ExecutionResult(
-                vector_doc_id=contract.vector_doc_id,
+                vector_doc_id=self._contract_adapter.vector_doc_id(contract),
                 operation=op,
                 status="failed",
                 reason=f"upsert_infra_failed：{error}",
@@ -813,7 +868,7 @@ class ContractConsumerCore:
         entry = result.results[0]
         if entry.status == "embedded":
             return ExecutionResult(
-                vector_doc_id=contract.vector_doc_id,
+                vector_doc_id=self._contract_adapter.vector_doc_id(contract),
                 operation=op,
                 status="committed",
                 result_code=RESULT_CODE_EMBEDDED,
@@ -824,7 +879,7 @@ class ContractConsumerCore:
         if entry.status == "skipped":
             # 防御分支：正常链路已在 Eligibility 预判中拦截，不应触达。
             return ExecutionResult(
-                vector_doc_id=contract.vector_doc_id,
+                vector_doc_id=self._contract_adapter.vector_doc_id(contract),
                 operation=op,
                 status="skipped",
                 result_code=RESULT_CODE_UPSERT_SKIPPED,
@@ -832,7 +887,7 @@ class ContractConsumerCore:
                 actions=actions,
             )
         return ExecutionResult(
-            vector_doc_id=contract.vector_doc_id,
+            vector_doc_id=self._contract_adapter.vector_doc_id(contract),
             operation=op,
             status="failed",
             reason=f"upsert_unexpected_status：{entry.status}",

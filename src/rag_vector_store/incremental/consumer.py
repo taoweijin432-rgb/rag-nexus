@@ -53,19 +53,6 @@ from .contract_adapter import (
 )
 from .models import V15VectorizationWorkItem
 
-# 供既有 ``from rag_vector_store.incremental.consumer import ...`` 用法兼容。
-__core_exports__ = [
-    "AdaptedContract",
-    "ContractConsumerCore",
-    "ContractDisableInput",
-    "ContractMetadataUpdateIntent",
-    "ContractSynthesisError",
-    "ContractUpsertIntent",
-    "PreRejectedInput",
-    "SourceEventOrderView",
-    "VectorMutationPort",
-]
-
 
 class WorkItemAdapterPort(Protocol):
     """Work Item → Contract 适配器端口（生产注入 Phase 2 薄适配器）。"""
@@ -240,10 +227,6 @@ class V15WorkItemConsumer:
             )
 
         return build
-
-
-_ = WorkItemAdapterPort  # 协议仅作静态类型用途
-
 
 __all__ = [
     "AdaptedContract",

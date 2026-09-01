@@ -400,7 +400,7 @@ def test_v15_from_row_supports_update_metadata_fields() -> None:
     restored = MilvusV15RowMapper().from_row(
         MilvusV15RowMapper().to_row(chunk)
     )
-    # 安全门所需字段（_metadata_gate_error / EmbeddedContractPreparedChunk 重建）
+    # 生命周期安全门所需字段（EmbeddedContractPreparedChunk 重建）
     assert restored.embedding
     assert restored.embedding_dim == 1024
     assert restored.embedding_model_alias == "alibaba-bailian:text-embedding-v4"

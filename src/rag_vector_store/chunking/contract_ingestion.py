@@ -16,11 +16,13 @@ from expert_contracts.models import (
     ExpertChunkEmbeddingInput,
 )
 
+from ..core.embedding import DomainEmbeddingResult, DomainSkippedVector
+from ..core.expert import ExpertContractAdapter
+from ..core.ingestion import DomainIngestionError, DomainIngestionService
 from ..models import MutationResult
 from .contract_pipeline import (
     ContractEmbeddingResult,
     ContractEmbeddingWorker,
-    SkippedContractChunk,
 )
 
 __all__ = [
@@ -31,6 +33,47 @@ __all__ = [
     "ContractIngestionService",
     "ContractRepository",
 ]
+
+
+class _ExpertEmbeddingPort:
+    """把专家兼容 Worker 的结果转换为通用核心结果。"""
+
+    def __init__(self, worker: object) -> None:
+        self.worker = worker
+
+    def embed(
+        self,
+        records: Iterable[ExpertChunkEmbeddingInput],
+    ) -> DomainEmbeddingResult[object, EmbeddedContractPreparedChunk]:
+        result = self.worker.embed(records)  # type: ignore[attr-defined]
+        if not isinstance(result, ContractEmbeddingResult):
+            raise ContractIngestionError("Worker 返回了非法 ContractEmbeddingResult")
+        return DomainEmbeddingResult(
+            embedded_chunks=result.embedded_chunks,
+            skipped_chunks=[
+                DomainSkippedVector(
+                    vector_doc_id=item.vector_doc_id,
+                    reason=item.reason,
+                )
+                for item in result.skipped_chunks
+            ],
+        )
+
+
+def _expert_adapter(worker: object) -> ExpertContractAdapter:
+    """从专家 Worker 取出其校验器，兼容编排层测试替身。"""
+
+    validator = getattr(worker, "validator", None)
+    eligibility = getattr(worker, "eligibility_validator", None)
+    if validator is None:
+        from .contract_pipeline import ContractValidator
+
+        validator = ContractValidator()
+    if eligibility is None:
+        from .contract_pipeline import EmbeddingEligibilityValidator
+
+        eligibility = EmbeddingEligibilityValidator()
+    return ExpertContractAdapter(validator, eligibility)
 
 
 class ContractRepository(Protocol):
@@ -181,6 +224,11 @@ class ContractIngestionService:
     ) -> None:
         self.embedding_worker = embedding_worker
         self.repository = repository
+        self._domain_ingestion = DomainIngestionService(
+            _ExpertEmbeddingPort(embedding_worker),
+            repository,
+            _expert_adapter(embedding_worker),
+        )
 
     def ingest_one(
         self,
@@ -191,9 +239,8 @@ class ContractIngestionService:
         调用链：
             ingest_one(record)
             -> embedding_worker.embed([record])            # 校验 + Eligibility + 向量化
-            -> _single_worker_result(record, result)       # 拒绝空/多结果与身份错配
+            -> DomainIngestionService                   # 结果对齐与一致性校验
             -> repository.upsert_batch([embedded])         # 单条写入 Milvus
-            -> _validate_repository_result(embedded, ...)  # affected_count/PK 一致
             -> ContractIngestionResult
 
         分支：
@@ -203,83 +250,16 @@ class ContractIngestionService:
             - fail-closed：Worker/Repository 结果身份或数量不一致时抛异常。
         """
 
-        if not isinstance(record, ExpertChunkEmbeddingInput):
-            raise TypeError("ingest_one 只接受 ExpertChunkEmbeddingInput")
-
-        # Validator、Eligibility 和 Embedding 统一由 Worker 执行，避免这里重复调用。
-        embedding_result = self.embedding_worker.embed([record])
-        embedded, skipped = self._single_worker_result(record, embedding_result)
-        if skipped is not None:
-            # skipped 是合法结果：记录结构没问题，只是当前不进入正式向量索引。
-            return ContractIngestionResult(
-                status="skipped",
-                vector_doc_id=record.vector_doc_id,
-                skip_reason=skipped.reason,
-            )
-
-        if embedded is None:  # 由 _single_worker_result 保证，仅用于保护未来修改。
-            raise ContractIngestionError("Worker 未返回 embedded 或 skipped 结果")
-
-        # 正式 Milvus Repository 内部负责 Schema gate、RowMapper 和 upsert。
-        mutation = self.repository.upsert_batch([embedded])
-        self._validate_repository_result(embedded, mutation)
+        try:
+            result = self._domain_ingestion.ingest_one(record)
+        except DomainIngestionError as exc:
+            raise ContractIngestionError(str(exc)) from exc
         return ContractIngestionResult(
-            status="embedded",
-            vector_doc_id=embedded.vector_doc_id,
-            affected_count=mutation.affected_count,
+            status=result.status,
+            vector_doc_id=result.vector_doc_id,
+            affected_count=result.affected_count,
+            skip_reason=result.skip_reason,
         )
-
-    @staticmethod
-    def _single_worker_result(
-        record: ExpertChunkEmbeddingInput,
-        result: ContractEmbeddingResult,
-    ) -> tuple[EmbeddedContractPreparedChunk | None, SkippedContractChunk | None]:
-        """拒绝 Worker 的空结果、多结果或记录身份错配。
-
-        单条入口必须以 ``vector_doc_id`` 对齐 Worker 输出：无论 embedded 还是
-        skipped，输出主键必须与输入一致，否则不能继续（fail-closed）。
-        """
-
-        if not isinstance(result, ContractEmbeddingResult):
-            raise ContractIngestionError("Worker 返回了非法 ContractEmbeddingResult")
-
-        embedded_count = len(result.embedded_chunks)
-        skipped_count = len(result.skipped_chunks)
-        if embedded_count + skipped_count != 1:
-            raise ContractIngestionError(
-                "单条 ingestion 必须得到且只能得到一个 embedded 或 skipped 结果"
-            )
-
-        if embedded_count == 1:
-            embedded = result.embedded_chunks[0]
-            if not isinstance(embedded, EmbeddedContractPreparedChunk):
-                raise ContractIngestionError("Worker 返回了非法 embedded Contract")
-            if embedded.vector_doc_id != record.vector_doc_id:
-                raise ContractIngestionError("Worker 返回的 vector_doc_id 与输入不一致")
-            return embedded, None
-
-        skipped = result.skipped_chunks[0]
-        if not isinstance(skipped, SkippedContractChunk):
-            raise ContractIngestionError("Worker 返回了非法 skipped Contract")
-        if skipped.vector_doc_id != record.vector_doc_id:
-            raise ContractIngestionError(
-                "Worker 返回的 skipped vector_doc_id 与输入不一致"
-            )
-        return None, skipped
-
-    @staticmethod
-    def _validate_repository_result(
-        embedded: EmbeddedContractPreparedChunk,
-        mutation: MutationResult,
-    ) -> None:
-        """确保 Repository 的单条 mutation 结果与向量主键一致。"""
-
-        if not isinstance(mutation, MutationResult):
-            raise ContractIngestionError("Repository 返回了非法 MutationResult")
-        if mutation.affected_count != 1:
-            raise ContractIngestionError("单条 Contract upsert 的 affected_count 必须是 1")
-        if mutation.primary_keys != [embedded.vector_doc_id]:
-            raise ContractIngestionError("Repository 返回的 primary_keys 与 vector_doc_id 不一致")
 
 
 class ContractBatchIngestionService:
@@ -294,11 +274,9 @@ class ContractBatchIngestionService:
         但尚未经过消费端 Validator / Eligibility / Embedding。
 
     主要调用：
-        1. ``authenticate_validate_input_records``（批量输入检查）
-        2. ``ContractEmbeddingWorker.embed(items)``（一次向量化全部 eligible）
-        3. ``validate_worker_result``（结果全覆盖与身份对齐）
-        4. ``ContractRepository.upsert_batch(embedded)``（单次批量写入 Milvus）
-        5. ``validate_repository_result``（affected_count/primary_keys 一致）
+        1. ``ContractEmbeddingWorker.embed(items)``（一次向量化全部 eligible）
+        2. ``DomainIngestionService``（结果全覆盖与身份对齐）
+        3. ``ContractRepository.upsert_batch(embedded)``（单次批量写入 Milvus）
 
     输出：
         ``ContractBatchIngestionResult`` —— results（逐条 embedded/skipped）+
@@ -325,6 +303,11 @@ class ContractBatchIngestionService:
     ) -> None:
         self.embedding_worker = embedding_worker
         self.repository = repository
+        self._domain_ingestion = DomainIngestionService(
+            _ExpertEmbeddingPort(embedding_worker),
+            repository,
+            _expert_adapter(embedding_worker),
+        )
 
     def ingest_batch(
         self,
@@ -334,11 +317,10 @@ class ContractBatchIngestionService:
 
         调用链：
             ingest_batch(records)
-            -> _validate_input_records(items)              # 类型 + 批内去重
+            -> DomainIngestionService                   # 类型 + 批内去重
             -> embedding_worker.embed(items)               # 校验/Eligibility/向量化
-            -> _validate_worker_result(items, result)      # 全覆盖 + 身份对齐
+            -> DomainIngestionService                   # 全覆盖 + 身份对齐
             -> repository.upsert_batch(embedded)           # 单次批量写入
-            -> _validate_repository_result(embedded, ...)  # 数量/PK 一致
             -> ContractBatchIngestionResult
 
         分支：
@@ -348,120 +330,21 @@ class ContractBatchIngestionService:
               时整批抛出异常。
         """
 
-        items = list(records)
-        self._validate_input_records(items)
-        embedding_result = self.embedding_worker.embed(items)
-        embedded, skipped = self._validate_worker_result(items, embedding_result)
-
-        affected_count = 0
-        if embedded:
-            mutation = self.repository.upsert_batch(embedded)
-            self._validate_repository_result(embedded, mutation)
-            affected_count = mutation.affected_count
-
-        embedded_by_vid = {item.vector_doc_id: item for item in embedded}
-        skipped_by_vid = {item.vector_doc_id: item for item in skipped}
-        results: list[ContractIngestionResult] = []
-        for item in items:
-            embedded_item = embedded_by_vid.get(item.vector_doc_id)
-            if embedded_item is not None:
-                results.append(
-                    ContractIngestionResult(
-                        status="embedded",
-                        vector_doc_id=item.vector_doc_id,
-                        affected_count=1,
-                    )
-                )
-                continue
-
-            skipped_item = skipped_by_vid.get(item.vector_doc_id)
-            if skipped_item is None:
-                # _validate_worker_result 已保证全覆盖，此处仅防御未来修改。
-                raise ContractIngestionError(
-                    f"Worker 结果缺少输入 vector_doc_id: {item.vector_doc_id}"
-                )
-            results.append(
-                ContractIngestionResult(
-                    status="skipped",
-                    vector_doc_id=item.vector_doc_id,
-                    skip_reason=skipped_item.reason,
-                )
-            )
-
+        try:
+            result = self._domain_ingestion.ingest_batch(records)
+        except DomainIngestionError as exc:
+            raise ContractIngestionError(str(exc)) from exc
         return ContractBatchIngestionResult(
-            results=results,
-            embedded_count=len(embedded),
-            skipped_count=len(skipped),
-            affected_count=affected_count,
+            results=[
+                ContractIngestionResult(
+                    status=item.status,
+                    vector_doc_id=item.vector_doc_id,
+                    affected_count=item.affected_count,
+                    skip_reason=item.skip_reason,
+                )
+                for item in result.results
+            ],
+            embedded_count=result.embedded_count,
+            skipped_count=result.skipped_count,
+            affected_count=result.affected_count,
         )
-
-    @staticmethod
-    def _validate_input_records(
-        records: Sequence[ExpertChunkEmbeddingInput],
-    ) -> None:
-        """在调用 Worker 前拒绝非 Contract 和重复批次主键（vector_doc_id）。"""
-
-        if not all(isinstance(item, ExpertChunkEmbeddingInput) for item in records):
-            raise TypeError("ingest_batch 只接受 ExpertChunkEmbeddingInput")
-
-        vector_doc_ids = [item.vector_doc_id for item in records]
-        if len(vector_doc_ids) != len(set(vector_doc_ids)):
-            raise ContractIngestionError("一个批次不能包含重复 vector_doc_id")
-
-    @staticmethod
-    def _validate_worker_result(
-        records: Sequence[ExpertChunkEmbeddingInput],
-        result: ContractEmbeddingResult,
-    ) -> tuple[
-        list[EmbeddedContractPreparedChunk],
-        list[SkippedContractChunk],
-    ]:
-        """确保 Worker 返回的结果完整覆盖输入且不发生身份错配。"""
-
-        if not isinstance(result, ContractEmbeddingResult):
-            raise ContractIngestionError("Worker 返回了非法 ContractEmbeddingResult")
-
-        embedded = result.embedded_chunks
-        skipped = result.skipped_chunks
-        if len(embedded) + len(skipped) != len(records):
-            raise ContractIngestionError("批量 ingestion 返回结果数量与输入不一致")
-        if any(
-            not isinstance(item, EmbeddedContractPreparedChunk) for item in embedded
-        ):
-            raise ContractIngestionError("Worker 返回了非法 embedded Contract")
-        if any(not isinstance(item, SkippedContractChunk) for item in skipped):
-            raise ContractIngestionError("Worker 返回了非法 skipped Contract")
-
-        input_vids = {item.vector_doc_id for item in records}
-        result_vids = [item.vector_doc_id for item in embedded] + [
-            item.vector_doc_id for item in skipped
-        ]
-        if len(result_vids) != len(set(result_vids)):
-            raise ContractIngestionError("Worker 返回了重复 vector_doc_id")
-        if set(result_vids) != input_vids:
-            missing = sorted(input_vids - set(result_vids))
-            extra = sorted(set(result_vids) - input_vids)
-            raise ContractIngestionError(
-                f"Worker 返回的 vector_doc_id 与输入不一致 "
-                f"(missing={missing}, extra={extra})"
-            )
-        return embedded, skipped
-
-    @staticmethod
-    def _validate_repository_result(
-        embedded: Sequence[EmbeddedContractPreparedChunk],
-        mutation: MutationResult,
-    ) -> None:
-        """确保一次批量 mutation 完整覆盖所有已向量化记录。"""
-
-        if not isinstance(mutation, MutationResult):
-            raise ContractIngestionError("Repository 返回了非法 MutationResult")
-        if mutation.affected_count != len(embedded):
-            raise ContractIngestionError(
-                "批量 Contract upsert 的 affected_count 与 embedded 数量不一致"
-            )
-        expected_ids = [item.vector_doc_id for item in embedded]
-        if mutation.primary_keys != expected_ids:
-            raise ContractIngestionError(
-                "Repository 返回的 primary_keys 与 embedded 记录不一致"
-            )

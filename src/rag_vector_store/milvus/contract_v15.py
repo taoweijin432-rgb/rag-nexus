@@ -47,6 +47,7 @@ from expert_contracts.models import (
     metadata_model_for_chunk_type,
 )
 
+from ..core.flat_metadata import merge_flat_metadata
 from .schemas.contract_v15 import (
     V15_CONTRACT_VECTOR_DIMENSION,
     V15_VECTOR_DOC_ID_MAX_BYTES,
@@ -291,26 +292,11 @@ def _merge_flat_metadata(
         - ``null`` / ``[]`` / Decimal 字符串 / ISO 8601 字符串原样保留。
     """
 
-    merged: dict[str, object] = {}
-    origin_of: dict[str, str] = {}
-    for origin, mapping in parts:
-        for key, value in mapping.items():
-            if key in merged:
-                raise ValueError(
-                    f"V15 flat metadata key 冲突: {key!r} 同时来自 "
-                    f"{origin_of[key]} 与 {origin}，禁止覆盖"
-                )
-            if key in _V15_PHYSICAL_KEYS:
-                raise ValueError(
-                    f"V15 一级字段 {key!r} 不得重复出现在 flat metadata JSON"
-                )
-            if key in _V15_NAMESPACE_KEYS:
-                raise ValueError(
-                    f"V15 flat metadata 禁止 namespace 键 {key!r}"
-                )
-            merged[key] = value
-            origin_of[key] = origin
-    return merged
+    return merge_flat_metadata(
+        parts,
+        physical_keys=_V15_PHYSICAL_KEYS,
+        namespace_keys=_V15_NAMESPACE_KEYS,
+    )
 
 
 def _pick_flat_fields(

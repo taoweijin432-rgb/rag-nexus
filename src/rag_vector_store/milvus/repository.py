@@ -19,17 +19,13 @@ builder、索引集合、RowMapper、全量扫描 filter、模型空间字段）
 from __future__ import annotations
 
 import json
-import math
 from collections.abc import Mapping, Sequence
-from numbers import Real
 from threading import Lock
 from typing import Any
 
-from expert_contracts.models import EmbeddedContractPreparedChunk
-
 from ..config import MilvusSettings
 from ..model_space import is_placeholder_model_version
-from ..models import MutationResult, SearchHit
+from ..models import MutationResult
 from .compatibility import (
     compare_contract_indexes as compare_contract_indexes_definition,
 )
@@ -49,6 +45,11 @@ _REQUIRED_PROFILE_ATTRS = (
     "_row_mapper_cls",
     "_full_scan_filter",
     "_model_space_fields",
+    "_contract_adapter_cls",
+    "_owner_field",
+    "_vector_doc_id_prefix",
+    "_owner_filter_fn",
+    "_owner_output_fields",
 )
 
 
@@ -85,8 +86,10 @@ class ContractMilvusRepositoryBase:
     持久化 profile：
         本基类不携带任何物理 Schema 默认值；子类必须整体提供
         ``_schema_field_specs`` / ``_schema_builder`` / ``_index_specs_fn`` /
-        ``_row_mapper_cls`` / ``_full_scan_filter`` / ``_model_space_fields``
-        六个类属性（见 ``__init_subclass__``），禁止在方法内部按版本分支。
+        ``_row_mapper_cls`` / ``_full_scan_filter`` / ``_model_space_fields`` /
+        ``_contract_adapter_cls`` / ``_owner_field`` / ``_vector_doc_id_prefix`` /
+        ``_owner_filter_fn`` / ``_owner_output_fields`` 全部类属性（见
+        ``__init_subclass__``），禁止在方法内部按版本分支。
     """
 
     def __init_subclass__(cls, **kwargs: Any) -> None:
@@ -122,6 +125,7 @@ class ContractMilvusRepositoryBase:
         self._owns_client = client is None
         self._allow_collection_creation = allow_collection_creation
         self._contract_row_mapper = self._row_mapper_cls()
+        self._contract_adapter = self._contract_adapter_cls()
         self._lock = Lock()
         # 模型空间一致性缓存：同一 Repository 生命周期内，同一个
         # (embedding_model_alias, embedding_model_version, embedding_dim) 只校验
@@ -349,7 +353,7 @@ class ContractMilvusRepositoryBase:
 
     def upsert_batch(
         self,
-        records: Sequence[EmbeddedContractPreparedChunk],
+        records: Sequence[Any],
     ) -> MutationResult:
         """按 Contract 主键 upsert 一批已经完成向量化的记录。
 
@@ -385,10 +389,10 @@ class ContractMilvusRepositoryBase:
         items = list(records)
         if not items:
             return MutationResult(affected_count=0)
-        if not all(isinstance(item, EmbeddedContractPreparedChunk) for item in items):
-            raise TypeError(
-                "ContractMilvusRepositoryBase 只接受 EmbeddedContractPreparedChunk"
-            )
+        if not all(self._contract_adapter.is_embedded(item) for item in items):
+            raise TypeError("ContractMilvusRepositoryBase 只接受当前 Profile 的 Embedded Contract")
+
+        self._validate_identity_profile(items)
 
         self._ensure_dimension_from_records(items)
         self._validate_batch_model_space(items)
@@ -487,51 +491,28 @@ class ContractMilvusRepositoryBase:
             raise TypeError("Milvus query 返回了非法 Entity 结构")
         return dict(rows[0])
 
-    def query_by_expert_id(
+    def query_by_owner_id(
         self,
-        expert_id: int,
+        owner_id: Any,
         *,
         output_fields: Sequence[str] | None = None,
     ) -> list[dict[str, object]]:
-        """按 ``expert_id`` 查询该专家的全部向量记录（默认不含 embedding）。
-
-        语义：
-            - 基于标量字段 ``expert_id`` 过滤（INT64 索引字段），分页遍历全部匹配行。
-            - 默认只返回最小字段集 ``vector_doc_id`` / ``expert_id`` /
-              ``content_hash`` / ``metadata_hash``，供上游做残留差集判断；
-              不返回 embedding，避免大字段拉取。
-            - 调用方可通过 ``output_fields`` 显式扩展返回字段。
-
-        Args:
-            expert_id: 专家 ID（INT64）。
-            output_fields: 要返回的字段；默认最小字段集。
-
-        Returns:
-            list[dict[str, object]]：按查询顺序返回每行的字段字典。
-        """
-
-        if isinstance(expert_id, bool) or not isinstance(expert_id, int):
-            raise ValueError(  # noqa: TRY004
-                "expert_id 必须是整数"
-            )
-        if expert_id < 1:
-            raise ValueError("expert_id 必须是正整数")
+        """按当前 Profile 的 owner 字段查询全部向量记录。"""
 
         fields = list(
             output_fields
             if output_fields is not None
-            else ["vector_doc_id", "expert_id", "content_hash", "metadata_hash"]
+            else self._owner_output_fields
         )
         if not fields or any(
             not isinstance(field, str) or not field.strip() for field in fields
         ):
             raise ValueError("output_fields 必须是非空字符串序列")
-
         iterator = self._get_client().query_iterator(
             collection_name=self.settings.collection_name,
             batch_size=1000,
             limit=-1,
-            filter=f"expert_id == {int(expert_id)}",
+            filter=self._owner_filter_fn(owner_id),
             output_fields=fields,
             consistency_level="Strong",
             **self._timeout_kwargs(),
@@ -543,7 +524,7 @@ class ContractMilvusRepositoryBase:
                 if not isinstance(batch, list) or not all(
                     isinstance(row, Mapping) for row in batch
                 ):
-                    raise TypeError("Milvus expert_id iterator 返回了非法 Entity 批次")
+                    raise TypeError("Milvus owner iterator 返回了非法 Entity 批次")
                 if not batch:
                     break
                 rows.extend(dict(row) for row in batch)
@@ -646,53 +627,13 @@ class ContractMilvusRepositoryBase:
         *,
         limit: int = 3,
         chunk_type: str | None = None,
-    ) -> list[SearchHit]:
-        """执行 Contract Collection 基础向量检索，并转换为 ``SearchHit``。
+    ) -> list[Any]:
+        """由具体 Repository Profile 实现领域相关的检索结果映射。"""
 
-        输入向量会先做有限数值检查并锁定维度，过滤条件只允许当前基础的
-        ``chunk_type`` 等值表达式；原始 SDK 结果不会直接泄漏到业务层。
-        """
-
-        if isinstance(limit, bool) or not isinstance(limit, int) or limit < 1:
-            raise ValueError("limit 必须是正整数")
-        if chunk_type is not None and (
-            not isinstance(chunk_type, str) or not chunk_type.strip()
-        ):
-            raise ValueError("chunk_type 必须是非空字符串或 None")
-
-        vector = _normalize_search_embedding(embedding)
-        self._set_vector_dimension(len(vector))
-        self.initialize(len(vector))
-
-        filter_expression = ""
-        if chunk_type is not None:
-            filter_expression = (
-                "chunk_type == "
-                f"'{_escape_milvus_string_literal(chunk_type)}'"
-            )
-
-        response = self._get_client().search(
-            collection_name=self.settings.collection_name,
-            data=[vector],
-            anns_field="embedding",
-            filter=filter_expression,
-            limit=limit,
-            output_fields=[
-                "vector_doc_id",
-                "expert_id",
-                "chunk_type",
-                "chunk_text",
-            ],
-            search_params=self._search_params(limit),
-            consistency_level="Strong",
-            **self._timeout_kwargs(),
+        del embedding, limit, chunk_type
+        raise NotImplementedError(
+            "当前 Repository Profile 未提供领域相关 search 实现"
         )
-        if not isinstance(response, list) or len(response) != 1:
-            raise TypeError("Milvus search 返回结果必须包含一个 query 结果列表")
-        hits = response[0]
-        if not isinstance(hits, list):
-            raise TypeError("Milvus search 的 query 结果必须是列表")
-        return [_to_search_hit(hit) for hit in hits]
 
     def close(self) -> None:
         """关闭由当前 Repository 创建的 PyMilvus client。
@@ -743,37 +684,33 @@ class ContractMilvusRepositoryBase:
 
     def _ensure_dimension_from_records(
         self,
-        records: Sequence[EmbeddedContractPreparedChunk],
+        records: Sequence[Any],
     ) -> None:
-        self._set_vector_dimension(len(records[0].embedding))
+        self._set_vector_dimension(len(self._contract_adapter.embedding(records[0])))
         for record in records:
-            if len(record.embedding) != self._vector_dimension:
+            dimension = len(self._contract_adapter.embedding(record))
+            if dimension != self._vector_dimension:
                 raise ValueError(
-                    f"embedding dimension mismatch for chunk {record.vector_doc_id!r}: "
-                    f"expected {self._vector_dimension}, got {len(record.embedding)}"
+                    f"embedding dimension mismatch for chunk "
+                    f"{self._contract_adapter.vector_doc_id(record)!r}: "
+                    f"expected {self._vector_dimension}, got {dimension}"
                 )
 
-    @staticmethod
     def _validate_batch_model_space(
-        records: Sequence[EmbeddedContractPreparedChunk],
+        self,
+        records: Sequence[Any],
     ) -> None:
         """在任何 Collection 操作前拒绝批内混用模型空间。"""
 
-        first = records[0]
-        if is_placeholder_model_version(first.embedding_model_version):
+        model_spaces = [self._contract_adapter.model_space(record) for record in records]
+        first_model_space = model_spaces[0]
+        if is_placeholder_model_version(first_model_space["embedding_model_version"]):
             raise ValueError("正式 Contract 写入禁止使用 embedding_model_version=dev-unknown")
         difference = compare_model_space(
-            [
-                {
-                    "embedding_model_alias": record.embedding_model_alias,
-                    "embedding_model_version": record.embedding_model_version,
-                    "embedding_dim": record.embedding_dim,
-                }
-                for record in records
-            ],
-            embedding_model_alias=first.embedding_model_alias,
-            embedding_model_version=first.embedding_model_version,
-            embedding_dimension=first.embedding_dim,
+            model_spaces,
+            embedding_model_alias=first_model_space["embedding_model_alias"],
+            embedding_model_version=first_model_space["embedding_model_version"],
+            embedding_dimension=first_model_space["embedding_dim"],
         )
         if not difference.compatible:
             raise ValueError(
@@ -783,7 +720,7 @@ class ContractMilvusRepositoryBase:
 
     def _validate_existing_model_space(
         self,
-        record: EmbeddedContractPreparedChunk,
+        record: Any,
     ) -> None:
         """在 upsert 前分批遍历已有 Entity，确认 Collection 模型空间一致。
 
@@ -795,11 +732,7 @@ class ContractMilvusRepositoryBase:
         重新扫描。
         """
 
-        requested = {
-            "embedding_model_alias": record.embedding_model_alias,
-            "embedding_model_version": record.embedding_model_version,
-            "embedding_dim": record.embedding_dim,
-        }
+        requested = self._contract_adapter.model_space(record)
         if self._validated_model_space == requested:
             return
 
@@ -823,9 +756,9 @@ class ContractMilvusRepositoryBase:
                     break
                 difference = compare_model_space(
                     [self._model_space_from_row(row) for row in rows],
-                    embedding_model_alias=record.embedding_model_alias,
-                    embedding_model_version=record.embedding_model_version,
-                    embedding_dimension=record.embedding_dim,
+                    embedding_model_alias=requested["embedding_model_alias"],
+                    embedding_model_version=requested["embedding_model_version"],
+                    embedding_dimension=requested["embedding_dim"],
                 )
                 if not difference.compatible:
                     raise ValueError(
@@ -855,11 +788,6 @@ class ContractMilvusRepositoryBase:
 
     def _build_schema(self, vector_dimension: int | None) -> Any:
         """构造 profile 指定的 Contract Schema，不修改任何已有 Collection。"""
-
-        return self._schema_builder(self.settings, vector_dimension)
-
-    def _build_contract_schema(self, vector_dimension: int | None) -> Any:
-        """保留内部构建入口，实际使用 profile 指定的 Contract Schema。"""
 
         return self._schema_builder(self.settings, vector_dimension)
 
@@ -897,39 +825,51 @@ class ContractMilvusRepositoryBase:
 
     def _to_rows(
         self,
-        records: Sequence[EmbeddedContractPreparedChunk],
+        records: Sequence[Any],
     ) -> list[dict[str, Any]]:
         """在交给 SDK 前统一执行批次主键检查和 Contract 行映射。"""
 
         self._validate_batch_ids(records)
         return self._contract_row_mapper.to_rows(records)
 
-    @staticmethod
     def _validate_batch_ids(
-        records: Sequence[EmbeddedContractPreparedChunk],
+        self,
+        records: Sequence[Any],
     ) -> None:
-        ids = [record.vector_doc_id for record in records]
+        ids = [self._contract_adapter.vector_doc_id(record) for record in records]
         if len(ids) != len(set(ids)):
             raise ValueError("一个 mutation batch 不能包含重复的主键")
 
     def _primary_keys(
         self,
-        records: Sequence[EmbeddedContractPreparedChunk],
+        records: Sequence[Any],
     ) -> list[str]:
-        return [record.vector_doc_id for record in records]
+        return [self._contract_adapter.vector_doc_id(record) for record in records]
+
+    def _validate_identity_profile(self, records: Sequence[Any]) -> None:
+        """验证 owner、Metadata 和主键前缀属于同一个 Repository Profile。"""
+
+        owner_field = self._owner_field
+        prefix = self._vector_doc_id_prefix
+        if self._contract_adapter.owner_field() != owner_field:
+            raise ValueError("Contract Adapter 与 Repository Profile 的 owner 字段不一致")
+        if self._contract_adapter.id_prefix() != prefix:
+            raise ValueError("Contract Adapter 与 Repository Profile 的 vector_doc_id 前缀不一致")
+        for record in records:
+            vector_doc_id = self._contract_adapter.vector_doc_id(record)
+            if not vector_doc_id.startswith(prefix):
+                raise ValueError(
+                    f"vector_doc_id {vector_doc_id!r} 不符合当前 Profile 前缀 {prefix!r}"
+                )
+            owner_id = self._contract_adapter.owner_id(record)
+            metadata = self._contract_adapter.metadata(record)
+            if metadata.get(owner_field) != owner_id:
+                raise ValueError(
+                    f"Embedded Contract 的 owner 字段 {owner_field!r} 与 owner_id 不一致"
+                )
 
     def _timeout_kwargs(self) -> dict[str, Any]:
         return {} if self.settings.timeout is None else {"timeout": self.settings.timeout}
-
-    def _search_params(self, limit: int) -> dict[str, object]:
-        """构造当前开发索引可用的最小 search 参数。"""
-
-        params: dict[str, object] = {
-            "metric_type": self.settings.metric_type.upper(),
-        }
-        if self.settings.index_type.upper() == "HNSW":
-            params["params"] = {"ef": max(64, limit)}
-        return params
 
 
 def _mutation_result(
@@ -987,46 +927,3 @@ def _delete_count(response: Any) -> int:
     if count < 0:
         raise ValueError("Milvus delete_count 不能为负数")
     return count
-
-
-def _normalize_search_embedding(embedding: Sequence[float]) -> list[float]:
-    """校验并复制 search 输入向量，避免把可变输入直接传给 SDK。"""
-
-    if isinstance(embedding, (str, bytes)):
-        raise TypeError("embedding 必须是数值序列")
-
-    vector: list[float] = []
-    for value in embedding:
-        if isinstance(value, bool) or not isinstance(value, Real):
-            raise TypeError("embedding 元素必须是数值")
-        number = float(value)
-        if not math.isfinite(number):
-            raise ValueError("embedding 元素必须是有限数值")
-        vector.append(number)
-    if not vector:
-        raise ValueError("embedding 不能为空")
-    return vector
-
-
-def _escape_milvus_string_literal(value: str) -> str:
-    """转义等值过滤中的字符串字面量。"""
-
-    return value.replace("\\", "\\\\").replace("'", "\\'")
-
-
-def _to_search_hit(raw_hit: object) -> SearchHit:
-    """将 PyMilvus 的单条 search 结果转换为稳定的 SearchHit。"""
-
-    if not isinstance(raw_hit, Mapping):
-        raise TypeError("Milvus search 单条结果必须是映射结构")
-
-    raw_entity = raw_hit.get("entity")
-    entity: Mapping[str, Any] = raw_entity if isinstance(raw_entity, Mapping) else raw_hit
-    payload = {
-        "vector_doc_id": entity.get("vector_doc_id", raw_hit.get("id")),
-        "expert_id": entity.get("expert_id"),
-        "chunk_type": entity.get("chunk_type"),
-        "chunk_text": entity.get("chunk_text"),
-        "score": raw_hit.get("distance", raw_hit.get("score")),
-    }
-    return SearchHit.model_validate(payload)
