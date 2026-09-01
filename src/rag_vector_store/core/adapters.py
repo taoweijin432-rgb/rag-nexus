@@ -86,21 +86,6 @@ class VectorContractAdapter(Protocol[InputT, PreparedT, EmbeddedT]):
 
         ...
 
-    def source(self, value: EmbeddedT) -> dict[str, object]:
-        """返回可存储的 Source 映射。"""
-
-        ...
-
-    def versions(self, value: EmbeddedT) -> dict[str, object]:
-        """返回可存储的 Versions 映射。"""
-
-        ...
-
-    def from_embedded_row(self, row: dict[str, object]) -> EmbeddedT:
-        """从领域 Collection 行还原 Embedded Contract。"""
-
-        ...
-
     def with_active(self, value: EmbeddedT, is_active: bool) -> EmbeddedT:
         """只改变生命周期激活标记，保留原向量及其它字段。"""
 
@@ -123,11 +108,6 @@ class VectorContractAdapter(Protocol[InputT, PreparedT, EmbeddedT]):
 
     def text_and_identity_equal(self, left: object, right: object) -> bool:
         """判断 metadata-only 更新所需的正文和身份是否完全一致。"""
-
-        ...
-
-    def identity(self, value: object) -> str:
-        """返回通用核心使用的稳定身份键。"""
 
         ...
 

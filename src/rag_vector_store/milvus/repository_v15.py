@@ -23,11 +23,11 @@ V15 物理 Schema（4 字段，dynamic=False）：
     metadata       JSON（单层 flat，其余全部 Contract 信息，
                    含 expert_id / content_hash / metadata_hash）
 
-所有 CRUD 统一通过 ``vector_doc_id`` 定位：
+所有在线写入与查询统一通过 ``vector_doc_id`` 定位：
     - upsert：直接使用传入 Contract 的 ``vector_doc_id``（不生成 / 不重算）；
     - update_metadata：按 ``vector_doc_id`` 读旧 Entity → 保留原 embedding →
       重建 chunk_text/metadata → 同 PK upsert（不重新 Embedding）；
-    - delete / get：按 PK ``vector_doc_id``。
+    - disable / get：按 PK ``vector_doc_id``；Repository 不提供物理删除。
 
 ``query_by_expert_id`` 是迁移期兼容路径（``expert_index`` 仍依赖
 ``list_vectors_by_expert(expert_id)``）：V15 通过 flat metadata JSON path
@@ -41,8 +41,8 @@ Embedding、Task State；不创建真实 Collection（是否创建由调用方�
 ``allow_collection_creation`` 决定）；不修改 .env；不迁移真实数据。
 
 检索（``search``）暂未接通：V15 没有一级 ``chunk_type`` / ``expert_id`` 过滤
-字段（已进入 metadata JSON），检索语义需要单独设计，本任务不进入检索功能，
-调用直接抛 ``NotImplementedError``。
+字段（已进入 metadata JSON），检索语义需要单独设计，本任务不进入检索功能。
+``supports_search`` 明确为 False，调用会抛 ``NotImplementedError``。
 """
 
 from __future__ import annotations
@@ -54,6 +54,8 @@ from typing import Any
 from expert_contracts.models import EmbeddedContractPreparedChunk
 
 from ..core.expert import ExpertContractAdapter
+from ..core.hash_state import read_hash_field
+from ..core.storage import VectorRepositoryProfile
 from .compatibility import compare_model_space
 from .contract_v15 import MilvusV15RowMapper
 from .indexes import index_specs_v15
@@ -76,12 +78,14 @@ class ContractMilvusV15VectorRepository(ContractMilvusRepositoryBase):
     """V15 精简 Contract Collection 的 Repository 类型。
 
     构造参数、initialize / upsert_batch / get_by_vector_doc_id /
-    delete_by_vector_doc_ids / query_by_expert_id / list_all_vector_states /
+    query_by_expert_id / list_all_vector_states /
     assert_destructive_maintenance_allowed / close 的语义与基类一致；差异只体现
     在持久化 profile 上（见模块 docstring）。
 
-    ``search`` 暂不支持（V15 检索通路未接通），调用抛 ``NotImplementedError``。
+    ``search`` 暂不支持（V15 检索通路未接通），调用抛明确的能力未启用异常。
     """
+
+    supports_search = False
 
     # 持久化 profile：整体替换为 V15 定义（禁止方法内按版本分支）。
     _schema_field_specs = staticmethod(v15_milvus_field_specs)
@@ -101,6 +105,19 @@ class ContractMilvusV15VectorRepository(ContractMilvusRepositoryBase):
         lambda owner_id: f'metadata["expert_id"] == {int(owner_id)}'
     )
     _owner_output_fields = ("vector_doc_id",)
+    _profile = VectorRepositoryProfile(
+        _schema_field_specs=v15_milvus_field_specs,
+        _schema_builder=build_v15_schema,
+        _index_specs_fn=index_specs_v15,
+        _row_mapper_cls=MilvusV15RowMapper,
+        _full_scan_filter='vector_doc_id != ""',
+        _model_space_fields=("metadata",),
+        _contract_adapter_cls=ExpertContractAdapter,
+        _owner_field="expert_id",
+        _vector_doc_id_prefix="expert:",
+        _owner_filter_fn=lambda owner_id: f'metadata["expert_id"] == {int(owner_id)}',
+        _owner_output_fields=("vector_doc_id",),
+    )
 
     def _model_space_from_row(
         self,
@@ -337,12 +354,21 @@ class ContractMilvusV15VectorRepository(ContractMilvusRepositoryBase):
         flat = projected.pop("metadata")
         if not isinstance(flat, Mapping):
             raise TypeError("Milvus V15 全量状态行缺少合法 metadata JSON 对象")
-        content_hash = flat.get("content_hash")
-        metadata_hash = flat.get("metadata_hash")
-        if not isinstance(content_hash, str) or not content_hash:
-            raise RuntimeError("Milvus V15 全量状态 metadata 缺少合法 content_hash")
-        if not isinstance(metadata_hash, str) or not metadata_hash:
-            raise RuntimeError("Milvus V15 全量状态 metadata 缺少合法 metadata_hash")
+        try:
+            content_hash = read_hash_field(
+                {"metadata": flat}, "content_hash", required=True
+            )
+            metadata_hash = read_hash_field(
+                {"metadata": flat}, "metadata_hash", required=True
+            )
+        except ValueError as exc:
+            raise RuntimeError(
+                f"Milvus V15 全量状态 metadata Hash 不合法: {exc}"
+            ) from exc
+        # required=True 保证这里不会是 None；显式断言让类型检查和后续模型都保持
+        # 严格字符串语义。
+        assert content_hash is not None
+        assert metadata_hash is not None
         projected["content_hash"] = content_hash
         projected["metadata_hash"] = metadata_hash
         return projected

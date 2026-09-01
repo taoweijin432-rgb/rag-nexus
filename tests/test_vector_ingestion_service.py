@@ -65,11 +65,9 @@ class FakeMilvusRepository:
     def __init__(self) -> None:
         self.rows: dict[str, dict[str, Any]] = {}
         self.upsert_calls: list[list[EmbeddedContractPreparedChunk]] = []
-        self.delete_calls: list[list[str]] = []
         self.get_calls: list[str] = []
         self.query_calls: list[int] = []
         self.get_error: Exception | None = None
-        self.delete_error: Exception | None = None
         self.query_error: Exception | None = None
         self.upsert_error: Exception | None = None
 
@@ -88,19 +86,6 @@ class FakeMilvusRepository:
         if not include_embedding:
             return {k: v for k, v in row.items() if k != "embedding"}
         return dict(row)
-
-    def delete_by_vector_doc_ids(
-        self,
-        vector_doc_ids: Sequence[str],
-    ) -> MutationResult:
-        self.delete_calls.append(list(vector_doc_ids))
-        if self.delete_error is not None:
-            raise self.delete_error
-        ids = list(vector_doc_ids)
-        deleted = [i for i in ids if i in self.rows]
-        for i in deleted:
-            del self.rows[i]
-        return MutationResult(affected_count=len(deleted))
 
     def upsert_batch(
         self,
@@ -358,7 +343,7 @@ def test_delete_vectors_empty_is_safe() -> None:
     assert result.requested_count == 0
     assert result.deleted_count == 0
     assert result.not_found_count == 0
-    assert repo.delete_calls == []
+    assert not hasattr(repo, "delete_by_vector_doc_ids")
 
 
 def test_delete_vectors_dedupes_via_disable() -> None:
@@ -379,7 +364,7 @@ def test_delete_vectors_dedupes_via_disable() -> None:
     assert result.requested_count == 1
     assert result.deleted_count == 1
     # 不触发物理删除；去重后只读取一次。
-    assert repo.delete_calls == []
+    assert not hasattr(repo, "delete_by_vector_doc_ids")
     assert repo.get_calls == [chunk.vector_doc_id]
     assert chunk.vector_doc_id in repo.rows
 
@@ -976,7 +961,7 @@ def test_disable_vectors_marks_inactive_and_preserves_payload() -> None:
     assert result.deleted_count == 1
     assert result.not_found_count == 0
     # 实体仍在，无物理删除调用。
-    assert repo.delete_calls == []
+    assert not hasattr(repo, "delete_by_vector_doc_ids")
     new_row = repo.rows[chunk.vector_doc_id]
     assert new_row is not None
     restored = MilvusV15RowMapper().from_row(new_row)

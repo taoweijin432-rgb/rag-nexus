@@ -36,9 +36,9 @@ from ..chunking.contract_pipeline import (
 from ..config import MilvusSettings
 from ..embedding_adapters.company_cloud import CompanyCloudEmbeddingModel
 from ..ingestion.factory import (
-    _VALID_PROFILES,
     SchemaProfile,
     create_vector_ingestion_service,
+    validate_schema_profile,
 )
 from ..milvus.contract_v15 import MilvusV15RowMapper
 from ..milvus.repository_v15 import ContractMilvusV15VectorRepository
@@ -82,15 +82,7 @@ def create_full_vector_reconciliation_service(
     每个参数语义与 ``create_vector_ingestion_service()`` 一致。
     """
 
-    if schema_profile not in _VALID_PROFILES:
-        if schema_profile == "v14":
-            raise ValueError(
-                "V14 旧向量链路已退役，schema_profile='v14' 不再支持；"
-                "请使用 schema_profile='v15'"
-            )
-        raise ValueError(
-            f"schema_profile 必须为 'v15'，收到 {schema_profile!r}"
-        )
+    validate_schema_profile(schema_profile)
 
     if validator is None:
         validator = ContractValidator()

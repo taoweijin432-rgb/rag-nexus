@@ -22,16 +22,15 @@ ingestion 或 Milvus Repository。
 from __future__ import annotations
 
 import json
-import math
 import os
 from collections.abc import Callable, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
-from numbers import Real
 from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
+from ..core.embedding_validation import validate_embedding_vector
 from ..embedding import EmbeddingModel
 from ..model_space import (
     FORMAL_EMBEDDING_DIMENSION,
@@ -365,18 +364,13 @@ def _parse_embeddings(response_body: bytes) -> list[list[float]]:
         if not raw_embedding:
             raise CompanyCloudEmbeddingError("Embedding API 返回了空 embedding")
 
-        vector: list[float] = []
-        for value in raw_embedding:
-            if isinstance(value, bool) or not isinstance(value, Real):
-                raise CompanyCloudEmbeddingError(
-                    "Embedding API 返回的 embedding 元素必须是数值"
-                )
-            number = float(value)
-            if not math.isfinite(number):
-                raise CompanyCloudEmbeddingError(
-                    "Embedding API 返回的 embedding 只能包含有限数值"
-                )
-            vector.append(number)
+        try:
+            vector = validate_embedding_vector(
+                raw_embedding,
+                label="Embedding API",
+            )
+        except (TypeError, ValueError) as exc:
+            raise CompanyCloudEmbeddingError(str(exc)) from exc
 
         raw_index = item.get("index")
         has_index.append(raw_index is not None)

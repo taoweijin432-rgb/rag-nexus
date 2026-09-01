@@ -17,7 +17,7 @@
 from __future__ import annotations
 
 import functools
-from collections.abc import Mapping, Sequence
+from collections.abc import Sequence
 from typing import Any
 
 from pymilvus.exceptions import MilvusException
@@ -36,6 +36,7 @@ from ..chunking.contract_pipeline import (
     EmbeddingEligibilityError,
 )
 from ..core.expert import ExpertContractAdapter
+from ..core.hash_state import project_hash_fields
 from ..core.lifecycle import DomainVectorLifecycleService
 from ..embedding_adapters.company_cloud import CompanyCloudEmbeddingError
 from ..milvus.contract_v15 import MilvusV15RowMapper
@@ -169,57 +170,6 @@ def _dedupe(vector_doc_ids: Sequence[str]) -> list[str]:
     return cleaned
 
 
-# 增量幂等读取需要投影到逻辑返回顶层的三个哈希字段名。V15 把它们存进
-# ``metadata`` JSON；本常量只服务于 get_vectors 的逻辑投影，不代表物理
-# Schema 字段。三 Hash 动作矩阵（C1，仅增量 ``ContractConsumerCore`` 消费）：
-# content_hash 变化→重新 Embedding；content_hash 不变而 source_hash /
-# metadata_hash 任一变化→metadata-only；三 Hash 全同且 active→Skip。
-# 全量对账 ``ExpertVectorSynchronizer``（同事侧）仍只消费前两个哈希，
-# 多投影的 source_hash 对它无害。
-_HASH_PROJECTION_FIELDS = ("content_hash", "metadata_hash", "source_hash")
-
-
-def _project_hash_fields(row: Mapping[str, object]) -> dict[str, object]:
-    """把上游幂等判断需要的哈希投影到逻辑返回 record 顶层。
-
-    语义：
-        - 不修改原始物理 row（先 ``dict(row)`` 复制）；
-        - 顶层已有合法哈希时保持不变（兼容历史 V14 物理 row 形态，已是死分支
-          但无害，避免误处理旧回放数据）；
-        - 顶层缺失时，从 ``metadata`` JSON 中提取 ``content_hash`` /
-          ``metadata_hash`` / ``source_hash`` 到逻辑返回顶层（V15 物理 row
-          哈希位于 metadata）；
-        - 只投影本模块明确声明需要的哈希字段，不平铺其它 metadata 字段；
-        - 顶层与 ``metadata`` 均缺失时不补造哈希，交由调用方 fail-closed
-          （``content_hash`` / ``metadata_hash`` 缺失即 fail-closed；
-          ``source_hash`` 例外：旧版行可能未写 source_hash，缺失时不补造，
-          下游 ``ContractConsumerCore`` 把已存 source_hash 缺失路由到
-          metadata-only，不误判为三 Hash 全同；存在但空字符串/非字符串仍
-          fail-closed，不静默当缺失）。
-
-    Args:
-        row: Repository ``get_by_vector_doc_id`` 返回的物理 row。
-
-    Returns:
-        逻辑返回 record（可能含投影后的顶层哈希）。
-    """
-
-    record = dict(row)
-    metadata = record.get("metadata")
-    if not isinstance(metadata, Mapping):
-        # metadata 不是对象时无法从其提取哈希；保持物理 row 形态，
-        # 由下游 fail-closed。
-        return record
-    for field in _HASH_PROJECTION_FIELDS:
-        top_value = record.get(field)
-        if isinstance(top_value, str) and top_value:
-            continue
-        flat_value = metadata.get(field)
-        if isinstance(flat_value, str) and flat_value:
-            record[field] = flat_value
-    return record
-
-
 class VectorIngestionService:
     """统一编排 Chunk 向量化、写入、更新、删除与查询的 Facade。
 
@@ -317,8 +267,7 @@ class VectorIngestionService:
             4. 否则保留 vector_doc_id / chunk_text / embedding 与全部历史
                metadata，仅置 ``is_active=false`` 后以同一主键 upsert 回写。
 
-        全程禁止调用 ``repository.delete_by_vector_doc_ids``；旧实体携带的
-        model_space 信息随行保留，若与 Collection 现行空间不一致由底层
+        Repository 不提供物理删除能力；旧实体携带的 model_space 信息随行保留，若与 Collection 现行空间不一致由底层
         upsert 校验 fail-closed。
 
         返回的 ``deleted_count`` 语义为"处理后处于下线状态的数量"。
@@ -340,7 +289,7 @@ class VectorIngestionService:
 
         自 T2-1 起在线删除语义统一为逻辑下线：本方法只委派
         ``disable_vectors``（保留实体与向量，仅置 is_active=false），
-        不再调用 ``repository.delete_by_vector_doc_ids`` 物理删除。
+        Repository 已移除物理删除能力。
         签名与返回类型不变，上游 ``VectorStorePort`` 调用方无感知；
         空输入安全返回，去重保序，重复执行幂等。
         """
@@ -389,7 +338,7 @@ class VectorIngestionService:
             if row is None:
                 missing.append(vid)
             else:
-                records.append(_project_hash_fields(row))
+                records.append(project_hash_fields(row))
         return VectorQueryResult(records=records, missing=missing)
 
     # ------------------------------------------------------------------

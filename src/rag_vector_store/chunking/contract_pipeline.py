@@ -23,12 +23,13 @@ from expert_contracts.models import (
     ExpertChunkEmbeddingInput,
 )
 
+from ..constants import FORMAL_EMBEDDING_DIMENSION
 from ..core.embedding import DomainEmbeddingWorker
 from ..core.expert import ExpertContractAdapter
 from ..embedding import EmbeddingModel
 from ..milvus.schemas.contract_v15 import v15_milvus_field_specs
 
-EXPECTED_EMBEDDING_DIMENSION = 1024
+EXPECTED_EMBEDDING_DIMENSION = FORMAL_EMBEDDING_DIMENSION
 
 _CHUNK_TEXT_LIMITS = {
     "profile_summary": 600,

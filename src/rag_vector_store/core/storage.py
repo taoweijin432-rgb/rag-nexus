@@ -1,4 +1,4 @@
-"""向量持久化 Profile 的领域无关协议。
+"""向量持久化 Profile 的领域无关模型与协议。
 
 Milvus Repository 基类通过 Profile 获得物理 Schema、行映射和身份隔离规则；本
 模块不包含任何领域字段或 Collection 名称。
@@ -7,7 +7,8 @@ Milvus Repository 基类通过 Profile 获得物理 Schema、行映射和身份�
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping, Sequence
-from typing import Any, Protocol, TypeVar
+from dataclasses import dataclass
+from typing import Any, Generic, Protocol, TypeVar
 
 EmbeddedT = TypeVar("EmbeddedT")
 
@@ -22,8 +23,13 @@ class VectorRowMapper(Protocol[EmbeddedT]):
         ...
 
 
-class VectorRepositoryProfile(Protocol[EmbeddedT]):
-    """Repository 所需的完整持久化 profile。"""
+@dataclass(frozen=True)
+class VectorRepositoryProfile(Generic[EmbeddedT]):
+    """Repository 所需的完整、不可变持久化 profile。
+
+    Repository 在构造时把该对象复制到实例状态，后续不会从请求数据或全局变量
+    动态切换领域、Collection 或 Contract 类型。
+    """
 
     _schema_field_specs: Any
     _schema_builder: Any

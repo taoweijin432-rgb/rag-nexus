@@ -9,6 +9,7 @@ from typing import Any, Generic, Literal, Protocol, TypeVar
 from ..models import MutationResult
 from .adapters import VectorContractAdapter
 from .embedding import DomainEmbeddingResult, DomainSkippedVector
+from .guards import require_adapter_input
 
 InputT = TypeVar("InputT")
 PreparedT = TypeVar("PreparedT")
@@ -101,8 +102,7 @@ class DomainIngestionService(Generic[InputT, PreparedT, EmbeddedT]):
         self.adapter = adapter
 
     def ingest_one(self, record: InputT) -> DomainIngestionResult:
-        if not self.adapter.is_input(record):
-            raise TypeError("ingest_one 只接受当前领域 Contract")
+        require_adapter_input(self.adapter, record, operation="ingest_one")
         result = self.embedding_worker.embed([record])
         embedded, skipped = self._single_worker_result(record, result)
         if skipped is not None:
@@ -168,8 +168,8 @@ class DomainIngestionService(Generic[InputT, PreparedT, EmbeddedT]):
         )
 
     def _validate_input_records(self, records: Sequence[InputT]) -> None:
-        if any(not self.adapter.is_input(item) for item in records):
-            raise TypeError("ingest_batch 只接受当前领域 Contract")
+        for item in records:
+            require_adapter_input(self.adapter, item, operation="ingest_batch")
         ids = [self.adapter.vector_doc_id(item) for item in records]
         if len(ids) != len(set(ids)):
             raise DomainIngestionError("一个批次不能包含重复 vector_doc_id")

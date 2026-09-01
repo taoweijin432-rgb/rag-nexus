@@ -21,9 +21,10 @@ from __future__ import annotations
 import json
 from collections.abc import Mapping, Sequence
 from threading import Lock
-from typing import Any
+from typing import Any, ClassVar
 
 from ..config import MilvusSettings
+from ..core.storage import VectorRepositoryProfile
 from ..model_space import is_placeholder_model_version
 from ..models import MutationResult
 from .compatibility import (
@@ -92,6 +93,9 @@ class ContractMilvusRepositoryBase:
         ``__init_subclass__``），禁止在方法内部按版本分支。
     """
 
+    # 当前 Repository 仅承诺 CRUD/Query；具体 profile 可将其设为 True 后实现检索。
+    supports_search: ClassVar[bool] = False
+
     def __init_subclass__(cls, **kwargs: Any) -> None:
         """校验子类整体提供了全部持久化 profile 类属性。
 
@@ -113,6 +117,7 @@ class ContractMilvusRepositoryBase:
         *,
         client: Any | None = None,
         allow_collection_creation: bool = True,
+        profile: VectorRepositoryProfile[Any] | None = None,
     ) -> None:
         if settings.schema_mode != "contract":
             raise ValueError(
@@ -124,6 +129,17 @@ class ContractMilvusRepositoryBase:
         self._initialized = False
         self._owns_client = client is None
         self._allow_collection_creation = allow_collection_creation
+        self._profile = profile or getattr(type(self), "_profile", None)
+        if self._profile is None:
+            self._profile = VectorRepositoryProfile(
+                **{
+                    name: getattr(type(self), name)
+                    for name in _REQUIRED_PROFILE_ATTRS
+                }
+            )
+        # 从不可变 profile 固定实例配置，避免运行时按请求切换领域或 Collection。
+        for name in _REQUIRED_PROFILE_ATTRS:
+            setattr(self, name, getattr(self._profile, name))
         self._contract_row_mapper = self._row_mapper_cls()
         self._contract_adapter = self._contract_adapter_cls()
         self._lock = Lock()
@@ -413,46 +429,6 @@ class ContractMilvusRepositoryBase:
             expected_count=len(items),
             expected_ids=self._primary_keys(items),
         )
-
-    def delete_by_vector_doc_ids(
-        self,
-        vector_doc_ids: Sequence[str],
-    ) -> MutationResult:
-        """按 vector_doc_id 集合删除 Milvus 实体。
-
-        语义：
-            - 按主键精确删除，幂等；不存在的 vector_doc_id 不视为错误（不参与计数）。
-            - 空列表安全返回（不发起 SDK 调用）。
-            - 本方法不生成或修改 vector_doc_id，只透传调用方提供的主键。
-            - 返回 ``MutationResult``，其中 ``affected_count`` 为实际删除条数、
-              ``primary_keys`` 为空（pymilvus delete 不返回已删主键列表）。
-
-        Args:
-            vector_doc_ids: 待删除的主键集合。
-
-        Returns:
-            MutationResult：``affected_count`` 为实际删除条数。
-        """
-
-        cleaned: list[str] = []
-        seen: set[str] = set()
-        for vector_doc_id in vector_doc_ids:
-            if not isinstance(vector_doc_id, str) or not vector_doc_id.strip():
-                raise ValueError("vector_doc_id 必须是非空字符串")
-            normalized = vector_doc_id.strip()
-            if normalized not in seen:
-                seen.add(normalized)
-                cleaned.append(normalized)
-
-        if not cleaned:
-            return MutationResult(affected_count=0)
-
-        response = self._get_client().delete(
-            collection_name=self.settings.collection_name,
-            ids=cleaned,
-            **self._timeout_kwargs(),
-        )
-        return MutationResult(affected_count=_delete_count(response))
 
     def get_by_vector_doc_id(
         self,
@@ -909,21 +885,3 @@ def _mutation_result(
         affected_count=count,
         primary_keys=primary_keys,
     )
-
-
-def _delete_count(response: Any) -> int:
-    """解析 pymilvus delete 响应，返回实际删除条数。
-
-    delete 用于删除不存在的向量：请求的 ID 可能部分或全部未命中，因此这里只
-    读取实际 ``delete_count``，不要求与请求数量一致（存在视为成功）。响应格式
-    兼容 pymilvus 2.3.2+（``{'delete_count': N}``）及更早版本。
-    """
-
-    if not isinstance(response, Mapping):
-        raise TypeError("Milvus delete 响应必须是 Mapping")
-    count = response.get("delete_count")
-    if isinstance(count, bool) or not isinstance(count, int):
-        raise TypeError("Milvus delete 响应缺少合法的 delete_count")
-    if count < 0:
-        raise ValueError("Milvus delete_count 不能为负数")
-    return count

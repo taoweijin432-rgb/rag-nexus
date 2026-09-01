@@ -27,14 +27,17 @@ from __future__ import annotations
 from typing import Any
 
 from ...config import MilvusSettings
+from ...constants import (
+    FORMAL_EMBEDDING_DIMENSION,
+    V15_CHUNK_TEXT_MAX_BYTES,
+    V15_VECTOR_DOC_ID_MAX_BYTES,
+)
 from .builder import build_schema_from_specs
 from .specs import MilvusFieldSpec
 
-V15_CONTRACT_VECTOR_DIMENSION = 1024
-V15_VECTOR_DOC_ID_MAX_BYTES = 2048
+V15_CONTRACT_VECTOR_DIMENSION = FORMAL_EMBEDDING_DIMENSION
 # chunk_text 的 Milvus VARCHAR 字节容量沿用 ContractValidator 的 UTF-8
 # 上限（8192 bytes），保证任意合法 Contract chunk_text 都能落库。
-V15_CHUNK_TEXT_MAX_BYTES = 8192
 
 # V15 不保留任何 scalar index：expert_id / content_hash / metadata_hash 均已
 # 进入 flat metadata JSON，本阶段冻结纯 4 字段 persistence correctness。

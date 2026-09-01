@@ -45,9 +45,6 @@ class ExpertContractAdapter:
             raise TypeError("Contract 缺少合法 vector_doc_id")
         return vector_doc_id
 
-    def identity(self, value: object) -> str:
-        return self.vector_doc_id(value)
-
     def chunk_text(self, value: ContractPreparedChunk) -> str:
         return value.chunk_text
 
@@ -97,17 +94,6 @@ class ExpertContractAdapter:
         # 保持原有 per-type Metadata，不增加 expert_id 副本。
         metadata["expert_id"] = value.expert_id
         return metadata
-
-    def source(self, value: EmbeddedContractPreparedChunk) -> dict[str, object]:
-        return value.source.model_dump(mode="json")
-
-    def versions(self, value: EmbeddedContractPreparedChunk) -> dict[str, object]:
-        return value.versions.model_dump(mode="json")
-
-    def from_embedded_row(self, row: dict[str, object]) -> EmbeddedContractPreparedChunk:
-        raise NotImplementedError(
-            "专家 V15 行还原仍由 MilvusV15RowMapper 负责；不要绕过 Mapper"
-        )
 
     def with_active(
         self,

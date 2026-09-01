@@ -2,15 +2,16 @@
 
 from __future__ import annotations
 
-import math
-from collections.abc import Callable, Iterable, Sequence
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from numbers import Real
 from typing import Any, Generic, TypeVar
 
+from ..constants import FORMAL_EMBEDDING_DIMENSION
 from ..embedding import EmbeddingModel
 from .adapters import VectorContractAdapter
+from .embedding_validation import validate_embedding_vector
+from .guards import require_adapter_input
 
 PreparedT = TypeVar("PreparedT")
 EmbeddedT = TypeVar("EmbeddedT")
@@ -51,7 +52,7 @@ class DomainEmbeddingWorker(Generic[InputT, PreparedT, EmbeddedT]):
         *,
         embedding_model_alias: str | None = None,
         embedding_model_version: str | None = None,
-        expected_dimension: int = 1024,
+        expected_dimension: int = FORMAL_EMBEDDING_DIMENSION,
         clock: Callable[[], datetime] | None = None,
     ) -> None:
         if isinstance(expected_dimension, bool) or not isinstance(expected_dimension, int):
@@ -78,8 +79,7 @@ class DomainEmbeddingWorker(Generic[InputT, PreparedT, EmbeddedT]):
         eligible: list[PreparedT] = []
         skipped: list[DomainSkippedVector] = []
         for record in records:
-            if not self.adapter.is_input(record):
-                raise TypeError("输入记录不属于当前领域 Contract")
+            require_adapter_input(self.adapter, record, operation="Embedding")
             prepared = self.adapter.validate(record)
             if not self.adapter.is_prepared(prepared):
                 raise TypeError("Contract Adapter 返回了非法 Prepared Contract")
@@ -105,10 +105,10 @@ class DomainEmbeddingWorker(Generic[InputT, PreparedT, EmbeddedT]):
         embedded_at = _format_embedded_at(self.clock())
         embedded: list[EmbeddedT] = []
         for prepared, raw_embedding in zip(eligible, raw_embeddings):
-            embedding = _validate_embedding(
+            embedding = validate_embedding_vector(
                 raw_embedding,
                 expected_dimension=self.expected_dimension,
-                vector_doc_id=self.adapter.vector_doc_id(prepared),
+                label=f"vector_doc_id {self.adapter.vector_doc_id(prepared)!r} 的 Embedding",
             )
             item = self.adapter.attach_embedding(
                 prepared,
@@ -131,30 +131,6 @@ def _required_model_text(model: Any, name: str) -> str:
     if not isinstance(value, str) or not value.strip():
         raise ValueError(f"Embedding model 缺少合法的 {name}")
     return value
-
-
-def _validate_embedding(
-    raw_embedding: Sequence[float],
-    *,
-    expected_dimension: int,
-    vector_doc_id: str,
-) -> list[float]:
-    if isinstance(raw_embedding, (str, bytes)):
-        raise TypeError(f"Embedding 返回的向量类型非法: {vector_doc_id}")
-    vector: list[float] = []
-    for value in raw_embedding:
-        if isinstance(value, bool) or not isinstance(value, Real):
-            raise TypeError(f"Embedding 向量元素类型非法: {vector_doc_id}")
-        number = float(value)
-        if not math.isfinite(number):
-            raise ValueError(f"Embedding 向量包含非有限数值: {vector_doc_id}")
-        vector.append(number)
-    if len(vector) != expected_dimension:
-        raise ValueError(
-            f"Embedding dimension mismatch for {vector_doc_id!r}: "
-            f"expected {expected_dimension}, got {len(vector)}"
-        )
-    return vector
 
 
 def _format_embedded_at(value: datetime) -> str:

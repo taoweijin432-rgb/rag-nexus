@@ -78,10 +78,9 @@ def _validate_repository_profile(
 
 def _validate_row_mapper_profile(
     row_mapper: Any,
-    repository: Any,
     schema_profile: SchemaProfile,
 ) -> None:
-    """显式注入 row_mapper 与 schema_profile / repository profile 冲突时 fail-closed。
+    """显式注入 row_mapper 与 schema_profile 冲突时 fail-closed。
 
     规则：
         - 正式 ``MilvusV15RowMapper``（V15）严格识别后放行；
@@ -93,7 +92,6 @@ def _validate_row_mapper_profile(
         - ``schema_profile='v15'`` + 不符合 RowMapper 协议的对象。
     """
 
-    del repository  # 当前仅按 schema_profile 与 RowMapper 协议校验，未使用
     if row_mapper is None:
         return
     if isinstance(row_mapper, MilvusV15RowMapper):
@@ -125,7 +123,7 @@ def _build_repository(
     raise ValueError(f"未支持的 schema_profile {schema_profile!r}")
 
 
-def _validate_schema_profile(schema_profile: str) -> None:
+def validate_schema_profile(schema_profile: str) -> None:
     """校验 schema_profile，V14 已退役时显式 fail-closed。"""
 
     if schema_profile == _RETired_PROFILE:
@@ -137,6 +135,10 @@ def _validate_schema_profile(schema_profile: str) -> None:
         raise ValueError(
             f"schema_profile 必须为 'v15'，收到 {schema_profile!r}"
         )
+
+
+# 保留内部旧名称，避免已有测试或同包代码直接引用时产生不必要的断裂。
+_validate_schema_profile = validate_schema_profile
 
 
 def _resolve_row_mapper(
@@ -151,7 +153,11 @@ def _resolve_row_mapper(
 
     if row_mapper is not None:
         return row_mapper
-    return MilvusV15RowMapper()
+    mapper_cls = getattr(repository, "_row_mapper_cls", MilvusV15RowMapper)
+    mapper = mapper_cls()
+    if not hasattr(mapper, "to_row") or not hasattr(mapper, "from_row"):
+        raise ValueError("Repository profile 未提供合法 RowMapper")
+    return mapper
 
 
 def create_vector_ingestion_service(
@@ -189,9 +195,9 @@ def create_vector_ingestion_service(
     其余关键字用于测试 / 自定义组装，未注入项自动从环境读取。
     """
 
-    _validate_schema_profile(schema_profile)
+    validate_schema_profile(schema_profile)
     _validate_repository_profile(repository, schema_profile)
-    _validate_row_mapper_profile(row_mapper, repository, schema_profile)
+    _validate_row_mapper_profile(row_mapper, schema_profile)
 
     if validator is None:
         validator = ContractValidator()
@@ -225,4 +231,8 @@ def create_vector_ingestion_service(
     )
 
 
-__all__ = ["SchemaProfile", "create_vector_ingestion_service"]
+__all__ = [
+    "SchemaProfile",
+    "create_vector_ingestion_service",
+    "validate_schema_profile",
+]

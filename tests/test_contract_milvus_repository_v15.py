@@ -1009,32 +1009,13 @@ def test_v15_repository_uses_v15_builder_behind_initialize() -> None:
 
 
 # ---------------------------------------------------------------------------
-# V15 delete / 继承能力与 search 占位
+# V15 继承能力与 search 能力占位
 # ---------------------------------------------------------------------------
-
-
-def test_v15_delete_by_vector_doc_ids() -> None:
-    chunks = embedded_contract_chunks()
-    client = FakeV15MilvusClient(exists=True)
-    repository = make_v15_repository(client)
-    client.description = v15_description(repository)
-    _seed_rows(repository, client, chunks)
-
-    target = chunks[0].vector_doc_id
-    result = repository.delete_by_vector_doc_ids(
-        [target, "expert:99999:profile_summary:1:0"]
-    )
-
-    assert result.affected_count == 1
-    assert target not in client.rows
-    assert client.delete_calls[0]["ids"] == [
-        target,
-        "expert:99999:profile_summary:1:0",
-    ]
 
 
 def test_v15_search_not_connected_yet() -> None:
     repository = make_v15_repository()
+    assert repository.supports_search is False
     with pytest.raises(NotImplementedError, match="检索通路尚未接通"):
         repository.search([0.1] * 1024)
 

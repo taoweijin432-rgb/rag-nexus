@@ -11,7 +11,10 @@ from .embedding import (
     DomainEmbeddingWorker,
     DomainSkippedVector,
 )
+from .embedding_validation import validate_embedding_vector
 from .flat_metadata import merge_flat_metadata
+from .guards import require_adapter_input
+from .hash_state import HASH_FIELDS, project_hash_fields, read_hash_field
 from .ingestion import (
     DomainBatchIngestionResult,
     DomainBatchIngestionService,
@@ -28,6 +31,7 @@ from .lifecycle import (
 from .storage import VectorRepositoryProfile, VectorRowMapper
 
 __all__ = [
+    "HASH_FIELDS",
     "DomainBatchIngestionResult",
     "DomainBatchIngestionService",
     "DomainDeletionResult",
@@ -45,4 +49,8 @@ __all__ = [
     "VectorRepositoryProfile",
     "VectorRowMapper",
     "merge_flat_metadata",
+    "project_hash_fields",
+    "read_hash_field",
+    "require_adapter_input",
+    "validate_embedding_vector",
 ]

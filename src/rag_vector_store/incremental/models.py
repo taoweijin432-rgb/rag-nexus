@@ -20,10 +20,9 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
-# 与 Milvus V15 Schema 一致的字节上限。
-V15_VECTOR_DOC_ID_MAX_BYTES = 2048
-V15_CHUNK_TEXT_MAX_BYTES = 8192
+from ..constants import V15_CHUNK_TEXT_MAX_BYTES, V15_VECTOR_DOC_ID_MAX_BYTES
 
+# 与 Milvus V15 Schema 一致的字节上限。
 # Contract 侧 hash 为 SHA-256 十六进制（64 位小写）。
 _SHA256_HEX_PATTERN = r"^[0-9a-f]{64}$"
 

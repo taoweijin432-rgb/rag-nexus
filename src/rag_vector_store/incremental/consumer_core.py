@@ -31,6 +31,7 @@ from dataclasses import dataclass
 from typing import Any, Protocol
 
 from ..core.adapters import VectorConsumerContractAdapter
+from ..core.hash_state import read_hash_field
 from ..ingestion.errors import (
     VectorContractError,
     VectorIngestionError,
@@ -356,25 +357,12 @@ def _extract_existing_state(record: dict[str, object]) -> _ExistingVectorState:
     metadata = record.get("metadata")
     flat: dict[str, object] = dict(metadata) if isinstance(metadata, dict) else {}
 
-    def _hash_field(field: str) -> str:
-        for source in (record, flat):
-            value = source.get(field)
-            if isinstance(value, str) and value:
-                return value
-        raise _ExistingStateError(f"已存记录缺少 {field}")
-
-    def _optional_hash_field(field: str) -> str | None:
-        for source in (record, flat):
-            value = source.get(field)
-            if value is None:
-                continue
-            if isinstance(value, str) and value:
-                return value
-            # 存在但类型非法（空字符串 / 非字符串）→ fail-closed，不静默当缺失。
-            raise _ExistingStateError(
-                f"已存记录 {field} 类型非法：{type(value).__name__}"
-            )
-        return None
+    try:
+        content_hash = read_hash_field(record, "content_hash", required=True)
+        metadata_hash = read_hash_field(record, "metadata_hash", required=True)
+        source_hash = read_hash_field(record, "source_hash", required=False)
+    except ValueError as exc:
+        raise _ExistingStateError(str(exc)) from exc
 
     is_active = flat.get("is_active")
     if not isinstance(is_active, bool):
@@ -383,9 +371,9 @@ def _extract_existing_state(record: dict[str, object]) -> _ExistingVectorState:
         )
     return _ExistingVectorState(
         vector_doc_id=vector_doc_id,
-        content_hash=_hash_field("content_hash"),
-        metadata_hash=_hash_field("metadata_hash"),
-        source_hash=_optional_hash_field("source_hash"),
+        content_hash=content_hash,
+        metadata_hash=metadata_hash,
+        source_hash=source_hash,
         is_active=is_active,
     )
 
