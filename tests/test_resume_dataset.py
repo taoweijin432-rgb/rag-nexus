@@ -102,6 +102,8 @@ def test_resume_spec_freezes_identity_lifecycle_and_table_mapping() -> None:
     assert RESUME_SPEC.child_identity_column == "resume_id"
     assert RESUME_SPEC.profile_deleted_at_column == "resume_deleted_at"
     assert RESUME_SPEC.child_deleted_at_column == "deleted_at"
+    assert RESUME_SPEC.vector_doc_id_prefix == "resume"
+    assert EXPERT_SPEC.vector_doc_id_prefix == "expert"
     assert RESUME_SPEC.target_type_for_source_table("resume_profile") == "profile"
     assert RESUME_SPEC.target_type_for_source_table("resume_education_experience") == "education"
 
@@ -164,6 +166,8 @@ def test_resume_spec_changes_only_dataset_source_labels() -> None:
     resume_chunks = ChunkFactory(_settings(), dataset_spec=RESUME_SPEC).build_all(*resume_result)
     assert expert_chunks[0].source_table == "experts+experts_education_experience"
     assert resume_chunks[0].source_table == ("resume_profile+resume_education_experience")
+    assert all(chunk.vector_doc_id.startswith("resume:") for chunk in resume_chunks)
+    assert all(chunk.vector_doc_id.startswith("expert:") for chunk in expert_chunks)
     assert {chunk.source_table for chunk in resume_chunks[1:]} == {
         "resume_work_experience",
         "resume_project_experience",

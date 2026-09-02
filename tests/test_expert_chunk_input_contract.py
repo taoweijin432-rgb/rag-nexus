@@ -167,6 +167,18 @@ def test_vector_doc_id_formula_mismatch_is_rejected() -> None:
         ExpertChunkEmbeddingInput.model_validate(payload)
 
 
+def test_resume_source_uses_resume_vector_doc_id_namespace() -> None:
+    """共享 Contract 按 Resume 冻结来源标签接受 ``resume:`` 主键。"""
+
+    payload = fixture_payload("employment")
+    payload["source"]["source_table"] = "resume_work_experience"
+    payload["vector_doc_id"] = "resume:900001:employment:21307:0"
+
+    record = ExpertChunkEmbeddingInput.model_validate(payload)
+
+    assert record.vector_doc_id == "resume:900001:employment:21307:0"
+
+
 def test_contract_version_error_is_rejected() -> None:
     payload = fixture_payload()
     payload["contract_version"] = "2.0.0"

@@ -1,8 +1,8 @@
 """来源数据集的只读结构规格。
 
-该模块只描述 Source Adapter 和 Normalize 需要知道的稳定结构信息，不包含连接配置、
-SQL 参数或运行状态。Expert 使用 :data:`EXPERT_SPEC` 作为默认值；其他数据集必须由各自
-入口显式传入规格，不能通过环境变量或名称猜测切换。
+该模块只描述 Source Adapter、Normalize、Chunk Builder 和 Validator 需要知道的稳定
+结构信息，不包含连接配置、SQL 参数或运行状态。Expert 使用 :data:`EXPERT_SPEC` 作为
+默认值；其他数据集必须由各自入口显式传入规格，不能通过环境变量或名称猜测切换。
 """
 
 from __future__ import annotations
@@ -37,11 +37,14 @@ class DatasetSpec:
         人物和子记录的权威生命周期字段。
     profile_source_columns, employment_source_columns, project_source_columns:
         进入三类 Chunk 的来源字段白名单，同时用于生成稳定 ``source_field`` 标签。
+    vector_doc_id_prefix:
+        Milvus ``vector_doc_id`` 的命名空间前缀。Expert 固定为 ``expert``，Resume
+        固定为 ``resume``；默认值保持既有 Expert 行为，避免未显式传入规格的调用改变。
 
     Notes
     -----
     下游 Contract 首版仍使用内部字段名 ``expert_id``。规格只决定该字段从哪个来源身份
-    列取得，不修改 Contract 字段名、稳定 ID 公式或 Milvus Metadata。
+    列取得，并声明 ID 命名空间；不修改 Contract 字段名、Metadata 结构或 Hash 规则。
     """
 
     name: str
@@ -60,12 +63,19 @@ class DatasetSpec:
     profile_source_columns: tuple[str, ...]
     employment_source_columns: tuple[str, ...]
     project_source_columns: tuple[str, ...]
+    vector_doc_id_prefix: str = "expert"
 
     def __post_init__(self) -> None:
         """拒绝空规格、重复表和可注入的 SQL 标识符。"""
 
         if not isinstance(self.name, str) or not self.name.strip():
             raise ValueError("DatasetSpec.name 必须是非空字符串")
+        if not isinstance(self.vector_doc_id_prefix, str) or not re.fullmatch(
+            r"[a-z][a-z0-9_]*", self.vector_doc_id_prefix
+        ):
+            raise ValueError(
+                "DatasetSpec.vector_doc_id_prefix 必须是小写字母/数字/下划线命名空间"
+            )
 
         identifiers = {
             "profile_table": self.profile_table,

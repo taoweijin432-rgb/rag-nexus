@@ -33,14 +33,19 @@ def build_vector_doc_id(
     chunk_type: str,
     source_field_id: str,
     chunk_index: int,
+    prefix: str = "expert",
 ) -> str:
     """按产品规则生成 Milvus 记录的稳定唯一标识。
 
     产品公式中的旧 ``source_record_id`` 已由新溯源契约的 ``source_field_id``
-    等价替代。该 ID 只依赖业务来源和分片位置，因此重复构建同一 Chunk 时保持稳定。
+    等价替代；``prefix`` 由 DatasetSpec 注入，用于隔离 Expert 与 Resume 命名空间。
+    该 ID 只依赖业务来源和分片位置，因此重复构建同一 Chunk 时保持稳定。未传 prefix
+    时默认 ``expert``，确保历史 Expert 调用结果不变。
     """
 
-    return f"expert:{expert_id}:{chunk_type}:{source_field_id}:{chunk_index}"
+    if not isinstance(prefix, str) or not re.fullmatch(r"[a-z][a-z0-9_]*", prefix):
+        raise ValueError("vector_doc_id 前缀必须是小写字母/数字/下划线命名空间")
+    return f"{prefix}:{expert_id}:{chunk_type}:{source_field_id}:{chunk_index}"
 
 
 class ChunkFactory:
@@ -335,6 +340,7 @@ class ChunkFactory:
             chunk_type=chunk_type,
             source_field_id=source_field_id,
             chunk_index=chunk_index,
+            prefix=self.dataset_spec.vector_doc_id_prefix,
         )
         # 把数据库无时区时间转换成接口契约使用的带时区版本字符串。
         source_version = _iso_with_zone(source_updated_at, self.settings.timezone)

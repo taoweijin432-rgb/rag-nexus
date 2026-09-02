@@ -45,6 +45,7 @@ RESUME_SPEC = DatasetSpec(
         "end_date",
         "work_description",
     ),
+    vector_doc_id_prefix="resume",
 )
 
 

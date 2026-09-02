@@ -8,7 +8,10 @@ from __future__ import annotations
 
 import re
 
+from expert_contracts.models import vector_doc_id_prefix_for_source_table
+
 from .chunk_builder import HARD_LIMITS, build_vector_doc_id, calculate_metadata_hash
+from .dataset import EXPERT_SPEC, DatasetSpec
 from .models import ChunkRecord
 from .normalize import pii_hits, sha256_value
 
@@ -23,17 +26,25 @@ class ChunkValidationError(ValueError):
     """包含 vector_doc_id 的可定位校验错误，但不包含原始正文。"""
 
 
-def validate_chunks(chunks: list[ChunkRecord]) -> None:
-    """校验完整集合，同时检查 vector_doc_id 唯一性。"""
+def validate_chunks(
+    chunks: list[ChunkRecord],
+    *,
+    dataset_spec: DatasetSpec = EXPERT_SPEC,
+) -> None:
+    """校验完整集合，同时检查 vector_doc_id 唯一性。
+
+    ``dataset_spec`` 只影响 ID 命名空间；默认值固定为 Expert，保持现有调用和
+    生产链路的 ``expert:`` 公式不变。
+    """
 
     ids = [chunk.vector_doc_id for chunk in chunks]
     if len(ids) != len(set(ids)):
         raise ChunkValidationError("同一专家生成了重复 vector_doc_id")
     for chunk in chunks:
-        _validate_one(chunk)
+        _validate_one(chunk, dataset_spec=dataset_spec)
 
 
-def _validate_one(chunk: ChunkRecord) -> None:
+def _validate_one(chunk: ChunkRecord, *, dataset_spec: DatasetSpec) -> None:
     """执行长度、PII、哈希、结构、Metadata 一致性检查。"""
 
     def fail(message: str) -> None:
@@ -70,11 +81,17 @@ def _validate_one(chunk: ChunkRecord) -> None:
         fail("source_field 必须是非空源列名组合")
     if not chunk.source_field_id.strip():
         fail("source_field_id 不能为空")
+    # 旧调用未携带 DatasetSpec 时仍能处理 Resume：其来源标签是冻结契约的一部分。
+    # 显式传入 ResumeSpec/其他规格时，以规格声明为权威，避免仅凭表名猜测。
+    prefix = dataset_spec.vector_doc_id_prefix
+    if dataset_spec is EXPERT_SPEC:
+        prefix = vector_doc_id_prefix_for_source_table(chunk.source_table)
     expected_vector_doc_id = build_vector_doc_id(
         expert_id=chunk.expert_id,
         chunk_type=chunk.chunk_type,
         source_field_id=chunk.source_field_id,
         chunk_index=chunk.chunk_index,
+        prefix=prefix,
     )
     if chunk.vector_doc_id != expected_vector_doc_id:
         fail("vector_doc_id 不符合统一生成规则")

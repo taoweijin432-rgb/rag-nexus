@@ -22,6 +22,7 @@ from expert_contracts import (
     ProjectMetadata,
 )
 
+from .dataset import EXPERT_SPEC, DatasetSpec
 from .models import ChunkRecord
 from .validators import ChunkValidationError, validate_chunks
 
@@ -142,16 +143,24 @@ def chunk_records_to_contracts(
     *,
     updated_at: datetime,
     timezone_name: str,
+    dataset_spec: DatasetSpec = EXPERT_SPEC,
 ) -> list[ExpertChunkEmbeddingInput]:
     """校验并转换一位专家的完整 Chunk 快照。
 
+    ``dataset_spec`` 用于把上游 Validator 与 Dataset 的 ID 命名空间保持一致；省略时
+    使用 Expert 默认规格，Resume 入口必须显式传入 ``RESUME_SPEC``。
     空快照直接返回空列表；非空快照先复用上游 Validator 检查 ID、Hash 和集合唯一性，
     再拒绝混入多个专家的输入。校验完成后按原顺序转换，并为全部记录使用同一交付
     时间。任一记录失败时不返回部分 Contract。
     """
 
     prepared_chunks = list(chunks)
-    validate_chunks(prepared_chunks)
+    # Expert 仍走历史单参数入口，保持外部 monkeypatch/扩展兼容；Resume 等显式规格
+    # 才把命名空间传入 Validator。这样共享桥接不会改变 Expert 的调用形态。
+    if dataset_spec is EXPERT_SPEC:
+        validate_chunks(prepared_chunks)
+    else:
+        validate_chunks(prepared_chunks, dataset_spec=dataset_spec)
     expert_ids = {chunk.expert_id for chunk in prepared_chunks}
     if len(expert_ids) > 1:
         raise ChunkValidationError("内存 Contract 批次只能包含同一专家的完整 Chunk 快照")

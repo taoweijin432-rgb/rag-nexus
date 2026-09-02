@@ -22,6 +22,7 @@ from .models import (
     VerificationStatus,
     WeightTier,
     metadata_model_for_chunk_type,
+    vector_doc_id_prefix_for_source_table,
 )
 
 __all__ = [
@@ -44,4 +45,5 @@ __all__ = [
     "WeightTier",
     "adapt_expert_chunk_mapping",
     "metadata_model_for_chunk_type",
+    "vector_doc_id_prefix_for_source_table",
 ]

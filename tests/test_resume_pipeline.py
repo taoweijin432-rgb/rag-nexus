@@ -210,7 +210,7 @@ def test_single_resume_uses_resume_labels_and_internal_contract_identity() -> No
     assert records[0].expert_id == 70001
     assert records[0].source.source_table == ("resume_profile+resume_education_experience")
     assert records[0].source.source_field_id == "70001"
-    assert records[0].vector_doc_id.startswith("expert:70001:profile_summary:")
+    assert records[0].vector_doc_id.startswith("resume:70001:profile_summary:")
 
 
 def test_single_deleted_resume_disables_vectors_without_reading_body() -> None:

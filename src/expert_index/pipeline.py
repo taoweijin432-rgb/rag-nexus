@@ -927,7 +927,10 @@ class ExpertIndexPipeline:
             progress.vector_sync = self._sync_expert_vector_snapshot(expert_id, [])
             return "rejected"
 
-        validate_chunks(chunks)
+        if self.dataset_spec is EXPERT_SPEC:
+            validate_chunks(chunks)
+        else:
+            validate_chunks(chunks, dataset_spec=self.dataset_spec)
         # 校验完成后记录 Chunk 数量；向量同步失败时外层会把本专家标记为 failed。
         progress.chunk_count = len(chunks)
         progress.vector_sync = self._sync_expert_vector_snapshot(expert_id, chunks)
@@ -948,6 +951,7 @@ class ExpertIndexPipeline:
             chunks,
             updated_at=updated_at,
             timezone_name=self.settings.timezone,
+            dataset_spec=self.dataset_spec,
         )
         return self.vector_sync.sync_expert(expert_id, contracts)
 
@@ -986,7 +990,10 @@ class ExpertIndexPipeline:
             # 无可生成内容属于 rejected 业务结果，返回空快照用于清除旧向量。
             return "rejected", self._contracts_for_expert([])
 
-        validate_chunks(chunks)
+        if self.dataset_spec is EXPERT_SPEC:
+            validate_chunks(chunks)
+        else:
+            validate_chunks(chunks, dataset_spec=self.dataset_spec)
         progress.chunk_count = len(chunks)
         return "success", self._contracts_for_expert(chunks)
 
@@ -1001,6 +1008,7 @@ class ExpertIndexPipeline:
             chunks,
             updated_at=updated_at,
             timezone_name=self.settings.timezone,
+            dataset_spec=self.dataset_spec,
         )
 
     def _sync_experts_batch(

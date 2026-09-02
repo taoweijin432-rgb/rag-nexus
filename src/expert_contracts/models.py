@@ -51,6 +51,24 @@ _MONTH_PATTERN = r"^[0-9]{4}(0[1-9]|1[0-2])$"
 _SHA256_PATTERN = r"^[0-9a-f]{64}$"
 _CODE_PATTERN = r"^[a-z][a-z0-9_]*$"
 
+
+def vector_doc_id_prefix_for_source_table(source_table: str) -> str:
+    """根据冻结来源表标签返回 ``vector_doc_id`` 命名空间。
+
+    Contract 不携带数据集字段，为了不改变 4.1.0 的公开字段和 Milvus 物理 Schema，
+    复用已经必填的 ``source.source_table`` 判断命名空间。所有 Resume 来源标签均以
+    ``resume_`` 开头（Profile 聚合标签的第一个组成表也满足该规则）；未知或历史
+    Expert 标签继续回退 ``expert``，确保既有 Expert Contract 行为完全兼容。
+    """
+
+    if not isinstance(source_table, str) or not source_table.strip():
+        raise ValueError("source_table 必须是非空字符串")
+    source_tables = tuple(part.strip() for part in source_table.split("+"))
+    if source_tables and all(part.startswith("resume_") for part in source_tables):
+        return "resume"
+    return "expert"
+
+
 __all__ = [
     "EXPERT_CHUNK_CONTRACT_VERSION",
     "EXPERT_CHUNK_METADATA_BY_TYPE",
@@ -68,6 +86,7 @@ __all__ = [
     "VerificationStatus",
     "WeightTier",
     "metadata_model_for_chunk_type",
+    "vector_doc_id_prefix_for_source_table",
 ]
 
 
@@ -305,9 +324,10 @@ class ExpertChunkEmbeddingInput(_ContractModel):
     def validate_contract_consistency(self) -> ExpertChunkEmbeddingInput:
         """校验正式契约版本，并依据正式公式校验顶层向量主键。
 
-        ``metadata`` 不保留 ``vector_doc_id`` 副本，因此这里不再比对快照，
-        而是用公式 ``expert:{expert_id}:{chunk_type}:{source_field_id}:{chunk_index}``
-        直接校验顶层 ``vector_doc_id``。
+        ``metadata`` 不保留 ``vector_doc_id`` 副本，因此这里不再比对快照，而是用
+        ``{namespace}:{expert_id}:{chunk_type}:{source_field_id}:{chunk_index}`` 公式
+        直接校验顶层 ``vector_doc_id``。namespace 由冻结来源表标签决定：Expert 为
+        ``expert``，Resume 为 ``resume``。
         """
 
         if self.contract_version != EXPERT_CHUNK_CONTRACT_VERSION:
@@ -324,14 +344,17 @@ class ExpertChunkEmbeddingInput(_ContractModel):
                 f"{self.chunk_type} 的 metadata 必须是 "
                 f"{expected_metadata_type.__name__}"
             )
+        namespace = vector_doc_id_prefix_for_source_table(self.source.source_table)
         expected_vector_doc_id = (
-            f"expert:{self.expert_id}:{self.chunk_type}:"
+            f"{namespace}:{self.expert_id}:{self.chunk_type}:"
             f"{self.source.source_field_id}:{self.chunk_index}"
         )
         if self.vector_doc_id != expected_vector_doc_id:
             raise ValueError(
                 "vector_doc_id 必须等于正式公式 "
-                "expert:{expert_id}:{chunk_type}:{source_field_id}:{chunk_index}"
+                f"{namespace}:{{expert_id}}:{{chunk_type}}:"
+                "{source_field_id}:{chunk_index}"
+                f"（namespace={namespace}）"
             )
         return self
 

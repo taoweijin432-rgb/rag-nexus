@@ -33,6 +33,7 @@ from typing import Literal
 from expert_contracts import ExpertChunkEmbeddingInput
 
 from .contract_bridge import chunk_records_to_contracts
+from .dataset import EXPERT_SPEC, DatasetSpec
 from .models import (
     IncrementalImpactScope,
     PreparedChunkSet,
@@ -357,6 +358,7 @@ class ScopeHandoffBuilder:
     """
 
     timezone_name: str
+    dataset_spec: DatasetSpec = EXPERT_SPEC
 
     def build(
         self,
@@ -417,6 +419,7 @@ class ScopeHandoffBuilder:
             prepared.desired_chunks,
             updated_at=task.updated_at,
             timezone_name=self.timezone_name,
+            dataset_spec=self.dataset_spec,
         )
         contracts = tuple(contracts_list)
 

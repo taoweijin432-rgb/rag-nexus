@@ -195,7 +195,7 @@ def build_incremental_handoff_runtime(
     task_repo = MySQLSourceSyncTaskRepository(settings.index_db)
     artifact_repo = MySQLArtifactRepository(settings.index_db)
     scope_fence = MySQLScopeExecutionFence(settings.index_db)
-    builder = ScopeHandoffBuilder(settings.timezone)
+    builder = ScopeHandoffBuilder(settings.timezone, dataset_spec=dataset_spec)
 
     # 7) PreparationCoordinator（P4 外层协调器）：复用同一 task_repo/source/chunk_factory；
     #    lease_seconds 复用 settings.incremental_scan.lease_seconds（与 P3 claim/renew

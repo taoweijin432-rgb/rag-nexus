@@ -136,6 +136,8 @@ def _prepared_result(
     """
 
     materialized = tuple(chunks)
+    # 保持该公共校验入口的单参数调用兼容性；Validator 会依据 Resume/Expert 的
+    # 冻结来源表标签识别命名空间，避免旧的测试/扩展 monkeypatch 被关键字参数破坏。
     validate_chunks(list(materialized))
     return PreparedChunkSet(
         task_id=task_id,
