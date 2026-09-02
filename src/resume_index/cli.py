@@ -12,16 +12,21 @@ from dataclasses import asdict
 
 from .config import ResumeSettings
 from .preflight import run_resume_source_preflight
+from .schema_initializer import MySQLResumeSchemaInitializer
 
 
 def build_parser() -> argparse.ArgumentParser:
-    """创建当前阶段唯一的只读预检命令。"""
+    """创建 Resume 来源预检和独立 Index 初始化命令。"""
 
     parser = argparse.ArgumentParser(description="Resume 数据处理独立入口")
     subcommands = parser.add_subparsers(dest="command", required=True)
     subcommands.add_parser(
         "preflight-source",
         help="只读检查四张 Resume 来源表和 Expert 隔离边界",
+    )
+    subcommands.add_parser(
+        "init-db",
+        help="在 RESUME_INDEX_DB_* 创建 Resume 控制表",
     )
     return parser
 
@@ -36,6 +41,10 @@ def main(argv: list[str] | None = None) -> None:
     if args.command == "preflight-source":
         settings = ResumeSettings.from_env()
         result = run_resume_source_preflight(settings)
+        print(json.dumps(asdict(result), ensure_ascii=False, sort_keys=True))
+    elif args.command == "init-db":
+        settings = ResumeSettings.from_env()
+        result = MySQLResumeSchemaInitializer(settings).initialize_schema()
         print(json.dumps(asdict(result), ensure_ascii=False, sort_keys=True))
 
 

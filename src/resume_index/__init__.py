@@ -2,6 +2,11 @@
 
 from .config import PhysicalDatabaseTarget, ResumeSettings
 from .preflight import ResumeSourcePreflightResult, run_resume_source_preflight
+from .schema_initializer import (
+    DEFAULT_RESUME_INDEX_DDL,
+    MySQLResumeSchemaInitializer,
+    ResumeSchemaInitializationResult,
+)
 from .source_schema import (
     RESUME_SOURCE_TABLES,
     ResumeSourceSchemaError,
@@ -11,8 +16,11 @@ from .source_schema import (
 )
 
 __all__ = [
+    "DEFAULT_RESUME_INDEX_DDL",
     "RESUME_SOURCE_TABLES",
+    "MySQLResumeSchemaInitializer",
     "PhysicalDatabaseTarget",
+    "ResumeSchemaInitializationResult",
     "ResumeSettings",
     "ResumeSourcePreflightResult",
     "ResumeSourceSchemaError",

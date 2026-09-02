@@ -11,6 +11,7 @@ import pytest
 from resume_index.cli import build_parser, main
 from resume_index.config import ResumeSettings
 from resume_index.preflight import run_resume_source_preflight
+from resume_index.schema_initializer import ResumeSchemaInitializationResult
 from resume_index.source_schema import ResumeSourceSchemaError, ResumeSourceSchemaReport
 
 
@@ -108,13 +109,13 @@ def test_preflight_closes_connection_when_schema_is_incompatible(
     assert connection.closed
 
 
-def test_resume_cli_exposes_only_source_preflight() -> None:
+def test_resume_cli_exposes_only_current_safe_commands() -> None:
     parser = build_parser()
     subparsers = next(
         action for action in parser._actions if isinstance(action, argparse._SubParsersAction)
     )
 
-    assert set(subparsers.choices) == {"preflight-source"}
+    assert set(subparsers.choices) == {"preflight-source", "init-db"}
 
 
 def test_cli_prints_safe_json_summary(
@@ -143,4 +144,34 @@ def test_cli_prints_safe_json_summary(
         "milvus_collection_name": "resume_candidates_v15_contract",
         "source_schema": "shared_source",
         "source_tables": ["resume_profile"],
+    }
+
+
+def test_cli_init_db_uses_resume_initializer_and_prints_safe_summary(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    settings = _settings()
+    captured: dict[str, object] = {}
+
+    class FakeInitializer:
+        def __init__(self, received_settings: ResumeSettings) -> None:
+            captured["settings"] = received_settings
+
+        def initialize_schema(self) -> ResumeSchemaInitializationResult:
+            captured["initialized"] = True
+            return ResumeSchemaInitializationResult(
+                schema_name="resume_index",
+                statements_executed=7,
+            )
+
+    monkeypatch.setattr("resume_index.cli.ResumeSettings.from_env", lambda: settings)
+    monkeypatch.setattr("resume_index.cli.MySQLResumeSchemaInitializer", FakeInitializer)
+
+    main(["init-db"])
+
+    assert captured == {"settings": settings, "initialized": True}
+    assert json.loads(capsys.readouterr().out) == {
+        "schema_name": "resume_index",
+        "statements_executed": 7,
     }
