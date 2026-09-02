@@ -4,12 +4,14 @@ from __future__ import annotations
 
 import argparse
 import json
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
 
 from resume_index.cli import build_parser, main
 from resume_index.config import ResumeSettings
+from resume_index.pipeline import ResumeBuildResult, ResumeVectorSyncSummary
 from resume_index.preflight import run_resume_source_preflight
 from resume_index.schema_initializer import ResumeSchemaInitializationResult
 from resume_index.source_schema import ResumeSourceSchemaError, ResumeSourceSchemaReport
@@ -109,13 +111,20 @@ def test_preflight_closes_connection_when_schema_is_incompatible(
     assert connection.closed
 
 
-def test_resume_cli_exposes_only_current_safe_commands() -> None:
+def test_resume_cli_exposes_only_resume_commands() -> None:
     parser = build_parser()
     subparsers = next(
         action for action in parser._actions if isinstance(action, argparse._SubParsersAction)
     )
 
-    assert set(subparsers.choices) == {"preflight-source", "init-db"}
+    assert set(subparsers.choices) == {
+        "preflight-source",
+        "init-db",
+        "build",
+        "build-batch",
+        "resume-batch",
+        "retry-batch",
+    }
 
 
 def test_cli_prints_safe_json_summary(
@@ -175,3 +184,75 @@ def test_cli_init_db_uses_resume_initializer_and_prints_safe_summary(
         "schema_name": "resume_index",
         "statements_executed": 7,
     }
+
+
+def test_cli_build_uses_resume_id_and_prints_resume_semantics(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    settings = _settings()
+    captured: dict[str, object] = {}
+
+    class FakePipeline:
+        def build_single_resume(
+            self,
+            resume_id: int,
+            *,
+            data_version: str,
+            batch_no: str | None,
+        ) -> ResumeBuildResult:
+            captured.update(
+                resume_id=resume_id,
+                data_version=data_version,
+                batch_no=batch_no,
+            )
+            return ResumeBuildResult(
+                batch_id=501,
+                batch_no=batch_no or "generated",
+                resume_id=resume_id,
+                extracted_count=4,
+                stage_count=0,
+                chunk_count=3,
+                partial_chunk_count=0,
+                vector_sync=ResumeVectorSyncSummary(
+                    resume_count=1,
+                    current_count=3,
+                    eligible_count=3,
+                    embedded_count=3,
+                    metadata_updated_count=0,
+                    unchanged_count=0,
+                    deleted_count=0,
+                    delete_not_found_count=0,
+                ),
+            )
+
+    monkeypatch.setattr("resume_index.cli.ResumeSettings.from_env", lambda: settings)
+    monkeypatch.setattr(
+        "resume_index.cli._build_runtime",
+        lambda received: SimpleNamespace(
+            pipeline=FakePipeline(),
+            settings=received,
+        ),
+    )
+
+    main(
+        [
+            "build",
+            "--resume-id",
+            "70001",
+            "--data-version",
+            "resume-v1",
+            "--batch-no",
+            "resume-single-test",
+        ]
+    )
+
+    assert captured == {
+        "resume_id": 70001,
+        "data_version": "resume-v1",
+        "batch_no": "resume-single-test",
+    }
+    output = json.loads(capsys.readouterr().out)
+    assert output["resume_id"] == 70001
+    assert output["vector_sync"]["resume_count"] == 1
+    assert "expert_id" not in output

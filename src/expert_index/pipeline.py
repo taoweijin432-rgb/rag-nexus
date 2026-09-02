@@ -25,6 +25,7 @@ from __future__ import annotations
 from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime
+from typing import cast
 from zoneinfo import ZoneInfo
 
 from expert_contracts import ExpertChunkEmbeddingInput
@@ -32,7 +33,8 @@ from expert_contracts import ExpertChunkEmbeddingInput
 from .chunk_builder import ChunkFactory
 from .config import Settings
 from .contract_bridge import chunk_records_to_contracts
-from .models import ChunkRecord, ExpertCandidate
+from .dataset import EXPERT_SPEC, DatasetSpec
+from .models import ChunkRecord, ExpertAggregate, ExpertCandidate
 from .normalize import normalize_aggregate
 from .ports import ExpertBatchSyncInput, ExpertVectorSyncPort
 from .repositories import (
@@ -152,11 +154,12 @@ class ExpertIndexPipeline:
         self,
         settings: Settings,
         *,
-        source: MySQLSourceAdapter | None = None,
+        source: object | None = None,
         build_lock_repository: MySQLBuildLockRepository | None = None,
         batch_repository: MySQLBatchRepository | None = None,
         batch_item_repository: MySQLBatchItemRepository | None = None,
         vector_sync: ExpertVectorSyncPort,
+        dataset_spec: DatasetSpec = EXPERT_SPEC,
     ) -> None:
         # 默认 Repository 会真实写入状态库；完整注入 Fake 的测试路径不建立数据库连接。
         if any(
@@ -170,6 +173,7 @@ class ExpertIndexPipeline:
             settings.validate_index_write_boundary()
         self.settings = settings
         self.source = source or MySQLSourceAdapter(settings.source_db)
+        self.dataset_spec = dataset_spec
         self.build_lock_repository = (
             build_lock_repository or MySQLBuildLockRepository(settings.index_db)
         )
@@ -180,7 +184,7 @@ class ExpertIndexPipeline:
             settings.index_db
         )
         self.vector_sync = vector_sync
-        self.factory = ChunkFactory(settings)
+        self.factory = ChunkFactory(settings, dataset_spec=dataset_spec)
 
     def build_single_expert(
         self,
@@ -225,12 +229,17 @@ class ExpertIndexPipeline:
         progress = _ExpertProgress(expert_id=expert_id)
         vector_sync = VectorSyncSummary()
         try:
-            outcome = self._process_active_expert(
-                expert_id,
-                data_version=data_version,
-                batch_id=batch_id,
-                progress=progress,
-            )
+            if self._single_person_is_deleted(expert_id):
+                # 数据集显式声明人物已删除时，不读取正文；空快照负责停用历史向量。
+                progress.vector_sync = self._sync_expert_vector_snapshot(expert_id, [])
+                outcome = "deactivated"
+            else:
+                outcome = self._process_active_expert(
+                    expert_id,
+                    data_version=data_version,
+                    batch_id=batch_id,
+                    progress=progress,
+                )
             assert progress.vector_sync is not None
             vector_sync = vector_sync.add(progress.vector_sync)
             # 当前只生成完整 Chunk；返回结构中的 partial 数量固定为 0。
@@ -392,7 +401,7 @@ class ExpertIndexPipeline:
                 result_code: str | None = None
                 error_type: str | None = None
                 try:
-                    candidate = self.source.load_expert_candidate(expert_id)
+                    candidate = self._load_person_candidate(expert_id)
                     if candidate.is_deleted:
                         progress.vector_sync = self._sync_expert_vector_snapshot(
                             expert_id,
@@ -433,7 +442,10 @@ class ExpertIndexPipeline:
                     len(error_summaries) < MAX_BATCH_ERROR_SUMMARIES
                 ):
                     error_summaries.append(
-                        {"expert_id": expert_id, "error_type": error_type}
+                        {
+                            f"{self.dataset_spec.name}_id": expert_id,
+                            "error_type": error_type,
+                        }
                     )
 
             after_expert_id = expert_ids[-1]
@@ -513,9 +525,7 @@ class ExpertIndexPipeline:
 
         if checkpoint is None:
             # 创建批次前固定扫描上界，使任务运行期间新增的专家不进入本次范围。
-            upper_bound_id = self.source.get_full_scan_upper_bound(
-                max_experts=max_experts,
-            )
+            upper_bound_id = self._get_full_scan_upper_bound(max_experts)
             actual_batch_no = batch_no or _generate_full_batch_number()
             batch_id = self.batch_repository.start_batch(
                 actual_batch_no,
@@ -566,9 +576,9 @@ class ExpertIndexPipeline:
 
         try:
             while cursor_id < upper_bound_id:
-                candidates = self.source.load_full_scan_candidates(
-                    after_id=cursor_id,
-                    upper_bound_id=upper_bound_id,
+                candidates = self._load_full_scan_candidates(
+                    after_cursor_id=cursor_id,
+                    upper_bound_cursor_id=upper_bound_id,
                     limit=page_size,
                 )
                 if not candidates:
@@ -600,15 +610,16 @@ class ExpertIndexPipeline:
                     }
                     reliable_persisted_vector_sync = persisted_vector_sync
                     break
-                _validate_expert_candidate_page(
+                self._validate_candidate_page(
                     candidates,
                     after_id=cursor_id,
                     upper_bound_id=upper_bound_id,
                 )
+                person_ids = [self._candidate_person_id(candidate) for candidate in candidates]
                 # 先幂等登记整页明细。登记失败时不开始处理专家，游标保持在上一完整页。
                 self.batch_item_repository.prepare_batch_items(
                     batch_id,
-                    [candidate.id for candidate in candidates],
+                    person_ids,
                 )
 
                 # 阶段 1：逐专家读、生成、校验（CPU，不触发 Embedding），
@@ -618,7 +629,7 @@ class ExpertIndexPipeline:
                 batch_inputs: list[ExpertBatchSyncInput] = []
                 pending: list[
                     tuple[
-                        ExpertCandidate,
+                        object,
                         _ExpertProgress,
                         str,
                         str | None,
@@ -626,11 +637,12 @@ class ExpertIndexPipeline:
                     ]
                 ] = []
                 for candidate in candidates:
+                    person_id = self._candidate_person_id(candidate)
                     candidate_count += 1
-                    progress = _ExpertProgress(expert_id=candidate.id)
+                    progress = _ExpertProgress(expert_id=person_id)
                     self.batch_item_repository.mark_batch_item_running(
                         batch_id,
-                        candidate.id,
+                        person_id,
                     )
                     terminal_status: str
                     result_code: str | None = None
@@ -644,7 +656,7 @@ class ExpertIndexPipeline:
                         else:
                             terminal_status, contracts = (
                                 self._build_expert_contracts_for_batch(
-                                    candidate.id,
+                                    person_id,
                                     data_version=data_version,
                                     batch_id=batch_id,
                                     progress=progress,
@@ -654,7 +666,7 @@ class ExpertIndexPipeline:
                                 result_code = "no_chunkable_content"
                         batch_inputs.append(
                             ExpertBatchSyncInput(
-                                expert_id=candidate.id,
+                                expert_id=person_id,
                                 records=contracts,
                             )
                         )
@@ -674,12 +686,13 @@ class ExpertIndexPipeline:
 
                 # 落库阶段：逐专家回填同步结果、持久化终态、累计批次数量。
                 for candidate, progress, terminal_status, result_code, error_type in pending:
+                    person_id = self._candidate_person_id(candidate)
                     if terminal_status != "failed":
-                        progress.vector_sync = sync_results.get(candidate.id)
+                        progress.vector_sync = sync_results.get(person_id)
                     # 先持久化专家终态，再把该专家计入批次累计数量。
                     self.batch_item_repository.finish_batch_item(
                         batch_id,
-                        candidate.id,
+                        person_id,
                         status=terminal_status,
                         extracted_count=progress.extracted_count,
                         stage_count=0,
@@ -704,7 +717,7 @@ class ExpertIndexPipeline:
                         if len(error_summaries) < MAX_BATCH_ERROR_SUMMARIES:
                             error_summaries.append(
                                 {
-                                    "expert_id": candidate.id,
+                                    f"{self.dataset_spec.name}_id": person_id,
                                     "error_type": error_type,
                                 }
                             )
@@ -714,7 +727,7 @@ class ExpertIndexPipeline:
                     chunk_count += progress.chunk_count
 
                 # 整页明细全部到达终态后，才把游标和累计数量作为同一检查点持久化。
-                cursor_id = candidates[-1].id
+                cursor_id = self._candidate_cursor_id(candidates[-1])
                 self.batch_repository.update_batch_progress(
                     batch_id,
                     cursor_id=cursor_id,
@@ -800,6 +813,79 @@ class ExpertIndexPipeline:
             vector_sync=vector_sync,
         )
 
+    # ------------------------------------------------------------------
+    # 全量 Source 注入缝隙
+    # ------------------------------------------------------------------
+
+    def _get_full_scan_upper_bound(self, max_people: int | None) -> int:
+        """读取固定扫描上界；默认保持现有 Expert Source 调用。"""
+
+        source = cast(MySQLSourceAdapter, self.source)
+        return source.get_full_scan_upper_bound(max_experts=max_people)
+
+    def _load_full_scan_candidates(
+        self,
+        *,
+        after_cursor_id: int,
+        upper_bound_cursor_id: int,
+        limit: int,
+    ) -> list[object]:
+        """读取一页候选；子类可保持人物身份与物理游标分离。"""
+
+        source = cast(MySQLSourceAdapter, self.source)
+        return list(
+            source.load_full_scan_candidates(
+                after_id=after_cursor_id,
+                upper_bound_id=upper_bound_cursor_id,
+                limit=limit,
+            )
+        )
+
+    def _load_person_candidate(self, person_id: int) -> object:
+        """读取人物生命周期候选；默认按 Expert ID 查询。"""
+
+        source = cast(MySQLSourceAdapter, self.source)
+        return source.load_expert_candidate(person_id)
+
+    def _single_person_is_deleted(self, person_id: int) -> bool:
+        """返回单人物入口是否应走停用分支；Expert 默认保持原有 active 路径。"""
+
+        del person_id
+        return False
+
+    def _load_person_aggregate(self, person_id: int) -> ExpertAggregate:
+        """读取人物四表快照；默认按 Expert ID 查询。"""
+
+        source = cast(MySQLSourceAdapter, self.source)
+        return source.load_expert(person_id)
+
+    @staticmethod
+    def _candidate_person_id(candidate: object) -> int:
+        """返回状态表及下游 Contract 使用的人物身份。"""
+
+        return cast(ExpertCandidate, candidate).id
+
+    @staticmethod
+    def _candidate_cursor_id(candidate: object) -> int:
+        """返回全量 Keyset Pagination 使用的物理来源游标。"""
+
+        return cast(ExpertCandidate, candidate).id
+
+    def _validate_candidate_page(
+        self,
+        candidates: list[object],
+        *,
+        after_id: int,
+        upper_bound_id: int,
+    ) -> None:
+        """按 Expert ID 校验候选页，保持现有错误语义不变。"""
+
+        _validate_expert_candidate_page(
+            [cast(ExpertCandidate, candidate) for candidate in candidates],
+            after_id=after_id,
+            upper_bound_id=upper_bound_id,
+        )
+
     def _process_active_expert(
         self,
         expert_id: int,
@@ -821,7 +907,7 @@ class ExpertIndexPipeline:
         批次，批量入口只结束当前专家。``progress`` 保存异常发生前已完成阶段的数量。
         """
 
-        aggregate = self.source.load_expert(expert_id)
+        aggregate = self._load_person_aggregate(expert_id)
         progress.extracted_count = (
             1
             + len(aggregate.employments)
@@ -833,6 +919,7 @@ class ExpertIndexPipeline:
             aggregate,
             data_version=data_version,
             build_batch_id=batch_id,
+            dataset_spec=self.dataset_spec,
         )
         chunks = self.factory.build_all(profile, employments, projects)
         if not chunks:
@@ -880,7 +967,7 @@ class ExpertIndexPipeline:
         共用读、生成、校验逻辑，但不调用下游，以便批量循环合并 Embedding。
         """
 
-        aggregate = self.source.load_expert(expert_id)
+        aggregate = self._load_person_aggregate(expert_id)
         progress.extracted_count = (
             1
             + len(aggregate.employments)
@@ -892,6 +979,7 @@ class ExpertIndexPipeline:
             aggregate,
             data_version=data_version,
             build_batch_id=batch_id,
+            dataset_spec=self.dataset_spec,
         )
         chunks = self.factory.build_all(profile, employments, projects)
         if not chunks:

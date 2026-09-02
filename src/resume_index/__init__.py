@@ -2,7 +2,14 @@
 
 from .config import PhysicalDatabaseTarget, ResumeSettings
 from .dataset import RESUME_SPEC
+from .pipeline import (
+    ResumeBatchBuildResult,
+    ResumeBuildResult,
+    ResumeIndexPipeline,
+    ResumeVectorSyncSummary,
+)
 from .preflight import ResumeSourcePreflightResult, run_resume_source_preflight
+from .runtime import ResumeRuntime, build_resume_runtime
 from .schema_initializer import (
     DEFAULT_RESUME_INDEX_DDL,
     MySQLResumeSchemaInitializer,
@@ -24,13 +31,19 @@ __all__ = [
     "MySQLResumeSchemaInitializer",
     "MySQLResumeSourceAdapter",
     "PhysicalDatabaseTarget",
+    "ResumeBatchBuildResult",
+    "ResumeBuildResult",
     "ResumeCandidate",
+    "ResumeIndexPipeline",
     "ResumeNotFoundError",
+    "ResumeRuntime",
     "ResumeSchemaInitializationResult",
     "ResumeSettings",
     "ResumeSourcePreflightResult",
     "ResumeSourceSchemaError",
     "ResumeSourceSchemaReport",
+    "ResumeVectorSyncSummary",
+    "build_resume_runtime",
     "inspect_resume_source_schema",
     "require_resume_source_schema",
     "run_resume_source_preflight",
