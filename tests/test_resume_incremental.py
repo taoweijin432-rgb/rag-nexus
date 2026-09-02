@@ -98,9 +98,9 @@ def _task(new_task) -> SourceSyncTask:
     )
 
 
-def test_resume_profile_candidate_maps_physical_id_to_resume_person_scope() -> None:
+def test_resume_candidate_maps_physical_id_to_resume_person_scope() -> None:
     candidate = SourceChangeCandidate(
-        source_table="resume_profile",
+        source_table="resume",
         record_id=17,
         expert_id=70001,
         updated_at=NOW,
@@ -156,7 +156,7 @@ def test_resume_scan_coordinator_uses_frozen_four_table_order() -> None:
         RESUME_SPEC.source_tables
     )
     assert tuple(outcome.source_table for outcome in result.outcomes) == (RESUME_SPEC.source_tables)
-    assert all("resume_profile" not in batch_no for _source, _owner, batch_no in calls)
+    assert all("resume" not in batch_no for _source, _owner, batch_no in calls)
 
 
 def test_resume_employment_scope_builds_resume_source_labels() -> None:
@@ -222,6 +222,75 @@ def test_resume_employment_scope_builds_resume_source_labels() -> None:
     assert prepared.impact_scope.source_table == "resume_work_experience"
     assert prepared.desired_chunks
     assert {chunk.source_table for chunk in prepared.desired_chunks} == {"resume_work_experience"}
+
+
+def test_resume_employment_allows_nullable_company_when_role_exists() -> None:
+    """Resume 与 Expert 共用同一可空公司契约，岗位存在时仍应生成 Chunk。"""
+
+    new_task = map_poll_candidate_to_task(
+        SourceChangeCandidate(
+            source_table="resume_work_experience",
+            record_id=81001,
+            expert_id=70001,
+            updated_at=NOW,
+            deleted_at=None,
+        ),
+        batch_id=8,
+        policy_version="v1.3",
+        dataset_spec=RESUME_SPEC,
+    )
+    task = _task(new_task)
+    scope = impact_scope_from_target(
+        target_type="employment",
+        expert_id=70001,
+        source_field_id="81001",
+        dataset_spec=RESUME_SPEC,
+    )
+    facts = ScopedCurrentFacts(
+        scope=scope,
+        expert=ExpertSource(
+            id=70001,
+            serial_number="RESUME-001",
+            company="示例科技",
+            job_status=1,
+            job_name="项目经理",
+            contact_status=3,
+            doubtful_flag=1,
+            abroad_flag=2,
+            background="负责知识库建设。",
+            work_years=5,
+            updated_at=NOW,
+            created_at=NOW,
+            deleted_at=None,
+        ),
+        employments=(
+            EmploymentSource(
+                id=81001,
+                expert_id=70001,
+                company_name=None,
+                position_title="项目经理",
+                start_date=NOW,
+                end_date=None,
+                work_description="工作职责：负责知识库建设。",
+                is_employed=1,
+                updated_at=NOW,
+                created_at=NOW,
+                deleted_at=None,
+            ),
+        ),
+    )
+    factory = ChunkFactory(
+        _settings().to_processing_settings(),
+        dataset_spec=RESUME_SPEC,
+    )
+
+    prepared = build_prepared_chunk_set(task, facts, factory)
+
+    assert len(prepared.desired_chunks) == 1
+    chunk = prepared.desired_chunks[0]
+    assert chunk.source_table == "resume_work_experience"
+    assert chunk.company_name_raw is None
+    assert chunk.role_name_raw == "项目经理"
 
 
 def test_resume_incremental_runtime_binds_four_resume_sources_without_cdc() -> None:

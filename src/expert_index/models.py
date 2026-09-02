@@ -20,7 +20,7 @@ from .dataset import EXPERT_SPEC, DatasetSpec
 # 能复用状态模型，同时 Expert Scanner 默认仍只遍历 EXPERT_SPEC.source_tables。
 RESUME_CHECKPOINT_SOURCE_TABLES = frozenset(
     {
-        "resume_profile",
+        "resume",
         "resume_work_experience",
         "resume_project_experience",
         "resume_education_experience",
@@ -54,7 +54,7 @@ _SOURCE_SYNC_TARGETS_BY_TABLE = {
     "experts_work_experience": frozenset({"employment"}),
     "experts_project_experience": frozenset({"project"}),
     "experts_education_experience": frozenset({"education"}),
-    "resume_profile": frozenset({"expert", "profile"}),
+    "resume": frozenset({"expert", "profile"}),
     "resume_work_experience": frozenset({"employment"}),
     "resume_project_experience": frozenset({"project"}),
     "resume_education_experience": frozenset({"education"}),
@@ -875,7 +875,7 @@ _PROFILE_IMPACT_SOURCE_TABLE = EXPERT_SPEC.profile_source_label
 _PROFILE_IMPACT_SOURCE_TABLES = frozenset(
     {
         _PROFILE_IMPACT_SOURCE_TABLE,
-        "resume_profile+resume_education_experience",
+        "resume+resume_education_experience",
     }
 )
 
@@ -1140,7 +1140,7 @@ _TRIGGER_TARGET_TYPE_BY_TABLE = {
     "experts_work_experience": "employment",
     "experts_project_experience": "project",
     "experts_education_experience": "education",
-    "resume_profile": "expert",
+    "resume": "expert",
     "resume_work_experience": "employment",
     "resume_project_experience": "project",
     "resume_education_experience": "education",
@@ -1149,8 +1149,8 @@ _TRIGGER_TARGET_TYPE_BY_TABLE = {
 _PROFILE_SOURCE_LABEL_BY_TRIGGER_TABLE = {
     "experts": "experts+experts_education_experience",
     "experts_education_experience": "experts+experts_education_experience",
-    "resume_profile": "resume_profile+resume_education_experience",
-    "resume_education_experience": "resume_profile+resume_education_experience",
+    "resume": "resume+resume_education_experience",
+    "resume_education_experience": "resume+resume_education_experience",
 }
 
 
@@ -1198,7 +1198,7 @@ class CurrentFactReadRequest:
         if scope_type == "expert":
             if trigger_target != "expert":
                 raise ValueError(
-                    "expert 范围的触发来源必须是 experts 或 resume_profile，"
+                    "expert 范围的触发来源必须是 experts 或 resume，"
                     f"实际为 {self.trigger_source_table}"
                 )
             if self.trigger_source_table == "experts" and self.trigger_source_field_id != str(

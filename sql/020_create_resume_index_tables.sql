@@ -2,7 +2,8 @@
 --
 -- 强制边界：
 -- 1. 本脚本只能由 resume_index.cli init-db 在 RESUME_INDEX_DB_* 指向的独立 Schema 执行。
--- 2. 本脚本不创建 Schema，不创建或修改四张 resume_* Source 表，也不包含任何来源正文。
+-- 2. 本脚本不创建 Schema，不创建或修改 Resume 主表及三张 resume_* Source 表，
+--    也不包含任何来源正文。
 -- 3. 为复用现有 Repository，控制表沿用内部 expert_index_* 表名；由于 Resume Index
 --    使用独立 Schema，不会与 Expert 控制表混用。
 -- 4. 控制表中的 expert_id 是现有内部技术字段，在 Resume 链路中固定承载 resume_id。
@@ -16,8 +17,8 @@ CREATE TABLE IF NOT EXISTS expert_index_batch (
     data_version VARCHAR(64) NULL COMMENT '本批次使用的业务数据版本',
     status VARCHAR(16) NOT NULL COMMENT 'running/success/failed/partial',
     cursor_updated_at DATETIME(6) NULL,
-    cursor_id BIGINT UNSIGNED NULL COMMENT '最后完成调度的 resume_profile.id 物理游标',
-    upper_bound_id BIGINT UNSIGNED NULL COMMENT '全量启动时固定的 resume_profile.id 上界',
+    cursor_id BIGINT UNSIGNED NULL COMMENT '最后完成调度的 resume.id 物理游标',
+    upper_bound_id BIGINT UNSIGNED NULL COMMENT '全量启动时固定的 resume.id 上界',
     candidate_count INT UNSIGNED NOT NULL DEFAULT 0,
     success_count INT UNSIGNED NOT NULL DEFAULT 0,
     failed_count INT UNSIGNED NOT NULL DEFAULT 0,
@@ -51,7 +52,7 @@ CREATE TABLE IF NOT EXISTS expert_index_batch (
 
 -- 四张物理来源表分别维护已经安全提交的 (updated_at, id) Checkpoint。
 CREATE TABLE IF NOT EXISTS expert_index_source_checkpoint (
-    source_table VARCHAR(128) NOT NULL COMMENT '四张 resume_* 物理来源表之一',
+    source_table VARCHAR(128) NOT NULL COMMENT '四张 Resume 物理来源表之一',
     last_updated_at DATETIME(6) NOT NULL COMMENT '最后安全提交的来源更新时间游标',
     last_id BIGINT UNSIGNED NOT NULL COMMENT '同一更新时间内最后安全提交的来源主键',
     last_batch_id BIGINT UNSIGNED NULL COMMENT '最后推进 Checkpoint 的构建批次 ID',
@@ -66,7 +67,7 @@ CREATE TABLE IF NOT EXISTS expert_index_source_checkpoint (
     KEY idx_expert_source_checkpoint_lease (lease_until, source_table),
     CONSTRAINT chk_expert_index_source_checkpoint_table CHECK (
         source_table IN (
-            'resume_profile',
+            'resume',
             'resume_work_experience',
             'resume_project_experience',
             'resume_education_experience'
@@ -82,7 +83,7 @@ CREATE TABLE IF NOT EXISTS expert_index_source_checkpoint (
 CREATE TABLE IF NOT EXISTS expert_index_batch_source (
     id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
     batch_id BIGINT UNSIGNED NOT NULL COMMENT '逻辑关联 expert_index_batch.id',
-    source_table VARCHAR(128) NOT NULL COMMENT '本行负责扫描的 resume_* 来源表',
+    source_table VARCHAR(128) NOT NULL COMMENT '本行负责扫描的 Resume 来源表',
     start_updated_at DATETIME(6) NOT NULL COMMENT '批次启动时的安全 Checkpoint 时间',
     start_id BIGINT UNSIGNED NOT NULL COMMENT '批次启动时的安全 Checkpoint 来源主键',
     cursor_updated_at DATETIME(6) NOT NULL COMMENT '当前已扫描到的临时时间游标',
@@ -108,7 +109,7 @@ CREATE TABLE IF NOT EXISTS expert_index_batch_source (
     KEY idx_expert_batch_source_claim (source_table, status, id),
     CONSTRAINT chk_expert_batch_source_table CHECK (
         source_table IN (
-            'resume_profile',
+            'resume',
             'resume_work_experience',
             'resume_project_experience',
             'resume_education_experience'
@@ -135,7 +136,7 @@ CREATE TABLE IF NOT EXISTS expert_index_sync_task (
     batch_id BIGINT UNSIGNED NOT NULL COMMENT '逻辑关联 expert_index_batch.id',
     event_source VARCHAR(16) NOT NULL DEFAULT 'poll'
         COMMENT 'poll/reconcile/replay，首版不接入 cdc',
-    source_table VARCHAR(128) NOT NULL COMMENT '发生变化的 resume_* 来源表',
+    source_table VARCHAR(128) NOT NULL COMMENT '发生变化的 Resume 来源表',
     source_record_id BIGINT UNSIGNED NOT NULL COMMENT '来源表物理主键 id',
     source_updated_at DATETIME(6) NULL COMMENT '扫描候选的来源 updated_at',
     expert_id BIGINT UNSIGNED NULL COMMENT '内部兼容字段，Resume 链路中固定承载 resume_id',
@@ -174,7 +175,7 @@ CREATE TABLE IF NOT EXISTS expert_index_sync_task (
     ),
     CONSTRAINT chk_expert_sync_task_table CHECK (
         source_table IN (
-            'resume_profile',
+            'resume',
             'resume_work_experience',
             'resume_project_experience',
             'resume_education_experience'
@@ -260,7 +261,7 @@ CREATE TABLE IF NOT EXISTS expert_index_sync_dead_letter (
     id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
     task_id BIGINT UNSIGNED NOT NULL COMMENT '逻辑关联 expert_index_sync_task.id',
     batch_id BIGINT UNSIGNED NOT NULL COMMENT '冗余批次 ID，便于审计和补偿',
-    source_table VARCHAR(128) NOT NULL COMMENT '发生失败的 resume_* 来源表',
+    source_table VARCHAR(128) NOT NULL COMMENT '发生失败的 Resume 来源表',
     source_record_id BIGINT UNSIGNED NOT NULL COMMENT '来源表物理主键 id',
     expert_id BIGINT UNSIGNED NULL COMMENT '内部兼容字段，Resume 链路中固定承载 resume_id',
     failure_stage VARCHAR(32) NOT NULL COMMENT '进入 Dead Letter 时的处理阶段',
@@ -285,7 +286,7 @@ CREATE TABLE IF NOT EXISTS expert_index_sync_dead_letter (
     KEY idx_expert_sync_dead_letter_expert (expert_id, id),
     CONSTRAINT chk_expert_sync_dead_letter_table CHECK (
         source_table IN (
-            'resume_profile',
+            'resume',
             'resume_work_experience',
             'resume_project_experience',
             'resume_education_experience'

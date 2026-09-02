@@ -42,7 +42,7 @@ def _preflight(settings: ResumeSettings) -> ResumeSourcePreflightResult:
     return ResumeSourcePreflightResult(
         source_schema=settings.source_db.database,
         source_tables=(
-            "resume_profile",
+            "resume",
             "resume_work_experience",
             "resume_project_experience",
             "resume_education_experience",

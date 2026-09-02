@@ -93,7 +93,7 @@ def test_resume_spec_freezes_identity_lifecycle_and_table_mapping() -> None:
     """Resume 规格必须完整表达三个冻结上游契约。"""
 
     assert RESUME_SPEC.source_tables == (
-        "resume_profile",
+        "resume",
         "resume_work_experience",
         "resume_project_experience",
         "resume_education_experience",
@@ -104,7 +104,7 @@ def test_resume_spec_freezes_identity_lifecycle_and_table_mapping() -> None:
     assert RESUME_SPEC.child_deleted_at_column == "deleted_at"
     assert RESUME_SPEC.vector_doc_id_prefix == "resume"
     assert EXPERT_SPEC.vector_doc_id_prefix == "expert"
-    assert RESUME_SPEC.target_type_for_source_table("resume_profile") == "profile"
+    assert RESUME_SPEC.target_type_for_source_table("resume") == "profile"
     assert RESUME_SPEC.target_type_for_source_table("resume_education_experience") == "education"
 
 
@@ -114,7 +114,7 @@ def test_dataset_spec_rejects_unknown_table_and_sql_fragment() -> None:
     with pytest.raises(ValueError, match="不支持来源表"):
         RESUME_SPEC.target_type_for_source_table("experts")
     with pytest.raises(ValueError, match="不是合法 SQL 标识符"):
-        replace(RESUME_SPEC, profile_table="resume_profile; DROP TABLE x")
+        replace(RESUME_SPEC, profile_table="resume; DROP TABLE x")
 
 
 def test_normalize_default_remains_identical_to_explicit_expert_spec() -> None:
@@ -165,7 +165,7 @@ def test_resume_spec_changes_only_dataset_source_labels() -> None:
     expert_chunks = ChunkFactory(_settings()).build_all(*expert_result)
     resume_chunks = ChunkFactory(_settings(), dataset_spec=RESUME_SPEC).build_all(*resume_result)
     assert expert_chunks[0].source_table == "experts+experts_education_experience"
-    assert resume_chunks[0].source_table == ("resume_profile+resume_education_experience")
+    assert resume_chunks[0].source_table == ("resume+resume_education_experience")
     assert all(chunk.vector_doc_id.startswith("resume:") for chunk in resume_chunks)
     assert all(chunk.vector_doc_id.startswith("expert:") for chunk in expert_chunks)
     assert {chunk.source_table for chunk in resume_chunks[1:]} == {

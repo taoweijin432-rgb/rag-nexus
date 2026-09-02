@@ -93,7 +93,7 @@ class ResumeBatchBuildResult:
     """Resume 全量、续跑或失败重试的安全计数结果。
 
     ``upper_bound_source_record_id`` 和 ``cursor_source_record_id`` 均表示
-    ``resume_profile.id`` 物理游标，不是 ``resume_id``。
+    ``resume.id`` 物理游标，不是 ``resume_id``。
     """
 
     batch_id: int
@@ -181,7 +181,7 @@ class _ResumePipelineCore(ExpertIndexPipeline):
         after_id: int,
         upper_bound_id: int,
     ) -> None:
-        """按 ``resume_profile.id`` 校验候选页物理游标。"""
+        """按 ``resume.id`` 校验候选页物理游标。"""
 
         cursor_ids = [self._candidate_cursor_id(candidate) for candidate in candidates]
         if cursor_ids != sorted(set(cursor_ids)):
@@ -249,7 +249,7 @@ class ResumeIndexPipeline:
         max_resumes: int | None = None,
         batch_no: str | None = None,
     ) -> ResumeBatchBuildResult:
-        """按 ``resume_profile.id`` 固定上界运行全量或限定数量批次。"""
+        """按 ``resume.id`` 固定上界运行全量或限定数量批次。"""
 
         result = self._core.build_expert_batch(
             data_version=data_version,
@@ -265,7 +265,7 @@ class ResumeIndexPipeline:
         *,
         page_size: int = 200,
     ) -> ResumeBatchBuildResult:
-        """从原批次最后可靠的 ``resume_profile.id`` 页边界继续执行。"""
+        """从原批次最后可靠的 ``resume.id`` 页边界继续执行。"""
 
         return ResumeBatchBuildResult.from_internal(
             self._core.resume_expert_batch(batch_id, page_size=page_size)

@@ -1,6 +1,7 @@
 """Resume MySQL Source Adapter。
 
-本模块只读四张 ``resume_*`` 派生表，并把允许字段映射到现有公共 Source 模型。
+本模块只读 ``resume`` 主表和三张 ``resume_*`` 派生表，并把允许字段映射到现有公共
+Source 模型。
 ``resume_id`` 在映射后承载内部兼容字段 ``expert_id`` 的语义；人物主表物理 ``id``
 只用于全量分页游标和来源追踪，绝不替代人物身份。
 """
@@ -45,11 +46,11 @@ class ResumeCandidate:
     Parameters
     ----------
     source_record_id:
-        ``resume_profile.id`` 物理行 ID，只用于 Keyset Pagination 和来源追踪。
+        ``resume.id`` 物理行 ID，只用于 Keyset Pagination 和来源追踪。
     resume_id:
         Resume 全链路唯一人物/任务身份，后续映射到公共模型的 ``expert_id``。
     deleted_at:
-        ``resume_profile.resume_deleted_at`` 的别名；非空时应停用该人物历史 Chunk。
+        ``resume.resume_deleted_at`` 的别名；非空时应停用该人物历史 Chunk。
     """
 
     source_record_id: int
@@ -97,7 +98,7 @@ class MySQLResumeSourceAdapter:
         self.dataset_spec = dataset_spec
 
     def get_full_scan_upper_bound(self, *, max_resumes: int | None = None) -> int:
-        """固定本批次允许扫描到的最大 ``resume_profile.id``。
+        """固定本批次允许扫描到的最大 ``resume.id``。
 
         ``max_resumes=None`` 时读取全表最大物理 ID；传入正整数 N 时只把按物理 ID
         升序排列的前 N 位人物纳入批次。查询不排除逻辑删除人物，因为删除记录同样需要
@@ -137,7 +138,7 @@ class MySQLResumeSourceAdapter:
         upper_bound_source_record_id: int,
         limit: int,
     ) -> list[ResumeCandidate]:
-        """按 ``resume_profile.id`` Keyset 游标读取一页人物候选。
+        """按 ``resume.id`` Keyset 游标读取一页人物候选。
 
         结果同时返回物理 ``source_record_id`` 和业务 ``resume_id``，从类型层面阻止调用方
         混用两个身份。查询只读取调度字段和生命周期标记，不读取背景或经历正文。
@@ -541,7 +542,7 @@ class MySQLResumeSourceAdapter:
         *,
         expected_resume_id: int,
     ) -> ExpertSource:
-        """按 ``resume_profile.id`` 读取触发行并核对其业务人物身份。"""
+        """按 ``resume.id`` 读取触发行并核对其业务人物身份。"""
 
         spec = self.dataset_spec
         cursor.execute(

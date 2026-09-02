@@ -64,7 +64,7 @@ class ResumeSourceSchemaError(RuntimeError):
 
 
 RESUME_SOURCE_TABLES = (
-    "resume_profile",
+    "resume",
     "resume_work_experience",
     "resume_project_experience",
     "resume_education_experience",
@@ -77,7 +77,7 @@ _COMMON_TIMESTAMPS = {
 }
 
 RESUME_SOURCE_COLUMN_REQUIREMENTS: Mapping[str, Mapping[str, ColumnRequirement]] = {
-    "resume_profile": {
+    "resume": {
         "id": ColumnRequirement(_INTEGER_TYPES, nullable=False),
         "resume_id": ColumnRequirement(_INTEGER_TYPES, nullable=False),
         "serial_number": ColumnRequirement(_TEXT_TYPES, nullable=False),
@@ -132,7 +132,7 @@ _COMMON_INDEXES = (
     IndexRequirement("scan(updated_at,id)", ("updated_at", "id")),
 )
 RESUME_SOURCE_INDEX_REQUIREMENTS: Mapping[str, tuple[IndexRequirement, ...]] = {
-    "resume_profile": _COMMON_INDEXES
+    "resume": _COMMON_INDEXES
     + (IndexRequirement("UNIQUE(resume_id)", ("resume_id",), unique=True),),
     "resume_work_experience": _COMMON_INDEXES
     + (IndexRequirement("lookup(resume_id)", ("resume_id",)),),

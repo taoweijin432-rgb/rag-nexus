@@ -57,7 +57,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     build_batch = subcommands.add_parser(
         "build-batch",
-        help="按 resume_profile.id 固定范围执行全量构建",
+        help="按 resume.id 固定范围执行全量构建",
     )
     build_batch.add_argument("--data-version", required=True)
     build_batch.add_argument("--page-size", type=int, default=200)

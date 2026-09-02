@@ -17,7 +17,7 @@ EXPECTED_CONTROL_TABLES = {
     "expert_index_batch_item",
 }
 RESUME_SOURCE_TABLES = {
-    "resume_profile",
+    "resume",
     "resume_work_experience",
     "resume_project_experience",
     "resume_education_experience",

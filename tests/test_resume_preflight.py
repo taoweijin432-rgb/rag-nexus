@@ -98,11 +98,11 @@ def test_preflight_closes_connection_when_schema_is_incompatible(
     connection = _Connection()
 
     def reject_schema(*_args: object, **_kwargs: object) -> None:
-        raise ResumeSourceSchemaError("缺少表 resume_profile")
+        raise ResumeSourceSchemaError("缺少表 resume")
 
     monkeypatch.setattr("resume_index.preflight.require_resume_source_schema", reject_schema)
 
-    with pytest.raises(ResumeSourceSchemaError, match="resume_profile"):
+    with pytest.raises(ResumeSourceSchemaError, match="resume"):
         run_resume_source_preflight(
             _settings(),
             connection_factory=_ConnectionFactory(connection),
@@ -142,7 +142,7 @@ def test_cli_prints_safe_json_summary(
 
     expected = ResumeSourcePreflightResult(
         source_schema="shared_source",
-        source_tables=("resume_profile",),
+        source_tables=("resume",),
         index_schema="resume_index",
         milvus_collection_name="resume_candidates_v15_contract",
     )
@@ -155,7 +155,7 @@ def test_cli_prints_safe_json_summary(
         "index_schema": "resume_index",
         "milvus_collection_name": "resume_candidates_v15_contract",
         "source_schema": "shared_source",
-        "source_tables": ["resume_profile"],
+        "source_tables": ["resume"],
     }
 
 

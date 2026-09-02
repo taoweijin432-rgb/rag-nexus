@@ -208,7 +208,7 @@ def test_single_resume_uses_resume_labels_and_internal_contract_identity() -> No
     synced_id, records = vector_sync.calls[0]
     assert synced_id == 70001
     assert records[0].expert_id == 70001
-    assert records[0].source.source_table == ("resume_profile+resume_education_experience")
+    assert records[0].source.source_table == ("resume+resume_education_experience")
     assert records[0].source.source_field_id == "70001"
     assert records[0].vector_doc_id.startswith("resume:70001:profile_summary:")
 

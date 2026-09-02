@@ -114,7 +114,7 @@ def test_load_resume_maps_resume_id_and_preserves_child_record_ids(
     when = datetime(2026, 9, 2, 10, 0, 0)  # noqa: DTZ001
     cursor = ScriptedCursor(
         {
-            "FROM resume_profile": [_profile_row()],
+            "FROM resume ": [_profile_row()],
             "FROM resume_work_experience": [
                 [
                     {
@@ -209,7 +209,7 @@ def test_full_scan_candidates_keep_physical_cursor_separate_from_resume_id(
     deleted_at = datetime(2026, 9, 2, 11, 0, 0)  # noqa: DTZ001
     cursor = ScriptedCursor(
         {
-            "FROM resume_profile": [
+            "FROM resume ": [
                 [
                     {"source_record_id": 41, "resume_id": 70001, "deleted_at": None},
                     {
@@ -250,7 +250,7 @@ def test_full_scan_candidates_keep_physical_cursor_separate_from_resume_id(
 def test_full_scan_upper_bound_uses_profile_physical_id(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    cursor = ScriptedCursor({"FROM resume_profile": [{"upper_bound_id": 42}]})
+    cursor = ScriptedCursor({"FROM resume ": [{"upper_bound_id": 42}]})
     connection = FakeConnection(cursor)
     monkeypatch.setattr(
         "resume_index.source.pymysql.connect",
@@ -263,7 +263,7 @@ def test_full_scan_upper_bound_uses_profile_physical_id(
 
     assert upper_bound == 42
     sql, params = cursor.executed[0]
-    assert "SELECT id FROM resume_profile ORDER BY id ASC LIMIT %s" in sql
+    assert "SELECT id FROM resume ORDER BY id ASC LIMIT %s" in sql
     assert "resume_id" not in sql
     assert params == (20,)
 
@@ -272,7 +272,7 @@ def test_load_resume_candidate_reads_lifecycle_without_body(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     cursor = ScriptedCursor(
-        {"FROM resume_profile": [{"source_record_id": 17, "resume_id": 70001, "deleted_at": None}]}
+        {"FROM resume ": [{"source_record_id": 17, "resume_id": 70001, "deleted_at": None}]}
     )
     connection = FakeConnection(cursor)
     monkeypatch.setattr(
@@ -293,7 +293,7 @@ def test_load_resume_candidate_reads_lifecycle_without_body(
 def test_missing_profile_rolls_back_and_closes_snapshot(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    cursor = ScriptedCursor({"FROM resume_profile": [None]})
+    cursor = ScriptedCursor({"FROM resume ": [None]})
     connection = FakeConnection(cursor)
     monkeypatch.setattr(
         "resume_index.source.pymysql.connect",
@@ -313,7 +313,7 @@ def test_poll_candidate_scan_keeps_physical_id_and_resume_id_separate(
     when = datetime(2026, 9, 2, 10, 0, 0)  # noqa: DTZ001
     cursor = ScriptedCursor(
         {
-            "FROM resume_profile": [
+            "FROM resume ": [
                 [
                     {
                         "id": 17,
@@ -332,7 +332,7 @@ def test_poll_candidate_scan_keeps_physical_id_and_resume_id_separate(
     adapter = MySQLResumeSourceAdapter(_source_config())
 
     candidates = adapter.load_source_change_candidates(
-        "resume_profile",
+        "resume",
         after_cursor=SourceScanCursor(datetime(1970, 1, 1), 0),  # noqa: DTZ001
         upper_bound=SourceScanCursor(when, 17),
         limit=100,
@@ -341,7 +341,7 @@ def test_poll_candidate_scan_keeps_physical_id_and_resume_id_separate(
     assert len(candidates) == 1
     assert candidates[0].record_id == 17
     assert candidates[0].expert_id == 70001
-    assert candidates[0].source_table == "resume_profile"
+    assert candidates[0].source_table == "resume"
     sql, params = cursor.executed[-1]
     assert "ORDER BY updated_at ASC, id ASC" in sql
     assert params is not None and params[-1] == 100
@@ -354,7 +354,7 @@ def test_poll_profile_delete_reads_by_physical_id_and_returns_empty_person_scope
     profile = _profile_row()
     profile["physical_source_id"] = 17
     profile["lifecycle_deleted_at"] = when
-    cursor = ScriptedCursor({"FROM resume_profile": [profile]})
+    cursor = ScriptedCursor({"FROM resume ": [profile]})
     connection = FakeConnection(cursor)
     monkeypatch.setattr(
         "resume_index.source.pymysql.connect",
@@ -369,7 +369,7 @@ def test_poll_profile_delete_reads_by_physical_id_and_returns_empty_person_scope
     facts = MySQLResumeSourceAdapter(_source_config()).read_current_facts(
         CurrentFactReadRequest(
             impact_scope=scope,
-            trigger_source_table="resume_profile",
+            trigger_source_table="resume",
             trigger_source_field_id="17",
             trigger_source_updated_at=when,
         )
@@ -403,7 +403,7 @@ def test_poll_deleted_employment_returns_trigger_and_parent_lifecycle(
     cursor = ScriptedCursor(
         {
             "FROM resume_work_experience": [employment],
-            "FROM resume_profile": [_profile_row()],
+            "FROM resume ": [_profile_row()],
         }
     )
     monkeypatch.setattr(

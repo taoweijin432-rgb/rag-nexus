@@ -76,7 +76,7 @@ def _valid_rows() -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
         ]
         definitions.append(
             ("uk_resume_id", 0, ("resume_id",))
-            if table == "resume_profile"
+            if table == "resume"
             else ("idx_resume_id", 1, ("resume_id",))
         )
         for index_name, non_unique, index_columns in definitions:
@@ -122,7 +122,7 @@ def test_missing_column_and_index_fail_closed() -> None:
     columns = [
         row
         for row in columns
-        if not (row["TABLE_NAME"] == "resume_profile" and row["COLUMN_NAME"] == "resume_deleted_at")
+        if not (row["TABLE_NAME"] == "resume" and row["COLUMN_NAME"] == "resume_deleted_at")
     ]
     indexes = [
         row
@@ -136,14 +136,14 @@ def test_missing_column_and_index_fail_closed() -> None:
         )
 
     message = str(error.value)
-    assert "resume_profile 缺少列 resume_deleted_at" in message
+    assert "resume 缺少列 resume_deleted_at" in message
     assert "resume_work_experience 缺少索引 scan(updated_at,id)" in message
 
 
 def test_incompatible_key_type_and_nullable_contract_are_reported() -> None:
     columns, indexes = _valid_rows()
     for row in columns:
-        if row["TABLE_NAME"] == "resume_profile" and row["COLUMN_NAME"] == "resume_id":
+        if row["TABLE_NAME"] == "resume" and row["COLUMN_NAME"] == "resume_id":
             row["DATA_TYPE"] = "varchar"
             row["IS_NULLABLE"] = "YES"
 
@@ -152,8 +152,8 @@ def test_incompatible_key_type_and_nullable_contract_are_reported() -> None:
         schema_name="resume_source",
     )
 
-    assert "resume_profile.resume_id 类型不兼容: varchar" in report.issues
-    assert "resume_profile.resume_id 必须非空" in report.issues
+    assert "resume.resume_id 类型不兼容: varchar" in report.issues
+    assert "resume.resume_id 必须非空" in report.issues
 
 
 @pytest.mark.parametrize("schema_name", ["", "   "])

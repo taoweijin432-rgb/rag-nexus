@@ -6,7 +6,7 @@ from expert_index.dataset import DatasetSpec
 # 主档生命周期由 resume_deleted_at 决定，子记录生命周期统一由 deleted_at 决定。
 RESUME_SPEC = DatasetSpec(
     name="resume",
-    profile_table="resume_profile",
+    profile_table="resume",
     employment_table="resume_work_experience",
     project_table="resume_project_experience",
     education_table="resume_education_experience",

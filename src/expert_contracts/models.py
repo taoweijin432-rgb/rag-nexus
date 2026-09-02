@@ -57,14 +57,19 @@ def vector_doc_id_prefix_for_source_table(source_table: str) -> str:
 
     Contract 不携带数据集字段，为了不改变 4.1.0 的公开字段和 Milvus 物理 Schema，
     复用已经必填的 ``source.source_table`` 判断命名空间。所有 Resume 来源标签均以
-    ``resume_`` 开头（Profile 聚合标签的第一个组成表也满足该规则）；未知或历史
-    Expert 标签继续回退 ``expert``，确保既有 Expert Contract 行为完全兼容。
+    ``resume`` 或 ``resume_`` 开头；未知或历史 Expert 标签继续回退
+    ``expert``，确保既有 Expert Contract 行为完全兼容。
     """
 
     if not isinstance(source_table, str) or not source_table.strip():
         raise ValueError("source_table 必须是非空字符串")
     source_tables = tuple(part.strip() for part in source_table.split("+"))
-    if source_tables and all(part.startswith("resume_") for part in source_tables):
+    # Resume 主档表名是 ``resume``，子表仍使用 ``resume_*``；两者都属于
+    # Resume 命名空间。不能只判断 ``resume_``，否则 Profile 聚合来源
+    # ``resume+resume_education_experience`` 会被误判为 Expert。
+    if source_tables and all(
+        part == "resume" or part.startswith("resume_") for part in source_tables
+    ):
         return "resume"
     return "expert"
 
