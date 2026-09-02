@@ -25,6 +25,7 @@ from collections.abc import Iterable, Sequence
 from datetime import date, datetime
 from typing import Any
 
+from .dataset import EXPERT_SPEC, DatasetSpec
 from .models import (
     EducationSource,
     EmploymentSource,
@@ -381,6 +382,7 @@ def normalize_aggregate(
     *,
     data_version: str,
     build_batch_id: int,
+    dataset_spec: DatasetSpec = EXPERT_SPEC,
 ) -> tuple[ProfileStage, list[EmploymentStage], list[ProjectStage]]:
     """把一位专家的四表一致性快照转换为三类 Stage。
 
@@ -399,7 +401,8 @@ def normalize_aggregate(
 
     实现上组合调用三个单对象入口（``normalize_profile``/``normalize_employment``/
     ``normalize_project``），保证 full build 与 incremental 只有一套清洗与 Hash 实现。
-    返回结果与抽取前逐字段一致。
+    返回结果与抽取前逐字段一致。``dataset_spec`` 只决定物理来源标签和来源字段标签；
+    默认值冻结为 :data:`EXPERT_SPEC`，因此现有 Expert 调用方无需修改且输出不变。
     """
 
     profile_stage = normalize_profile(
@@ -411,11 +414,21 @@ def normalize_aggregate(
     # 一条源经历对应一个 Stage，保持 source_field_id 可回查；经历为空时自然得到空列表，
     # 属于合法业务情况，不会阻止 Profile 或其他类型 Chunk 生成。
     employment_stages = [
-        normalize_employment(item, data_version=data_version, build_batch_id=build_batch_id)
+        normalize_employment(
+            item,
+            data_version=data_version,
+            build_batch_id=build_batch_id,
+            dataset_spec=dataset_spec,
+        )
         for item in aggregate.employments
     ]
     project_stages = [
-        normalize_project(item, data_version=data_version, build_batch_id=build_batch_id)
+        normalize_project(
+            item,
+            data_version=data_version,
+            build_batch_id=build_batch_id,
+            dataset_spec=dataset_spec,
+        )
         for item in aggregate.projects
     ]
     return profile_stage, employment_stages, project_stages
@@ -503,7 +516,11 @@ def normalize_profile(
 
 
 def normalize_employment(
-    item: EmploymentSource, *, data_version: str, build_batch_id: int
+    item: EmploymentSource,
+    *,
+    data_version: str,
+    build_batch_id: int,
+    dataset_spec: DatasetSpec = EXPERT_SPEC,
 ) -> EmploymentStage:
     """把一条有效工作经历转换为可溯源的 ``EmploymentStage``。
 
@@ -538,11 +555,8 @@ def normalize_employment(
     }
     return EmploymentStage(
         expert_id=item.expert_id,
-        source_table="experts_work_experience",
-        source_field=(
-            "company_name+position_title+start_date+end_date+"
-            "work_description+is_employed"
-        ),
+        source_table=dataset_spec.employment_table,
+        source_field=dataset_spec.employment_source_field,
         source_field_id=str(item.id),
         source_item_key=str(item.id),
         company_name_raw=raw_company,
@@ -568,7 +582,11 @@ def normalize_employment(
 
 
 def normalize_project(
-    item: ProjectSource, *, data_version: str, build_batch_id: int
+    item: ProjectSource,
+    *,
+    data_version: str,
+    build_batch_id: int,
+    dataset_spec: DatasetSpec = EXPERT_SPEC,
 ) -> ProjectStage:
     """把一条有效项目经历转换为可溯源的 ``ProjectStage``。
 
@@ -598,8 +616,8 @@ def normalize_project(
     }
     return ProjectStage(
         expert_id=item.expert_id,
-        source_table="experts_project_experience",
-        source_field="project_title+company_name+start_date+end_date+work_description",
+        source_table=dataset_spec.project_table,
+        source_field=dataset_spec.project_source_field,
         source_field_id=str(item.id),
         source_item_key=str(item.id),
         project_name=project_name,

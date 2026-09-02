@@ -18,6 +18,7 @@ from datetime import datetime
 from zoneinfo import ZoneInfo
 
 from .config import Settings
+from .dataset import EXPERT_SPEC, DatasetSpec
 from .models import ChunkRecord, EmploymentStage, ProfileStage, ProjectStage
 from .normalize import canonical_json, sha256_value
 
@@ -49,8 +50,16 @@ class ChunkFactory:
     数据库事务或向量化，因此相同 Stage 输入会得到相同正文、ID 和哈希。
     """
 
-    def __init__(self, settings: Settings) -> None:
+    def __init__(
+        self,
+        settings: Settings,
+        *,
+        dataset_spec: DatasetSpec = EXPERT_SPEC,
+    ) -> None:
+        """绑定构建设置和来源规格；现有调用默认保持 Expert 规格。"""
+
         self.settings = settings
+        self.dataset_spec = dataset_spec
 
     def build_all(
         self,
@@ -108,11 +117,8 @@ class ChunkFactory:
                 text=text,
                 # profile 同时压缩主档与教育表信息。source_field_id 仍使用专家 ID，
                 # 因为教育表是通过 expert_id 聚合，vector_doc_id 因而保持稳定。
-                source_table="experts+experts_education_experience",
-                source_field=(
-                    "company+job_status+job_name+contact_status+doubtful_flag+"
-                    "abroad_flag+background+work_years+school_name+major"
-                ),
+                source_table=self.dataset_spec.profile_source_label,
+                source_field=self.dataset_spec.profile_source_field,
                 source_field_id=str(item.expert_id),
                 source_updated_at=item.source_updated_at,
                 source_hash=item.source_hash,
