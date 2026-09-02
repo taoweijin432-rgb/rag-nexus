@@ -32,10 +32,13 @@ from expert_index.models import (
     SourceScanCursor,
     SourceSyncTask,
 )
+from expert_index.repositories.sync_task import SourceSyncTaskLeaseConflictError
 from expert_index.source_batch_coordinator import (
+    PreparationFailureHandler,
     SourceBatchCoordinator,
     SourceBatchRunResult,
 )
+from expert_index.validators import ChunkValidationError
 
 # ---------------------------------------------------------------------------
 # Fakes
@@ -182,6 +185,35 @@ class FakeTaskRepository:
         return self.claim_queue.pop(0)
 
 
+@dataclass
+class FakePreparationFailureHandler:
+    """记录 Coordinator 的 P4 异常落定调用，并返回预设结果。"""
+
+    result: HandoffResultStub
+    calls: list = field(default_factory=list)
+
+    def handle(self, task, attempt_token, error):
+        self.calls.append((task.task_id, attempt_token, error))
+        return self.result
+
+
+@dataclass
+class FakeFailureRepository:
+    """只实现失败落定器需要的最小 Repository 接口。"""
+
+    retry_status: str = "pending"
+    rejected_calls: list = field(default_factory=list)
+    retryable_calls: list = field(default_factory=list)
+
+    def mark_source_sync_task_rejected(self, task_id, attempt_token, **kwargs):
+        self.rejected_calls.append((task_id, attempt_token, kwargs))
+        return type("UpdatedTask", (), {"sync_status": "dead"})()
+
+    def mark_source_sync_task_retryable(self, task_id, attempt_token, **kwargs):
+        self.retryable_calls.append((task_id, attempt_token, kwargs))
+        return type("UpdatedTask", (), {"sync_status": self.retry_status})()
+
+
 # ---------------------------------------------------------------------------
 # Fixtures
 # ---------------------------------------------------------------------------
@@ -244,7 +276,7 @@ def _prepared():
 
 def _coordinator(
     prep, orch, checkpoint, source_state, task_repo, *,
-    task_lease_seconds=120, source_lease_seconds=120,
+    task_lease_seconds=120, source_lease_seconds=120, preparation_failure_handler=None,
 ):
     return SourceBatchCoordinator(
         preparation_coordinator=prep,
@@ -254,6 +286,7 @@ def _coordinator(
         task_repository=task_repo,
         task_lease_seconds=task_lease_seconds,
         source_lease_seconds=source_lease_seconds,
+        preparation_failure_handler=preparation_failure_handler,
     )
 
 
@@ -327,6 +360,123 @@ def test_new_task_candidate_stage_goes_through_prepare_then_orchestrator():
     assert prep.calls[0][1] == "candidate"  # stage
     assert len(orch.calls) == 1
     assert orch.calls[0][0] == 1
+
+
+def test_prepare_validation_failure_is_settled_and_does_not_retry_forever():
+    """P4 校验失败必须落 dead；后续由 Checkpoint 闸门阻断，但不再重领。"""
+
+    prep = FakePreparationCoordinator(returns=ChunkValidationError("来源正文不应写入状态库"))
+    orch = FakeOrchestrator()
+    handler = FakePreparationFailureHandler(
+        result=HandoffResultStub(final_status="dead", terminal=True)
+    )
+    checkpoint = FakeCheckpointManager(return_value=SourceBatchNotReadyError("存在 dead Task"))
+    source_state = FakeSourceStateRepository(scan=_scan(candidate_count=1))
+    task_repo = FakeTaskRepository(claim_queue=[(_task(task_id=1),)])
+
+    result = _coordinator(
+        prep,
+        orch,
+        checkpoint,
+        source_state,
+        task_repo,
+        preparation_failure_handler=handler,
+    ).run_claimed_source_batch("experts", 100, "owner-1", checkpoint_lock_version=7)
+
+    assert result.rejected_count == 1
+    assert result.retryable_count == 0
+    assert result.error == "SourceBatchNotReadyError"
+    assert len(handler.calls) == 1
+    assert orch.calls == []
+    assert len(task_repo.calls) == 2  # 领取坏任务后再确认已无更多待处理任务
+
+
+def test_prepare_transient_failure_is_settled_pending_and_stops_batch():
+    """P4 瞬时异常退回 pending，当前批次立即停止且不推进 Checkpoint。"""
+
+    prep = FakePreparationCoordinator(returns=RuntimeError("短暂的来源读取失败"))
+    handler = FakePreparationFailureHandler(
+        result=HandoffResultStub(final_status="pending", terminal=False)
+    )
+    checkpoint = FakeCheckpointManager(return_value=CommitResultStub(skipped_count=0))
+    source_state = FakeSourceStateRepository(scan=_scan(candidate_count=2))
+    task_repo = FakeTaskRepository(claim_queue=[(_task(task_id=1),), (_task(task_id=2),)])
+
+    result = _coordinator(
+        prep,
+        FakeOrchestrator(),
+        checkpoint,
+        source_state,
+        task_repo,
+        preparation_failure_handler=handler,
+    ).run_claimed_source_batch("experts", 100, "owner-1", checkpoint_lock_version=7)
+
+    assert result.retryable_count == 1
+    assert result.rejected_count == 0
+    assert result.error == "retryable"
+    assert len(task_repo.calls) == 1
+    assert checkpoint.calls == []
+
+
+def test_preparation_failure_handler_writes_safe_validation_evidence():
+    """确定性错误写 dead/DLQ 时只携带稳定摘要，不落原始异常正文。"""
+
+    repository = FakeFailureRepository()
+    handler = PreparationFailureHandler(
+        repository,
+        max_attempts=3,
+        retry_delay_seconds=30,
+    )
+
+    result = handler.handle(_task(), _TOKEN, ChunkValidationError("原始业务文本"))
+
+    assert result.final_status == "dead"
+    assert result.terminal is True
+    assert len(repository.rejected_calls) == 1
+    _, _, kwargs = repository.rejected_calls[0]
+    assert kwargs["error_stage"] == "validation"
+    assert kwargs["error_code"] == "chunk_validation_failed"
+    assert kwargs["safe_error_message"] == "Chunk 校验失败"
+    assert "原始业务文本" not in kwargs["safe_error_message"]
+
+
+def test_preparation_failure_handler_uses_existing_retry_policy():
+    """瞬时 P4 异常复用 max_attempts/retry_delay_seconds，不新增重试规则。"""
+
+    repository = FakeFailureRepository(retry_status="pending")
+    handler = PreparationFailureHandler(
+        repository,
+        max_attempts=4,
+        retry_delay_seconds=45,
+    )
+
+    result = handler.handle(_task(), _TOKEN, RuntimeError("数据库瞬时不可用"))
+
+    assert result.final_status == "pending"
+    assert result.terminal is False
+    assert len(repository.retryable_calls) == 1
+    _, _, kwargs = repository.retryable_calls[0]
+    assert kwargs["max_attempts"] == 4
+    assert kwargs["retry_delay_seconds"] == 45
+    assert kwargs["error_stage"] == "source"
+
+
+def test_preparation_failure_handler_does_not_overwrite_lease_conflict():
+    """旧 attempt 遇到 lease 冲突时只返回 processing，不写死信或重试状态。"""
+
+    repository = FakeFailureRepository()
+    handler = PreparationFailureHandler(
+        repository,
+        max_attempts=4,
+        retry_delay_seconds=45,
+    )
+
+    result = handler.handle(_task(), _TOKEN, SourceSyncTaskLeaseConflictError("token 已失效"))
+
+    assert result.final_status == "processing"
+    assert result.terminal is False
+    assert repository.rejected_calls == []
+    assert repository.retryable_calls == []
 
 
 # ---------------------------------------------------------------------------

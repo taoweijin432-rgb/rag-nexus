@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import datetime, timezone
 
 import pytest
@@ -255,6 +256,18 @@ class TestEmploymentScope:
         assert result.impact_scope.scope_type == "employment"
         assert all(c.chunk_type == "employment" for c in result.desired_chunks)
         assert all(c.source_field_id == "9201" for c in result.desired_chunks)
+
+    def test_company_is_nullable_when_role_or_description_exists(self):
+        """公司为空但岗位/职责存在时，Builder 与 Contract 应允许生成 Chunk。"""
+
+        emp = replace(_employment(), company_name=None)
+        result = _call(handle_employment_scope, _employment_facts(_expert(), emp))
+
+        assert len(result.desired_chunks) == 1
+        chunk = result.desired_chunks[0]
+        assert chunk.chunk_type == "employment"
+        assert chunk.company_name_raw is None
+        assert chunk.role_name_raw == "项目经理"
 
     def test_parent_deleted_upgrades_to_expert_empty(self):
         emp = _employment()

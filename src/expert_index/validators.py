@@ -122,9 +122,9 @@ def _validate_one(chunk: ChunkRecord, *, dataset_spec: DatasetSpec) -> None:
         if chunk.origin_type != "source_parsed" or chunk.verification_status != "verified":
             fail("employment/project 的来源/核验枚举不合法")
 
-    if chunk.chunk_type == "employment" and not (
-        chunk.company_name_raw or chunk.company_name_norm
-    ):
-        fail("employment 缺少公司")
+    # 公司不是 employment Chunk 的硬性字段：Builder 已经保证公司、岗位至少
+    # 有一个时才生成 Chunk，而 Contract 的 metadata 也明确允许两者为空。
+    # 这里不能再次把“公司为空、岗位/职责存在”的合法记录判成失败，否则
+    # P4 会生成 Chunk、P5 Validator 却拒绝，导致 Poll 任务长期停留在 processing。
     if chunk.chunk_type == "project" and not chunk.project_name:
         fail("project 缺少项目名")

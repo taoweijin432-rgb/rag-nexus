@@ -5,8 +5,10 @@
 - 只对“一个已经由 P3 scanner 创建好的 Batch Source”做一次受控执行：确认/续租
   source lease → 按 ``limit=1`` 逐条 claim task → P4 prepare 或 P5 orchestrator → 累计
   结果 → 满足闸门后调用现有 :class:`CheckpointManager.try_commit_source_batch`。
-- **不创建** Batch Source、不创建 Task、不修改 Task 状态、不修改 Batch/计数、
-  不推进 Checkpoint（全部由 P3/P5.3A/P5.6 现有实现权威写入）。
+- **不创建** Batch Source、不创建 Task、不直接修改 Batch/计数、不推进 Checkpoint；
+  正常路径仍由 P3/P5.3A/P5.6 现有实现权威写入。仅当注入的
+  :class:`PreparationFailureHandler` 捕获 P4 异常时，才按既有 Task Repository
+  接口落定当前失败 Task，避免异常任务无限重领。
 - 只持有受控执行期的 source lease（``ensure_source_lease``/续租），提交成功后由
   :class:`CheckpointManager` 释放；未提交不自行释放（留待下次执行/超时）。
 - 不解读 ``task.lease_until`` 的时区或与本机时间比较，全部由 Repository 以
@@ -30,6 +32,8 @@
 - Task ``final_status='pending'``（retryable 退回）→ 立即停止当前 Source Batch。
 - Task lease/token 冲突（``terminal==False``，``final_status=='processing'``）
   → 立即停止当前 Source Batch，计入 ``lease_conflict_count``。
+- P4 prepare 异常：注入 Handler 时按确定性/瞬时失败落定；未注入 Handler 时
+  保持 fail-closed 停止。
 - 未知/非法结果（``final_status`` 非 success/dead/pending/processing，或
   ``terminal`` 与 ``final_status`` 矛盾）→ fail-closed 立即停止。
 - source lease 续租冲突 → 立即停止剩余 Task，``error`` 记异常类名。
@@ -47,11 +51,18 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Protocol
 
 from .handoff_orchestrator import HandoffOrchestrationResult
+from .models import SourceSyncTask
 from .preparation_coordinator import PreparationCoordinator
+from .repositories.source_state import SourceLeaseConflictError
+from .repositories.sync_task import SourceSyncTaskLeaseConflictError
+from .validators import ChunkValidationError
 
 __all__ = [
+    "PreparationFailureHandler",
+    "PreparationFailureHandlerPort",
     "SourceBatchCoordinator",
     "SourceBatchRunResult",
 ]
@@ -92,6 +103,163 @@ _RETRYABLE_PENDING = "pending"
 _LEASE_CONFLICT_PROCESSING = "processing"
 
 
+class PreparationFailureHandlerPort(Protocol):
+    """P4 准备阶段异常的任务状态落定端口。
+
+    Coordinator 只依赖这个窄接口，不直接依赖 MySQL Repository，因而不会把
+    Expert 的正常 P4/P5 数据路径和任务失败写回耦合在一起；测试和未来 Resume
+    运行时也可以注入各自的实现。
+    """
+
+    def handle(
+        self,
+        task: SourceSyncTask,
+        attempt_token: str | None,
+        error: Exception,
+    ) -> HandoffOrchestrationResult: ...
+
+
+class PreparationFailureHandler:
+    """将 P4 prepare 异常按确定性/瞬时性质安全落定到 Task + DLQ。
+
+    ``PreparationCoordinator`` 本身是纯准备阶段，按设计只抛出异常、不写任务
+    终态。这个 Handler 由 Poll 运行时在更外层注入，补齐“异常必须结算”的边界：
+
+    * ``ChunkValidationError``、``ValueError``、``TypeError`` 是确定性契约问题，
+      直接写 ``dead``，避免同一坏数据反复领取；
+    * 其他异常按瞬时失败退回 ``pending``，达到 ``max_attempts`` 后由 Repository
+      原子转为 ``dead``；
+    * token/lease 冲突只返回 ``processing``，绝不覆盖新 Worker 的有效 attempt。
+
+    失败消息使用固定摘要，不把来源正文、Chunk 文本或异常原文写入 Index DB/DLQ。
+    """
+
+    def __init__(
+        self,
+        task_repository,
+        *,
+        max_attempts: int,
+        retry_delay_seconds: int,
+    ) -> None:
+        """保存状态仓储和重试策略；参数校验与 HandoffOrchestrator 保持一致。"""
+
+        if (
+            isinstance(max_attempts, bool)
+            or not isinstance(max_attempts, int)
+            or max_attempts < 0
+        ):
+            raise ValueError("max_attempts 必须是非负整数")
+        if (
+            isinstance(retry_delay_seconds, bool)
+            or not isinstance(retry_delay_seconds, int)
+            or retry_delay_seconds < 1
+        ):
+            raise ValueError("retry_delay_seconds 必须是正整数")
+        if not callable(getattr(task_repository, "mark_source_sync_task_rejected", None)):
+            raise TypeError("task_repository 缺少 mark_source_sync_task_rejected")
+        if not callable(getattr(task_repository, "mark_source_sync_task_retryable", None)):
+            raise TypeError("task_repository 缺少 mark_source_sync_task_retryable")
+        self._task_repo = task_repository
+        self._max_attempts = max_attempts
+        self._retry_delay_seconds = retry_delay_seconds
+
+    def handle(
+        self,
+        task: SourceSyncTask,
+        attempt_token: str | None,
+        error: Exception,
+    ) -> HandoffOrchestrationResult:
+        """落定一次 P4 异常，并返回 Coordinator 可复用的统一结果模型。"""
+
+        if not isinstance(task, SourceSyncTask):
+            raise TypeError("task 必须是 SourceSyncTask")
+        if not isinstance(error, Exception):
+            raise TypeError("error 必须是 Exception")
+        # 没有 token 就无法安全执行带 fencing 的状态写回，按未终态停止；
+        # 这类状态属于 claim/repository 异常，不应猜测或覆盖数据库记录。
+        if not isinstance(attempt_token, str) or not attempt_token.strip():
+            return _preparation_processing_result()
+        if isinstance(error, (SourceSyncTaskLeaseConflictError, SourceLeaseConflictError)):
+            return _preparation_processing_result()
+
+        error_stage, error_code, safe_message, deterministic = _preparation_error_details(error)
+        error_type = type(error).__name__
+        try:
+            if deterministic:
+                mark_rejected = getattr(
+                    self._task_repo,
+                    "mark_source_sync_task_rejected_with_dlq",
+                    None,
+                )
+                if not callable(mark_rejected):
+                    mark_rejected = self._task_repo.mark_source_sync_task_rejected
+                mark_rejected(
+                    task.task_id,
+                    attempt_token,
+                    error_stage=error_stage,
+                    error_code=error_code,
+                    error_type=error_type,
+                    safe_error_message=safe_message,
+                )
+                return HandoffOrchestrationResult(
+                    final_status="dead",
+                    terminal=True,
+                    result_code=None,
+                    error_stage=error_stage,
+                )
+
+            mark_retryable = getattr(
+                self._task_repo,
+                "mark_source_sync_task_retryable_with_dlq",
+                None,
+            )
+            if not callable(mark_retryable):
+                mark_retryable = self._task_repo.mark_source_sync_task_retryable
+            updated = mark_retryable(
+                task.task_id,
+                attempt_token,
+                error_stage=error_stage,
+                error_code=error_code,
+                max_attempts=self._max_attempts,
+                retry_delay_seconds=self._retry_delay_seconds,
+                error_type=error_type,
+                safe_error_message=safe_message,
+            )
+        except SourceSyncTaskLeaseConflictError:
+            # 新 attempt 已接管时，旧 Worker 只能停止；旧 token 不能覆盖新状态。
+            return _preparation_processing_result()
+
+        final_status = getattr(updated, "sync_status", None)
+        if final_status == "dead":
+            return HandoffOrchestrationResult(
+                final_status="dead", terminal=True, result_code=None, error_stage=error_stage
+            )
+        if final_status == "pending":
+            return HandoffOrchestrationResult(
+                final_status="pending", terminal=False, result_code=None, error_stage=error_stage
+            )
+        # Repository 返回非法状态时 fail-closed，不让 Coordinator 误认为成功。
+        return _preparation_processing_result()
+
+
+def _preparation_error_details(error: Exception) -> tuple[str, str, str, bool]:
+    """把异常映射为安全的失败阶段、错误码、摘要和确定性标记。"""
+
+    if isinstance(error, ChunkValidationError):
+        return "validation", "chunk_validation_failed", "Chunk 校验失败", True
+    if isinstance(error, (ValueError, TypeError)):
+        return "chunk_builder", "preparation_contract_failed", "P4 准备阶段契约校验失败", True
+    return "source", "preparation_failed", "P4 当前事实准备暂时失败", False
+
+
+def _preparation_processing_result() -> HandoffOrchestrationResult:
+    """返回不可安全落定时的统一未终态结果。"""
+
+    return HandoffOrchestrationResult(
+        final_status="processing", terminal=False, result_code=None, error_stage="fencing"
+    )
+
+
 class SourceBatchCoordinator:
     """单来源、单批次、单任务串行执行协调器。
 
@@ -107,6 +275,9 @@ class SourceBatchCoordinator:
     :param task_lease_seconds: claim/renew task lease 的建议秒数（真正有效性由
         Repository 以 Index MySQL ``CURRENT_TIMESTAMP(6)`` 权威判定）。
     :param source_lease_seconds: 续租 source lease 的建议秒数。
+    :param preparation_failure_handler: P4 prepare 异常的可选落定器。生产 Poll
+        runtime 会注入它；未注入时保留原有 fail-closed 行为，兼容直接使用
+        Coordinator 的调用方和测试替身。
     """
 
     def __init__(
@@ -119,12 +290,18 @@ class SourceBatchCoordinator:
         *,
         task_lease_seconds: int,
         source_lease_seconds: int,
+        preparation_failure_handler: PreparationFailureHandlerPort | None = None,
     ) -> None:
         self._prepare = preparation_coordinator
         self._orchestrator = orchestrator
         self._checkpoint = checkpoint_manager
         self._source_state = source_state_repository
         self._task_repo = task_repository
+        if preparation_failure_handler is not None and not callable(
+            getattr(preparation_failure_handler, "handle", None)
+        ):
+            raise TypeError("preparation_failure_handler 缺少 handle")
+        self._preparation_failure_handler = preparation_failure_handler
         if (
             isinstance(task_lease_seconds, bool)
             or not isinstance(task_lease_seconds, int)
@@ -258,15 +435,24 @@ class SourceBatchCoordinator:
             #    StageConflict → fail-closed 停止。
             try:
                 if task.processing_stage in _P4_PREPARATION_STAGES:
-                    prepared = self._prepare.prepare(task, task.attempt_token)
-                    self._source_state.renew_source_lease(
-                        source_table,
-                        lease_owner,
-                        lease_seconds=self._source_lease_seconds,
-                    )
-                    result = self._orchestrator.process(
-                        task.task_id, task.attempt_token, prepared
-                    )
+                    try:
+                        prepared = self._prepare.prepare(task, task.attempt_token)
+                    except Exception as error:  # noqa: BLE001 - 由 Handler 统一分类落定
+                        result = self._handle_preparation_failure(task, error)
+                        if result is None:
+                            # 未注入 Handler 时保留原有行为：异常直接停止，不猜测
+                            # Task 状态，确保现有直接调用方行为不变。
+                            stop_reason = type(error).__name__
+                            break
+                    else:
+                        self._source_state.renew_source_lease(
+                            source_table,
+                            lease_owner,
+                            lease_seconds=self._source_lease_seconds,
+                        )
+                        result = self._orchestrator.process(
+                            task.task_id, task.attempt_token, prepared
+                        )
                 elif task.processing_stage == "validated":
                     # Orchestrator 先查 Artifact；仅在不存在时调用 P4 当前事实重建。
                     self._source_state.renew_source_lease(
@@ -329,8 +515,8 @@ class SourceBatchCoordinator:
             break
 
         # 6) 终态汇总与 Checkpoint 闸门。
-        # 提前停止（retryable/lease 冲突/未知/中间阶段/prepare 抛异常）→ 不调
-        # try_commit，水位不动，source lease 不释放（留待下次执行/超时）。
+        # 提前停止（retryable/lease 冲突/未知/中间阶段/未落定的 prepare 异常）→
+        # 不调 try_commit，水位不动，source lease 不释放（留待下次执行/超时）。
         # stop_reason 为 None 表示全部 Task 处理完（含 dead 可继续场景），进入闸门。
         if stop_reason is not None:
             return SourceBatchRunResult(
@@ -410,6 +596,17 @@ class SourceBatchCoordinator:
             checkpoint_skipped_count=commit_result.skipped_count,
             error=None,
         )
+
+    def _handle_preparation_failure(
+        self,
+        task: SourceSyncTask,
+        error: Exception,
+    ) -> HandoffOrchestrationResult | None:
+        """调用可选 P4 异常落定器；未配置时返回 None 以维持旧行为。"""
+
+        if self._preparation_failure_handler is None:
+            return None
+        return self._preparation_failure_handler.handle(task, task.attempt_token, error)
 
 
 def _classify_outcome(result: HandoffOrchestrationResult) -> str:

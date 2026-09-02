@@ -24,7 +24,7 @@ from .scheduler import (
     IncrementalRoundScheduler,
     SourceBatchExecutionPlan,
 )
-from .source_batch_coordinator import SourceBatchCoordinator
+from .source_batch_coordinator import PreparationFailureHandler, SourceBatchCoordinator
 
 
 class IncrementalRuntimeAssemblyError(RuntimeError):
@@ -175,6 +175,14 @@ def build_incremental_runtime(
         source=source,
         include_cdc_delete_processor=include_cdc_delete_processor,
     )
+    # P4 prepare 是纯准备阶段，异常不会自行写 Task 终态。由运行时在同一
+    # Task Repository 上注入失败落定器，避免坏数据让 lease 过期后无限重领；
+    # 正常 Expert/Resume P4→P5 路径不改变，只有 prepare 抛异常时才会触发。
+    preparation_failure_handler = PreparationFailureHandler(
+        handoff.task_repo,
+        max_attempts=max_attempts,
+        retry_delay_seconds=retry_delay_seconds,
+    )
     coordinator = SourceBatchCoordinator(
         handoff.preparation_coordinator,
         handoff.orchestrator,
@@ -183,6 +191,7 @@ def build_incremental_runtime(
         handoff.task_repo,
         task_lease_seconds=task_lease_seconds,
         source_lease_seconds=settings.incremental_scan.lease_seconds,
+        preparation_failure_handler=preparation_failure_handler,
     )
     return IncrementalRuntime(
         scanner,
