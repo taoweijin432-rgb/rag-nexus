@@ -54,6 +54,7 @@ from dataclasses import dataclass
 from .cdc.task_processor import CdcDeleteTaskProcessor
 from .chunk_builder import ChunkFactory
 from .config import Settings
+from .dataset import EXPERT_SPEC, DatasetSpec
 from .handoff import ScopeHandoffBuilder, ScopeHandoffReceipt
 from .handoff_orchestrator import HandoffOrchestrator
 from .models import IncrementalImpactScope
@@ -87,14 +88,14 @@ class IncrementalHandoffRuntime:
     本结构不暴露任何后台入口、不轮询、不认领任务、不推进 checkpoint。
     """
 
-    source: MySQLSourceAdapter
+    source: object
     chunk_factory: ChunkFactory
     task_repo: MySQLSourceSyncTaskRepository
     artifact_repo: MySQLArtifactRepository
     builder: ScopeHandoffBuilder
     preparation_coordinator: PreparationCoordinator
     orchestrator: HandoffOrchestrator
-    cdc_delete_processor: CdcDeleteTaskProcessor
+    cdc_delete_processor: CdcDeleteTaskProcessor | None
     # 以下两项暴露供 P5.7 续租/重放/诊断使用；本层不直接调用它们的后台方法。
     vector_service: object
     scope_consumer: object
@@ -125,6 +126,9 @@ def build_incremental_handoff_runtime(
     vector_service: object | None = None,
     max_attempts: int,
     retry_delay_seconds: int,
+    dataset_spec: DatasetSpec = EXPERT_SPEC,
+    source: object | None = None,
+    include_cdc_delete_processor: bool = True,
 ) -> IncrementalHandoffRuntime:
     """组装正式增量 Handoff 闭环组件集合。
 
@@ -186,8 +190,8 @@ def build_incremental_handoff_runtime(
     from rag_vector_store.incremental.scope_consumer import ScopeConsumer
 
     # 6) 来源/构建器/持久化（P4.3 / P4.4 / P5.3A）。
-    source = MySQLSourceAdapter(settings.source_db)
-    chunk_factory = ChunkFactory(settings)
+    resolved_source = source or MySQLSourceAdapter(settings.source_db)
+    chunk_factory = ChunkFactory(settings, dataset_spec=dataset_spec)
     task_repo = MySQLSourceSyncTaskRepository(settings.index_db)
     artifact_repo = MySQLArtifactRepository(settings.index_db)
     scope_fence = MySQLScopeExecutionFence(settings.index_db)
@@ -199,7 +203,7 @@ def build_incremental_handoff_runtime(
     #    MySQL CURRENT_TIMESTAMP(6) + attempt_token + rowcount 权威判定。
     preparation_coordinator = PreparationCoordinator(
         task_repo,
-        source,
+        resolved_source,
         chunk_factory,
         lease_seconds=settings.incremental_scan.lease_seconds,
     )
@@ -217,6 +221,11 @@ def build_incremental_handoff_runtime(
         core=consumer_core,
         state_port=vector_service,  # type: ignore[arg-type]
         receipt_sink=receipt_sink,
+        scope_source_tables={
+            "profile": dataset_spec.profile_source_label,
+            "employment": dataset_spec.employment_table,
+            "project": dataset_spec.project_table,
+        },
     )
 
     # 10) HandoffOrchestrator（P5.3B）。
@@ -233,18 +242,22 @@ def build_incremental_handoff_runtime(
 
     # 11) P7.6 CDC Task：复用同一 Handoff/P6 失败恢复，不提交 CDC Checkpoint，
     #     也不调用 Canal ACK。
-    cdc_delete_processor = CdcDeleteTaskProcessor(
-        task_repository=task_repo,
-        source=source,
-        factory=chunk_factory,
-        orchestrator=orchestrator,
-        lease_seconds=settings.incremental_scan.lease_seconds,
-        max_attempts=max_attempts,
-        retry_delay_seconds=retry_delay_seconds,
-    )
+    cdc_delete_processor = None
+    if include_cdc_delete_processor:
+        if not isinstance(resolved_source, MySQLSourceAdapter):
+            raise TypeError("CDC Delete Processor 只能绑定 Expert MySQLSourceAdapter")
+        cdc_delete_processor = CdcDeleteTaskProcessor(
+            task_repository=task_repo,
+            source=resolved_source,
+            factory=chunk_factory,
+            orchestrator=orchestrator,
+            lease_seconds=settings.incremental_scan.lease_seconds,
+            max_attempts=max_attempts,
+            retry_delay_seconds=retry_delay_seconds,
+        )
 
     return IncrementalHandoffRuntime(
-        source=source,
+        source=resolved_source,
         chunk_factory=chunk_factory,
         task_repo=task_repo,
         artifact_repo=artifact_repo,

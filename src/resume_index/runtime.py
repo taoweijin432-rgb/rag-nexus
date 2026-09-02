@@ -90,15 +90,11 @@ def build_resume_runtime(
 
     resolved_vector_sync = vector_sync
     if resolved_vector_sync is None:
-        resolved_vector_service = vector_service
-        if resolved_vector_service is None:
-            milvus_settings = _resume_milvus_settings(
-                settings,
-                base=base_milvus_settings,
-            )
-            resolved_vector_service = create_vector_ingestion_service(
-                milvus_settings=milvus_settings,
-            )
+        resolved_vector_service = resolve_resume_vector_service(
+            settings,
+            vector_service=vector_service,
+            base_milvus_settings=base_milvus_settings,
+        )
         resolved_vector_sync = ExpertVectorSynchronizer(resolved_vector_service)
 
     pipeline = ResumeIndexPipeline(
@@ -110,6 +106,29 @@ def build_resume_runtime(
         vector_sync=resolved_vector_sync,
     )
     return ResumeRuntime(pipeline=pipeline, preflight=preflight)
+
+
+def resolve_resume_vector_service(
+    settings: ResumeSettings,
+    *,
+    vector_service: VectorIngestionService | None = None,
+    base_milvus_settings: MilvusSettings | None = None,
+) -> VectorIngestionService:
+    """返回已证明绑定 Resume Collection 的公共向量服务。
+
+    显式注入服务时只做 Collection 边界校验；未注入时复制通用 Milvus 连接参数并
+    强制覆盖 Collection 名称。函数不调用 Repository ``initialize``，因此组装阶段
+    不会创建 Collection 或产生向量写入。
+    """
+
+    if not isinstance(settings, ResumeSettings):
+        raise TypeError("settings 必须是 ResumeSettings")
+    settings.validate_isolation_boundaries()
+    if vector_service is not None:
+        _require_resume_vector_service(settings, vector_service)
+        return vector_service
+    milvus_settings = _resume_milvus_settings(settings, base=base_milvus_settings)
+    return create_vector_ingestion_service(milvus_settings=milvus_settings)
 
 
 def _resume_milvus_settings(
@@ -141,4 +160,4 @@ def _require_resume_vector_service(
         )
 
 
-__all__ = ["ResumeRuntime", "build_resume_runtime"]
+__all__ = ["ResumeRuntime", "build_resume_runtime", "resolve_resume_vector_service"]

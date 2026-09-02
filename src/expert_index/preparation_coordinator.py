@@ -34,7 +34,6 @@ from typing import Protocol
 from .chunk_builder import ChunkFactory
 from .models import PreparedChunkSet, SourceSyncTask
 from .preparation_dispatcher import build_prepared_chunk_set, read_scoped_facts
-from .source import MySQLSourceAdapter
 
 __all__ = ["PreparationCoordinator", "TaskRepositoryPort"]
 
@@ -95,7 +94,7 @@ class PreparationCoordinator:
     def __init__(
         self,
         task_repository: TaskRepositoryPort,
-        source: MySQLSourceAdapter,
+        source: object,
         factory: ChunkFactory,
         *,
         lease_seconds: int = DEFAULT_LEASE_SECONDS,
@@ -164,7 +163,11 @@ class PreparationCoordinator:
 
         # 3) 读取当前事实（纯读取，不构建）。任何读取/归属/时序异常立即向上传播，
         #    不推进 source_read，不构建 Chunk。
-        facts = read_scoped_facts(task, self._source)
+        facts = read_scoped_facts(
+            task,
+            self._source,
+            dataset_spec=self._factory.dataset_spec,
+        )
 
         # 4) 首次任务推进 source_read；恢复任务保留已完成阶段，只重读当前事实。
         if current_stage == "candidate":

@@ -194,7 +194,10 @@ def handle_expert_scope(
         educations=facts.educations,
     )
     profile_stage, employment_stages, project_stages = normalize_aggregate(
-        aggregate, data_version=data_version, build_batch_id=batch_id
+        aggregate,
+        data_version=data_version,
+        build_batch_id=batch_id,
+        dataset_spec=factory.dataset_spec,
     )
     chunks = factory.build_all(profile_stage, employment_stages, project_stages)
     return _prepared_result(
@@ -275,7 +278,10 @@ def handle_employment_scope(
             facts, task_id=task_id, batch_id=batch_id, data_version=data_version
         )
     stage = normalize_employment(
-        employment_row, data_version=data_version, build_batch_id=batch_id
+        employment_row,
+        data_version=data_version,
+        build_batch_id=batch_id,
+        dataset_spec=factory.dataset_spec,
     )
     serial_number = clean_text(facts.expert.serial_number) or None
     chunks = factory.build_employment(serial_number, stage)
@@ -311,7 +317,10 @@ def handle_project_scope(
             facts, task_id=task_id, batch_id=batch_id, data_version=data_version
         )
     stage = normalize_project(
-        project_row, data_version=data_version, build_batch_id=batch_id
+        project_row,
+        data_version=data_version,
+        build_batch_id=batch_id,
+        dataset_spec=factory.dataset_spec,
     )
     serial_number = clean_text(facts.expert.serial_number) or None
     chunks = factory.build_project(serial_number, stage)

@@ -16,8 +16,8 @@ from .config import (
     DEFAULT_INCREMENTAL_LEASE_SECONDS,
     Settings,
 )
+from .dataset import EXPERT_SPEC, DatasetSpec
 from .models import (
-    CHECKPOINT_SOURCE_TABLES,
     BatchSourceScan,
     NewSourceSyncTask,
     SourceChangeCandidate,
@@ -47,18 +47,12 @@ _BATCH_SOURCE_ALIAS = {
     "experts_education_experience": "education",
 }
 
-_POLL_TARGET_TYPE_BY_SOURCE_TABLE = {
-    "experts": "expert",
-    "experts_work_experience": "employment",
-    "experts_project_experience": "project",
-    "experts_education_experience": "education",
-}
-
 
 def build_poll_task_dedupe_key(
     candidate: SourceChangeCandidate,
     *,
     policy_version: str,
+    dataset_spec: DatasetSpec = EXPERT_SPEC,
 ) -> str:
     """按冻结的 Poll 任务身份字段生成跨批次 SHA-256 幂等键。
 
@@ -66,10 +60,10 @@ def build_poll_task_dedupe_key(
     输出时区偏移。``batch_id``、``expert_id``、``deleted_at`` 原值和业务正文不参与。
     """
 
-    _validate_candidate(candidate)
+    _validate_candidate(candidate, dataset_spec=dataset_spec)
     _validate_policy_version(policy_version)
     operation_type = "delete" if candidate.is_deleted else "update"
-    target_type = _target_type(candidate.source_table)
+    target_type = _target_type(candidate.source_table, dataset_spec=dataset_spec)
     identity = {
         "event_source": POLL_EVENT_SOURCE,
         "source_table": candidate.source_table,
@@ -87,6 +81,7 @@ def map_poll_candidate_to_task(
     *,
     batch_id: int,
     policy_version: str,
+    dataset_spec: DatasetSpec = EXPERT_SPEC,
 ) -> NewSourceSyncTask:
     """把一个最小 Poll 候选映射为可幂等持久化的 pending 任务参数。
 
@@ -94,18 +89,23 @@ def map_poll_candidate_to_task(
     不替换成正式来源的 ``experts_updated_at``。
     """
 
-    _validate_candidate(candidate)
+    _validate_candidate(candidate, dataset_spec=dataset_spec)
     _validate_batch_id(batch_id)
     _validate_policy_version(policy_version)
-    if candidate.source_table == "experts" and candidate.expert_id != candidate.record_id:
+    if (
+        dataset_spec.profile_identity_column == "id"
+        and candidate.source_table == dataset_spec.profile_table
+        and candidate.expert_id != candidate.record_id
+    ):
         raise ValueError("experts 候选的 expert_id 必须等于来源记录 id")
 
     operation_type = "delete" if candidate.is_deleted else "update"
-    target_type = _target_type(candidate.source_table)
+    target_type = _target_type(candidate.source_table, dataset_spec=dataset_spec)
     return NewSourceSyncTask(
         dedupe_key=build_poll_task_dedupe_key(
             candidate,
             policy_version=policy_version,
+            dataset_spec=dataset_spec,
         ),
         batch_id=batch_id,
         event_source=POLL_EVENT_SOURCE,
@@ -128,6 +128,7 @@ class IncrementalScanner:
     """
 
     policy_version: str
+    dataset_spec: DatasetSpec = EXPERT_SPEC
 
     def __post_init__(self) -> None:
         """在处理任何候选前校验策略版本可写入任务契约。"""
@@ -146,6 +147,7 @@ class IncrementalScanner:
             candidate,
             batch_id=batch_id,
             policy_version=self.policy_version,
+            dataset_spec=self.dataset_spec,
         )
 
     def map_candidates(
@@ -157,9 +159,7 @@ class IncrementalScanner:
         """保持候选顺序，返回不可变的任务参数序列。"""
 
         _validate_batch_id(batch_id)
-        return tuple(
-            self.map_candidate(candidate, batch_id=batch_id) for candidate in candidates
-        )
+        return tuple(self.map_candidate(candidate, batch_id=batch_id) for candidate in candidates)
 
 
 class CrossBatchTaskConflictError(RuntimeError):
@@ -236,25 +236,26 @@ class IncrementalSourceScanService:
     继续使用；零候选范围会立即释放 lease。
     """
 
-    source_adapter: MySQLSourceAdapter
+    source_adapter: object
     source_state_repository: MySQLSourceStateRepository
     task_repository: MySQLSourceSyncTaskRepository
     policy_version: str
     page_size: int = DEFAULT_INCREMENTAL_PAGE_SIZE
     lease_seconds: int = DEFAULT_SOURCE_LEASE_SECONDS
+    dataset_spec: DatasetSpec = EXPERT_SPEC
 
     def __post_init__(self) -> None:
         """校验分页、租约和策略参数，避免扫描启动后才发现配置错误。"""
 
         _validate_policy_version(self.policy_version)
+        if not isinstance(self.dataset_spec, DatasetSpec):
+            raise TypeError("dataset_spec 必须是 DatasetSpec")
         if (
             isinstance(self.page_size, bool)
             or not isinstance(self.page_size, int)
             or not 1 <= self.page_size <= MAX_SOURCE_SCAN_PAGE_SIZE
         ):
-            raise ValueError(
-                f"page_size 必须位于 1 到 {MAX_SOURCE_SCAN_PAGE_SIZE} 之间"
-            )
+            raise ValueError(f"page_size 必须位于 1 到 {MAX_SOURCE_SCAN_PAGE_SIZE} 之间")
         if (
             isinstance(self.lease_seconds, bool)
             or not isinstance(self.lease_seconds, int)
@@ -271,7 +272,12 @@ class IncrementalSourceScanService:
     ) -> IncrementalScanResult:
         """恢复或创建固定范围，并按“先任务、后游标”扫描到上界。"""
 
-        _validate_scan_request(source_table, lease_owner, batch_no)
+        _validate_scan_request(
+            source_table,
+            lease_owner,
+            batch_no,
+            dataset_spec=self.dataset_spec,
+        )
         checkpoint = self.source_state_repository.acquire_source_lease(
             source_table,
             lease_owner,
@@ -310,7 +316,10 @@ class IncrementalSourceScanService:
                 upper_bound=upper_bound,
             )
 
-        mapper = IncrementalScanner(policy_version=self.policy_version)
+        mapper = IncrementalScanner(
+            policy_version=self.policy_version,
+            dataset_spec=self.dataset_spec,
+        )
         page_count = 0
         scheduled_candidate_count = 0
         if scan.current_cursor == scan.upper_bound and scan.status == "failed":
@@ -353,9 +362,7 @@ class IncrementalSourceScanService:
                 task_id = self.task_repository.create_source_sync_task(task)
                 persisted_task = self.task_repository.get_source_sync_task(task_id)
                 if persisted_task is None:
-                    raise RuntimeError(
-                        f"任务 {task_id} 创建后无法读取持久化状态"
-                    )
+                    raise RuntimeError(f"任务 {task_id} 创建后无法读取持久化状态")
                 if persisted_task.batch_id != scan.batch_id:
                     raise CrossBatchTaskConflictError(
                         f"dedupe_key 命中其他批次任务: "
@@ -386,7 +393,6 @@ class IncrementalSourceScanService:
         )
 
 
-@dataclass(frozen=True)
 class IncrementalScanCoordinator:
     """按固定顺序独立调用四张来源表的候选扫描服务。
 
@@ -394,7 +400,18 @@ class IncrementalScanCoordinator:
     协调器继续扫描后续表；本类不处理 pending 任务，也不提交安全 Checkpoint。
     """
 
-    scan_service: IncrementalSourceScanService
+    def __init__(
+        self,
+        scan_service: IncrementalSourceScanService,
+        *,
+        dataset_spec: DatasetSpec = EXPERT_SPEC,
+    ) -> None:
+        """绑定单表扫描服务和固定四表顺序，不暴露额外业务执行方法。"""
+
+        if not isinstance(dataset_spec, DatasetSpec):
+            raise TypeError("dataset_spec 必须是 DatasetSpec")
+        self.scan_service = scan_service
+        self._dataset_spec = dataset_spec
 
     def scan_all_sources(
         self,
@@ -419,16 +436,25 @@ class IncrementalScanCoordinator:
             maximum_length=48,
         )
         batch_numbers = {
-            source_table: _incremental_batch_no(cycle_id, source_table)
-            for source_table in INCREMENTAL_SOURCE_TABLE_ORDER
+            source_table: _incremental_batch_no(
+                cycle_id,
+                source_table,
+                dataset_spec=self._dataset_spec,
+            )
+            for source_table in self._dataset_spec.source_tables
         }
         lease_owners = {
-            source_table: _source_lease_owner(worker_id, cycle_id, source_table)
-            for source_table in INCREMENTAL_SOURCE_TABLE_ORDER
+            source_table: _source_lease_owner(
+                worker_id,
+                cycle_id,
+                source_table,
+                dataset_spec=self._dataset_spec,
+            )
+            for source_table in self._dataset_spec.source_tables
         }
 
         outcomes: list[IncrementalSourceScanOutcome] = []
-        for source_table in INCREMENTAL_SOURCE_TABLE_ORDER:
+        for source_table in self._dataset_spec.source_tables:
             try:
                 result = self.scan_service.scan_source(
                     source_table,
@@ -457,7 +483,12 @@ class IncrementalScanCoordinator:
         )
 
 
-def build_incremental_scan_coordinator(settings: Settings) -> IncrementalScanCoordinator:
+def build_incremental_scan_coordinator(
+    settings: Settings,
+    *,
+    dataset_spec: DatasetSpec = EXPERT_SPEC,
+    source_adapter: object | None = None,
+) -> IncrementalScanCoordinator:
     """从正式 Source/Index 配置组装默认关闭的候选扫描协调器。
 
     构造阶段先验证所有状态写入明确指向独立 Index Schema，再检查显式启用开关。
@@ -468,19 +499,20 @@ def build_incremental_scan_coordinator(settings: Settings) -> IncrementalScanCoo
         raise TypeError("settings 必须是 Settings")
     settings.validate_index_write_boundary()
     if not settings.incremental_scan.enabled:
-        raise IncrementalScanDisabledError(
-            "INCREMENTAL_ENABLED 未开启，候选扫描入口保持禁用"
-        )
+        raise IncrementalScanDisabledError("INCREMENTAL_ENABLED 未开启，候选扫描入口保持禁用")
     scan_config = settings.incremental_scan
+    resolved_source = source_adapter or MySQLSourceAdapter(settings.source_db)
     return IncrementalScanCoordinator(
         scan_service=IncrementalSourceScanService(
-            source_adapter=MySQLSourceAdapter(settings.source_db),
+            source_adapter=resolved_source,
             source_state_repository=MySQLSourceStateRepository(settings.index_db),
             task_repository=MySQLSourceSyncTaskRepository(settings.index_db),
             policy_version=settings.chunk_policy_version,
             page_size=scan_config.batch_size,
             lease_seconds=scan_config.lease_seconds,
-        )
+            dataset_spec=dataset_spec,
+        ),
+        dataset_spec=dataset_spec,
     )
 
 
@@ -490,10 +522,15 @@ def _source_datetime_literal(value: datetime) -> str:
     return value.replace(tzinfo=None).isoformat(timespec="microseconds")
 
 
-def _incremental_batch_no(cycle_id: str, source_table: str) -> str:
+def _incremental_batch_no(
+    cycle_id: str,
+    source_table: str,
+    *,
+    dataset_spec: DatasetSpec = EXPERT_SPEC,
+) -> str:
     """生成同一周期内按来源表隔离且满足数据库长度约束的批次号。"""
 
-    batch_no = f"inc-{cycle_id}-{_BATCH_SOURCE_ALIAS[source_table]}"
+    batch_no = f"inc-{cycle_id}-{_source_alias(source_table, dataset_spec=dataset_spec)}"
     if len(batch_no) > 64:
         raise ValueError("生成的 incremental batch_no 超过 64 个字符")
     return batch_no
@@ -503,10 +540,12 @@ def _source_lease_owner(
     worker_id: str,
     cycle_id: str,
     source_table: str,
+    *,
+    dataset_spec: DatasetSpec = EXPERT_SPEC,
 ) -> str:
     """生成一次扫描周期内按来源表隔离且不可跨表复用的 lease owner。"""
 
-    lease_owner = f"{worker_id}.{cycle_id}.{_BATCH_SOURCE_ALIAS[source_table]}"
+    lease_owner = f"{worker_id}.{cycle_id}.{_source_alias(source_table, dataset_spec=dataset_spec)}"
     if len(lease_owner) > 128:
         raise ValueError("生成的 source lease_owner 超过 128 个字符")
     return lease_owner
@@ -526,9 +565,7 @@ def _validate_orchestration_identifier(
         or len(value) > maximum_length
         or _SAFE_ORCHESTRATION_IDENTIFIER.fullmatch(value) is None
     ):
-        raise ValueError(
-            f"{name} 必须是长度不超过 {maximum_length} 的安全非空标识"
-        )
+        raise ValueError(f"{name} 必须是长度不超过 {maximum_length} 的安全非空标识")
 
 
 def _has_new_source_range(
@@ -574,10 +611,12 @@ def _validate_scan_request(
     source_table: str,
     lease_owner: str,
     batch_no: str,
+    *,
+    dataset_spec: DatasetSpec = EXPERT_SPEC,
 ) -> None:
     """校验一张来源表扫描请求的表名、owner 和批次号。"""
 
-    if source_table not in CHECKPOINT_SOURCE_TABLES:
+    if source_table not in dataset_spec.checkpoint_source_tables:
         raise ValueError(f"不支持的 Checkpoint 来源表: {source_table}")
     if (
         not isinstance(lease_owner, str)
@@ -595,20 +634,50 @@ def _validate_scan_request(
         raise ValueError("batch_no 必须是长度不超过 64 的非空字符串")
 
 
-def _target_type(source_table: str) -> str:
+def _target_type(
+    source_table: str,
+    *,
+    dataset_spec: DatasetSpec = EXPERT_SPEC,
+) -> str:
     """返回 P3 冻结的来源表级最小影响类型。"""
 
-    try:
-        return _POLL_TARGET_TYPE_BY_SOURCE_TABLE[source_table]
-    except KeyError as exc:
-        raise ValueError(f"不支持的 Poll 来源表: {source_table}") from exc
+    if source_table == dataset_spec.profile_table:
+        # 主档变化（尤其人物删除/恢复）必须收敛人物完整范围。
+        return "expert"
+    return dataset_spec.target_type_for_source_table(source_table)
 
 
-def _validate_candidate(candidate: SourceChangeCandidate) -> None:
+def _validate_candidate(
+    candidate: SourceChangeCandidate,
+    *,
+    dataset_spec: DatasetSpec = EXPERT_SPEC,
+) -> None:
     """校验映射入口收到显式的最小来源候选模型。"""
 
     if not isinstance(candidate, SourceChangeCandidate):
         raise TypeError("candidate 必须是 SourceChangeCandidate")
+    if candidate.source_table not in dataset_spec.checkpoint_source_tables:
+        raise ValueError(f"候选来源表 {candidate.source_table} 不属于 {dataset_spec.name} 数据集")
+
+
+def _source_alias(source_table: str, *, dataset_spec: DatasetSpec) -> str:
+    """返回批次号和租约使用的短别名，不把物理表名直接拼入标识。"""
+
+    if dataset_spec == EXPERT_SPEC:
+        try:
+            return _BATCH_SOURCE_ALIAS[source_table]
+        except KeyError as exc:  # pragma: no cover - 前置白名单已经拒绝。
+            raise ValueError(f"不支持的 Poll 来源表: {source_table}") from exc
+    mapping = {
+        dataset_spec.profile_table: "profile",
+        dataset_spec.employment_table: "work",
+        dataset_spec.project_table: "project",
+        dataset_spec.education_table: "education",
+    }
+    try:
+        return mapping[source_table]
+    except KeyError as exc:
+        raise ValueError(f"{dataset_spec.name} 不支持来源表: {source_table}") from exc
 
 
 def _validate_batch_id(batch_id: int) -> None:

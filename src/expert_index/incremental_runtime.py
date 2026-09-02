@@ -12,6 +12,7 @@ from typing import Protocol
 
 from .checkpoint import CheckpointManager
 from .config import Settings
+from .dataset import EXPERT_SPEC, DatasetSpec
 from .handoff_factory import build_incremental_handoff_runtime
 from .models import BatchSourceScan
 from .scanner import (
@@ -154,15 +155,25 @@ def build_incremental_runtime(
     retry_delay_seconds: int,
     task_lease_seconds: int,
     vector_service: object | None = None,
+    dataset_spec: DatasetSpec = EXPERT_SPEC,
+    source: object | None = None,
+    include_cdc_delete_processor: bool = True,
 ) -> IncrementalRuntime:
     """组装普通 Poll 总编排入口，所有重试和 lease 参数必须显式传入。"""
 
-    scanner = build_incremental_scan_coordinator(settings)
+    scanner = build_incremental_scan_coordinator(
+        settings,
+        dataset_spec=dataset_spec,
+        source_adapter=source,
+    )
     handoff = build_incremental_handoff_runtime(
         settings,
         max_attempts=max_attempts,
         retry_delay_seconds=retry_delay_seconds,
         vector_service=vector_service,
+        dataset_spec=dataset_spec,
+        source=source,
+        include_cdc_delete_processor=include_cdc_delete_processor,
     )
     coordinator = SourceBatchCoordinator(
         handoff.preparation_coordinator,
@@ -173,7 +184,13 @@ def build_incremental_runtime(
         task_lease_seconds=task_lease_seconds,
         source_lease_seconds=settings.incremental_scan.lease_seconds,
     )
-    return IncrementalRuntime(scanner, IncrementalRoundScheduler(coordinator))
+    return IncrementalRuntime(
+        scanner,
+        IncrementalRoundScheduler(
+            coordinator,
+            source_table_order=dataset_spec.source_tables,
+        ),
+    )
 
 
 __all__ = [

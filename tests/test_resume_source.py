@@ -9,6 +9,7 @@ from typing import Any
 import pytest
 
 from expert_index.config import DatabaseBoundaryError, DatabaseConfig, DatabaseRole
+from expert_index.models import CurrentFactReadRequest, SourceScanCursor, impact_scope_from_target
 from expert_index.normalize import normalize_aggregate
 from resume_index.dataset import RESUME_SPEC
 from resume_index.source import (
@@ -304,6 +305,130 @@ def test_missing_profile_rolls_back_and_closes_snapshot(
 
     assert connection.rollback_count == 1
     assert connection.closed is True
+
+
+def test_poll_candidate_scan_keeps_physical_id_and_resume_id_separate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    when = datetime(2026, 9, 2, 10, 0, 0)  # noqa: DTZ001
+    cursor = ScriptedCursor(
+        {
+            "FROM resume_profile": [
+                [
+                    {
+                        "id": 17,
+                        "internal_person_id": 70001,
+                        "updated_at": when,
+                        "lifecycle_deleted_at": None,
+                    }
+                ]
+            ]
+        }
+    )
+    monkeypatch.setattr(
+        "resume_index.source.pymysql.connect",
+        lambda **_kwargs: FakeConnection(cursor),
+    )
+    adapter = MySQLResumeSourceAdapter(_source_config())
+
+    candidates = adapter.load_source_change_candidates(
+        "resume_profile",
+        after_cursor=SourceScanCursor(datetime(1970, 1, 1), 0),  # noqa: DTZ001
+        upper_bound=SourceScanCursor(when, 17),
+        limit=100,
+    )
+
+    assert len(candidates) == 1
+    assert candidates[0].record_id == 17
+    assert candidates[0].expert_id == 70001
+    assert candidates[0].source_table == "resume_profile"
+    sql, params = cursor.executed[-1]
+    assert "ORDER BY updated_at ASC, id ASC" in sql
+    assert params is not None and params[-1] == 100
+
+
+def test_poll_profile_delete_reads_by_physical_id_and_returns_empty_person_scope(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    when = datetime(2026, 9, 2, 10, 0, 0)  # noqa: DTZ001
+    profile = _profile_row()
+    profile["physical_source_id"] = 17
+    profile["lifecycle_deleted_at"] = when
+    cursor = ScriptedCursor({"FROM resume_profile": [profile]})
+    connection = FakeConnection(cursor)
+    monkeypatch.setattr(
+        "resume_index.source.pymysql.connect",
+        lambda **_kwargs: connection,
+    )
+    scope = impact_scope_from_target(
+        target_type="expert",
+        expert_id=70001,
+        dataset_spec=RESUME_SPEC,
+    )
+
+    facts = MySQLResumeSourceAdapter(_source_config()).read_current_facts(
+        CurrentFactReadRequest(
+            impact_scope=scope,
+            trigger_source_table="resume_profile",
+            trigger_source_field_id="17",
+            trigger_source_updated_at=when,
+        )
+    )
+
+    assert facts.expert.id == 70001
+    assert facts.expert_deleted is True
+    assert not facts.employments and not facts.projects and not facts.educations
+    assert cursor.executed[-1][1] == (17,)
+    assert connection.rollback_count == 1
+
+
+def test_poll_deleted_employment_returns_trigger_and_parent_lifecycle(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    when = datetime(2026, 9, 2, 10, 0, 0)  # noqa: DTZ001
+    employment = {
+        "id": 81001,
+        "internal_person_id": 70001,
+        "company_name": "示例科技有限公司",
+        "position_title": "项目经理",
+        "start_date": when,
+        "end_date": None,
+        "work_description": "工作职责：负责知识库建设。",
+        "is_employed": 1,
+        "business_updated_at": when,
+        "scan_updated_at": when,
+        "created_at": when,
+        "deleted_at": when,
+    }
+    cursor = ScriptedCursor(
+        {
+            "FROM resume_work_experience": [employment],
+            "FROM resume_profile": [_profile_row()],
+        }
+    )
+    monkeypatch.setattr(
+        "resume_index.source.pymysql.connect",
+        lambda **_kwargs: FakeConnection(cursor),
+    )
+    scope = impact_scope_from_target(
+        target_type="employment",
+        expert_id=70001,
+        source_field_id="81001",
+        dataset_spec=RESUME_SPEC,
+    )
+
+    facts = MySQLResumeSourceAdapter(_source_config()).read_current_facts(
+        CurrentFactReadRequest(
+            impact_scope=scope,
+            trigger_source_table="resume_work_experience",
+            trigger_source_field_id="81001",
+            trigger_source_updated_at=when,
+        )
+    )
+
+    assert facts.employments[0].id == 81001
+    assert facts.employments[0].deleted_at == when
+    assert facts.expert.id == 70001
 
 
 def test_adapter_rejects_non_resume_spec() -> None:

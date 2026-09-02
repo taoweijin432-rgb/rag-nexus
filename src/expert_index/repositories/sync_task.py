@@ -14,7 +14,7 @@ import pymysql
 
 from ..config import DatabaseConfig, require_index_database
 from ..models import (
-    CHECKPOINT_SOURCE_TABLES,
+    PERSISTED_SOURCE_TABLES,
     SOURCE_SYNC_ERROR_STAGES,
     SOURCE_SYNC_PROCESSING_STAGE_ORDER,
     TASK_RESULT_CODES,
@@ -1180,7 +1180,7 @@ def _new_attempt_token() -> str:
 def _validate_source_table(source_table: str) -> None:
     """校验领取范围只使用四张冻结的来源表名。"""
 
-    if source_table not in CHECKPOINT_SOURCE_TABLES:
+    if source_table not in PERSISTED_SOURCE_TABLES:
         raise ValueError(f"不支持的同步任务来源表: {source_table}")
 
 

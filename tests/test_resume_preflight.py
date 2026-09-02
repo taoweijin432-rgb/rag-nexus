@@ -120,8 +120,11 @@ def test_resume_cli_exposes_only_resume_commands() -> None:
     assert set(subparsers.choices) == {
         "preflight-source",
         "init-db",
+        "init-checkpoints",
         "build",
         "build-batch",
+        "incremental-once",
+        "incremental-worker",
         "resume-batch",
         "retry-batch",
     }
@@ -256,3 +259,57 @@ def test_cli_build_uses_resume_id_and_prints_resume_semantics(
     assert output["resume_id"] == 70001
     assert output["vector_sync"]["resume_count"] == 1
     assert "expert_id" not in output
+
+
+def test_cli_incremental_once_uses_resume_poll_runtime(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    settings = _settings()
+    captured: dict[str, object] = {}
+
+    class FakeResult:
+        @staticmethod
+        def to_summary() -> dict[str, object]:
+            return {"cycle_id": "resume-cycle-1", "success_count": 2}
+
+    class FakeRuntime:
+        def run_once(self, worker_id: str, *, cycle_id: str) -> FakeResult:
+            captured.update(worker_id=worker_id, cycle_id=cycle_id)
+            return FakeResult()
+
+    def build_poll_runtime(received: ResumeSettings, **kwargs: object) -> FakeRuntime:
+        captured.update(settings=received, **kwargs)
+        return FakeRuntime()
+
+    monkeypatch.setattr("resume_index.cli.ResumeSettings.from_env", lambda: settings)
+    monkeypatch.setattr("resume_index.cli._build_poll_runtime", build_poll_runtime)
+
+    main(
+        [
+            "incremental-once",
+            "--worker-id",
+            "resume-worker-1",
+            "--cycle-id",
+            "resume-cycle-1",
+            "--max-attempts",
+            "3",
+            "--retry-delay-seconds",
+            "30",
+            "--task-lease-seconds",
+            "120",
+        ]
+    )
+
+    assert captured == {
+        "settings": settings,
+        "max_attempts": 3,
+        "retry_delay_seconds": 30,
+        "task_lease_seconds": 120,
+        "worker_id": "resume-worker-1",
+        "cycle_id": "resume-cycle-1",
+    }
+    assert json.loads(capsys.readouterr().out) == {
+        "cycle_id": "resume-cycle-1",
+        "success_count": 2,
+    }

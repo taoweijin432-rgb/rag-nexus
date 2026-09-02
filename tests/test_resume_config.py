@@ -46,6 +46,32 @@ def test_from_env_builds_explicit_resume_roles_and_targets() -> None:
     assert settings.index_db.role is DatabaseRole.INDEX
     assert settings.index_db.database == "resume_index"
     assert settings.milvus_collection_name == "resume_candidates_v15_contract"
+    assert settings.incremental_scan.enabled is False
+
+
+def test_resume_incremental_settings_use_only_resume_prefix() -> None:
+    environment = _environment()
+    environment.update(
+        {
+            "RESUME_INCREMENTAL_ENABLED": "1",
+            "RESUME_INCREMENTAL_BATCH_SIZE": "240",
+            "RESUME_INCREMENTAL_LEASE_SECONDS": "180",
+            # Expert 配置故意冲突，证明 Resume 不读取这些值。
+            "INCREMENTAL_ENABLED": "0",
+            "INCREMENTAL_BATCH_SIZE": "999",
+            "INCREMENTAL_LEASE_SECONDS": "999",
+        }
+    )
+
+    settings = ResumeSettings.from_env(environment)
+
+    assert settings.incremental_scan.enabled is True
+    assert settings.incremental_scan.batch_size == 240
+    assert settings.incremental_scan.lease_seconds == 180
+    processing = settings.to_processing_settings()
+    assert processing.source_db is settings.source_db
+    assert processing.index_db is settings.index_db
+    assert processing.incremental_scan is settings.incremental_scan
 
 
 @pytest.mark.parametrize(

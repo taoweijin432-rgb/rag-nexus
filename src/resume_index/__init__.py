@@ -1,7 +1,12 @@
 """Resume 数据处理的独立上游边界。"""
 
+from .checkpoint_initializer import (
+    ResumeCheckpointInitializationResult,
+    initialize_resume_checkpoints,
+)
 from .config import PhysicalDatabaseTarget, ResumeSettings
 from .dataset import RESUME_SPEC
+from .incremental_runtime import ResumeIncrementalRuntime, build_resume_incremental_runtime
 from .pipeline import (
     ResumeBatchBuildResult,
     ResumeBuildResult,
@@ -34,6 +39,8 @@ __all__ = [
     "ResumeBatchBuildResult",
     "ResumeBuildResult",
     "ResumeCandidate",
+    "ResumeCheckpointInitializationResult",
+    "ResumeIncrementalRuntime",
     "ResumeIndexPipeline",
     "ResumeNotFoundError",
     "ResumeRuntime",
@@ -43,7 +50,9 @@ __all__ = [
     "ResumeSourceSchemaError",
     "ResumeSourceSchemaReport",
     "ResumeVectorSyncSummary",
+    "build_resume_incremental_runtime",
     "build_resume_runtime",
+    "initialize_resume_checkpoints",
     "inspect_resume_source_schema",
     "require_resume_source_schema",
     "run_resume_source_preflight",

@@ -27,13 +27,13 @@ from __future__ import annotations
 
 from . import scope_handlers
 from .chunk_builder import ChunkFactory
+from .dataset import EXPERT_SPEC, DatasetSpec
 from .models import (
     PreparedChunkSet,
     ScopedCurrentFacts,
     SourceSyncTask,
     source_sync_task_to_read_request,
 )
-from .source import MySQLSourceAdapter
 
 __all__ = [
     "build_prepared_chunk_set",
@@ -57,7 +57,7 @@ def _validate_token(token: str) -> None:
 def prepare_claimed_source_sync_task(
     task: SourceSyncTask,
     attempt_token: str,
-    source: MySQLSourceAdapter,
+    source: object,
     factory: ChunkFactory,
 ) -> PreparedChunkSet:
     """把一个已领取的来源同步任务转换为 :class:`PreparedChunkSet`。
@@ -102,13 +102,19 @@ def prepare_claimed_source_sync_task(
 
     # 复用 P4.3 mapping（education→profile 已在此完成）+ 防御性 scope 一致性校验。
     # 复用 read_scoped_facts，保证“整函数路径”与“拆分路径”走同一套防御。
-    facts = read_scoped_facts(task, source)
+    facts = read_scoped_facts(
+        task,
+        source,
+        dataset_spec=factory.dataset_spec,
+    )
     return build_prepared_chunk_set(task, facts, factory)
 
 
 def read_scoped_facts(
     task: SourceSyncTask,
-    source: MySQLSourceAdapter,
+    source: object,
+    *,
+    dataset_spec: DatasetSpec = EXPERT_SPEC,
 ) -> ScopedCurrentFacts:
     """读取当前事实但不构建 Chunk。
 
@@ -118,8 +124,13 @@ def read_scoped_facts(
     ``read_current_facts`` 内部的时序校验。
     """
 
-    request = source_sync_task_to_read_request(task)
-    facts: ScopedCurrentFacts = source.read_current_facts(request)
+    request = source_sync_task_to_read_request(task, dataset_spec=dataset_spec)
+    read_current_facts = getattr(source, "read_current_facts", None)
+    if not callable(read_current_facts):
+        raise TypeError("source 缺少 read_current_facts")
+    facts = read_current_facts(request)
+    if not isinstance(facts, ScopedCurrentFacts):
+        raise TypeError("source.read_current_facts 必须返回 ScopedCurrentFacts")
     # 防御畸形 source：返回事实的范围必须与请求范围一致，否则可能路由到错误 Handler。
     if facts.scope != request.impact_scope:
         raise ValueError("source 返回的 scope 与请求 scope 不一致，拒绝分发")

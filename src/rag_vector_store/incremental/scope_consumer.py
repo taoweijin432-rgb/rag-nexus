@@ -45,6 +45,7 @@ Receipt 计数：
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from typing import Protocol, runtime_checkable
 
 from expert_contracts import ExpertChunkEmbeddingInput
@@ -72,6 +73,11 @@ _SCOPE_TYPES = frozenset({"expert", "profile", "employment", "project"})
 _PROFILE_SOURCE_TABLE = "experts+experts_education_experience"
 _EMPLOYMENT_SOURCE_TABLE = "experts_work_experience"
 _PROJECT_SOURCE_TABLE = "experts_project_experience"
+_DEFAULT_SCOPE_SOURCE_TABLES = {
+    "profile": _PROFILE_SOURCE_TABLE,
+    "employment": _EMPLOYMENT_SOURCE_TABLE,
+    "project": _PROJECT_SOURCE_TABLE,
+}
 
 
 @runtime_checkable
@@ -253,7 +259,11 @@ def _in_scope(
     return source_field_id == scope.source_field_id
 
 
-def _expected_scope_invariants(scope: ScopeView) -> None:
+def _expected_scope_invariants(
+    scope: ScopeView,
+    *,
+    scope_source_tables: Mapping[str, str] = _DEFAULT_SCOPE_SOURCE_TABLES,
+) -> None:
     """校验 scope 字段组合与 INCREMENTAL_IMPACT_SCOPE_TYPES 一致（fail-closed）。"""
 
     if scope.scope_type not in _SCOPE_TYPES:
@@ -264,11 +274,7 @@ def _expected_scope_invariants(scope: ScopeView) -> None:
         return
     if scope.chunk_type is None or scope.source_table is None or scope.source_field_id is None:
         raise _ScopeStateError(f"{scope.scope_type} 范围必须提供 chunk_type/source_table/source_field_id")
-    expected_table = {
-        "profile": _PROFILE_SOURCE_TABLE,
-        "employment": _EMPLOYMENT_SOURCE_TABLE,
-        "project": _PROJECT_SOURCE_TABLE,
-    }[scope.scope_type]
+    expected_table = scope_source_tables[scope.scope_type]
     if scope.source_table != expected_table:
         raise _ScopeStateError(f"{scope.scope_type} 范围 source_table 必须为 {expected_table}")
     expected_chunk = {"profile": "profile_summary", "employment": "employment", "project": "project"}[scope.scope_type]
@@ -364,17 +370,29 @@ class ScopeConsumer:
         core: ContractConsumerCore,
         state_port: ScopeVectorStatePort,
         receipt_sink: ScopeReceiptSink,
+        scope_source_tables: Mapping[str, str] | None = None,
     ) -> None:
         self._core = core
         self._state_port = state_port
         self._receipt_sink = receipt_sink
+        resolved_tables = dict(scope_source_tables or _DEFAULT_SCOPE_SOURCE_TABLES)
+        if set(resolved_tables) != {"profile", "employment", "project"}:
+            raise ValueError(
+                "scope_source_tables 必须完整包含 profile/employment/project"
+            )
+        if any(not isinstance(value, str) or not value.strip() for value in resolved_tables.values()):
+            raise ValueError("scope_source_tables 的来源表标签必须是非空字符串")
+        self._scope_source_tables = resolved_tables
 
     def process(self, request: ScopeHandoffRequestView) -> ScopeHandoffReceiptView:
         """执行范围收敛：查询 active → 收敛 desired → 下线 stale → 返回 Receipt。"""
 
         scope = request.impact_scope
         try:
-            _expected_scope_invariants(scope)
+            _expected_scope_invariants(
+                scope,
+                scope_source_tables=self._scope_source_tables,
+            )
         except _ScopeStateError as error:
             return self._receipt(
                 request,

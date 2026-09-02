@@ -11,7 +11,7 @@ import re
 from collections.abc import Iterable
 from dataclasses import dataclass
 
-from .models import CHECKPOINT_SOURCE_TABLES
+from .models import PERSISTED_SOURCE_TABLES
 from .observability import IncrementalMetrics
 from .scanner import INCREMENTAL_SOURCE_TABLE_ORDER
 from .source_batch_coordinator import SourceBatchRunResult
@@ -37,7 +37,7 @@ class SourceBatchExecutionPlan:
     def __post_init__(self) -> None:
         """校验调度计划只包含合法来源和安全状态定位字段。"""
 
-        if self.source_table not in CHECKPOINT_SOURCE_TABLES:
+        if self.source_table not in PERSISTED_SOURCE_TABLES:
             raise ValueError(f"不支持的来源表: {self.source_table!r}")
         if (
             isinstance(self.batch_id, bool)
@@ -85,6 +85,7 @@ class IncrementalRoundScheduler:
         source_batch_coordinator,
         *,
         metrics: IncrementalMetrics | None = None,
+        source_table_order: tuple[str, ...] = INCREMENTAL_SOURCE_TABLE_ORDER,
     ) -> None:
         """注入单来源协调器和可选的进程内指标记录器。"""
 
@@ -93,7 +94,14 @@ class IncrementalRoundScheduler:
         self._coordinator = source_batch_coordinator
         if metrics is not None and not isinstance(metrics, IncrementalMetrics):
             raise TypeError("metrics 必须是 IncrementalMetrics 或 None")
+        if (
+            not source_table_order
+            or len(set(source_table_order)) != len(source_table_order)
+            or any(table not in PERSISTED_SOURCE_TABLES for table in source_table_order)
+        ):
+            raise ValueError("source_table_order 必须是已冻结且不重复的来源表顺序")
         self._metrics = metrics
+        self._source_table_order = source_table_order
 
     def run_once(
         self,
@@ -111,7 +119,10 @@ class IncrementalRoundScheduler:
             raise TypeError("plans 必须全部是 SourceBatchExecutionPlan")
         if len({plan.source_table for plan in normalized}) != len(normalized):
             raise ValueError("同一轮不能重复调度同一来源表")
-        order = {source: index for index, source in enumerate(INCREMENTAL_SOURCE_TABLE_ORDER)}
+        order = {source: index for index, source in enumerate(self._source_table_order)}
+        unknown = {plan.source_table for plan in normalized} - set(order)
+        if unknown:
+            raise ValueError(f"调度计划包含当前数据集之外的来源表: {sorted(unknown)}")
         ordered = tuple(sorted(normalized, key=lambda plan: order[plan.source_table]))
         outcomes: list[SourceBatchRunResult] = []
         for plan in ordered:

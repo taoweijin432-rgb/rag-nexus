@@ -10,12 +10,17 @@ from __future__ import annotations
 
 import os
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from expert_index.config import (
+    DEFAULT_INCREMENTAL_BATCH_SIZE,
+    DEFAULT_INCREMENTAL_LEASE_SECONDS,
+    MAX_INCREMENTAL_BATCH_SIZE,
     DatabaseBoundaryError,
     DatabaseConfig,
     DatabaseRole,
+    IncrementalScanConfig,
+    Settings,
     load_env_file,
 )
 from rag_vector_store.config import DEFAULT_MILVUS_COLLECTION_NAME
@@ -78,6 +83,7 @@ class ResumeSettings:
     expert_source_target: PhysicalDatabaseTarget
     expert_index_target: PhysicalDatabaseTarget
     expert_milvus_collection_name: str
+    incremental_scan: IncrementalScanConfig = field(default_factory=IncrementalScanConfig)
 
     def __post_init__(self) -> None:
         """任何构造方式都必须经过角色和物理目标隔离校验。"""
@@ -159,6 +165,29 @@ class ResumeSettings:
         ).strip()
         if not expert_collection:
             expert_collection = DEFAULT_MILVUS_COLLECTION_NAME
+        incremental_scan = IncrementalScanConfig(
+            enabled=_parse_boolean(
+                "RESUME_INCREMENTAL_ENABLED",
+                values.get("RESUME_INCREMENTAL_ENABLED", "0"),
+            ),
+            batch_size=_parse_integer(
+                "RESUME_INCREMENTAL_BATCH_SIZE",
+                values.get(
+                    "RESUME_INCREMENTAL_BATCH_SIZE",
+                    str(DEFAULT_INCREMENTAL_BATCH_SIZE),
+                ),
+                minimum=1,
+                maximum=MAX_INCREMENTAL_BATCH_SIZE,
+            ),
+            lease_seconds=_parse_integer(
+                "RESUME_INCREMENTAL_LEASE_SECONDS",
+                values.get(
+                    "RESUME_INCREMENTAL_LEASE_SECONDS",
+                    str(DEFAULT_INCREMENTAL_LEASE_SECONDS),
+                ),
+                minimum=1,
+            ),
+        )
 
         return cls(
             source_db=source_db,
@@ -170,6 +199,21 @@ class ResumeSettings:
             expert_source_target=expert_source_target,
             expert_index_target=expert_index_target,
             expert_milvus_collection_name=expert_collection,
+            incremental_scan=incremental_scan,
+        )
+
+    def to_processing_settings(self) -> Settings:
+        """构造仅绑定 Resume Source/Index 的公共加工配置。
+
+        公共配置中的增量开关和分页参数只来自 ``RESUME_INCREMENTAL_*``，不会读取
+        Expert 的 ``INCREMENTAL_*``。CDC 保持默认关闭，Resume 首版不接入 Canal。
+        """
+
+        self.validate_isolation_boundaries()
+        return Settings(
+            source_db=self.source_db,
+            index_db=self.index_db,
+            incremental_scan=self.incremental_scan,
         )
 
     def validate_isolation_boundaries(self) -> None:
@@ -247,3 +291,33 @@ def _normalize_collection_name(name: str, value: str) -> str:
     if not isinstance(value, str) or not value.strip():
         raise ValueError(f"{name} 必须是非空字符串")
     return value.strip()
+
+
+def _parse_boolean(name: str, value: str) -> bool:
+    """解析显式布尔环境变量，拒绝可能产生歧义的文本。"""
+
+    normalized = value.strip().casefold()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    raise ValueError(f"{name} 必须是 0/1、true/false、yes/no 或 on/off")
+
+
+def _parse_integer(
+    name: str,
+    value: str,
+    *,
+    minimum: int,
+    maximum: int | None = None,
+) -> int:
+    """解析带上下界的 Resume 增量整数配置。"""
+
+    try:
+        parsed = int(value)
+    except ValueError as exc:
+        raise ValueError(f"{name} 必须是整数") from exc
+    if parsed < minimum or (maximum is not None and parsed > maximum):
+        upper = f" 到 {maximum}" if maximum is not None else "以上"
+        raise ValueError(f"{name} 必须位于 {minimum}{upper}")
+    return parsed

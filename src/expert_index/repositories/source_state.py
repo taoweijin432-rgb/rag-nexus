@@ -12,7 +12,7 @@ import pymysql
 
 from ..config import DatabaseConfig, require_index_database
 from ..models import (
-    CHECKPOINT_SOURCE_TABLES,
+    PERSISTED_SOURCE_TABLES,
     BatchSourceScan,
     SourceCheckpoint,
     SourceScanCursor,
@@ -771,7 +771,7 @@ class MySQLSourceStateRepository:
 def _validate_source_table(source_table: str) -> None:
     """校验来源表属于四表 Checkpoint 白名单。"""
 
-    if not isinstance(source_table, str) or source_table not in CHECKPOINT_SOURCE_TABLES:
+    if not isinstance(source_table, str) or source_table not in PERSISTED_SOURCE_TABLES:
         raise ValueError(f"不支持的 Checkpoint 来源表: {source_table}")
 
 

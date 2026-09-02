@@ -11,7 +11,6 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import cast
 
-from expert_index.config import Settings
 from expert_index.models import ExpertAggregate
 from expert_index.pipeline import (
     BatchBuildResult,
@@ -214,10 +213,7 @@ class ResumeIndexPipeline:
 
         # 公共加工规则只需要 Source/Index、时区和版本常量；这里显式从 Resume 配置
         # 构造，不读取或回退到任何 Expert 数据库环境变量。
-        processing_settings = Settings(
-            source_db=settings.source_db,
-            index_db=settings.index_db,
-        )
+        processing_settings = settings.to_processing_settings()
         self.settings = settings
         self._core = _ResumePipelineCore(
             processing_settings,

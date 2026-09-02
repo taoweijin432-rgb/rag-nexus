@@ -11,11 +11,15 @@ import json
 from dataclasses import asdict
 from typing import TYPE_CHECKING
 
+from expert_index.incremental_worker import IncrementalWorker, IncrementalWorkerConfig
+
+from .checkpoint_initializer import initialize_resume_checkpoints
 from .config import ResumeSettings
 from .preflight import run_resume_source_preflight
 from .schema_initializer import MySQLResumeSchemaInitializer
 
 if TYPE_CHECKING:
+    from .incremental_runtime import ResumeIncrementalRuntime
     from .runtime import ResumeRuntime
 
 
@@ -31,6 +35,16 @@ def build_parser() -> argparse.ArgumentParser:
     subcommands.add_parser(
         "init-db",
         help="在 RESUME_INDEX_DB_* 创建 Resume 控制表",
+    )
+    init_checkpoints = subcommands.add_parser(
+        "init-checkpoints",
+        help="显式初始化 Resume Poll 四表安全水位，不覆盖已有 Checkpoint",
+    )
+    init_checkpoints.add_argument(
+        "--position",
+        choices=("beginning", "current"),
+        required=True,
+        help="beginning=安全补扫全部历史；current=仅用于暂停来源写入的受控全量切换",
     )
 
     build = subcommands.add_parser(
@@ -63,6 +77,28 @@ def build_parser() -> argparse.ArgumentParser:
     )
     retry_batch.add_argument("--batch-id", type=int, required=True)
     retry_batch.add_argument("--page-size", type=int, default=200)
+
+    incremental_once = subcommands.add_parser(
+        "incremental-once",
+        help="执行一轮 Resume Poll：扫描、处理并提交安全 Checkpoint",
+    )
+    incremental_once.add_argument("--worker-id", required=True)
+    incremental_once.add_argument("--cycle-id", required=True)
+    incremental_once.add_argument("--max-attempts", type=int, required=True)
+    incremental_once.add_argument("--retry-delay-seconds", type=int, required=True)
+    incremental_once.add_argument("--task-lease-seconds", type=int, required=True)
+
+    incremental_worker = subcommands.add_parser(
+        "incremental-worker",
+        help="常驻执行 Resume Poll；不包含 CDC/Canal",
+    )
+    incremental_worker.add_argument("--worker-id", required=True)
+    incremental_worker.add_argument("--interval-seconds", type=float, default=60.0)
+    incremental_worker.add_argument("--error-sleep-seconds", type=float, default=30.0)
+    incremental_worker.add_argument("--max-attempts", type=int, required=True)
+    incremental_worker.add_argument("--retry-delay-seconds", type=int, required=True)
+    incremental_worker.add_argument("--task-lease-seconds", type=int, required=True)
+    incremental_worker.add_argument("--max-cycles", type=int)
     return parser
 
 
@@ -80,6 +116,10 @@ def main(argv: list[str] | None = None) -> None:
     elif args.command == "init-db":
         settings = ResumeSettings.from_env()
         result = MySQLResumeSchemaInitializer(settings).initialize_schema()
+        print(json.dumps(asdict(result), ensure_ascii=False, sort_keys=True))
+    elif args.command == "init-checkpoints":
+        settings = ResumeSettings.from_env()
+        result = initialize_resume_checkpoints(settings, position=args.position)
         print(json.dumps(asdict(result), ensure_ascii=False, sort_keys=True))
     elif args.command == "build":
         settings = ResumeSettings.from_env()
@@ -112,6 +152,33 @@ def main(argv: list[str] | None = None) -> None:
             page_size=args.page_size,
         )
         print(json.dumps(asdict(result), ensure_ascii=False, sort_keys=True))
+    elif args.command == "incremental-once":
+        settings = ResumeSettings.from_env()
+        result = _build_poll_runtime(
+            settings,
+            max_attempts=args.max_attempts,
+            retry_delay_seconds=args.retry_delay_seconds,
+            task_lease_seconds=args.task_lease_seconds,
+        ).run_once(args.worker_id, cycle_id=args.cycle_id)
+        print(json.dumps(result.to_summary(), ensure_ascii=False, sort_keys=True))
+    elif args.command == "incremental-worker":
+        settings = ResumeSettings.from_env()
+        runtime = _build_poll_runtime(
+            settings,
+            max_attempts=args.max_attempts,
+            retry_delay_seconds=args.retry_delay_seconds,
+            task_lease_seconds=args.task_lease_seconds,
+        )
+        result = IncrementalWorker(
+            runtime,
+            args.worker_id,
+            config=IncrementalWorkerConfig(
+                interval_seconds=args.interval_seconds,
+                error_sleep_seconds=args.error_sleep_seconds,
+                max_cycles=args.max_cycles,
+            ),
+        ).run()
+        print(json.dumps(asdict(result), ensure_ascii=False, sort_keys=True))
 
 
 def _build_runtime(settings: ResumeSettings) -> ResumeRuntime:
@@ -120,6 +187,25 @@ def _build_runtime(settings: ResumeSettings) -> ResumeRuntime:
     from .runtime import build_resume_runtime
 
     return build_resume_runtime(settings)
+
+
+def _build_poll_runtime(
+    settings: ResumeSettings,
+    *,
+    max_attempts: int,
+    retry_delay_seconds: int,
+    task_lease_seconds: int,
+) -> ResumeIncrementalRuntime:
+    """延迟组装 Resume Poll，其他命令不会导入或启动增量运行时。"""
+
+    from .incremental_runtime import build_resume_incremental_runtime
+
+    return build_resume_incremental_runtime(
+        settings,
+        max_attempts=max_attempts,
+        retry_delay_seconds=retry_delay_seconds,
+        task_lease_seconds=task_lease_seconds,
+    )
 
 
 if __name__ == "__main__":

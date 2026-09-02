@@ -11,16 +11,25 @@ import re
 from dataclasses import dataclass
 from datetime import datetime
 
+from .dataset import EXPERT_SPEC, DatasetSpec
+
 # Checkpoint 只允许跟踪当前进入专家索引链路的四张物理来源表，避免拼写错误创建出
 # 永远不会被扫描的孤立游标。新增来源表时必须显式更新本集合和对应数据库约束。
-CHECKPOINT_SOURCE_TABLES = frozenset(
+# 领域模型允许表达两套已经冻结的物理表契约；真正可访问的四张表仍由各自
+# Source Adapter 和运行时传入的 DatasetSpec 收窄。这样 Resume 独立 Index Schema
+# 能复用状态模型，同时 Expert Scanner 默认仍只遍历 EXPERT_SPEC.source_tables。
+RESUME_CHECKPOINT_SOURCE_TABLES = frozenset(
     {
-        "experts",
-        "experts_work_experience",
-        "experts_project_experience",
-        "experts_education_experience",
+        "resume_profile",
+        "resume_work_experience",
+        "resume_project_experience",
+        "resume_education_experience",
     }
 )
+# 保留现有 Expert 公开常量的精确含义；允许两套独立 Index Schema 复用模型的联合
+# 白名单使用新名称，避免 Expert Source/测试误把 Resume 表纳入自身扫描范围。
+CHECKPOINT_SOURCE_TABLES = EXPERT_SPEC.checkpoint_source_tables
+PERSISTED_SOURCE_TABLES = CHECKPOINT_SOURCE_TABLES | RESUME_CHECKPOINT_SOURCE_TABLES
 
 # 来源表在单个批次中的扫描状态；只描述扫描生命周期，不表示安全 Checkpoint 已推进。
 BATCH_SOURCE_SCAN_STATUSES = frozenset({"pending", "running", "success", "failed"})
@@ -38,15 +47,17 @@ SOURCE_SYNC_OPERATION_TYPES = frozenset({"insert", "update", "delete"})
 SOURCE_SYNC_EVENT_SOURCES = frozenset({"poll", "cdc", "reconcile", "replay"})
 
 # target_type 表达最小影响对象，教育变化保留独立类型供 Profile 重聚合。
-SOURCE_SYNC_TARGET_TYPES = frozenset(
-    {"expert", "profile", "employment", "project", "education"}
-)
+SOURCE_SYNC_TARGET_TYPES = frozenset({"expert", "profile", "employment", "project", "education"})
 
 _SOURCE_SYNC_TARGETS_BY_TABLE = {
     "experts": frozenset({"expert", "profile"}),
     "experts_work_experience": frozenset({"employment"}),
     "experts_project_experience": frozenset({"project"}),
     "experts_education_experience": frozenset({"education"}),
+    "resume_profile": frozenset({"expert", "profile"}),
+    "resume_work_experience": frozenset({"employment"}),
+    "resume_project_experience": frozenset({"project"}),
+    "resume_education_experience": frozenset({"education"}),
 }
 
 # processing_stage 只描述任务已经完成的标准处理边界；元组顺序是状态推进顺序。
@@ -87,9 +98,7 @@ SOURCE_SYNC_ERROR_STAGES = frozenset(
     }
 )
 
-DEAD_LETTER_RESOLUTION_STATUSES = frozenset(
-    {"pending", "requeued", "resolved", "ignored"}
-)
+DEAD_LETTER_RESOLUTION_STATUSES = frozenset({"pending", "requeued", "resolved", "ignored"})
 
 # P5.6 任务终态 result_code 冻结枚举。只表示已完成效果，不记录自由文本；
 # 由 Receipt 计数确定性推导，供 finalize_source_sync_task_success 落定任务。
@@ -246,13 +255,9 @@ class SourceSyncTask:
             ("result_code", self.result_code, 64),
         ):
             if value is not None and (
-                not isinstance(value, str)
-                or not value.strip()
-                or len(value) > max_length
+                not isinstance(value, str) or not value.strip() or len(value) > max_length
             ):
-                raise ValueError(
-                    f"{field_name} 必须是长度不超过 {max_length} 的非空字符串或 None"
-                )
+                raise ValueError(f"{field_name} 必须是长度不超过 {max_length} 的非空字符串或 None")
         for field_name, value in (
             ("created_at", self.created_at),
             ("updated_at", self.updated_at),
@@ -307,7 +312,7 @@ class DeadLetterRecord:
             _validate_positive_integer("expert_id", self.expert_id)
         if self.artifact_id is not None:
             _validate_positive_integer("artifact_id", self.artifact_id)
-        if self.source_table not in CHECKPOINT_SOURCE_TABLES:
+        if self.source_table not in PERSISTED_SOURCE_TABLES:
             raise ValueError(f"不支持的 DLQ 来源表: {self.source_table}")
         if self.failure_stage not in SOURCE_SYNC_ERROR_STAGES:
             raise ValueError(f"不支持的 DLQ 失败阶段: {self.failure_stage}")
@@ -333,9 +338,7 @@ class DeadLetterRecord:
             ("resolution_request_id", self.resolution_request_id, 128),
         ):
             if field_name == "reason_code":
-                _validate_optional_text(
-                    field_name, value, max_length=max_length, allow_none=False
-                )
+                _validate_optional_text(field_name, value, max_length=max_length, allow_none=False)
             elif value is not None:
                 _validate_optional_text(field_name, value, max_length=max_length)
         for field_name, value in (
@@ -369,7 +372,7 @@ def _validate_source_sync_identity(
         _validate_positive_integer("expert_id", expert_id, optional_label=True)
     if event_source not in SOURCE_SYNC_EVENT_SOURCES:
         raise ValueError(f"不支持的同步任务事件来源: {event_source}")
-    if source_table not in CHECKPOINT_SOURCE_TABLES:
+    if source_table not in PERSISTED_SOURCE_TABLES:
         raise ValueError(f"不支持的同步任务来源表: {source_table}")
     if source_updated_at is not None and not isinstance(source_updated_at, datetime):
         raise TypeError("source_updated_at 必须是 datetime 或 None")
@@ -468,7 +471,7 @@ class BatchSourceScan:
             or self.batch_id < 1
         ):
             raise ValueError("batch_id 必须是正整数")
-        if self.source_table not in CHECKPOINT_SOURCE_TABLES:
+        if self.source_table not in PERSISTED_SOURCE_TABLES:
             raise ValueError(f"不支持的 Checkpoint 来源表: {self.source_table}")
         for field_name, cursor in (
             ("start_cursor", self.start_cursor),
@@ -514,7 +517,7 @@ class SourceChangeCandidate:
     def __post_init__(self) -> None:
         """拒绝无法定位来源记录或无法参与增量排序的候选。"""
 
-        if self.source_table not in CHECKPOINT_SOURCE_TABLES:
+        if self.source_table not in PERSISTED_SOURCE_TABLES:
             raise ValueError(f"不支持的 Checkpoint 来源表: {self.source_table}")
         if (
             isinstance(self.record_id, bool)
@@ -567,15 +570,11 @@ class SourceCheckpoint:
     def __post_init__(self) -> None:
         """拒绝无法形成可靠复合游标或无法映射到 Checkpoint 表的状态。"""
 
-        if self.source_table not in CHECKPOINT_SOURCE_TABLES:
+        if self.source_table not in PERSISTED_SOURCE_TABLES:
             raise ValueError(f"不支持的 Checkpoint 来源表: {self.source_table}")
         if not isinstance(self.last_updated_at, datetime):
             raise TypeError("last_updated_at 必须是 datetime")
-        if (
-            isinstance(self.last_id, bool)
-            or not isinstance(self.last_id, int)
-            or self.last_id < 0
-        ):
+        if isinstance(self.last_id, bool) or not isinstance(self.last_id, int) or self.last_id < 0:
             raise ValueError("last_id 必须是非负整数")
         if self.last_batch_id is not None and (
             isinstance(self.last_batch_id, bool)
@@ -666,7 +665,9 @@ class EmploymentSource:
     is_employed: int | None  # experts_work_experience.is_employed：1=在职，2=不在职，其他=未知。
     updated_at: datetime | None  # experts_work_experience.updated_at：源记录最后更新时间。
     created_at: datetime | None  # experts_work_experience.created_at：源记录创建时间。
-    deleted_at: datetime | None  # experts_work_experience.deleted_at：逻辑删除时间；有效快照恒为 None。
+    deleted_at: (
+        datetime | None
+    )  # experts_work_experience.deleted_at：逻辑删除时间；有效快照恒为 None。
 
 
 @dataclass(frozen=True)
@@ -681,10 +682,14 @@ class ProjectSource:
     company_name: str | None  # experts_project_experience.company_name：项目所属公司或客户。
     start_date: datetime | None  # experts_project_experience.start_date：项目开始日期。
     end_date: datetime | None  # experts_project_experience.end_date：项目结束日期。
-    work_description: str | None  # experts_project_experience.work_description：包含角色/目标/动作/结果的项目。
+    work_description: (
+        str | None
+    )  # experts_project_experience.work_description：包含角色/目标/动作/结果的项目。
     updated_at: datetime | None  # experts_project_experience.updated_at：源记录最后更新时间。
     created_at: datetime | None  # experts_project_experience.created_at：源记录创建时间。
-    deleted_at: datetime | None  # experts_project_experience.deleted_at：逻辑删除时间；有效快照恒为 None。
+    deleted_at: (
+        datetime | None
+    )  # experts_project_experience.deleted_at：逻辑删除时间；有效快照恒为 None。
 
 
 @dataclass(frozen=True)
@@ -701,7 +706,9 @@ class EducationSource:
     major: str | None  # experts_education_experience.major：专业原始名称。
     updated_at: datetime | None  # experts_education_experience.updated_at：最后更新时间。
     created_at: datetime | None  # experts_education_experience.created_at：创建时间。
-    deleted_at: datetime | None  # experts_education_experience.deleted_at：逻辑删除时间；有效快照恒为 None。
+    deleted_at: (
+        datetime | None
+    )  # experts_education_experience.deleted_at：逻辑删除时间；有效快照恒为 None。
 
 
 @dataclass(frozen=True)
@@ -838,7 +845,9 @@ class ChunkRecord:
     major_names_raw: tuple[str, ...]  # 仅 profile_summary 使用的专业原始名集合。
     eligible_for_recommendation: bool | None  # 仅 profile_summary 使用；其他类型必须为 None。
     origin_type: str  # source_parsed 或 compressed_from_source。
-    verification_status: str  # verified 或 source_summary，如果是存疑/未知则为 rejected，受doubtful_flag字段影响。
+    verification_status: (
+        str  # verified 或 source_summary，如果是存疑/未知则为 rejected，受doubtful_flag字段影响。
+    )
     weight_tier: str  # 检索权重等级，如 A/B。
     chunk_policy_version: str  # Chunk 模板与切分规则版本。
     metadata_schema_version: str  # Metadata 数据契约版本。
@@ -862,12 +871,23 @@ INCREMENTAL_IMPACT_SCOPE_TYPES = frozenset({"expert", "profile", "employment", "
 INCREMENTAL_IMPACT_CHUNK_TYPES = frozenset({"profile_summary", "employment", "project"})
 
 # Profile 范围的规范化来源标识，与 ChunkFactory.build_profile 实际输出保持一致。
-_PROFILE_IMPACT_SOURCE_TABLE = "experts+experts_education_experience"
+_PROFILE_IMPACT_SOURCE_TABLE = EXPERT_SPEC.profile_source_label
+_PROFILE_IMPACT_SOURCE_TABLES = frozenset(
+    {
+        _PROFILE_IMPACT_SOURCE_TABLE,
+        "resume_profile+resume_education_experience",
+    }
+)
 
 # Employment / Project 范围的固定来源表，与 EmploymentStage/ProjectStage.source_table 一致。
-_EMPLOYMENT_IMPACT_SOURCE_TABLE = "experts_work_experience"
-_PROJECT_IMPACT_SOURCE_TABLE = "experts_project_experience"
-
+_EMPLOYMENT_IMPACT_SOURCE_TABLE = EXPERT_SPEC.employment_table
+_EMPLOYMENT_IMPACT_SOURCE_TABLES = frozenset(
+    {_EMPLOYMENT_IMPACT_SOURCE_TABLE, "resume_work_experience"}
+)
+_PROJECT_IMPACT_SOURCE_TABLE = EXPERT_SPEC.project_table
+_PROJECT_IMPACT_SOURCE_TABLES = frozenset(
+    {_PROJECT_IMPACT_SOURCE_TABLE, "resume_project_experience"}
+)
 
 
 @dataclass(frozen=True)
@@ -893,26 +913,36 @@ class IncrementalImpactScope:
         if self.scope_type not in INCREMENTAL_IMPACT_SCOPE_TYPES:
             raise ValueError(f"不支持的影响范围类型: {self.scope_type}")
         if self.scope_type == "expert":
-            if self.chunk_type is not None or self.source_table is not None or self.source_field_id is not None:
-                raise ValueError("expert 范围必须跨三类 Chunk，chunk_type/source_table/source_field_id 必须为 None")
+            if (
+                self.chunk_type is not None
+                or self.source_table is not None
+                or self.source_field_id is not None
+            ):
+                raise ValueError(
+                    "expert 范围必须跨三类 Chunk，chunk_type/source_table/source_field_id 必须为 None"
+                )
             return
         # 非 expert 范围：chunk_type/source_table/source_field_id 必须齐备。
         if self.chunk_type is None or self.source_table is None or self.source_field_id is None:
-            raise ValueError(f"{self.scope_type} 范围必须提供 chunk_type/source_table/source_field_id")
+            raise ValueError(
+                f"{self.scope_type} 范围必须提供 chunk_type/source_table/source_field_id"
+            )
         if self.chunk_type not in INCREMENTAL_IMPACT_CHUNK_TYPES:
             raise ValueError(f"不支持的影响范围 Chunk 类型: {self.chunk_type}")
         if self.scope_type == "profile":
             if self.chunk_type != "profile_summary":
                 raise ValueError("profile 范围的 chunk_type 必须为 profile_summary")
-            if self.source_table != _PROFILE_IMPACT_SOURCE_TABLE:
-                raise ValueError(f"profile 范围的 source_table 必须为 {_PROFILE_IMPACT_SOURCE_TABLE}")
+            if self.source_table not in _PROFILE_IMPACT_SOURCE_TABLES:
+                raise ValueError(
+                    "profile 范围的 source_table 必须为已冻结数据集的主档+教育来源标签"
+                )
             if self.source_field_id != str(self.expert_id):
                 raise ValueError("profile 范围的 source_field_id 必须等于 str(expert_id)")
         elif self.scope_type == "employment":
             if self.chunk_type != "employment":
                 raise ValueError("employment 范围的 chunk_type 必须为 employment")
-            if self.source_table != _EMPLOYMENT_IMPACT_SOURCE_TABLE:
-                raise ValueError(f"employment 范围的 source_table 必须为 {_EMPLOYMENT_IMPACT_SOURCE_TABLE}")
+            if self.source_table not in _EMPLOYMENT_IMPACT_SOURCE_TABLES:
+                raise ValueError("employment 范围的 source_table 必须为已冻结的工作来源表")
             if not isinstance(self.source_field_id, str) or not self.source_field_id.strip():
                 raise ValueError("employment 范围的 source_field_id 必须是非空字符串")
             if self.source_field_id != self.source_field_id.strip():
@@ -920,8 +950,8 @@ class IncrementalImpactScope:
         elif self.scope_type == "project":
             if self.chunk_type != "project":
                 raise ValueError("project 范围的 chunk_type 必须为 project")
-            if self.source_table != _PROJECT_IMPACT_SOURCE_TABLE:
-                raise ValueError(f"project 范围的 source_table 必须为 {_PROJECT_IMPACT_SOURCE_TABLE}")
+            if self.source_table not in _PROJECT_IMPACT_SOURCE_TABLES:
+                raise ValueError("project 范围的 source_table 必须为已冻结的项目来源表")
             if not isinstance(self.source_field_id, str) or not self.source_field_id.strip():
                 raise ValueError("project 范围的 source_field_id 必须是非空字符串")
             if self.source_field_id != self.source_field_id.strip():
@@ -933,6 +963,7 @@ def impact_scope_from_target(
     target_type: str,
     expert_id: int,
     source_field_id: str | None = None,
+    dataset_spec: DatasetSpec = EXPERT_SPEC,
 ) -> IncrementalImpactScope:
     """把任务发现的 target_type 映射为下游影响范围。
 
@@ -945,15 +976,13 @@ def impact_scope_from_target(
     """
 
     if target_type in {"expert", "profile", "education"} and source_field_id is not None:
-        raise ValueError(
-            f"{target_type} 范围不接受 source_field_id，来源身份由 expert_id 决定"
-        )
+        raise ValueError(f"{target_type} 范围不接受 source_field_id，来源身份由 expert_id 决定")
     if target_type == "education":
         return IncrementalImpactScope(
             scope_type="profile",
             expert_id=expert_id,
             chunk_type="profile_summary",
-            source_table=_PROFILE_IMPACT_SOURCE_TABLE,
+            source_table=dataset_spec.profile_source_label,
             source_field_id=str(expert_id),
         )
     if target_type == "expert":
@@ -969,7 +998,7 @@ def impact_scope_from_target(
             scope_type="profile",
             expert_id=expert_id,
             chunk_type="profile_summary",
-            source_table=_PROFILE_IMPACT_SOURCE_TABLE,
+            source_table=dataset_spec.profile_source_label,
             source_field_id=str(expert_id),
         )
     if target_type == "employment":
@@ -981,7 +1010,7 @@ def impact_scope_from_target(
             scope_type="employment",
             expert_id=expert_id,
             chunk_type="employment",
-            source_table=_EMPLOYMENT_IMPACT_SOURCE_TABLE,
+            source_table=dataset_spec.employment_table,
             source_field_id=source_field_id,
         )
     if target_type == "project":
@@ -993,7 +1022,7 @@ def impact_scope_from_target(
             scope_type="project",
             expert_id=expert_id,
             chunk_type="project",
-            source_table=_PROJECT_IMPACT_SOURCE_TABLE,
+            source_table=dataset_spec.project_table,
             source_field_id=source_field_id,
         )
     raise ValueError(f"不支持的同步任务目标类型: {target_type}")
@@ -1028,7 +1057,10 @@ class PreparedChunkSet:
         self._validate_chunks(chunks)
         deduped = self._dedupe(chunks)
         sorted_chunks = tuple(
-            sorted(deduped, key=lambda c: (c.chunk_type, c.source_field_id, c.chunk_index, c.vector_doc_id))
+            sorted(
+                deduped,
+                key=lambda c: (c.chunk_type, c.source_field_id, c.chunk_index, c.vector_doc_id),
+            )
         )
         object.__setattr__(self, "desired_chunks", sorted_chunks)
 
@@ -1046,9 +1078,7 @@ class PreparedChunkSet:
                     raise ValueError(f"expert 范围不允许 chunk_type={chunk.chunk_type}")
                 continue
             if chunk.chunk_type != scope.chunk_type:
-                raise ValueError(
-                    f"{scope.scope_type} 范围不允许 chunk_type={chunk.chunk_type}"
-                )
+                raise ValueError(f"{scope.scope_type} 范围不允许 chunk_type={chunk.chunk_type}")
             if chunk.source_table != scope.source_table:
                 raise ValueError(
                     f"{scope.scope_type} 范围 Chunk source_table={chunk.source_table} 与范围不一致"
@@ -1068,9 +1098,7 @@ class PreparedChunkSet:
                 seen[chunk.vector_doc_id] = chunk
                 continue
             if existing != chunk:
-                raise ValueError(
-                    f"vector_doc_id={chunk.vector_doc_id} 存在不一致的重复 Chunk"
-                )
+                raise ValueError(f"vector_doc_id={chunk.vector_doc_id} 存在不一致的重复 Chunk")
         return list(seen.values())
 
     @property
@@ -1103,11 +1131,8 @@ class PreparedChunkSet:
 #   ``source_field_id``，符合 P4.2 的 source_field_id 契约。
 # ---------------------------------------------------------------------------
 
-# 触发行来源表白名单：与 CHECKPOINT_SOURCE_TABLES 一致，但显式枚举便于 fail-closed 校验。
-_TRIGGER_SOURCE_TABLES = frozenset(
-    {"experts", "experts_work_experience", "experts_project_experience",
-     "experts_education_experience"}
-)
+# 触发行来源表白名单：覆盖共享状态库允许持久化的全部数据集来源表。
+_TRIGGER_SOURCE_TABLES = PERSISTED_SOURCE_TABLES
 
 # 来源表到触发 target_type 的映射，用于校验 trigger_source_table 与 P3 任务一致。
 _TRIGGER_TARGET_TYPE_BY_TABLE = {
@@ -1115,6 +1140,17 @@ _TRIGGER_TARGET_TYPE_BY_TABLE = {
     "experts_work_experience": "employment",
     "experts_project_experience": "project",
     "experts_education_experience": "education",
+    "resume_profile": "expert",
+    "resume_work_experience": "employment",
+    "resume_project_experience": "project",
+    "resume_education_experience": "education",
+}
+
+_PROFILE_SOURCE_LABEL_BY_TRIGGER_TABLE = {
+    "experts": "experts+experts_education_experience",
+    "experts_education_experience": "experts+experts_education_experience",
+    "resume_profile": "resume_profile+resume_education_experience",
+    "resume_education_experience": "resume_profile+resume_education_experience",
 }
 
 
@@ -1137,12 +1173,15 @@ class CurrentFactReadRequest:
             raise TypeError("impact_scope 必须是 IncrementalImpactScope")
         if self.trigger_source_table not in _TRIGGER_SOURCE_TABLES:
             raise ValueError(f"不支持的触发来源表: {self.trigger_source_table}")
-        if (not isinstance(self.trigger_source_field_id, str)
-                or not self.trigger_source_field_id.strip()
-                or self.trigger_source_field_id != self.trigger_source_field_id.strip()):
+        if (
+            not isinstance(self.trigger_source_field_id, str)
+            or not self.trigger_source_field_id.strip()
+            or self.trigger_source_field_id != self.trigger_source_field_id.strip()
+        ):
             raise ValueError("trigger_source_field_id 必须是无首尾空白的非空字符串")
-        if (self.trigger_source_updated_at is not None
-                and not isinstance(self.trigger_source_updated_at, datetime)):
+        if self.trigger_source_updated_at is not None and not isinstance(
+            self.trigger_source_updated_at, datetime
+        ):
             raise TypeError("trigger_source_updated_at 必须是 datetime 或 None")
         self._validate_scope_trigger_consistency()
 
@@ -1151,25 +1190,32 @@ class CurrentFactReadRequest:
 
         trigger_target = _TRIGGER_TARGET_TYPE_BY_TABLE[self.trigger_source_table]
         scope_type = self.impact_scope.scope_type
-        # expert 范围触发来源必须是 experts 主档。
+        expected_profile_source = _PROFILE_SOURCE_LABEL_BY_TRIGGER_TABLE.get(
+            self.trigger_source_table
+        )
+        # expert 范围触发来源必须是当前已冻结数据集的人物主档。Resume 主档物理 id
+        # 与 resume_id 分离，因此只对现有 Expert 主档保留 id 相等校验。
         if scope_type == "expert":
-            if self.trigger_source_table != "experts":
+            if trigger_target != "expert":
                 raise ValueError(
-                    f"expert 范围的触发来源必须是 experts，实际为 {self.trigger_source_table}"
+                    "expert 范围的触发来源必须是 experts 或 resume_profile，"
+                    f"实际为 {self.trigger_source_table}"
                 )
-            if self.trigger_source_field_id != str(self.impact_scope.expert_id):
-                raise ValueError(
-                    "expert 范围的触发行 source_field_id 必须等于 str(expert_id)"
-                )
+            if self.trigger_source_table == "experts" and self.trigger_source_field_id != str(
+                self.impact_scope.expert_id
+            ):
+                raise ValueError("expert 范围的触发行 source_field_id 必须等于 str(expert_id)")
         elif scope_type == "profile":
-            # profile 范围允许两种触发：experts 主档（profile 自身）或
-            # experts_education_experience（education 映射到 profile）。
-            if self.trigger_source_table == "experts":
-                if self.trigger_source_field_id != str(self.impact_scope.expert_id):
-                    raise ValueError(
-                        "profile 触发行 source_field_id 必须等于 str(expert_id)"
-                    )
-            elif self.trigger_source_table == "experts_education_experience":
+            # profile 范围允许同一数据集的主档或教育触发；来源聚合标签必须匹配，
+            # 防止把 Expert 触发行和 Resume 影响范围交叉组合。
+            if expected_profile_source != self.impact_scope.source_table:
+                raise ValueError("profile 触发来源与影响范围不属于同一数据集")
+            if trigger_target == "expert":
+                if self.trigger_source_table == "experts" and self.trigger_source_field_id != str(
+                    self.impact_scope.expert_id
+                ):
+                    raise ValueError("profile 触发行 source_field_id 必须等于 str(expert_id)")
+            elif trigger_target == "education":
                 # education 触发：trigger 保留教育记录主键，不进 impact_scope。
                 # 归属校验在 Adapter 读取教育行后执行。
                 pass
@@ -1179,13 +1225,19 @@ class CurrentFactReadRequest:
                     f"实际为 {self.trigger_source_table}"
                 )
         elif scope_type == "employment":
-            if self.trigger_source_table != "experts_work_experience":
-                raise ValueError("employment 范围的触发来源必须是 experts_work_experience")
+            if self.trigger_source_table != self.impact_scope.source_table:
+                raise ValueError(
+                    "employment 范围的触发来源必须是 experts_work_experience "
+                    "或 resume_work_experience，且与影响范围一致"
+                )
             if self.trigger_source_field_id != self.impact_scope.source_field_id:
                 raise ValueError("employment 触发行 source_field_id 与范围不一致")
         elif scope_type == "project":
-            if self.trigger_source_table != "experts_project_experience":
-                raise ValueError("project 范围的触发来源必须是 experts_project_experience")
+            if self.trigger_source_table != self.impact_scope.source_table:
+                raise ValueError(
+                    "project 范围的触发来源必须是 experts_project_experience "
+                    "或 resume_project_experience，且与影响范围一致"
+                )
             if self.trigger_source_field_id != self.impact_scope.source_field_id:
                 raise ValueError("project 触发行 source_field_id 与范围不一致")
         # education 触发来源表（trigger_target == "education"）映射到 profile 范围，
@@ -1265,7 +1317,11 @@ class ScopedCurrentFacts:
         return self.expert.deleted_at is not None
 
 
-def source_sync_task_to_read_request(task: SourceSyncTask) -> CurrentFactReadRequest:
+def source_sync_task_to_read_request(
+    task: SourceSyncTask,
+    *,
+    dataset_spec: DatasetSpec = EXPERT_SPEC,
+) -> CurrentFactReadRequest:
     """把 P3 的 :class:`SourceSyncTask` 转换为 P4 定向读取请求。
 
     本函数是 ``source_record_id``（P3 旧边界字段）的唯一消费点，用于兼容转换；
@@ -1284,13 +1340,17 @@ def source_sync_task_to_read_request(task: SourceSyncTask) -> CurrentFactReadReq
 
     if task.expert_id is None:
         raise ValueError("P3 任务缺少 expert_id，无法构造定向读取请求")
+    if task.source_table not in dataset_spec.checkpoint_source_tables:
+        raise ValueError(f"任务来源表 {task.source_table} 不属于 {dataset_spec.name} 数据集")
     scope = impact_scope_from_target(
         target_type=task.target_type,
         expert_id=task.expert_id,
         source_field_id=(
-            None if task.target_type in {"expert", "profile", "education"}
+            None
+            if task.target_type in {"expert", "profile", "education"}
             else str(task.source_record_id)
         ),
+        dataset_spec=dataset_spec,
     )
     return CurrentFactReadRequest(
         impact_scope=scope,

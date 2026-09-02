@@ -13,8 +13,8 @@ from typing import Any
 import pymysql
 
 from .config import DatabaseConfig
+from .dataset import EXPERT_SPEC
 from .models import (
-    CHECKPOINT_SOURCE_TABLES,
     CurrentFactReadRequest,
     EducationSource,
     EmploymentSource,
@@ -41,7 +41,7 @@ _SOURCE_SCAN_UPPER_BOUND_SQL = {
         f"SELECT updated_at, id FROM {source_table} "
         "ORDER BY updated_at DESC, id DESC LIMIT 1"
     )
-    for source_table in CHECKPOINT_SOURCE_TABLES
+    for source_table in EXPERT_SPEC.checkpoint_source_tables
 }
 
 # experts 使用自身主键作为 expert_id，并把正式来源删除时间映射为统一的 deleted_at；
@@ -58,7 +58,7 @@ _SOURCE_CHANGE_PAGE_SQL = {
         ORDER BY updated_at ASC, id ASC
         LIMIT %s
     """
-    for source_table in CHECKPOINT_SOURCE_TABLES
+    for source_table in EXPERT_SPEC.checkpoint_source_tables
 }
 
 
@@ -82,7 +82,10 @@ class MySQLSourceAdapter:
         扫描到的位置，不读取业务正文、不更新 Checkpoint，也不实现增量分页。
         """
 
-        if not isinstance(source_table, str) or source_table not in CHECKPOINT_SOURCE_TABLES:
+        if (
+            not isinstance(source_table, str)
+            or source_table not in EXPERT_SPEC.checkpoint_source_tables
+        ):
             raise ValueError(f"不支持的 Checkpoint 来源表: {source_table}")
 
         connection = pymysql.connect(**self.config.as_kwargs(autocommit=True))
@@ -114,7 +117,10 @@ class MySQLSourceAdapter:
         留给后续任务层隔离处理。本方法不读取正文，也不推进任何 Checkpoint。
         """
 
-        if not isinstance(source_table, str) or source_table not in CHECKPOINT_SOURCE_TABLES:
+        if (
+            not isinstance(source_table, str)
+            or source_table not in EXPERT_SPEC.checkpoint_source_tables
+        ):
             raise ValueError(f"不支持的 Checkpoint 来源表: {source_table}")
         if not isinstance(after_cursor, SourceScanCursor):
             raise TypeError("after_cursor 必须是 SourceScanCursor")
