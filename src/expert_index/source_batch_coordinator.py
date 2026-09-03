@@ -58,10 +58,7 @@ from .handoff_orchestrator import HandoffOrchestrationResult
 from .models import SourceSyncTask
 from .preparation_coordinator import PreparationCoordinator
 from .repositories.source_state import SourceLeaseConflictError
-from .repositories.sync_task import (
-    DEFAULT_SOURCE_SYNC_MAX_ATTEMPTS,
-    SourceSyncTaskLeaseConflictError,
-)
+from .repositories.sync_task import SourceSyncTaskLeaseConflictError
 from .validators import ChunkValidationError
 
 __all__ = [
@@ -296,7 +293,7 @@ class SourceBatchCoordinator:
         *,
         task_lease_seconds: int,
         source_lease_seconds: int,
-        max_attempts: int = DEFAULT_SOURCE_SYNC_MAX_ATTEMPTS,
+        max_attempts: int,
         preparation_failure_handler: PreparationFailureHandlerPort | None = None,
     ) -> None:
         self._prepare = preparation_coordinator

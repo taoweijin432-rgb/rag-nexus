@@ -135,6 +135,7 @@ def _verify_task_state_machine(config: DatabaseConfig, admin_connection: Any) ->
         "experts_work_experience",
         limit=1,
         lease_seconds=120,
+        max_attempts=4,
     )
     assert len(claimed_while_locked) == 1
     assert claimed_while_locked[0].task_id == second_task_id
@@ -153,6 +154,7 @@ def _verify_task_state_machine(config: DatabaseConfig, admin_connection: Any) ->
         "experts_work_experience",
         limit=1,
         lease_seconds=120,
+        max_attempts=4,
     )
     assert len(first_claim) == 1
     assert first_claim[0].task_id == first_task_id
@@ -172,6 +174,7 @@ def _verify_task_state_machine(config: DatabaseConfig, admin_connection: Any) ->
         "experts_work_experience",
         limit=1,
         lease_seconds=120,
+        max_attempts=4,
     )
     assert len(replacement_claim) == 1
     assert replacement_claim[0].task_id == first_task_id

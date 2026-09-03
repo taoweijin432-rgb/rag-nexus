@@ -96,9 +96,10 @@ class FakePreparationCoordinator:
 
     def prepare(self, task, attempt_token):
         self.calls.append((task.task_id, task.processing_stage, attempt_token))
-        if isinstance(self.returns, BaseException):
-            raise self.returns
-        return self.returns
+        result = self.returns.pop(0) if isinstance(self.returns, list) else self.returns
+        if isinstance(result, BaseException):
+            raise result
+        return result
 
 
 @dataclass
@@ -174,7 +175,7 @@ class FakeTaskRepository:
     claim_exc: object = None
 
     def claim_source_sync_tasks(
-        self, batch_id, source_table, *, limit, lease_seconds, max_attempts=4
+        self, batch_id, source_table, *, limit, lease_seconds, max_attempts
     ):
         self.calls.append((batch_id, source_table, limit, lease_seconds, max_attempts))
         if self.claim_fail_on_call is not None and len(self.calls) == self.claim_fail_on_call:
@@ -394,6 +395,41 @@ def test_prepare_validation_failure_is_settled_and_does_not_retry_forever():
     assert len(handler.calls) == 1
     assert orch.calls == []
     assert len(task_repo.calls) == 2  # 领取坏任务后再确认已无更多待处理任务
+
+
+def test_poison_prepare_task_is_dead_and_next_task_continues():
+    """P4 毒任务落 dead 后，Coordinator 必须继续领取后续正常 Task。"""
+
+    prep = FakePreparationCoordinator(
+        returns=[ChunkValidationError("坏任务"), _prepared()]
+    )
+    orch = FakeOrchestrator(
+        script={2: HandoffResultStub(final_status="success", terminal=True)}
+    )
+    handler = FakePreparationFailureHandler(
+        result=HandoffResultStub(final_status="dead", terminal=True)
+    )
+    checkpoint = FakeCheckpointManager(return_value=CommitResultStub(skipped_count=0))
+    source_state = FakeSourceStateRepository(scan=_scan(candidate_count=2))
+    task_repo = FakeTaskRepository(
+        claim_queue=[(_task(task_id=1),), (_task(task_id=2),)]
+    )
+
+    result = _coordinator(
+        prep,
+        orch,
+        checkpoint,
+        source_state,
+        task_repo,
+        preparation_failure_handler=handler,
+    ).run_claimed_source_batch("experts", 100, "owner-1", checkpoint_lock_version=7)
+
+    assert result.claimed_count == 2
+    assert result.rejected_count == 1
+    assert result.success_count == 1
+    assert result.checkpoint_committed is True
+    assert [call[0] for call in orch.calls] == [2]
+    assert len(handler.calls) == 1
 
 
 def test_prepare_transient_failure_is_settled_pending_and_stops_batch():
@@ -834,6 +870,7 @@ def test_invalid_lease_seconds_rejected():
             task_repository=task_repo,
             task_lease_seconds=0,
             source_lease_seconds=120,
+            max_attempts=4,
         )
     with pytest.raises(ValueError, match="source_lease_seconds"):
         SourceBatchCoordinator(
@@ -844,4 +881,5 @@ def test_invalid_lease_seconds_rejected():
             task_repository=task_repo,
             task_lease_seconds=120,
             source_lease_seconds=-1,
+            max_attempts=4,
         )

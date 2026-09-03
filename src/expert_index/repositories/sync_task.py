@@ -23,10 +23,6 @@ from ..models import (
 )
 
 MAX_SOURCE_SYNC_TASK_CLAIM_SIZE = 500
-# 直接调用 Repository 的旧集成代码没有重试策略参数时使用的兼容值。
-# 正式 Expert/Resume Poll 运行时始终从 CLI 显式传入 max_attempts；该默认值只避免
-# 历史脚本在升级期间立即失效，不会覆盖运行时配置。
-DEFAULT_SOURCE_SYNC_MAX_ATTEMPTS = 4
 _SAFE_IDENTIFIER_PATTERN = re.compile(r"^[A-Za-z0-9_.-]+$")
 # P5.6 原子落定接受的合法数据库阶段：Artifact 已持久化且下游已回执。
 # 不接受 validated（Artifact 可能尚未持久化，须先经 P5.3B artifact 路径）。
@@ -362,7 +358,7 @@ class MySQLSourceSyncTaskRepository:
         *,
         limit: int,
         lease_seconds: int,
-        max_attempts: int = DEFAULT_SOURCE_SYNC_MAX_ATTEMPTS,
+        max_attempts: int,
     ) -> tuple[SourceSyncTask, ...]:
         """并发安全领取当前 Batch 范围内严格队头任务。
 
@@ -391,8 +387,8 @@ class MySQLSourceSyncTaskRepository:
         路径仅在接口兼容场景出现。
 
         ``max_attempts`` 只限制自动重试，不限制首次 pending 领取；达到上限的
-        pending/过期 processing 会先写 DLQ 再变成 dead。默认值仅用于兼容旧的直接
-        Repository 调用，正式运行时应由 Poll CLI 显式传入。
+        pending/过期 processing 会先写 DLQ 再变成 dead。该策略参数必须由 Poll
+        运行时显式传入，避免 Repository 内部隐式覆盖 Expert/Resume 的统一配置。
 
         每条领取任务获得新的 ``attempt_token``；退避到期的 pending 和过期 processing
         都表示开始一次重试，因此增加 ``retry_count``，且不改变已完成的处理阶段。
@@ -1046,12 +1042,14 @@ class MySQLSourceSyncTaskRepository:
                 should_dead = force_dead or int(locked_row["retry_count"]) >= max_attempts
                 if should_dead:
                     # 015 将把此唯一性从 task_id 扩展为 (task_id, retry_count)，支持追加历史。
+                    # 不覆盖既有失败证据，重复回放同一 attempt 时保持幂等。
                     cursor.execute(
                         """
                         INSERT INTO expert_index_sync_dead_letter(
                             task_id, batch_id, source_table, source_record_id, expert_id,
                             failure_stage, reason_code, reason_message, retry_count, artifact_id
                         ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                        ON DUPLICATE KEY UPDATE id=id
                         """,
                         (
                             task_id,
