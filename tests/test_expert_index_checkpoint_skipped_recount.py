@@ -169,8 +169,8 @@ def test_skipped_count_recomputed_from_no_action_unchanged_only(
     )
 
     assert result.skipped_count == 1
-    # batch_source UPDATE 的第一个参数是重算的 skipped_count
-    assert cursor.executed[4][1][0] == 1
+    # batch_source UPDATE 的第二个参数是重算的 skipped_count；第一个是 success_count。
+    assert cursor.executed[4][1][1] == 1
 
 
 def test_skipped_count_zero_when_no_no_action_tasks(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -211,7 +211,7 @@ def test_skipped_count_counts_all_no_action_tasks(monkeypatch: pytest.MonkeyPatc
     )
 
     assert result.skipped_count == 3
-    assert cursor.executed[4][1][0] == 3
+    assert cursor.executed[4][1][1] == 3
 
 
 # ---------------------------------------------------------------------------
@@ -315,4 +315,4 @@ def test_batch_source_stored_skipped_count_is_overwritten_by_recomputed_value(
     )
 
     assert result.skipped_count == 0
-    assert cursor.executed[4][1][0] == 0
+    assert cursor.executed[4][1][1] == 0

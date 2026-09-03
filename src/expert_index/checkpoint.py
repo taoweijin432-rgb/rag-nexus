@@ -1,7 +1,8 @@
 """增量来源批次的安全 Checkpoint 提交器。
 
 本模块只在本地 Index MySQL 内校验并收口已经完成的来源批次，不读取来源业务事实，
-也不调用下游处理接口。所有状态更新位于同一事务，任一条件失败都会整体回滚。
+也不调用下游处理接口。success 与具备同 retry_count DLQ 证据的 dead 都是可收口终态；
+所有状态更新位于同一事务，任一条件失败都会整体回滚。
 """
 
 from __future__ import annotations
@@ -57,10 +58,12 @@ class CheckpointManager:
         *,
         checkpoint_lock_version: int,
     ) -> SourceBatchCommitResult:
-        """校验全部成功证据并原子提交一张来源表的固定范围。
+        """校验终态证据并原子提交一张来源表的固定范围。
 
         首次提交要求调用方仍持有有效来源 lease。若相同批次已经完整提交，方法在核对
         Checkpoint、Batch Source、Batch 和任务证据后幂等返回，不再次写入任何状态。
+        ``dead`` 任务只有在对应 retry_count 的 DLQ 证据存在时才算终态；它不计入
+        success_count，但允许安全水位越过并把批次标记为 partial。
         """
 
         _validate_source_table(source_table)
@@ -104,7 +107,7 @@ class CheckpointManager:
                     record_id=int(checkpoint_row["last_id"]),
                 )
                 candidate_count = int(batch_source_row["candidate_count"])
-                _validate_task_success_evidence(
+                completed_success_count, dead_count = _validate_task_terminal_evidence(
                     task_rows,
                     candidate_count=candidate_count,
                 )
@@ -136,6 +139,8 @@ class CheckpointManager:
                     current_cursor=current_cursor,
                     checkpoint_cursor=checkpoint_cursor,
                     candidate_count=candidate_count,
+                    completed_success_count=completed_success_count,
+                    dead_count=dead_count,
                 ):
                     checkpoint = _source_checkpoint_from_row(
                         checkpoint_row,
@@ -168,8 +173,8 @@ class CheckpointManager:
                 cursor.execute(
                     """
                     UPDATE expert_index_batch_source
-                    SET status='success', success_count=candidate_count,
-                        skipped_count=%s, failed_count=0,
+                    SET status='success', success_count=%s,
+                        skipped_count=%s, failed_count=%s,
                         finished_at=CURRENT_TIMESTAMP(6)
                     WHERE id=%s AND batch_id=%s AND source_table=%s
                       AND status='running'
@@ -178,7 +183,9 @@ class CheckpointManager:
                       AND checkpoint_lock_version=%s
                     """,
                     (
+                        completed_success_count,
                         skipped_count,
+                        dead_count,
                         int(batch_source_row["id"]),
                         batch_id,
                         source_table,
@@ -193,19 +200,30 @@ class CheckpointManager:
                 cursor.execute(
                     """
                     UPDATE expert_index_batch
-                    SET status='success',
+                    SET status=CASE WHEN %s > 0 THEN 'partial' ELSE 'success' END,
                         cursor_updated_at=%s, cursor_id=%s,
                         candidate_count=%s, success_count=%s,
-                        failed_count=0, error_summary=NULL,
+                        failed_count=%s,
+                        error_summary=CASE
+                            WHEN %s > 0 THEN JSON_OBJECT(
+                                'dead_task_count', %s,
+                                'reason', 'terminal_dead_task'
+                            )
+                            ELSE NULL
+                        END,
                         finished_at=CURRENT_TIMESTAMP(6)
                     WHERE id=%s AND run_mode='incremental'
                       AND status='running'
                     """,
                     (
+                        dead_count,
                         upper_bound.updated_at,
                         upper_bound.record_id,
                         candidate_count,
-                        candidate_count,
+                        completed_success_count,
+                        dead_count,
+                        dead_count,
+                        dead_count,
                         batch_id,
                     ),
                 )
@@ -305,20 +323,39 @@ def _validate_new_commit_state(
             )
 
 
-def _validate_task_success_evidence(
+def _validate_task_terminal_evidence(
     task_rows: list[dict[str, Any]],
     *,
     candidate_count: int,
-) -> None:
-    """要求任务数量一致，且每条任务都有无残留租约的 success 结果码证据。"""
+) -> tuple[int, int]:
+    """校验 success/dead 两类终态证据并返回 ``(success, dead)`` 计数。
+
+    ``dead`` 不是成功，但它是经过 DLQ 记录确认的不可自动恢复终态。只有这种
+    终态才能被 Checkpoint 闸门接受；仍处于 pending/processing 或缺少 DLQ 证据的
+    任务继续阻断水位，避免以“跳过校验”的方式丢失可重试数据。
+    """
 
     if candidate_count < 0:
         raise SourceBatchCommitConflictError("Batch Source candidate_count 不能为负数")
     if len(task_rows) != candidate_count:
         raise SourceBatchNotReadyError("任务总数与 Batch Source candidate_count 不一致")
     incomplete_statuses: dict[str, int] = {}
+    success_count = 0
+    dead_count = 0
     for row in task_rows:
         status = str(row["sync_status"])
+        if status == "dead":
+            if (
+                row.get("completed_at") is None
+                or row.get("attempt_token") is not None
+                or row.get("lease_until") is not None
+                or not bool(row.get("dead_letter_exists"))
+            ):
+                raise SourceBatchNotReadyError(
+                    "dead 任务缺少完成时间、无租约或 DLQ 证据"
+                )
+            dead_count += 1
+            continue
         if status != "success":
             incomplete_statuses[status] = incomplete_statuses.get(status, 0) + 1
             continue
@@ -336,14 +373,16 @@ def _validate_task_success_evidence(
             )
         if row.get("attempt_token") is not None or row.get("lease_until") is not None:
             raise SourceBatchNotReadyError("success 任务仍残留 attempt lease")
+        success_count += 1
     if incomplete_statuses:
         status_summary = ",".join(
             f"{status}:{count}"
             for status, count in sorted(incomplete_statuses.items())
         )
         raise SourceBatchNotReadyError(
-            f"来源批次仍有未成功任务: {status_summary}"
+            f"来源批次仍有未完成任务: {status_summary}"
         )
+    return success_count, dead_count
 
 
 def _is_already_committed(
@@ -357,6 +396,8 @@ def _is_already_committed(
     current_cursor: SourceScanCursor,
     checkpoint_cursor: SourceScanCursor,
     candidate_count: int,
+    completed_success_count: int,
+    dead_count: int,
 ) -> bool:
     """识别相同批次已经完整提交的幂等重放，并校验终态计数。"""
 
@@ -375,16 +416,16 @@ def _is_already_committed(
         or current_cursor != upper_bound
         or int(batch_source_row["checkpoint_lock_version"])
         != checkpoint_lock_version
-        or int(batch_source_row["success_count"]) != candidate_count
-        or int(batch_source_row["failed_count"]) != 0
+        or int(batch_source_row["success_count"]) != completed_success_count
+        or int(batch_source_row["failed_count"]) != dead_count
     ):
         raise SourceBatchCommitConflictError("已提交 Batch Source 的终态计数不一致")
     if (
         batch_row.get("run_mode") != "incremental"
-        or batch_row.get("status") != "success"
+        or batch_row.get("status") not in {"success", "partial"}
         or int(batch_row.get("candidate_count") or 0) != candidate_count
-        or int(batch_row.get("success_count") or 0) != candidate_count
-        or int(batch_row.get("failed_count") or 0) != 0
+        or int(batch_row.get("success_count") or 0) != completed_success_count
+        or int(batch_row.get("failed_count") or 0) != dead_count
         or batch_row.get("cursor_updated_at") != upper_bound.updated_at
         or int(batch_row.get("cursor_id") or -1) != upper_bound.record_id
     ):
@@ -479,12 +520,18 @@ def _lock_source_tasks(
     batch_id: int,
     source_table: str,
 ) -> list[dict[str, Any]]:
-    """按任务 ID 锁定当前来源批次的全部成功证据行。"""
+    """按任务 ID 锁定当前来源批次的终态证据行并关联 DLQ 存在性。"""
 
     cursor.execute(
         """
         SELECT id, processing_stage, sync_status, result_code,
-               attempt_token, lease_until, completed_at
+               attempt_token, lease_until, completed_at,
+               EXISTS (
+                   SELECT 1
+                   FROM expert_index_sync_dead_letter AS dl
+                   WHERE dl.task_id=expert_index_sync_task.id
+                     AND dl.retry_count=expert_index_sync_task.retry_count
+               ) AS dead_letter_exists
         FROM expert_index_sync_task
         WHERE batch_id=%s AND source_table=%s
         ORDER BY id ASC

@@ -1439,6 +1439,180 @@ def test_claim_frontier_processing_expired_reclaims_frontier(
     assert connection.commit_count == 1
 
 
+def test_claim_frontier_processing_expired_at_max_attempts_enters_dead_letter(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """过期 processing 达到 max_attempts 时不再领取，且同事务写入 dead/DLQ。"""
+
+    past_lease = datetime(2026, 8, 21, 9, 0, tzinfo=timezone.utc)
+    now = datetime(2026, 8, 21, 10, 0, tzinfo=timezone.utc)
+    locked = _task_row(
+        id=5,
+        sync_status="processing",
+        attempt_token="attempt-5-old",
+        lease_until=past_lease,
+        retry_count=4,
+    )
+    cursor = RecordingCursor(
+        ones=[{"id": 5}, locked, {"now": now}, None],
+        rowcounts=[0, 0, 0, 0, 1, 0],
+    )
+    connection = RecordingConnection(cursor)
+    _patch_connection(monkeypatch, connection)
+
+    tasks = _repository().claim_source_sync_tasks(
+        701,
+        "experts_work_experience",
+        limit=1,
+        lease_seconds=120,
+        max_attempts=4,
+    )
+
+    assert tasks == ()
+    assert "INSERT INTO expert_index_sync_dead_letter" in cursor.executed[3][0]
+    assert cursor.executed[3][1][-2:] == ("任务重试次数已达到上限，停止自动领取", 4)
+    assert "SET sync_status='dead'" in cursor.executed[4][0]
+    assert cursor.executed[4][1] == (
+        "lease_expired_max_attempts",
+        "任务重试次数已达到上限，停止自动领取",
+        5,
+        "processing",
+    )
+    assert connection.commit_count == 1
+
+
+def test_claim_frontier_pending_at_max_attempts_enters_dead_letter(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """历史 pending 重试次数已达上限时不等待退避，直接结算 dead/DLQ。"""
+
+    locked = _task_row(
+        id=5,
+        sync_status="pending",
+        attempt_token=None,
+        lease_until=None,
+        next_retry_at=datetime(2026, 8, 21, 12, 0, tzinfo=timezone.utc),
+        retry_count=4,
+    )
+    cursor = RecordingCursor(
+        ones=[{"id": 5}, locked, None],
+        rowcounts=[0, 0, 0, 1, 0],
+    )
+    connection = RecordingConnection(cursor)
+    _patch_connection(monkeypatch, connection)
+
+    tasks = _repository().claim_source_sync_tasks(
+        701,
+        "experts_work_experience",
+        limit=1,
+        lease_seconds=120,
+        max_attempts=4,
+    )
+
+    assert tasks == ()
+    assert cursor.executed[2][1][-3:] == (
+        "retry_limit_exceeded",
+        "任务重试次数已达到上限，停止自动领取",
+        4,
+    )
+    assert cursor.executed[3][1] == (
+        "retry_limit_exceeded",
+        "任务重试次数已达到上限，停止自动领取",
+        5,
+        "pending",
+    )
+    assert connection.commit_count == 1
+
+
+def test_claim_frontier_legacy_pending_retry_count_cannot_bypass_limit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """历史 pending 缺少 next_retry_at 时仍按 retry_count 执行上限判断。"""
+
+    locked = _task_row(
+        id=5,
+        sync_status="pending",
+        attempt_token=None,
+        lease_until=None,
+        next_retry_at=None,
+        retry_count=4,
+    )
+    cursor = RecordingCursor(
+        ones=[{"id": 5}, locked, None],
+        rowcounts=[0, 0, 0, 1, 0],
+    )
+    connection = RecordingConnection(cursor)
+    _patch_connection(monkeypatch, connection)
+
+    tasks = _repository().claim_source_sync_tasks(
+        701,
+        "experts_work_experience",
+        limit=1,
+        lease_seconds=120,
+        max_attempts=4,
+    )
+
+    assert tasks == ()
+    assert cursor.executed[2][1][-3:] == (
+        "retry_limit_exceeded",
+        "任务重试次数已达到上限，停止自动领取",
+        4,
+    )
+    assert connection.commit_count == 1
+
+
+def test_claim_frontier_dead_letter_does_not_block_later_task(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """毒任务超限落 dead 后，limit=1 仍应在同次 claim 领取后续任务。"""
+
+    past_lease = datetime(2026, 8, 21, 9, 0, tzinfo=timezone.utc)
+    now = datetime(2026, 8, 21, 10, 0, tzinfo=timezone.utc)
+    locked_dead = _task_row(
+        id=5,
+        sync_status="processing",
+        attempt_token="attempt-5-old",
+        lease_until=past_lease,
+        retry_count=4,
+    )
+    claimed = _task_row(
+        id=6,
+        sync_status="processing",
+        attempt_token="attempt-6-new",
+        lease_until=datetime(2026, 8, 21, 10, 5, tzinfo=timezone.utc),
+    )
+    locked_later = _task_row(
+        id=6,
+        sync_status="pending",
+        attempt_token=None,
+        lease_until=None,
+    )
+    cursor = RecordingCursor(
+        ones=[
+            {"id": 5},
+            locked_dead,
+            {"now": now},
+            {"id": 6},
+            locked_later,
+        ],
+        alls=[[claimed]],
+        rowcounts=[0, 0, 0, 0, 1, 0, 0, 1, 0],
+    )
+    connection = RecordingConnection(cursor)
+    _patch_connection(monkeypatch, connection)
+
+    tasks = _repository_with_tokens("attempt-6-new").claim_source_sync_tasks(
+        701,
+        "experts_work_experience",
+        limit=1,
+        lease_seconds=120,
+        max_attempts=4,
+    )
+
+    assert [task.task_id for task in tasks] == [6]
+    assert connection.commit_count == 1
+
+
 def test_claim_frontier_success_allows_next_frontier(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1472,9 +1646,9 @@ def test_claim_frontier_success_allows_next_frontier(
         lease_seconds=60,
     )
 
-    # 队头 5 是 success：find + lock 发现 success → 越过，循环结束返回空。
+    # 队头 5 是 success：find + lock 发现 success → 越过，再查找后续队头后返回空。
     assert tasks == ()
-    assert len(cursor.executed) == 2
+    assert len(cursor.executed) == 3
     assert connection.commit_count == 1
 
 
@@ -1506,8 +1680,8 @@ def test_claim_frontier_dead_allows_next_frontier(
     )
 
     assert tasks == ()
-    # 未发出 UPDATE，dead 未被改变。
-    assert len(cursor.executed) == 2
+    # 未发出 UPDATE，dead 未被改变；为保证 limit 只统计 claim，仍会探查后续队头。
+    assert len(cursor.executed) == 3
     assert connection.commit_count == 1
 
 

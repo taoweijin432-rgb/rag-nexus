@@ -196,6 +196,21 @@ def _success_tasks() -> list[dict[str, Any]]:
     ]
 
 
+def _dead_task(task_id: int = 801) -> dict[str, Any]:
+    """构造一条已写入本次 retry DLQ 的 dead 终态任务证据。"""
+
+    return {
+        "id": task_id,
+        "processing_stage": "candidate",
+        "sync_status": "dead",
+        "result_code": None,
+        "attempt_token": None,
+        "lease_until": None,
+        "completed_at": SUCCESS_TIME,
+        "dead_letter_exists": 1,
+    }
+
+
 def _committed_checkpoint_row() -> dict[str, Any]:
     """构造首次提交 UPDATE 后的 Checkpoint 查询行。"""
 
@@ -259,12 +274,16 @@ def test_try_commit_source_batch_atomically_closes_all_state(
     assert ["FOR UPDATE" in sql for sql, _ in cursor.executed[:4]] == [True] * 4
     assert "ORDER BY id ASC FOR UPDATE" in cursor.executed[3][0]
     assert "status='success'" in cursor.executed[4][0]
-    assert cursor.executed[4][1] == (0, 1001, BATCH_ID, SOURCE_TABLE, 0)
+    assert cursor.executed[4][1] == (2, 0, 0, 1001, BATCH_ID, SOURCE_TABLE, 0)
     assert cursor.executed[5][1] == (
+        0,
         UPPER_TIME,
         902,
         2,
         2,
+        0,
+        0,
+        0,
         BATCH_ID,
     )
     assert cursor.executed[6][1] == (
@@ -284,7 +303,7 @@ def test_try_commit_source_batch_atomically_closes_all_state(
 
 @pytest.mark.parametrize(
     "sync_status",
-    ["pending", "processing", "failed", "retrying", "dead"],
+    ["pending", "processing", "failed", "retrying"],
 )
 def test_try_commit_source_batch_rejects_any_non_success_task(
     monkeypatch: pytest.MonkeyPatch,
@@ -307,6 +326,52 @@ def test_try_commit_source_batch_rejects_any_non_success_task(
         )
 
     assert len(cursor.executed) == 4
+    assert connection.commit_count == 0
+    assert connection.rollback_count == 1
+
+
+def test_try_commit_source_batch_accepts_dead_with_dlq_evidence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """达到重试上限的 dead 任务有 DLQ 证据时可随成功任务一起推进水位。"""
+
+    cursor = _commit_cursor(tasks=[_dead_task(), _success_tasks()[1]])
+    connection = ScriptedConnection(cursor)
+    _patch_connection(monkeypatch, connection)
+
+    result = _manager().try_commit_source_batch(
+        SOURCE_TABLE,
+        BATCH_ID,
+        LEASE_OWNER,
+        checkpoint_lock_version=0,
+    )
+
+    assert result.already_committed is False
+    assert result.checkpoint.last_batch_id == BATCH_ID
+    # Batch Source UPDATE: success_count=1, skipped_count=0, failed_count=1。
+    assert cursor.executed[4][1][:3] == (1, 0, 1)
+    # Batch UPDATE: partial、成功 1、dead 1，并写入无正文的统计摘要。
+    assert cursor.executed[5][1][0] == 1
+    assert cursor.executed[5][1][4:7] == (1, 1, 1)
+    assert connection.commit_count == 1
+
+
+def test_try_commit_source_batch_rejects_dead_without_dlq_evidence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """仅把任务状态改成 dead 但没有 DLQ 记录时仍必须阻断 Checkpoint。"""
+
+    cursor = _commit_cursor(tasks=[dict(_dead_task(), dead_letter_exists=0), _success_tasks()[1]])
+    connection = ScriptedConnection(cursor)
+    _patch_connection(monkeypatch, connection)
+
+    with pytest.raises(SourceBatchNotReadyError, match="DLQ 证据"):
+        _manager().try_commit_source_batch(
+            SOURCE_TABLE,
+            BATCH_ID,
+            LEASE_OWNER,
+            checkpoint_lock_version=0,
+        )
     assert connection.commit_count == 0
     assert connection.rollback_count == 1
 

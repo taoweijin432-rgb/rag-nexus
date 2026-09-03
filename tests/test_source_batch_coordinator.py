@@ -11,7 +11,7 @@ MySQL/Milvus/Embedding，不触发任何物理删除。
 3. 新任务走 P4→P5（candidate 阶段经 prepare → orchestrator）；
 4. contract_ready/handed_off 恢复（直接经 orchestrator，不重新 prepare）；
 5. retryable 停止（final_status=pending → 立即停止，不调 try_commit）；
-6. dead 后 Checkpoint 不提交（可继续处理，但 try_commit 抛 NotReady）；
+6. dead 后继续处理并允许 Checkpoint 收口；
 7. task/source lease conflict 停止；
 8. 未知结果 fail-closed 停止；
 9. 重复提交幂等（BatchSourceScan status=success 直接返回 already_committed）；
@@ -173,8 +173,10 @@ class FakeTaskRepository:
     claim_fail_on_call: int | None = None
     claim_exc: object = None
 
-    def claim_source_sync_tasks(self, batch_id, source_table, *, limit, lease_seconds):
-        self.calls.append((batch_id, source_table, limit, lease_seconds))
+    def claim_source_sync_tasks(
+        self, batch_id, source_table, *, limit, lease_seconds, max_attempts=4
+    ):
+        self.calls.append((batch_id, source_table, limit, lease_seconds, max_attempts))
         if self.claim_fail_on_call is not None and len(self.calls) == self.claim_fail_on_call:
             self.claim_fail_on_call = None
             raise self.claim_exc if self.claim_exc is not None else SourceSyncTaskStageConflictError(
@@ -276,7 +278,8 @@ def _prepared():
 
 def _coordinator(
     prep, orch, checkpoint, source_state, task_repo, *,
-    task_lease_seconds=120, source_lease_seconds=120, preparation_failure_handler=None,
+    task_lease_seconds=120, source_lease_seconds=120, max_attempts=4,
+    preparation_failure_handler=None,
 ):
     return SourceBatchCoordinator(
         preparation_coordinator=prep,
@@ -286,6 +289,7 @@ def _coordinator(
         task_repository=task_repo,
         task_lease_seconds=task_lease_seconds,
         source_lease_seconds=source_lease_seconds,
+        max_attempts=max_attempts,
         preparation_failure_handler=preparation_failure_handler,
     )
 
@@ -317,6 +321,7 @@ def test_all_success_commits_checkpoint():
     assert result.error is None
     assert len(checkpoint.calls) == 1
     assert checkpoint.calls[0] == ("experts", 100, "owner-1", 7)
+    assert all(call[-1] == 4 for call in task_repo.calls)
 
 
 # ---------------------------------------------------------------------------
@@ -529,17 +534,16 @@ def test_retryable_stops_without_commit():
 
 
 # ---------------------------------------------------------------------------
-# 6. dead 后 Checkpoint 不提交（可继续处理，但 try_commit 抛 NotReady）
+# 6. dead 后继续处理并允许 Checkpoint 收口
 # ---------------------------------------------------------------------------
 
-def test_dead_continues_but_checkpoint_not_committed():
+def test_dead_continues_and_checkpoint_can_commit():
     prep = FakePreparationCoordinator(returns=_prepared())
     orch = FakeOrchestrator(script={
         1: HandoffResultStub(final_status="dead", terminal=True),
         2: HandoffResultStub(final_status="success", terminal=True),
     })
-    # try_commit 因 dead 存在抛 NotReady
-    checkpoint = FakeCheckpointManager(return_value=SourceBatchNotReadyError("仍有未成功任务"))
+    checkpoint = FakeCheckpointManager(return_value=CommitResultStub(skipped_count=0))
     source_state = FakeSourceStateRepository(scan=_scan(candidate_count=2))
     task_repo = FakeTaskRepository(claim_queue=[(_task(task_id=1),), (_task(task_id=2),)])
 
@@ -549,9 +553,9 @@ def test_dead_continues_but_checkpoint_not_committed():
     assert result.rejected_count == 1
     assert result.success_count == 1
     assert result.claimed_count == 2
-    assert result.checkpoint_committed is False
-    assert result.error == "SourceBatchNotReadyError"
-    assert len(checkpoint.calls) == 1, "dead 仍尝试 try_commit，由闸门阻断"
+    assert result.checkpoint_committed is True
+    assert result.error is None
+    assert len(checkpoint.calls) == 1, "dead 后仍应由 CheckpointManager 统一收口"
 
 
 # ---------------------------------------------------------------------------

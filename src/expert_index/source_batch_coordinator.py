@@ -27,8 +27,9 @@
 失败语义（用户冻结规则）：
 
 - Task ``final_status='success'``（terminal）→ 继续处理剩余 Task。
-- Task ``final_status='dead'``（rejected，确定性终态）→ 可继续处理剩余 Task，
-  但本 Source Batch 不提交 Checkpoint（Manager 闸门自然阻断）。
+- Task ``final_status='dead'``（rejected，确定性终态）→ 可继续处理剩余 Task；
+  只有 Repository 已在同一事务写入 DLQ 的 dead 才能通过 Manager 闸门，Checkpoint
+  会推进并在批次统计中记录 failed_count，后续人工处置以 DLQ 为准。
 - Task ``final_status='pending'``（retryable 退回）→ 立即停止当前 Source Batch。
 - Task lease/token 冲突（``terminal==False``，``final_status=='processing'``）
   → 立即停止当前 Source Batch，计入 ``lease_conflict_count``。
@@ -57,7 +58,10 @@ from .handoff_orchestrator import HandoffOrchestrationResult
 from .models import SourceSyncTask
 from .preparation_coordinator import PreparationCoordinator
 from .repositories.source_state import SourceLeaseConflictError
-from .repositories.sync_task import SourceSyncTaskLeaseConflictError
+from .repositories.sync_task import (
+    DEFAULT_SOURCE_SYNC_MAX_ATTEMPTS,
+    SourceSyncTaskLeaseConflictError,
+)
 from .validators import ChunkValidationError
 
 __all__ = [
@@ -274,6 +278,8 @@ class SourceBatchCoordinator:
         :class:`PreparationCoordinator` 共用同一 Repository 实例。
     :param task_lease_seconds: claim/renew task lease 的建议秒数（真正有效性由
         Repository 以 Index MySQL ``CURRENT_TIMESTAMP(6)`` 权威判定）。
+    :param max_attempts: 任务自动重试上限。必须与 Handoff/P4 失败处理器使用同一个
+        值，并传入每次 Poll claim；这样 Worker 崩溃导致的 lease 回收也不会绕过上限。
     :param source_lease_seconds: 续租 source lease 的建议秒数。
     :param preparation_failure_handler: P4 prepare 异常的可选落定器。生产 Poll
         runtime 会注入它；未注入时保留原有 fail-closed 行为，兼容直接使用
@@ -290,6 +296,7 @@ class SourceBatchCoordinator:
         *,
         task_lease_seconds: int,
         source_lease_seconds: int,
+        max_attempts: int = DEFAULT_SOURCE_SYNC_MAX_ATTEMPTS,
         preparation_failure_handler: PreparationFailureHandlerPort | None = None,
     ) -> None:
         self._prepare = preparation_coordinator
@@ -314,8 +321,15 @@ class SourceBatchCoordinator:
             or source_lease_seconds < 1
         ):
             raise ValueError("source_lease_seconds 必须是正整数")
+        if (
+            isinstance(max_attempts, bool)
+            or not isinstance(max_attempts, int)
+            or max_attempts < 0
+        ):
+            raise ValueError("max_attempts 必须是非负整数")
         self._task_lease_seconds = task_lease_seconds
         self._source_lease_seconds = source_lease_seconds
+        self._max_attempts = max_attempts
 
     def run_claimed_source_batch(
         self,
@@ -423,6 +437,7 @@ class SourceBatchCoordinator:
                 source_table,
                 limit=task_claim_limit,
                 lease_seconds=self._task_lease_seconds,
+                max_attempts=self._max_attempts,
             )
             if not tasks:
                 # 无更多 pending/可回收 processing：claim 完成，进入提交闸门。
@@ -557,8 +572,9 @@ class SourceBatchCoordinator:
                 error=type(error).__name__,
             )
 
-        # 调用现有 CheckpointManager：任一非 success → SourceBatchNotReadyError
-        # （水位不动，Coordinator 不自行修改水位、不释放 source lease）。
+        # 调用现有 CheckpointManager：success 与已具备 DLQ 证据的 dead 都是终态；
+        # 后者会以 failed_count 记录并允许水位继续前进。Coordinator 不自行修改
+        # 水位、不释放 source lease，所有收口仍由 Manager 的单事务完成。
         try:
             commit_result = self._checkpoint.try_commit_source_batch(
                 source_table,

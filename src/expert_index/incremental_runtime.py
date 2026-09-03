@@ -191,6 +191,9 @@ def build_incremental_runtime(
         handoff.task_repo,
         task_lease_seconds=task_lease_seconds,
         source_lease_seconds=settings.incremental_scan.lease_seconds,
+        # Poll claim 与 P4/P5 失败写回必须共享同一上限，避免 Worker 崩溃后的
+        # lease 回收绕过 HandoffOrchestrator 的 max_attempts 判断。
+        max_attempts=max_attempts,
         preparation_failure_handler=preparation_failure_handler,
     )
     return IncrementalRuntime(

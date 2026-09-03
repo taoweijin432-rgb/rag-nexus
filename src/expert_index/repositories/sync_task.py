@@ -23,6 +23,10 @@ from ..models import (
 )
 
 MAX_SOURCE_SYNC_TASK_CLAIM_SIZE = 500
+# 直接调用 Repository 的旧集成代码没有重试策略参数时使用的兼容值。
+# 正式 Expert/Resume Poll 运行时始终从 CLI 显式传入 max_attempts；该默认值只避免
+# 历史脚本在升级期间立即失效，不会覆盖运行时配置。
+DEFAULT_SOURCE_SYNC_MAX_ATTEMPTS = 4
 _SAFE_IDENTIFIER_PATTERN = re.compile(r"^[A-Za-z0-9_.-]+$")
 # P5.6 原子落定接受的合法数据库阶段：Artifact 已持久化且下游已回执。
 # 不接受 validated（Artifact 可能尚未持久化，须先经 P5.3B artifact 路径）。
@@ -45,6 +49,66 @@ class SourceSyncTaskLeaseConflictError(RuntimeError):
 
 class SourceSyncTaskStageConflictError(RuntimeError):
     """表示任务当前阶段不允许执行请求的状态转换。"""
+
+
+def _dead_letter_claimed_task(
+    cursor: Any,
+    locked: dict[str, Any],
+    *,
+    error_code: str,
+) -> None:
+    """把已锁定且不可再领取的任务原子结算为 ``dead`` 并写入 DLQ。
+
+    调用方已经在 ``claim_source_sync_tasks`` 的事务中持有任务行锁，因此 DLQ
+    证据和任务终态不会出现“只写了一半”的中间状态。``(task_id, retry_count)``
+    唯一键使 Poll 重试/恢复时的重复调用保持幂等；历史 DLQ 记录不会被覆盖。
+    """
+
+    task_id = int(locked["id"])
+    retry_count = int(locked.get("retry_count") or 0)
+    if error_code not in {"retry_limit_exceeded", "lease_expired_max_attempts"}:
+        raise ValueError("不支持的领取阶段 DLQ 错误码")
+    cursor.execute(
+        """
+        INSERT INTO expert_index_sync_dead_letter(
+            task_id, batch_id, source_table, source_record_id, expert_id,
+            failure_stage, reason_code, reason_message, retry_count, artifact_id
+        ) VALUES (%s, %s, %s, %s, %s, 'source', %s, %s, %s, NULL)
+        ON DUPLICATE KEY UPDATE id=id
+        """,
+        (
+            task_id,
+            locked["batch_id"],
+            locked["source_table"],
+            locked["source_record_id"],
+            locked.get("expert_id"),
+            error_code,
+            "任务重试次数已达到上限，停止自动领取",
+            retry_count,
+        ),
+    )
+    cursor.execute(
+        """
+        UPDATE expert_index_sync_task
+        SET sync_status='dead', attempt_token=NULL,
+            lease_until=NULL, next_retry_at=NULL,
+            error_stage='source', error_code=%s,
+            error_type='RetryLimitExceeded',
+            error_message=%s, result_code=NULL,
+            completed_at=CURRENT_TIMESTAMP(6)
+        WHERE id=%s AND sync_status=%s
+        """,
+        (
+            error_code,
+            "任务重试次数已达到上限，停止自动领取",
+            task_id,
+            locked["sync_status"],
+        ),
+    )
+    if cursor.rowcount != 1:
+        raise SourceSyncTaskLeaseConflictError(
+            f"任务 {task_id} 在领取超限结算期间状态已变化"
+        )
 
 
 class MySQLSourceSyncTaskRepository:
@@ -298,6 +362,7 @@ class MySQLSourceSyncTaskRepository:
         *,
         limit: int,
         lease_seconds: int,
+        max_attempts: int = DEFAULT_SOURCE_SYNC_MAX_ATTEMPTS,
     ) -> tuple[SourceSyncTask, ...]:
         """并发安全领取当前 Batch 范围内严格队头任务。
 
@@ -312,11 +377,11 @@ class MySQLSourceSyncTaskRepository:
         - ``pending`` 且 ``next_retry_at`` 已到：允许重试领取，``retry_count += 1``；
         - ``pending`` 且 ``next_retry_at`` 未到：**返回空**，不领取更晚任务
           （等待退避到期）；
-        - ``processing`` 且 lease 已过期：允许回收（``retry_count += 1``）；
+        - ``processing`` 且 lease 已过期：在未达到上限时允许回收
+          （``retry_count += 1``）；达到上限时原子写入 ``dead`` 和 DLQ；
         - ``processing`` 且 lease 未过期：**返回空**，不领取更晚任务；
         - ``success``：已完成，继续向下一队头扫描；
-        - ``dead``：不可重试终态，继续向下一队头扫描（本批最终由 Checkpoint
-          闸门阻止提交，不在本方法改变 dead）；
+        - ``dead``：不可重试终态，继续向下一队头扫描；
         - ``failed``/``retrying``/未知状态：fail-closed 抛
           :class:`SourceSyncTaskStageConflictError`，不越过队头。
 
@@ -324,6 +389,10 @@ class MySQLSourceSyncTaskRepository:
         **同一套逐条严格 FIFO** 逻辑继续领取后续任务（不再用旧过滤条件跳过
         正在退避或 lease 未过期的 task）。P5.7 正式调用固定 ``limit=1``，多领取
         路径仅在接口兼容场景出现。
+
+        ``max_attempts`` 只限制自动重试，不限制首次 pending 领取；达到上限的
+        pending/过期 processing 会先写 DLQ 再变成 dead。默认值仅用于兼容旧的直接
+        Repository 调用，正式运行时应由 Poll CLI 显式传入。
 
         每条领取任务获得新的 ``attempt_token``；退避到期的 pending 和过期 processing
         都表示开始一次重试，因此增加 ``retry_count``，且不改变已完成的处理阶段。
@@ -335,6 +404,7 @@ class MySQLSourceSyncTaskRepository:
         _validate_source_table(source_table)
         _validate_claim_limit(limit)
         _validate_lease_seconds(lease_seconds)
+        _validate_max_attempts(max_attempts)
         connection = pymysql.connect(**self.config.as_kwargs())
         try:
             with connection.cursor() as cursor:
@@ -342,9 +412,17 @@ class MySQLSourceSyncTaskRepository:
                 claimed_tokens: list[str] = []
                 after_id = 0
                 # 逐条严格 FIFO：最多领取 limit 条，绝不跳过阻塞 task 领取更晚 task。
-                for _ in range(limit):
+                # limit 统计“成功领取的 processing 任务”而不是队头决策次数。
+                # 超限任务会在本事务内转 dead 并被跳过；不能让一个毒任务消耗掉
+                # limit=1 后提前返回，否则后面的正常任务要再等一轮 Poll 才能执行。
+                while len(task_ids) < limit:
                     result = self._claim_one_strict(
-                        cursor, batch_id, source_table, lease_seconds, after_id
+                        cursor,
+                        batch_id,
+                        source_table,
+                        lease_seconds,
+                        max_attempts,
+                        after_id,
                     )
                     kind = result[0]
                     if kind == "claimed":
@@ -388,6 +466,7 @@ class MySQLSourceSyncTaskRepository:
         batch_id: int,
         source_table: str,
         lease_seconds: int,
+        max_attempts: int,
         after_id: int,
     ) -> tuple[Any, ...]:
         """逐条严格 FIFO 领取：定位 ``id > after_id`` 之后最早非终态任务并决策。
@@ -428,7 +507,8 @@ class MySQLSourceSyncTaskRepository:
         # 而不是跳到更晚 task）。
         cursor.execute(
             """
-            SELECT id, sync_status, next_retry_at, lease_until, attempt_token
+            SELECT id, batch_id, source_table, source_record_id, expert_id,
+                   retry_count, sync_status, next_retry_at, lease_until, attempt_token
             FROM expert_index_sync_task
             WHERE id=%s
             FOR UPDATE SKIP LOCKED
@@ -451,16 +531,32 @@ class MySQLSourceSyncTaskRepository:
         next_retry_at = locked.get("next_retry_at")
         lease_until = locked.get("lease_until")
         retry_attempt = False
+        current_retry_count = int(locked.get("retry_count") or 0)
         if status == "pending":
-            if next_retry_at is not None:
-                cursor.execute(
-                    "SELECT CURRENT_TIMESTAMP(6) AS now",
-                    (),
-                )
-                now_row = cursor.fetchone()
-                db_now = now_row["now"] if now_row is not None else None
-                if db_now is not None and next_retry_at > db_now:
-                    return ("stop",)
+            # retry_count>0 且 next_retry_at 为空属于历史/人工恢复数据，也按重试
+            # 处理，不能借由缺少退避时间绕过上限；只有 retry_count=0 且无退避时间
+            # 的 candidate pending 才是首次领取。
+            is_retry_attempt = next_retry_at is not None or current_retry_count > 0
+            if is_retry_attempt:
+                # 普通初次 pending（retry_count=0 且无退避时间）即使 max_attempts=0
+                # 也必须允许首次处理。历史重试次数已达上限时不再等待退避时间，
+                # 直接在当前事务内结算为 dead。
+                if current_retry_count >= max_attempts:
+                    _dead_letter_claimed_task(
+                        cursor,
+                        locked,
+                        error_code="retry_limit_exceeded",
+                    )
+                    return ("skip", frontier_id)
+                if next_retry_at is not None:
+                    cursor.execute(
+                        "SELECT CURRENT_TIMESTAMP(6) AS now",
+                        (),
+                    )
+                    now_row = cursor.fetchone()
+                    db_now = now_row["now"] if now_row is not None else None
+                    if db_now is not None and next_retry_at > db_now:
+                        return ("stop",)
                 retry_attempt = True
         else:  # processing
             retry_attempt = True
@@ -472,6 +568,13 @@ class MySQLSourceSyncTaskRepository:
             db_now = now_row["now"] if now_row is not None else None
             if lease_until is not None and db_now is not None and lease_until > db_now:
                 return ("stop",)
+            if current_retry_count >= max_attempts:
+                _dead_letter_claimed_task(
+                    cursor,
+                    locked,
+                    error_code="lease_expired_max_attempts",
+                )
+                return ("skip", frontier_id)
 
         attempt_token = self.attempt_token_factory()
         _validate_attempt_token(attempt_token)
@@ -1195,6 +1298,17 @@ def _validate_claim_limit(limit: int) -> None:
         raise ValueError(
             f"limit 必须位于 1 到 {MAX_SOURCE_SYNC_TASK_CLAIM_SIZE} 之间"
         )
+
+
+def _validate_max_attempts(max_attempts: int) -> None:
+    """校验 Poll 领取阶段使用的自动重试上限。"""
+
+    if (
+        isinstance(max_attempts, bool)
+        or not isinstance(max_attempts, int)
+        or max_attempts < 0
+    ):
+        raise ValueError("max_attempts 必须是非负整数")
 
 
 def _validate_lease_seconds(lease_seconds: int) -> None:
