@@ -102,10 +102,33 @@ def test_resume_spec_freezes_identity_lifecycle_and_table_mapping() -> None:
     assert RESUME_SPEC.child_identity_column == "resume_id"
     assert RESUME_SPEC.profile_deleted_at_column == "resume_deleted_at"
     assert RESUME_SPEC.child_deleted_at_column == "deleted_at"
+    assert RESUME_SPEC.employment_deleted_at_column == "resume_work_experience_deleted_at"
+    assert RESUME_SPEC.project_deleted_at_column == "resume_project_experience_deleted_at"
+    assert RESUME_SPEC.education_deleted_at_column == "deleted_at"
     assert RESUME_SPEC.vector_doc_id_prefix == "resume"
     assert EXPERT_SPEC.vector_doc_id_prefix == "expert"
+    assert all(
+        EXPERT_SPEC.lifecycle_deleted_at_column_for_source_table(table) == "deleted_at"
+        for table in (
+            "experts_work_experience",
+            "experts_project_experience",
+            "experts_education_experience",
+        )
+    )
     assert RESUME_SPEC.target_type_for_source_table("resume") == "profile"
     assert RESUME_SPEC.target_type_for_source_table("resume_education_experience") == "education"
+    assert (
+        RESUME_SPEC.lifecycle_deleted_at_column_for_source_table("resume_work_experience")
+        == "resume_work_experience_deleted_at"
+    )
+    assert (
+        RESUME_SPEC.lifecycle_deleted_at_column_for_source_table("resume_project_experience")
+        == "resume_project_experience_deleted_at"
+    )
+    assert (
+        RESUME_SPEC.lifecycle_deleted_at_column_for_source_table("resume_education_experience")
+        == "deleted_at"
+    )
 
 
 def test_dataset_spec_rejects_unknown_table_and_sql_fragment() -> None:
@@ -113,6 +136,8 @@ def test_dataset_spec_rejects_unknown_table_and_sql_fragment() -> None:
 
     with pytest.raises(ValueError, match="不支持来源表"):
         RESUME_SPEC.target_type_for_source_table("experts")
+    with pytest.raises(ValueError, match="不支持来源表"):
+        RESUME_SPEC.lifecycle_deleted_at_column_for_source_table("experts")
     with pytest.raises(ValueError, match="不是合法 SQL 标识符"):
         replace(RESUME_SPEC, profile_table="resume; DROP TABLE x")
 

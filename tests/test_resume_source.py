@@ -187,7 +187,9 @@ def test_load_resume_maps_resume_id_and_preserves_child_record_ids(
     statements = [sql for sql, _params in cursor.executed]
     assert all("SELECT *" not in sql for sql in statements)
     assert any("resume_deleted_at IS NULL" in sql for sql in statements)
-    assert sum("deleted_at IS NULL" in sql for sql in statements) == 4
+    assert any("resume_work_experience_deleted_at IS NULL" in sql for sql in statements)
+    assert any("resume_project_experience_deleted_at IS NULL" in sql for sql in statements)
+    assert sum("AND deleted_at IS NULL" in sql for sql in statements) == 1
     assert all(params == (70001,) for sql, params in cursor.executed if sql.startswith("SELECT"))
 
     profile, employments, projects = normalize_aggregate(
@@ -429,6 +431,9 @@ def test_poll_deleted_employment_returns_trigger_and_parent_lifecycle(
     assert facts.employments[0].id == 81001
     assert facts.employments[0].deleted_at == when
     assert facts.expert.id == 70001
+    assert any(
+        "resume_work_experience_deleted_at AS deleted_at" in sql for sql, _params in cursor.executed
+    )
 
 
 def test_adapter_rejects_non_resume_spec() -> None:

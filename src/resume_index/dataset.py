@@ -3,7 +3,7 @@
 from expert_index.dataset import DatasetSpec
 
 # ``resume_id`` 是全链路人物身份；四张表的 ``id`` 只承担物理行定位和稳定经历身份。
-# 主档生命周期由 resume_deleted_at 决定，子记录生命周期统一由 deleted_at 决定。
+# 主档、工作、项目、教育分别使用各自冻结的生命周期字段。
 RESUME_SPEC = DatasetSpec(
     name="resume",
     profile_table="resume",
@@ -18,6 +18,9 @@ RESUME_SPEC = DatasetSpec(
     education_source_updated_at_column="updated_at",
     profile_deleted_at_column="resume_deleted_at",
     child_deleted_at_column="deleted_at",
+    employment_deleted_at_column="resume_work_experience_deleted_at",
+    project_deleted_at_column="resume_project_experience_deleted_at",
+    education_deleted_at_column="deleted_at",
     profile_source_columns=(
         "company",
         "job_status",

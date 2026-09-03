@@ -282,9 +282,8 @@ class MySQLResumeSourceAdapter:
             else f"{spec.child_identity_column} AS internal_person_id"
         )
         deleted_expression = (
-            f"{spec.profile_deleted_at_column} AS lifecycle_deleted_at"
-            if source_table == spec.profile_table
-            else f"{spec.child_deleted_at_column} AS lifecycle_deleted_at"
+            f"{spec.lifecycle_deleted_at_column_for_source_table(source_table)}"
+            " AS lifecycle_deleted_at"
         )
         connection = pymysql.connect(**self.config.as_kwargs(autocommit=True))
         try:
@@ -598,9 +597,10 @@ class MySQLResumeSourceAdapter:
         cursor: Any,
         employment_id: int,
     ) -> tuple[EmploymentSource, datetime | None]:
-        """按工作物理主键读取触发行，不过滤 ``deleted_at``。"""
+        """按工作物理主键读取触发行，不过滤其权威逻辑删除列。"""
 
         spec = self.dataset_spec
+        deleted_at_column = spec.lifecycle_deleted_at_column_for_source_table(spec.employment_table)
         cursor.execute(
             f"""
             SELECT id, {spec.child_identity_column} AS internal_person_id,
@@ -608,7 +608,7 @@ class MySQLResumeSourceAdapter:
                    work_description, is_employed,
                    {spec.employment_source_updated_at_column} AS business_updated_at,
                    updated_at AS scan_updated_at, created_at,
-                   {spec.child_deleted_at_column} AS deleted_at
+                   {deleted_at_column} AS deleted_at
             FROM {spec.employment_table}
             WHERE id = %s
             """,
@@ -639,9 +639,10 @@ class MySQLResumeSourceAdapter:
         cursor: Any,
         project_id: int,
     ) -> tuple[ProjectSource, datetime | None]:
-        """按项目物理主键读取触发行，不过滤 ``deleted_at``。"""
+        """按项目物理主键读取触发行，不过滤其权威逻辑删除列。"""
 
         spec = self.dataset_spec
+        deleted_at_column = spec.lifecycle_deleted_at_column_for_source_table(spec.project_table)
         cursor.execute(
             f"""
             SELECT id, {spec.child_identity_column} AS internal_person_id,
@@ -649,7 +650,7 @@ class MySQLResumeSourceAdapter:
                    work_description,
                    {spec.project_source_updated_at_column} AS business_updated_at,
                    updated_at AS scan_updated_at, created_at,
-                   {spec.child_deleted_at_column} AS deleted_at
+                   {deleted_at_column} AS deleted_at
             FROM {spec.project_table}
             WHERE id = %s
             """,
@@ -679,16 +680,17 @@ class MySQLResumeSourceAdapter:
         cursor: Any,
         education_id: int,
     ) -> tuple[EducationSource, datetime | None]:
-        """按教育物理主键读取触发行，不过滤 ``deleted_at``。"""
+        """按教育物理主键读取触发行，不过滤其权威逻辑删除列。"""
 
         spec = self.dataset_spec
+        deleted_at_column = spec.lifecycle_deleted_at_column_for_source_table(spec.education_table)
         cursor.execute(
             f"""
             SELECT id, {spec.child_identity_column} AS internal_person_id,
                    school_name, major,
                    {spec.education_source_updated_at_column} AS business_updated_at,
                    updated_at AS scan_updated_at, created_at,
-                   {spec.child_deleted_at_column} AS deleted_at
+                   {deleted_at_column} AS deleted_at
             FROM {spec.education_table}
             WHERE id = %s
             """,
@@ -718,16 +720,17 @@ class MySQLResumeSourceAdapter:
         """读取全部有效工作经历；每条物理 ``id`` 保持为稳定 Chunk 来源 ID。"""
 
         spec = self.dataset_spec
+        deleted_at_column = spec.lifecycle_deleted_at_column_for_source_table(spec.employment_table)
         cursor.execute(
             f"""
             SELECT id, {spec.child_identity_column} AS internal_person_id,
                    company_name, position_title, start_date, end_date,
                    work_description, is_employed,
                    {spec.employment_source_updated_at_column} AS business_updated_at,
-                   created_at, {spec.child_deleted_at_column} AS deleted_at
+                   created_at, {deleted_at_column} AS deleted_at
             FROM {spec.employment_table}
             WHERE {spec.child_identity_column} = %s
-              AND {spec.child_deleted_at_column} IS NULL
+              AND {deleted_at_column} IS NULL
             ORDER BY COALESCE(end_date, '9999-12-31') DESC,
                      start_date DESC, id ASC
             """,
@@ -754,16 +757,17 @@ class MySQLResumeSourceAdapter:
         """读取全部有效项目经历；每条物理 ``id`` 保持为稳定 Chunk 来源 ID。"""
 
         spec = self.dataset_spec
+        deleted_at_column = spec.lifecycle_deleted_at_column_for_source_table(spec.project_table)
         cursor.execute(
             f"""
             SELECT id, {spec.child_identity_column} AS internal_person_id,
                    project_title, company_name, start_date, end_date,
                    work_description,
                    {spec.project_source_updated_at_column} AS business_updated_at,
-                   created_at, {spec.child_deleted_at_column} AS deleted_at
+                   created_at, {deleted_at_column} AS deleted_at
             FROM {spec.project_table}
             WHERE {spec.child_identity_column} = %s
-              AND {spec.child_deleted_at_column} IS NULL
+              AND {deleted_at_column} IS NULL
             ORDER BY COALESCE(end_date, '9999-12-31') DESC,
                      start_date DESC, id ASC
             """,
@@ -789,16 +793,17 @@ class MySQLResumeSourceAdapter:
         """读取有效教育经历；教育仅参与 Profile 聚合，不单独生成 Chunk。"""
 
         spec = self.dataset_spec
+        deleted_at_column = spec.lifecycle_deleted_at_column_for_source_table(spec.education_table)
         cursor.execute(
             f"""
             SELECT id, {spec.child_identity_column} AS internal_person_id,
                    school_name, major,
                    {spec.education_source_updated_at_column} AS business_updated_at,
                    created_at,
-                   {spec.child_deleted_at_column} AS deleted_at
+                   {deleted_at_column} AS deleted_at
             FROM {spec.education_table}
             WHERE {spec.child_identity_column} = %s
-              AND {spec.child_deleted_at_column} IS NULL
+              AND {deleted_at_column} IS NULL
             ORDER BY id ASC
             """,
             (resume_id,),

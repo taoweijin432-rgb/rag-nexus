@@ -34,7 +34,12 @@ class DatasetSpec:
         四类事实的业务版本时间。它们与用于 Poll 游标的通用 ``updated_at`` 可能具有
         不同语义，因此必须显式声明。
     profile_deleted_at_column, child_deleted_at_column:
-        人物和子记录的权威生命周期字段。
+        人物和子记录的生命周期字段。``child_deleted_at_column`` 是现有 Expert
+        三张子表共用字段的兼容默认值；如果不同子表使用不同字段，可通过下面三个
+        可选字段分别声明，未声明时回退到该默认值。
+    employment_deleted_at_column, project_deleted_at_column, education_deleted_at_column:
+        可选的按子表生命周期字段。它们只影响显式传入该规格的 Source Adapter，不会
+        改变未设置这些字段的既有 Expert 规格。
     profile_source_columns, employment_source_columns, project_source_columns:
         进入三类 Chunk 的来源字段白名单，同时用于生成稳定 ``source_field`` 标签。
     vector_doc_id_prefix:
@@ -64,6 +69,9 @@ class DatasetSpec:
     employment_source_columns: tuple[str, ...]
     project_source_columns: tuple[str, ...]
     vector_doc_id_prefix: str = "expert"
+    employment_deleted_at_column: str | None = None
+    project_deleted_at_column: str | None = None
+    education_deleted_at_column: str | None = None
 
     def __post_init__(self) -> None:
         """拒绝空规格、重复表和可注入的 SQL 标识符。"""
@@ -73,9 +81,7 @@ class DatasetSpec:
         if not isinstance(self.vector_doc_id_prefix, str) or not re.fullmatch(
             r"[a-z][a-z0-9_]*", self.vector_doc_id_prefix
         ):
-            raise ValueError(
-                "DatasetSpec.vector_doc_id_prefix 必须是小写字母/数字/下划线命名空间"
-            )
+            raise ValueError("DatasetSpec.vector_doc_id_prefix 必须是小写字母/数字/下划线命名空间")
 
         identifiers = {
             "profile_table": self.profile_table,
@@ -91,6 +97,17 @@ class DatasetSpec:
             "profile_deleted_at_column": self.profile_deleted_at_column,
             "child_deleted_at_column": self.child_deleted_at_column,
         }
+        identifiers.update(
+            {
+                label: identifier
+                for label, identifier in (
+                    ("employment_deleted_at_column", self.employment_deleted_at_column),
+                    ("project_deleted_at_column", self.project_deleted_at_column),
+                    ("education_deleted_at_column", self.education_deleted_at_column),
+                )
+                if identifier is not None
+            }
+        )
         identifiers.update(
             {
                 f"profile_source_columns[{index}]": column
@@ -183,6 +200,26 @@ class DatasetSpec:
         if target_type not in _SUPPORTED_TARGET_TYPES:  # pragma: no cover - 冻结映射自检
             raise RuntimeError(f"DatasetSpec 产生了不支持的目标类型: {target_type}")
         return target_type
+
+    def lifecycle_deleted_at_column_for_source_table(self, source_table: str) -> str:
+        """返回指定来源表的权威逻辑删除列。
+
+        ``child_deleted_at_column`` 保留为 Expert 的兼容默认值；Resume 通过显式的
+        工作、项目、教育字段声明覆盖对应子表。来源表必须来自当前规格，避免动态
+        SQL 使用未验证的表名或删除列名。
+        """
+
+        mapping = {
+            self.profile_table: self.profile_deleted_at_column,
+            self.employment_table: self.employment_deleted_at_column
+            or self.child_deleted_at_column,
+            self.project_table: self.project_deleted_at_column or self.child_deleted_at_column,
+            self.education_table: self.education_deleted_at_column or self.child_deleted_at_column,
+        }
+        try:
+            return mapping[source_table]
+        except (KeyError, TypeError) as exc:
+            raise ValueError(f"{self.name} 不支持来源表: {source_table}") from exc
 
 
 # Expert 规格冻结现有生产表名、身份列和来源标签。Normalize 的默认参数始终指向该对象，
