@@ -51,18 +51,51 @@ import json
 from collections.abc import Mapping, Sequence
 from typing import Any
 
-from expert_contracts.models import EmbeddedContractPreparedChunk
-
-from ..core.expert import ExpertContractAdapter
+from ..core.expert import ExpertContractAdapter, ResumeContractAdapter
 from ..core.hash_state import read_hash_field
 from ..core.storage import VectorRepositoryProfile
 from .compatibility import compare_model_space
-from .contract_v15 import MilvusV15RowMapper
+from .contract_v15 import (
+    MilvusV15RowMapper,
+    ResumeMilvusV15RowMapper,
+)
 from .indexes import index_specs_v15
 from .repository import ContractMilvusRepositoryBase
 from .schemas.contract_v15 import build_v15_schema, v15_milvus_field_specs
 
-__all__ = ["ContractMilvusV15VectorRepository"]
+__all__ = [
+    "EXPERT_V15_PROFILE",
+    "RESUME_V15_PROFILE",
+    "ContractMilvusV15VectorRepository",
+]
+
+EXPERT_V15_PROFILE = VectorRepositoryProfile(
+    _schema_field_specs=v15_milvus_field_specs,
+    _schema_builder=build_v15_schema,
+    _index_specs_fn=index_specs_v15,
+    _row_mapper_cls=MilvusV15RowMapper,
+    _full_scan_filter='vector_doc_id != ""',
+    _model_space_fields=("metadata",),
+    _contract_adapter_cls=ExpertContractAdapter,
+    _owner_field="expert_id",
+    _vector_doc_id_prefix="expert:",
+    _owner_filter_fn=lambda owner_id: f'metadata["expert_id"] == {int(owner_id)}',
+    _owner_output_fields=("vector_doc_id",),
+)
+
+RESUME_V15_PROFILE = VectorRepositoryProfile(
+    _schema_field_specs=v15_milvus_field_specs,
+    _schema_builder=build_v15_schema,
+    _index_specs_fn=index_specs_v15,
+    _row_mapper_cls=ResumeMilvusV15RowMapper,
+    _full_scan_filter='vector_doc_id != ""',
+    _model_space_fields=("metadata",),
+    _contract_adapter_cls=ResumeContractAdapter,
+    _owner_field="resume_id",
+    _vector_doc_id_prefix="resume:",
+    _owner_filter_fn=lambda owner_id: f'metadata["resume_id"] == {int(owner_id)}',
+    _owner_output_fields=("vector_doc_id",),
+)
 
 # 限量采样行数：V15 Collection 规模增长后，upsert 前的既有 model-space
 # 一致性检查不再全表扫描，改为采样前若干行校验。当前正式数据向量空间一致，
@@ -105,19 +138,7 @@ class ContractMilvusV15VectorRepository(ContractMilvusRepositoryBase):
         lambda owner_id: f'metadata["expert_id"] == {int(owner_id)}'
     )
     _owner_output_fields = ("vector_doc_id",)
-    _profile = VectorRepositoryProfile(
-        _schema_field_specs=v15_milvus_field_specs,
-        _schema_builder=build_v15_schema,
-        _index_specs_fn=index_specs_v15,
-        _row_mapper_cls=MilvusV15RowMapper,
-        _full_scan_filter='vector_doc_id != ""',
-        _model_space_fields=("metadata",),
-        _contract_adapter_cls=ExpertContractAdapter,
-        _owner_field="expert_id",
-        _vector_doc_id_prefix="expert:",
-        _owner_filter_fn=lambda owner_id: f'metadata["expert_id"] == {int(owner_id)}',
-        _owner_output_fields=("vector_doc_id",),
-    )
+    _profile = EXPERT_V15_PROFILE
 
     def _model_space_from_row(
         self,
@@ -133,6 +154,16 @@ class ContractMilvusV15VectorRepository(ContractMilvusRepositoryBase):
         flat = row.get("metadata")
         if not isinstance(flat, Mapping):
             raise TypeError("Milvus V15 行缺少合法 metadata JSON 对象")
+        if self._owner_field == "resume_id":
+            if "resume_id" not in flat:
+                raise ValueError(
+                    "Resume Collection 既有 Entity 缺少 metadata['resume_id']，"
+                    "拒绝与新 Resume 数据混写"
+                )
+            if "expert_id" in flat:
+                raise ValueError(
+                    "Resume Collection 既有 Entity 不得包含 metadata['expert_id']"
+                )
         return {
             "embedding_model_alias": flat.get("embedding_model_alias"),
             "embedding_model_version": flat.get("embedding_model_version"),
@@ -141,7 +172,7 @@ class ContractMilvusV15VectorRepository(ContractMilvusRepositoryBase):
 
     def _validate_existing_model_space(
         self,
-        record: EmbeddedContractPreparedChunk,
+        record: Any,
     ) -> None:
         """在 upsert 前采样校验既有 Entity 的模型空间一致性（V15 版本）。
 
@@ -216,51 +247,36 @@ class ContractMilvusV15VectorRepository(ContractMilvusRepositoryBase):
         公共 API 语义不变：返回行始终包含 ``vector_doc_id``。
         """
 
-        if isinstance(expert_id, bool) or not isinstance(expert_id, int):
-            raise ValueError(  # noqa: TRY004
-                "expert_id 必须是整数"
-            )
-        if expert_id < 1:
-            raise ValueError("expert_id 必须是正整数")
+        return self.query_by_owner_id(expert_id, output_fields=output_fields)
+
+    def query_by_owner_id(
+        self,
+        owner_id: int,
+        *,
+        output_fields: Sequence[str] | None = None,
+    ) -> list[dict[str, object]]:
+        """按当前 V15 Profile 的 owner JSON 字段查询向量记录。"""
+
+        if isinstance(owner_id, bool) or not isinstance(owner_id, int):
+            raise TypeError("owner_id 必须是整数")
+        if owner_id < 1:
+            raise ValueError("owner_id 必须是正整数")
 
         fields = list(
-            output_fields
-            if output_fields is not None
-            else ["vector_doc_id"]
+            output_fields if output_fields is not None else ["vector_doc_id"]
         )
         if not fields or any(
             not isinstance(field, str) or not field.strip() for field in fields
         ):
             raise ValueError("output_fields 必须是非空字符串序列")
-        for forbidden in _V15_FORBIDDEN_TOP_LEVEL_FIELDS:
+        forbidden_fields = set(_V15_FORBIDDEN_TOP_LEVEL_FIELDS)
+        forbidden_fields.add(self._owner_field)
+        for forbidden in forbidden_fields:
             if forbidden in fields:
                 raise ValueError(
                     f"V15 不存在一级字段 {forbidden!r}，请通过 'metadata' 读取"
                 )
-
-        iterator = self._get_client().query_iterator(
-            collection_name=self.settings.collection_name,
-            batch_size=1000,
-            limit=-1,
-            filter=f'metadata["expert_id"] == {int(expert_id)}',
-            output_fields=fields,
-            consistency_level="Strong",
-            **self._timeout_kwargs(),
-        )
-        rows: list[dict[str, object]] = []
-        try:
-            while True:
-                batch = iterator.next()
-                if not isinstance(batch, list) or not all(
-                    isinstance(row, Mapping) for row in batch
-                ):
-                    raise TypeError("Milvus expert_id iterator 返回了非法 Entity 批次")
-                if not batch:
-                    break
-                rows.extend(dict(row) for row in batch)
-        finally:
-            iterator.close()
-        return rows
+        return super().query_by_owner_id(owner_id, output_fields=fields)
 
     def list_all_vector_states(
         self,

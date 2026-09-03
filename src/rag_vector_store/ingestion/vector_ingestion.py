@@ -35,6 +35,7 @@ from ..chunking.contract_pipeline import (
     ContractValidator,
     EmbeddingEligibilityError,
 )
+from ..core.adapters import VectorContractAdapter
 from ..core.expert import ExpertContractAdapter
 from ..core.hash_state import project_hash_fields
 from ..core.lifecycle import DomainVectorLifecycleService
@@ -56,6 +57,7 @@ from .models import (
     VectorIngestionResult,
     VectorItemResult,
     VectorQueryResult,
+    VectorResumeList,
 )
 
 
@@ -155,7 +157,11 @@ class _GuardedLifecycleRowMapper:
         return _guard_call(self.row_mapper.from_row, row)
 
 
-def _dedupe(vector_doc_ids: Sequence[str]) -> list[str]:
+def _dedupe(
+    vector_doc_ids: Sequence[str],
+    *,
+    prefix: str | None = None,
+) -> list[str]:
     """按输入顺序去重并校验主键，返回清理后的 ID 列表。"""
 
     cleaned: list[str] = []
@@ -164,6 +170,10 @@ def _dedupe(vector_doc_ids: Sequence[str]) -> list[str]:
         if not isinstance(vector_doc_id, str) or not vector_doc_id.strip():
             raise VectorContractError("vector_doc_id 必须是非空字符串")
         normalized = vector_doc_id.strip()
+        if prefix is not None and not normalized.startswith(prefix):
+            raise VectorContractError(
+                f"vector_doc_id {normalized!r} 不符合当前领域前缀 {prefix!r}"
+            )
         if normalized not in seen:
             seen.add(normalized)
             cleaned.append(normalized)
@@ -183,11 +193,12 @@ class VectorIngestionService:
     def __init__(
         self,
         *,
-        ingestion_service: ContractBatchIngestionService | None = None,
+        ingestion_service: Any | None = None,
         embedding_worker: ContractEmbeddingWorker | None = None,
         repository: ContractMilvusRepositoryBase,
         validator: ContractValidator | None = None,
-        row_mapper: MilvusV15RowMapper | None = None,
+        row_mapper: Any | None = None,
+        adapter: VectorContractAdapter[Any, Any, Any] | None = None,
         expected_dimension: int = EXPECTED_EMBEDDING_DIMENSION,
         formal_model_space_id: str = FORMAL_EMBEDDING_MODEL_SPACE_ID,
     ) -> None:
@@ -213,7 +224,7 @@ class VectorIngestionService:
             "eligibility_validator",
             None,
         )
-        self._adapter = ExpertContractAdapter(
+        self._adapter = adapter or ExpertContractAdapter(
             self.validator,
             eligibility_validator,
         )
@@ -240,8 +251,8 @@ class VectorIngestionService:
         非法公共输入（非 Contract 记录）直接判为 ``VectorContractError``。
         """
 
-        if not all(isinstance(c, ExpertChunkEmbeddingInput) for c in chunks):
-            raise VectorContractError("upsert_chunks 只接受 ExpertChunkEmbeddingInput")
+        if not all(self._adapter.is_input(c) for c in chunks):
+            raise VectorContractError("upsert_chunks 只接受当前领域 Contract")
 
         result = _guard_call(self.ingestion.ingest_batch, chunks)
         items = [
@@ -326,7 +337,10 @@ class VectorIngestionService:
         （不误判为全同 Skip，不调用 Embedding）。
         """
 
-        cleaned = _dedupe(vector_doc_ids)
+        cleaned = _dedupe(
+            vector_doc_ids,
+            prefix=self._adapter.id_prefix(),
+        )
         records: list[dict[str, object]] = []
         missing: list[str] = []
         for vid in cleaned:
@@ -390,7 +404,65 @@ class VectorIngestionService:
                 f"expert_id 必须是正整数，收到 {expert_id!r}"
             )
 
-        rows = _guard_call(self.repository.query_by_expert_id, expert_id)
+        rows = self._list_vectors_by_owner(expert_id)
+        vector_doc_ids = [str(row["vector_doc_id"]) for row in rows]
+        return VectorExpertList(
+            expert_id=expert_id,
+            vector_doc_ids=vector_doc_ids,
+            count=len(vector_doc_ids),
+        )
+
+    def _list_vectors_by_owner(
+        self,
+        owner_id: int,
+    ) -> list[dict[str, object]]:
+        """按当前 Adapter/Profile 的 owner 查询向量主键。"""
+
+        if isinstance(owner_id, bool) or not isinstance(owner_id, int) or owner_id < 1:
+            raise VectorContractError(
+                f"owner_id 必须是正整数，收到 {owner_id!r}"
+            )
+        query_by_owner = getattr(self.repository, "query_by_owner_id", None)
+        if callable(query_by_owner):
+            return _guard_call(query_by_owner, owner_id)
+        # 保留 Expert Fake/兼容 Repository 的既有接口。
+        return _guard_call(self.repository.query_by_expert_id, owner_id)
+
+
+class ResumeVectorIngestionService(VectorIngestionService):
+    """Resume 领域 Facade，复用通用向量核心并暴露 Resume 语义查询。"""
+
+    @_guard_errors
+    def list_vectors_by_resume(
+        self,
+        resume_id: int,
+    ) -> VectorResumeList:
+        """按 Resume owner 查询其全部 vector_doc_id。"""
+
+        if isinstance(resume_id, bool) or not isinstance(resume_id, int) or resume_id < 1:
+            raise VectorContractError(
+                f"resume_id 必须是正整数，收到 {resume_id!r}"
+            )
+        rows = self._list_vectors_by_owner(resume_id)
+        vector_doc_ids = [str(row["vector_doc_id"]) for row in rows]
+        return VectorResumeList(
+            resume_id=resume_id,
+            vector_doc_ids=vector_doc_ids,
+            count=len(vector_doc_ids),
+        )
+
+    @_guard_errors
+    def list_vectors_by_expert(
+        self,
+        expert_id: int,
+    ) -> VectorExpertList:
+        """兼容现有 ExpertVectorSynchronizer 的 Resume owner 查询入口。"""
+
+        if isinstance(expert_id, bool) or not isinstance(expert_id, int) or expert_id < 1:
+            raise VectorContractError(
+                f"resume_id 必须是正整数，收到 {expert_id!r}"
+            )
+        rows = self._list_vectors_by_owner(expert_id)
         vector_doc_ids = [str(row["vector_doc_id"]) for row in rows]
         return VectorExpertList(
             expert_id=expert_id,
@@ -414,4 +486,4 @@ def _make_item_from_batch_item(item: Any) -> VectorItemResult:
     )
 
 
-__all__ = ["VectorIngestionService"]
+__all__ = ["ResumeVectorIngestionService", "VectorIngestionService"]

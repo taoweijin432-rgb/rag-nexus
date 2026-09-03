@@ -76,7 +76,10 @@ class DomainVectorLifecycleService(Generic[InputT, PreparedT, EmbeddedT]):
         self.formal_model_space_id = formal_model_space_id
 
     def disable_vectors(self, vector_doc_ids: Sequence[str]) -> DomainDeletionResult:
-        cleaned = _dedupe(vector_doc_ids)
+        cleaned = _dedupe(
+            vector_doc_ids,
+            prefix=self.adapter.id_prefix(),
+        )
         disabled_count = 0
         not_found_count = 0
         for vector_doc_id in cleaned:
@@ -224,13 +227,21 @@ class DomainVectorLifecycleService(Generic[InputT, PreparedT, EmbeddedT]):
             raise ValueError("Repository 返回的 primary_keys 与请求主键不一致")
 
 
-def _dedupe(vector_doc_ids: Sequence[str]) -> list[str]:
+def _dedupe(
+    vector_doc_ids: Sequence[str],
+    *,
+    prefix: str | None = None,
+) -> list[str]:
     cleaned: list[str] = []
     seen: set[str] = set()
     for vector_doc_id in vector_doc_ids:
         if not isinstance(vector_doc_id, str) or not vector_doc_id.strip():
             raise ValueError("vector_doc_id 必须是非空字符串")
         normalized = vector_doc_id.strip()
+        if prefix is not None and not normalized.startswith(prefix):
+            raise ValueError(
+                f"vector_doc_id {normalized!r} 不符合当前领域前缀 {prefix!r}"
+            )
         if normalized not in seen:
             seen.add(normalized)
             cleaned.append(normalized)

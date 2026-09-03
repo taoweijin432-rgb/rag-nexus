@@ -71,6 +71,8 @@ def _preflight(settings: ResumeSettings) -> ResumeSourcePreflightResult:
 
 class _VectorRepository:
     settings = MilvusSettings(collection_name="resume_candidates_v15_contract")
+    _owner_field = "resume_id"
+    _vector_doc_id_prefix = "resume:"
 
 
 class _VectorService:

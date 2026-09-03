@@ -5,13 +5,18 @@
 Contract Adapter，而无需改动 Embedding/入库编排。
 """
 
-from .adapters import VectorConsumerContractAdapter, VectorContractAdapter
+from .adapters import (
+    VectorConsumerContractAdapter,
+    VectorContractAdapter,
+    VectorStorageAdapter,
+)
 from .embedding import (
     DomainEmbeddingResult,
     DomainEmbeddingWorker,
     DomainSkippedVector,
 )
 from .embedding_validation import validate_embedding_vector
+from .expert import ExpertContractAdapter, ResumeContractAdapter
 from .flat_metadata import merge_flat_metadata
 from .guards import require_adapter_input
 from .hash_state import HASH_FIELDS, project_hash_fields, read_hash_field
@@ -44,10 +49,13 @@ __all__ = [
     "DomainLifecycleResult",
     "DomainSkippedVector",
     "DomainVectorLifecycleService",
+    "ExpertContractAdapter",
+    "ResumeContractAdapter",
     "VectorConsumerContractAdapter",
     "VectorContractAdapter",
     "VectorRepositoryProfile",
     "VectorRowMapper",
+    "VectorStorageAdapter",
     "merge_flat_metadata",
     "project_hash_fields",
     "read_hash_field",

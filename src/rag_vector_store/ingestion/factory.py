@@ -25,11 +25,14 @@ from ..chunking.contract_pipeline import (
     ContractValidator,
 )
 from ..config import MilvusSettings
+from ..core.embedding import DomainEmbeddingWorker
+from ..core.expert import ExpertContractAdapter, ResumeContractAdapter
+from ..core.ingestion import DomainIngestionService
 from ..embedding_adapters.company_cloud import CompanyCloudEmbeddingModel
-from ..milvus.contract_v15 import MilvusV15RowMapper
-from ..milvus.repository_v15 import ContractMilvusV15VectorRepository
+from ..milvus.contract_v15 import MilvusV15RowMapper, ResumeMilvusV15RowMapper
+from ..milvus.repository_v15 import RESUME_V15_PROFILE, ContractMilvusV15VectorRepository
 from ..model_space import FORMAL_EMBEDDING_MODEL_SPACE_ID
-from .vector_ingestion import VectorIngestionService
+from .vector_ingestion import ResumeVectorIngestionService, VectorIngestionService
 
 # 当前唯一允许的持久化 profile；V14 已退役。
 SchemaProfile = Literal["v15"]
@@ -47,7 +50,10 @@ def _repository_is_v15(repository: Any) -> bool:
 
     if isinstance(repository, ContractMilvusV15VectorRepository):
         return True
-    return getattr(repository, "_row_mapper_cls", None) is MilvusV15RowMapper
+    return getattr(repository, "_row_mapper_cls", None) in {
+        MilvusV15RowMapper,
+        ResumeMilvusV15RowMapper,
+    }
 
 
 def _validate_repository_profile(
@@ -106,11 +112,57 @@ def _validate_row_mapper_profile(
         )
 
 
+def _profile_value(repository: Any, name: str) -> Any:
+    """读取 Repository 实例或其不可变 Profile 上的配置值。"""
+
+    value = getattr(repository, name, None)
+    if value is not None:
+        return value
+    profile = getattr(repository, "_profile", None)
+    return getattr(profile, name, None)
+
+
+def _validate_resume_repository_profile(repository: Any) -> None:
+    """Resume Factory 只接受明确绑定 Resume 身份空间的 Repository。"""
+
+    if repository is None:
+        return
+    owner_field = _profile_value(repository, "_owner_field")
+    id_prefix = _profile_value(repository, "_vector_doc_id_prefix")
+    if owner_field != "resume_id" or id_prefix != "resume:":
+        raise ValueError(
+            "Resume Factory 要求 Repository 绑定 Resume Profile "
+            "(owner_field='resume_id', vector_doc_id_prefix='resume:')"
+        )
+    adapter_cls = _profile_value(repository, "_contract_adapter_cls")
+    if adapter_cls is not None and adapter_cls is not ResumeContractAdapter:
+        raise ValueError(
+            "Resume Factory 要求 Repository 使用 ResumeContractAdapter"
+        )
+    mapper_cls = _profile_value(repository, "_row_mapper_cls")
+    if mapper_cls is not None and mapper_cls is not ResumeMilvusV15RowMapper:
+        raise ValueError(
+            "Resume Factory 要求 Repository 使用 ResumeMilvusV15RowMapper"
+        )
+
+
+def _validate_resume_row_mapper(row_mapper: Any) -> None:
+    """Resume Factory 只接受 Resume V15 行映射器。"""
+
+    if row_mapper is None or isinstance(row_mapper, ResumeMilvusV15RowMapper):
+        return
+    raise ValueError(
+        "Resume Factory 要求使用 ResumeMilvusV15RowMapper，"
+        "禁止复用 Expert MilvusV15RowMapper"
+    )
+
+
 def _build_repository(
     *,
     milvus_settings: MilvusSettings,
     expected_dimension: int,
     schema_profile: SchemaProfile,
+    profile: Any | None = None,
 ) -> ContractMilvusV15VectorRepository:
     """按 schema_profile 构造 Repository（仅 V15）。"""
 
@@ -118,6 +170,7 @@ def _build_repository(
         return ContractMilvusV15VectorRepository(
             milvus_settings,
             vector_dimension=expected_dimension,
+            profile=profile,
         )
     # 理论不可达：_validate_schema_profile 已拦截非法 profile。
     raise ValueError(f"未支持的 schema_profile {schema_profile!r}")
@@ -228,11 +281,71 @@ def create_vector_ingestion_service(
         row_mapper=resolved_row_mapper,
         expected_dimension=expected_dimension,
         formal_model_space_id=formal_model_space_id,
+        adapter=ExpertContractAdapter(validator, getattr(embedding_worker, "eligibility_validator", None)),
+    )
+
+
+def create_resume_vector_ingestion_service(
+    *,
+    embedding_model: CompanyCloudEmbeddingModel | None = None,
+    milvus_settings: MilvusSettings | None = None,
+    repository: ContractMilvusV15VectorRepository | None = None,
+    embedding_worker: Any | None = None,
+    validator: ContractValidator | None = None,
+    row_mapper: Any | None = None,
+    expected_dimension: int = EXPECTED_EMBEDDING_DIMENSION,
+    formal_model_space_id: str = FORMAL_EMBEDDING_MODEL_SPACE_ID,
+    schema_profile: SchemaProfile = "v15",
+) -> ResumeVectorIngestionService:
+    """构造固定绑定 Resume Profile 的向量化服务。"""
+
+    validate_schema_profile(schema_profile)
+    _validate_resume_repository_profile(repository)
+    _validate_resume_row_mapper(row_mapper)
+    if validator is None:
+        validator = ContractValidator()
+    if embedding_model is None and embedding_worker is None:
+        embedding_model = CompanyCloudEmbeddingModel.from_env()
+    adapter = ResumeContractAdapter(
+        validator,
+        getattr(embedding_worker, "eligibility_validator", None),
+    )
+    if embedding_worker is None:
+        embedding_worker = DomainEmbeddingWorker(
+            embedding_model,
+            adapter,
+            expected_dimension=expected_dimension,
+        )
+    if milvus_settings is None:
+        milvus_settings = MilvusSettings.from_env()
+    if repository is None:
+        repository = _build_repository(
+            milvus_settings=milvus_settings,
+            expected_dimension=expected_dimension,
+            schema_profile=schema_profile,
+            profile=RESUME_V15_PROFILE,
+        )
+    if row_mapper is None:
+        row_mapper = ResumeMilvusV15RowMapper(adapter)
+    ingestion_service = DomainIngestionService(
+        embedding_worker,
+        repository,
+        adapter,
+    )
+    return ResumeVectorIngestionService(
+        ingestion_service=ingestion_service,
+        repository=repository,
+        validator=validator,
+        row_mapper=row_mapper,
+        expected_dimension=expected_dimension,
+        formal_model_space_id=formal_model_space_id,
+        adapter=adapter,
     )
 
 
 __all__ = [
     "SchemaProfile",
+    "create_resume_vector_ingestion_service",
     "create_vector_ingestion_service",
     "validate_schema_profile",
 ]

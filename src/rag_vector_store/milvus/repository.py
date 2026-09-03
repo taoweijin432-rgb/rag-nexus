@@ -444,6 +444,11 @@ class ContractMilvusRepositoryBase:
 
         if not isinstance(vector_doc_id, str) or not vector_doc_id.strip():
             raise ValueError("vector_doc_id 必须是非空字符串")
+        if not vector_doc_id.startswith(self._vector_doc_id_prefix):
+            raise ValueError(
+                f"vector_doc_id {vector_doc_id!r} 不符合当前 Profile 前缀 "
+                f"{self._vector_doc_id_prefix!r}"
+            )
 
         dimension = self._resolve_vector_dimension(None)
         output_fields = [
@@ -503,7 +508,18 @@ class ContractMilvusRepositoryBase:
                     raise TypeError("Milvus owner iterator 返回了非法 Entity 批次")
                 if not batch:
                     break
-                rows.extend(dict(row) for row in batch)
+                for row in batch:
+                    projected = dict(row)
+                    vector_doc_id = projected.get("vector_doc_id")
+                    if vector_doc_id is not None and (
+                        not isinstance(vector_doc_id, str)
+                        or not vector_doc_id.startswith(self._vector_doc_id_prefix)
+                    ):
+                        raise RuntimeError(
+                            "Milvus owner 查询返回了不属于当前 Profile 的 "
+                            f"vector_doc_id: {vector_doc_id!r}"
+                        )
+                    rows.append(projected)
         finally:
             iterator.close()
         return rows

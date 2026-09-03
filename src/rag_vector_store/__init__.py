@@ -38,6 +38,7 @@ from .embedding_adapters import (
     CompanyCloudEmbeddingSettings,
 )
 from .ingestion import (
+    ResumeVectorIngestionService,
     VectorContractError,
     VectorDeletionResult,
     VectorEmbeddingError,
@@ -50,13 +51,17 @@ from .ingestion import (
     VectorItemStatus,
     VectorMilvusError,
     VectorQueryResult,
+    VectorResumeList,
+    create_resume_vector_ingestion_service,
     create_vector_ingestion_service,
 )
 from .milvus.contract_v15 import (
     V15_CONTRACT_VECTOR_DIMENSION,
     V15_VECTOR_DOC_ID_MAX_BYTES,
+    ContractV15RowMapper,
     MilvusV15Entity,
     MilvusV15RowMapper,
+    ResumeMilvusV15RowMapper,
 )
 from .milvus.repository import ContractMilvusRepositoryBase
 from .milvus.repository_v15 import ContractMilvusV15VectorRepository
@@ -102,6 +107,7 @@ __all__ = [
     "ContractMilvusV15VectorRepository",
     "ContractPreparedChunk",
     "ContractRepository",
+    "ContractV15RowMapper",
     "ContractValidationError",
     "ContractValidator",
     "EmbeddedContractPreparedChunk",
@@ -121,6 +127,8 @@ __all__ = [
     "MutationResult",
     "ProfileSummaryMetadata",
     "ProjectMetadata",
+    "ResumeMilvusV15RowMapper",
+    "ResumeVectorIngestionService",
     "SearchHit",
     "SkippedContractChunk",
     "VectorContractError",
@@ -135,9 +143,11 @@ __all__ = [
     "VectorItemStatus",
     "VectorMilvusError",
     "VectorQueryResult",
+    "VectorResumeList",
     "build_model_space_id",
     "compare_contract_output_schema",
     "create_full_vector_reconciliation_service",
+    "create_resume_vector_ingestion_service",
     "create_vector_ingestion_service",
     "expected_contract_output_fields",
 ]

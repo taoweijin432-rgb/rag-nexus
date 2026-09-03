@@ -40,13 +40,8 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
-from expert_contracts.models import (
-    EmbeddedContractPreparedChunk,
-    ExpertChunkSource,
-    ExpertChunkVersions,
-    metadata_model_for_chunk_type,
-)
-
+from ..core.adapters import VectorStorageAdapter
+from ..core.expert import ExpertContractAdapter, ResumeContractAdapter
 from ..core.flat_metadata import merge_flat_metadata
 from .schemas.contract_v15 import (
     V15_CONTRACT_VECTOR_DIMENSION,
@@ -57,8 +52,10 @@ from .schemas.contract_v15 import (
 __all__ = [
     "V15_CONTRACT_VECTOR_DIMENSION",
     "V15_VECTOR_DOC_ID_MAX_BYTES",
+    "ContractV15RowMapper",
     "MilvusV15Entity",
     "MilvusV15RowMapper",
+    "ResumeMilvusV15RowMapper",
     "v15_milvus_field_specs",
 ]
 
@@ -103,8 +100,8 @@ class MilvusV15Entity(BaseModel):
         return value
 
 
-class MilvusV15RowMapper:
-    """将 ``EmbeddedContractPreparedChunk`` 无损映射为 V15 行（4 字段 + flat JSON）。
+class ContractV15RowMapper:
+    """使用领域 Adapter 将 Embedded Contract 无损映射为 V15 行。
 
     这是 V15 主链路中唯一的“业务 Contract → Milvus 物理存储模型”映射边界：
 
@@ -139,55 +136,50 @@ class MilvusV15RowMapper:
         Embedding、生成或重算主键、修改输入对象或执行 Milvus CRUD。
     """
 
-    def to_entity(
+    def __init__(
         self,
-        chunk: EmbeddedContractPreparedChunk,
-    ) -> MilvusV15Entity:
+        adapter: VectorStorageAdapter[Any, Any, Any],
+    ) -> None:
+        self.adapter = adapter
+
+    def to_entity(self, chunk: Any) -> MilvusV15Entity:
         """创建包含 4 个物理字段和 flat metadata JSON 的 V15 Entity。"""
 
-        if not isinstance(chunk, EmbeddedContractPreparedChunk):
-            raise TypeError("MilvusV15RowMapper 只接受 EmbeddedContractPreparedChunk")
+        if not self.adapter.is_embedded(chunk):
+            raise TypeError(
+                "MilvusV15RowMapper 只接受 EmbeddedContractPreparedChunk"
+            )
 
-        # 顶层 Contract 的非物理字段（model_dump(mode="json") 已稳定序列化
-        # Decimal / datetime），与 metadata/source/versions 分开平铺。
-        # V15 纯 4 字段：expert_id / content_hash / metadata_hash 不再是物理
-        # 字段，因此进入 top_level_flat（最终合并进 metadata），不重算 hash。
-        top_level = chunk.model_dump(mode="json")
-        top_level_flat = {
-            key: value
-            for key, value in top_level.items()
-            if key not in _V15_PHYSICAL_KEYS
-            and key not in ("metadata", "source", "versions")
-        }
-        metadata = chunk.metadata.model_dump(mode="json")
-        source = chunk.source.model_dump(mode="json")
-        versions = chunk.versions.model_dump(mode="json")
+        projection = self.adapter.storage_projection(chunk)
+        required_parts = ("contract", "metadata", "source", "versions")
+        if any(key not in projection for key in required_parts):
+            raise ValueError(
+                "Contract Adapter 的 storage_projection 缺少 V15 必需分区"
+            )
         flat = _merge_flat_metadata(
-            (
-                ("contract 顶层", top_level_flat),
-                ("业务 metadata", metadata),
-                ("source", source),
-                ("versions", versions),
+            tuple(
+                (origin, projection[origin])
+                for origin in required_parts
             )
         )
 
         entity = MilvusV15Entity(
-            vector_doc_id=chunk.vector_doc_id,
-            chunk_text=chunk.chunk_text,
-            embedding=list(chunk.embedding),
+            vector_doc_id=self.adapter.vector_doc_id(chunk),
+            chunk_text=self.adapter.chunk_text(chunk),
+            embedding=list(self.adapter.embedding(chunk)),
             metadata=flat,
         )
         self._validate_storage_limits(entity)
         return entity
 
-    def to_row(self, chunk: EmbeddedContractPreparedChunk) -> dict[str, object]:
+    def to_row(self, chunk: Any) -> dict[str, object]:
         """返回可直接交给 PyMilvus 的 V15 字典行。"""
 
         return self.to_entity(chunk).model_dump(mode="python")
 
     def to_rows(
         self,
-        chunks: Sequence[EmbeddedContractPreparedChunk],
+        chunks: Sequence[Any],
     ) -> list[dict[str, object]]:
         """批量映射并拒绝同批重复主键。
 
@@ -201,7 +193,7 @@ class MilvusV15RowMapper:
             raise ValueError("一个 Milvus batch 不能包含重复 vector_doc_id")
         return [entity.model_dump(mode="python") for entity in entities]
 
-    def from_row(self, row: Mapping[str, object]) -> EmbeddedContractPreparedChunk:
+    def from_row(self, row: Mapping[str, object]) -> Any:
         """将已有 V15 行还原为 Contract 输出对象（反向映射，非主写入路径）。
 
         用途：
@@ -214,41 +206,7 @@ class MilvusV15RowMapper:
             模型重新构造为 ``Decimal``。不重新计算 vector_doc_id、不改变 hash。
         """
 
-        flat = row.get("metadata")
-        if not isinstance(flat, Mapping):
-            raise TypeError("Milvus V15 行缺少合法 metadata JSON 对象")
-
-        # V15 纯 4 字段：expert_id / content_hash / metadata_hash 从 flat
-        # metadata 读取（不再是一级字段），vector_doc_id / chunk_text /
-        # embedding 仍是一级字段。
-        # per-type 后按行中 chunk_type 挑选对应 Metadata 模型（机械查找，
-        # 不包含 if chunk_type 分支），只投影该类型声明字段。
-        metadata_model = metadata_model_for_chunk_type(flat.get("chunk_type"))
-        payload = {
-            "contract_version": flat.get("contract_version"),
-            "vector_doc_id": row.get("vector_doc_id"),
-            "expert_id": flat.get("expert_id"),
-            "serial_number": flat.get("serial_number"),
-            "chunk_type": flat.get("chunk_type"),
-            "chunk_subtype": flat.get("chunk_subtype"),
-            "chunk_index": flat.get("chunk_index"),
-            "chunk_total": flat.get("chunk_total"),
-            "chunk_text": row.get("chunk_text"),
-            "char_count": flat.get("char_count"),
-            "content_hash": flat.get("content_hash"),
-            "metadata_hash": flat.get("metadata_hash"),
-            "metadata": _pick_flat_fields(flat, metadata_model),
-            "source": _pick_flat_fields(flat, ExpertChunkSource),
-            "versions": _pick_flat_fields(flat, ExpertChunkVersions),
-            "is_active": flat.get("is_active"),
-            "updated_at": flat.get("updated_at"),
-            "embedding": row.get("embedding"),
-            "embedding_dim": flat.get("embedding_dim"),
-            "embedding_model_alias": flat.get("embedding_model_alias"),
-            "embedding_model_version": flat.get("embedding_model_version"),
-            "embedded_at": flat.get("embedded_at"),
-        }
-        return EmbeddedContractPreparedChunk.model_validate(payload)
+        return self.adapter.restore_embedded(row)
 
     @staticmethod
     def _validate_storage_limits(entity: MilvusV15Entity) -> None:
@@ -299,19 +257,21 @@ def _merge_flat_metadata(
     )
 
 
-def _pick_flat_fields(
-    flat: Mapping[str, object],
-    model_cls: type[Any],
-) -> dict[str, object]:
-    """从 flat metadata 中挑选指定 Contract 模型声明的字段。
+class MilvusV15RowMapper(ContractV15RowMapper):
+    """Expert 领域的 V15 RowMapper 兼容包装。"""
 
-    只挑选 ``model_cls.model_fields`` 中存在的键，避免把 flat 中的其他字段
-    （如 ``contract_version`` / ``source_table``）误传给 extra=forbid 的业务模型。
-    缺失的必需字段由 ``model_validate`` 兜底 fail-closed。
-    """
+    def __init__(
+        self,
+        adapter: VectorStorageAdapter[Any, Any, Any] | None = None,
+    ) -> None:
+        super().__init__(adapter or ExpertContractAdapter())
 
-    return {
-        field_name: flat[field_name]
-        for field_name in model_cls.model_fields
-        if field_name in flat
-    }
+
+class ResumeMilvusV15RowMapper(ContractV15RowMapper):
+    """Resume 领域的 V15 RowMapper 兼容包装。"""
+
+    def __init__(
+        self,
+        adapter: VectorStorageAdapter[Any, Any, Any] | None = None,
+    ) -> None:
+        super().__init__(adapter or ResumeContractAdapter())

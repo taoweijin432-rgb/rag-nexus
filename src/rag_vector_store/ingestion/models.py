@@ -149,6 +149,24 @@ class VectorExpertList(BaseModel):
         return self
 
 
+class VectorResumeList(BaseModel):
+    """``list_vectors_by_resume`` 的按 Resume 查询结果。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    resume_id: int = Field(ge=1)
+    vector_doc_ids: list[str] = Field(default_factory=list)
+    count: int = Field(default=0, ge=0)
+
+    @model_validator(mode="after")
+    def validate_count(self) -> VectorResumeList:
+        """``count`` 必须等于 ``vector_doc_ids`` 的长度。"""
+
+        if self.count != len(self.vector_doc_ids):
+            raise ValueError("count 必须等于 vector_doc_ids 的长度")
+        return self
+
+
 __all__ = [
     "VectorDeletionResult",
     "VectorExpertList",
@@ -156,4 +174,5 @@ __all__ = [
     "VectorItemResult",
     "VectorItemStatus",
     "VectorQueryResult",
+    "VectorResumeList",
 ]

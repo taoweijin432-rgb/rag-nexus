@@ -12,7 +12,7 @@ from dataclasses import dataclass
 
 from expert_index.incremental_runtime import IncrementalOnceResult, IncrementalRuntime
 from expert_index.scanner import IncrementalScanDisabledError
-from rag_vector_store import MilvusSettings, VectorIngestionService
+from rag_vector_store import MilvusSettings, ResumeVectorIngestionService, VectorIngestionService
 
 from .config import ResumeSettings
 from .dataset import RESUME_SPEC
@@ -41,7 +41,7 @@ def build_resume_incremental_runtime(
     retry_delay_seconds: int,
     task_lease_seconds: int,
     source: MySQLResumeSourceAdapter | None = None,
-    vector_service: VectorIngestionService | None = None,
+    vector_service: VectorIngestionService | ResumeVectorIngestionService | None = None,
     base_milvus_settings: MilvusSettings | None = None,
     preflight_runner: Callable[[ResumeSettings], ResumeSourcePreflightResult] = (
         run_resume_source_preflight

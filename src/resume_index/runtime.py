@@ -20,9 +20,14 @@ from expert_index.repositories import (
 from expert_index.vector_sync import ExpertVectorSynchronizer
 from rag_vector_store import (
     MilvusSettings,
+    ResumeVectorIngestionService,
     VectorIngestionService,
-    create_vector_ingestion_service,
+    create_resume_vector_ingestion_service,
 )
+
+# 兼容旧测试和外部注入点：该名称现在指向固定的 Resume Factory，
+# 不再创建 Expert Profile。
+create_vector_ingestion_service = create_resume_vector_ingestion_service
 
 from .config import ResumeSettings
 from .pipeline import ResumeIndexPipeline
@@ -46,7 +51,7 @@ def build_resume_runtime(
     batch_repository: MySQLBatchRepository | None = None,
     batch_item_repository: MySQLBatchItemRepository | None = None,
     vector_sync: ExpertVectorSyncPort | None = None,
-    vector_service: VectorIngestionService | None = None,
+    vector_service: VectorIngestionService | ResumeVectorIngestionService | None = None,
     base_milvus_settings: MilvusSettings | None = None,
     preflight_runner: Callable[[ResumeSettings], ResumeSourcePreflightResult] = (
         run_resume_source_preflight
@@ -111,9 +116,9 @@ def build_resume_runtime(
 def resolve_resume_vector_service(
     settings: ResumeSettings,
     *,
-    vector_service: VectorIngestionService | None = None,
+    vector_service: VectorIngestionService | ResumeVectorIngestionService | None = None,
     base_milvus_settings: MilvusSettings | None = None,
-) -> VectorIngestionService:
+) -> ResumeVectorIngestionService:
     """返回已证明绑定 Resume Collection 的公共向量服务。
 
     显式注入服务时只做 Collection 边界校验；未注入时复制通用 Milvus 连接参数并
@@ -144,9 +149,9 @@ def _resume_milvus_settings(
 
 def _require_resume_vector_service(
     settings: ResumeSettings,
-    vector_service: VectorIngestionService,
+    vector_service: VectorIngestionService | ResumeVectorIngestionService,
 ) -> None:
-    """拒绝无法证明已绑定 Resume Collection 的外部向量服务。"""
+    """拒绝无法证明已绑定 Resume Profile 的外部向量服务。"""
 
     repository = getattr(vector_service, "repository", None)
     repository_settings = getattr(repository, "settings", None)
@@ -157,6 +162,13 @@ def _require_resume_vector_service(
     ):
         raise DatabaseBoundaryError(
             "显式 vector_service 未绑定 RESUME_MILVUS_COLLECTION_NAME，已拒绝启动"
+        )
+    owner_field = getattr(repository, "_owner_field", None)
+    id_prefix = getattr(repository, "_vector_doc_id_prefix", None)
+    if owner_field != "resume_id" or id_prefix != "resume:":
+        raise DatabaseBoundaryError(
+            "显式 vector_service 未绑定 Resume Profile（resume_id/resume:），"
+            "已拒绝启动"
         )
 
 

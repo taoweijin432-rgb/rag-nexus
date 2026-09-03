@@ -6,7 +6,7 @@ Contract，避免未来新增领域时把某个领域的 Pydantic 类型带入�
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from typing import Any, Protocol, TypeVar, runtime_checkable
 
 InputT = TypeVar("InputT")
@@ -146,4 +146,29 @@ class VectorConsumerContractAdapter(Protocol):
         ...
 
 
-__all__ = ["VectorConsumerContractAdapter", "VectorContractAdapter"]
+@runtime_checkable
+class VectorStorageAdapter(VectorContractAdapter[InputT, PreparedT, EmbeddedT], Protocol):
+    """包含 V15 物理行投影能力的领域 Adapter 扩展协议。"""
+
+    def storage_projection(
+        self,
+        value: EmbeddedT,
+    ) -> dict[str, Mapping[str, object]]:
+        """返回 V15 flat metadata 所需的分区投影。"""
+
+        ...
+
+    def restore_embedded(
+        self,
+        row: Mapping[str, object],
+    ) -> EmbeddedT:
+        """从 V15 物理行还原领域 Embedded Contract。"""
+
+        ...
+
+
+__all__ = [
+    "VectorConsumerContractAdapter",
+    "VectorContractAdapter",
+    "VectorStorageAdapter",
+]

@@ -15,7 +15,10 @@ from .errors import (
     VectorIngestionError,
     VectorMilvusError,
 )
-from .factory import create_vector_ingestion_service
+from .factory import (
+    create_resume_vector_ingestion_service,
+    create_vector_ingestion_service,
+)
 from .models import (
     VectorDeletionResult,
     VectorExpertList,
@@ -23,10 +26,12 @@ from .models import (
     VectorItemResult,
     VectorItemStatus,
     VectorQueryResult,
+    VectorResumeList,
 )
-from .vector_ingestion import VectorIngestionService
+from .vector_ingestion import ResumeVectorIngestionService, VectorIngestionService
 
 __all__ = [
+    "ResumeVectorIngestionService",
     "VectorContractError",
     "VectorDeletionResult",
     "VectorEmbeddingError",
@@ -39,5 +44,7 @@ __all__ = [
     "VectorItemStatus",
     "VectorMilvusError",
     "VectorQueryResult",
+    "VectorResumeList",
+    "create_resume_vector_ingestion_service",
     "create_vector_ingestion_service",
 ]
