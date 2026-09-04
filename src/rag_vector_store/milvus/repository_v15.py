@@ -40,9 +40,7 @@ metadata 提取 ``content_hash`` / ``metadata_hash`` —— 这是纯 4 字段�
 Embedding、Task State；不创建真实 Collection（是否创建由调用方结合
 ``allow_collection_creation`` 决定）；不修改 .env；不迁移真实数据。
 
-检索（``search``）暂未接通：V15 没有一级 ``chunk_type`` / ``expert_id`` 过滤
-字段（已进入 metadata JSON），检索语义需要单独设计，本任务不进入检索功能。
-``supports_search`` 明确为 False，调用会抛 ``NotImplementedError``。
+检索能力不在当前 Repository 公共接口内；未来需要按多领域查询契约另行设计。
 """
 
 from __future__ import annotations
@@ -51,9 +49,10 @@ import json
 from collections.abc import Mapping, Sequence
 from typing import Any
 
-from ..core.expert import ExpertContractAdapter, ResumeContractAdapter
+from ..config import MilvusSettings
 from ..core.hash_state import read_hash_field
 from ..core.storage import VectorRepositoryProfile
+from ..domains import ExpertContractAdapter, ResumeContractAdapter
 from .compatibility import compare_model_space
 from .contract_v15 import (
     MilvusV15RowMapper,
@@ -101,7 +100,7 @@ RESUME_V15_PROFILE = VectorRepositoryProfile(
 # 一致性检查不再全表扫描，改为采样前若干行校验。当前正式数据向量空间一致，
 # 采样校验既避免隧道链路下的全表扫描超时，又保留 fail-closed 的方向性
 # （采样到不一致即拒绝）。
-_MODEL_SPACE_SAMPLE_LIMIT = 50
+_MODEL_SPACE_SAMPLE_LIMIT = 500
 
 # V15 不存在的一级字段（已进入 flat metadata JSON）：禁止作为一级 output field。
 _V15_FORBIDDEN_TOP_LEVEL_FIELDS = ("expert_id", "content_hash", "metadata_hash")
@@ -115,30 +114,25 @@ class ContractMilvusV15VectorRepository(ContractMilvusRepositoryBase):
     assert_destructive_maintenance_allowed / close 的语义与基类一致；差异只体现
     在持久化 profile 上（见模块 docstring）。
 
-    ``search`` 暂不支持（V15 检索通路未接通），调用抛明确的能力未启用异常。
+    Expert 是默认 Profile；Resume Factory 必须显式注入 ``RESUME_V15_PROFILE``。
     """
 
-    supports_search = False
-
-    # 持久化 profile：整体替换为 V15 定义（禁止方法内按版本分支）。
-    _schema_field_specs = staticmethod(v15_milvus_field_specs)
-    _schema_builder = staticmethod(build_v15_schema)
-    _index_specs_fn = staticmethod(index_specs_v15)
-    _row_mapper_cls = MilvusV15RowMapper
-    # 全量扫描 filter：不依赖任何不存在的 V15 scalar——使用一级 PK
-    # vector_doc_id（VARCHAR，必填非空）的恒真合法范围 ``vector_doc_id != ""``。
-    # 所有落库 Entity 的 PK 都是非空字符串，因此该表达式等价于全库扫描。
-    # 不使用 metadata JSON path（如 metadata["embedding_dim"]）做全库 filter。
-    _full_scan_filter = 'vector_doc_id != ""'
-    _model_space_fields = ("metadata",)
-    _contract_adapter_cls = ExpertContractAdapter
-    _owner_field = "expert_id"
-    _vector_doc_id_prefix = "expert:"
-    _owner_filter_fn = staticmethod(
-        lambda owner_id: f'metadata["expert_id"] == {int(owner_id)}'
-    )
-    _owner_output_fields = ("vector_doc_id",)
-    _profile = EXPERT_V15_PROFILE
+    def __init__(
+        self,
+        settings: MilvusSettings,
+        vector_dimension: int | None = None,
+        *,
+        client: Any | None = None,
+        allow_collection_creation: bool = True,
+        profile: VectorRepositoryProfile[Any] = EXPERT_V15_PROFILE,
+    ) -> None:
+        super().__init__(
+            settings,
+            vector_dimension,
+            client=client,
+            allow_collection_creation=allow_collection_creation,
+            profile=profile,
+        )
 
     def _model_space_from_row(
         self,
@@ -200,10 +194,35 @@ class ContractMilvusV15VectorRepository(ContractMilvusRepositoryBase):
         if self._validated_model_space == requested:
             return
 
-        rows = self._get_client().query(
+        client = self._get_client()
+        stats = client.get_collection_stats(
             collection_name=self.settings.collection_name,
-            filter=self._full_scan_filter,
-            output_fields=list(self._model_space_fields),
+        )
+        row_count_raw = stats.get("row_count") if isinstance(stats, Mapping) else None
+        try:
+            row_count = int(row_count_raw)
+        except (TypeError, ValueError) as error:
+            raise TypeError("Milvus Collection stats 缺少合法 row_count") from error
+        if row_count < 0:
+            raise ValueError("Milvus Collection stats 的 row_count 不能为负数")
+        if row_count == 0:
+            self._validated_model_space = requested
+            return
+        if row_count <= _MODEL_SPACE_SAMPLE_LIMIT:
+            sample_filter = self._full_scan_filter
+        else:
+            # 目标候选数约为上限的两倍，再由 limit 截断到500条；最低比例避免
+            # 超大 Collection 因浮点下溢形成空采样。
+            factor = min(
+                1.0,
+                max(0.000001, (_MODEL_SPACE_SAMPLE_LIMIT * 2) / row_count),
+            )
+            sample_filter = f"RANDOM_SAMPLE({factor:.12g})"
+
+        rows = client.query(
+            collection_name=self.settings.collection_name,
+            filter=sample_filter,
+            output_fields=["vector_doc_id", *self._model_space_fields],
             limit=_MODEL_SPACE_SAMPLE_LIMIT,
             consistency_level="Strong",
             **self._timeout_kwargs(),
@@ -453,18 +472,3 @@ class ContractMilvusV15VectorRepository(ContractMilvusRepositoryBase):
         finally:
             iterator.close()
         return rows
-
-    def search(
-        self,
-        embedding: Sequence[float],
-        *,
-        limit: int = 3,
-        chunk_type: str | None = None,
-    ) -> list[Any]:
-        """V15 检索通路尚未接通：chunk_type 已进入 metadata JSON，语义需单独设计。"""
-
-        del embedding, limit, chunk_type
-        raise NotImplementedError(
-            "V15 Collection 的检索通路尚未接通（chunk_type 已进入 metadata JSON）；"
-            "当前任务只接通 initialize/CRUD/Query/Safety"
-        )

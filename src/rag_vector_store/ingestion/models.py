@@ -48,7 +48,7 @@ class VectorItemResult(BaseModel):
     @field_validator("vector_doc_id")
     @classmethod
     def reject_whitespace_only(cls, value: str) -> str:
-        """拒绝空白标识，对齐 ``SearchHit`` 的标识语义。"""
+        """拒绝空白标识。"""
 
         if not value.strip():
             raise ValueError("vector_doc_id 不能只包含空白字符")

@@ -21,8 +21,9 @@ from __future__ import annotations
 import json
 from collections.abc import Mapping, Sequence
 from threading import Lock
-from typing import Any, ClassVar
+from typing import Any
 
+from .._utils import batched, dedupe_nonempty_strings
 from ..config import MilvusSettings
 from ..core.storage import VectorRepositoryProfile
 from ..model_space import is_placeholder_model_version
@@ -37,21 +38,7 @@ from .compatibility import (
 )
 from .indexes import build_index_params, vector_index_spec
 
-# 子类必须整体提供的持久化 profile 抽象类属性名。基类不再自带任何 V14 默认值；
-# 子类必须在类定义时声明全部这些属性，否则 ``__init_subclass__`` fail-closed。
-_REQUIRED_PROFILE_ATTRS = (
-    "_schema_field_specs",
-    "_schema_builder",
-    "_index_specs_fn",
-    "_row_mapper_cls",
-    "_full_scan_filter",
-    "_model_space_fields",
-    "_contract_adapter_cls",
-    "_owner_field",
-    "_vector_doc_id_prefix",
-    "_owner_filter_fn",
-    "_owner_output_fields",
-)
+_PRIMARY_KEY_QUERY_BATCH_SIZE = 200
 
 
 class ContractMilvusRepositoryBase:
@@ -85,30 +72,9 @@ class ContractMilvusRepositoryBase:
         会阻断，不自动 drop、alter 或 recreate。
 
     持久化 profile：
-        本基类不携带任何物理 Schema 默认值；子类必须整体提供
-        ``_schema_field_specs`` / ``_schema_builder`` / ``_index_specs_fn`` /
-        ``_row_mapper_cls`` / ``_full_scan_filter`` / ``_model_space_fields`` /
-        ``_contract_adapter_cls`` / ``_owner_field`` / ``_vector_doc_id_prefix`` /
-        ``_owner_filter_fn`` / ``_owner_output_fields`` 全部类属性（见
-        ``__init_subclass__``），禁止在方法内部按版本分支。
+        本基类不携带任何物理 Schema 默认值；构造时必须注入完整且不可变的
+        :class:`VectorRepositoryProfile`，禁止再通过子类类属性重复声明配置。
     """
-
-    # 当前 Repository 仅承诺 CRUD/Query；具体 profile 可将其设为 True 后实现检索。
-    supports_search: ClassVar[bool] = False
-
-    def __init_subclass__(cls, **kwargs: Any) -> None:
-        """校验子类整体提供了全部持久化 profile 类属性。
-
-        基类不再自带 V14 默认值；任一 profile 属性缺失即 fail-closed，避免
-        子类在运行时因 ``AttributeError`` 才暴露 profile 配置不完整。
-        """
-
-        super().__init_subclass__(**kwargs)
-        missing = [name for name in _REQUIRED_PROFILE_ATTRS if not hasattr(cls, name)]
-        if missing:
-            raise TypeError(
-                f"{cls.__name__} 必须声明持久化 profile 类属性 {list(missing)}"
-            )
 
     def __init__(
         self,
@@ -117,7 +83,7 @@ class ContractMilvusRepositoryBase:
         *,
         client: Any | None = None,
         allow_collection_creation: bool = True,
-        profile: VectorRepositoryProfile[Any] | None = None,
+        profile: VectorRepositoryProfile[Any],
     ) -> None:
         if settings.schema_mode != "contract":
             raise ValueError(
@@ -129,17 +95,9 @@ class ContractMilvusRepositoryBase:
         self._initialized = False
         self._owns_client = client is None
         self._allow_collection_creation = allow_collection_creation
-        self._profile = profile or getattr(type(self), "_profile", None)
-        if self._profile is None:
-            self._profile = VectorRepositoryProfile(
-                **{
-                    name: getattr(type(self), name)
-                    for name in _REQUIRED_PROFILE_ATTRS
-                }
-            )
-        # 从不可变 profile 固定实例配置，避免运行时按请求切换领域或 Collection。
-        for name in _REQUIRED_PROFILE_ATTRS:
-            setattr(self, name, getattr(self._profile, name))
+        if not isinstance(profile, VectorRepositoryProfile):
+            raise TypeError("profile 必须是 VectorRepositoryProfile")
+        self._profile = profile
         self._contract_row_mapper = self._row_mapper_cls()
         self._contract_adapter = self._contract_adapter_cls()
         self._lock = Lock()
@@ -157,6 +115,56 @@ class ContractMilvusRepositoryBase:
         """暴露延迟创建的 SDK client，供高级集成场景使用。"""
 
         return self._get_client()
+
+    @property
+    def profile(self) -> VectorRepositoryProfile[Any]:
+        """返回当前实例唯一、不可变的持久化 Profile。"""
+
+        return self._profile
+
+    @property
+    def _schema_field_specs(self) -> Any:
+        return self._profile._schema_field_specs
+
+    @property
+    def _schema_builder(self) -> Any:
+        return self._profile._schema_builder
+
+    @property
+    def _index_specs_fn(self) -> Any:
+        return self._profile._index_specs_fn
+
+    @property
+    def _row_mapper_cls(self) -> Any:
+        return self._profile._row_mapper_cls
+
+    @property
+    def _full_scan_filter(self) -> str:
+        return self._profile._full_scan_filter
+
+    @property
+    def _model_space_fields(self) -> tuple[str, ...]:
+        return self._profile._model_space_fields
+
+    @property
+    def _contract_adapter_cls(self) -> Any:
+        return self._profile._contract_adapter_cls
+
+    @property
+    def _owner_field(self) -> str:
+        return self._profile._owner_field
+
+    @property
+    def _vector_doc_id_prefix(self) -> str:
+        return self._profile._vector_doc_id_prefix
+
+    @property
+    def _owner_filter_fn(self) -> Any:
+        return self._profile._owner_filter_fn
+
+    @property
+    def _owner_output_fields(self) -> tuple[str, ...]:
+        return self._profile._owner_output_fields
 
     def contract_schema_summary(
         self,
@@ -442,13 +450,26 @@ class ContractMilvusRepositoryBase:
         不重新 Embedding 的前提下重建完整 Entity；查询为空时由上层决定是否修复。
         """
 
-        if not isinstance(vector_doc_id, str) or not vector_doc_id.strip():
-            raise ValueError("vector_doc_id 必须是非空字符串")
-        if not vector_doc_id.startswith(self._vector_doc_id_prefix):
-            raise ValueError(
-                f"vector_doc_id {vector_doc_id!r} 不符合当前 Profile 前缀 "
-                f"{self._vector_doc_id_prefix!r}"
-            )
+        rows = self.get_many_by_vector_doc_ids(
+            [vector_doc_id],
+            include_embedding=include_embedding,
+        )
+        return rows.get(vector_doc_id.strip())
+
+    def get_many_by_vector_doc_ids(
+        self,
+        vector_doc_ids: Sequence[str],
+        *,
+        include_embedding: bool = True,
+    ) -> dict[str, dict[str, Any]]:
+        """按主键批量回查 Entity，并严格校验返回身份。"""
+
+        cleaned = dedupe_nonempty_strings(
+            vector_doc_ids,
+            prefix=self._vector_doc_id_prefix,
+        )
+        if not cleaned:
+            return {}
 
         dimension = self._resolve_vector_dimension(None)
         output_fields = [
@@ -457,20 +478,35 @@ class ContractMilvusRepositoryBase:
         if not include_embedding:
             output_fields.remove("embedding")
 
-        rows = self._get_client().query(
-            collection_name=self.settings.collection_name,
-            ids=[vector_doc_id],
-            output_fields=output_fields,
-            consistency_level="Strong",
-            **self._timeout_kwargs(),
-        )
-        if len(rows) > 1:
-            raise RuntimeError("同一个 vector_doc_id 回查到多条 Entity")
-        if not rows:
-            return None
-        if not isinstance(rows[0], Mapping):
-            raise TypeError("Milvus query 返回了非法 Entity 结构")
-        return dict(rows[0])
+        requested = set(cleaned)
+        found: dict[str, dict[str, Any]] = {}
+        for batch in batched(cleaned, size=_PRIMARY_KEY_QUERY_BATCH_SIZE):
+            rows = self._get_client().query(
+                collection_name=self.settings.collection_name,
+                ids=list(batch),
+                output_fields=output_fields,
+                consistency_level="Strong",
+                **self._timeout_kwargs(),
+            )
+            if not isinstance(rows, list) or not all(
+                isinstance(row, Mapping) for row in rows
+            ):
+                raise TypeError("Milvus query 返回了非法 Entity 批次")
+            for raw in rows:
+                row = dict(raw)
+                vector_doc_id = row.get("vector_doc_id")
+                if not isinstance(vector_doc_id, str):
+                    raise TypeError("Milvus query 返回的 Entity 缺少合法 vector_doc_id")
+                if vector_doc_id not in requested:
+                    raise RuntimeError(
+                        f"Milvus query 返回了未请求的 vector_doc_id: {vector_doc_id!r}"
+                    )
+                if vector_doc_id in found:
+                    raise RuntimeError(
+                        f"同一个 vector_doc_id 回查到多条 Entity: {vector_doc_id!r}"
+                    )
+                found[vector_doc_id] = row
+        return found
 
     def query_by_owner_id(
         self,
@@ -611,20 +647,6 @@ class ContractMilvusRepositoryBase:
         raise NotImplementedError(
             "当前 Repository Profile 不支持活动状态扫描；"
             "list_all_vector_activity_states 仅由 V15 Repository 实现"
-        )
-
-    def search(
-        self,
-        embedding: Sequence[float],
-        *,
-        limit: int = 3,
-        chunk_type: str | None = None,
-    ) -> list[Any]:
-        """由具体 Repository Profile 实现领域相关的检索结果映射。"""
-
-        del embedding, limit, chunk_type
-        raise NotImplementedError(
-            "当前 Repository Profile 未提供领域相关 search 实现"
         )
 
     def close(self) -> None:

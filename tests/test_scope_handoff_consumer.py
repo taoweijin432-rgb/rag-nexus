@@ -46,6 +46,7 @@ from rag_vector_store.ingestion.models import (
     VectorItemResult,
     VectorQueryResult,
 )
+from resume_index.dataset import RESUME_SPEC
 
 CREATED = datetime(2026, 8, 13, 15, 0, tzinfo=timezone.utc)
 UPDATED = datetime(2026, 8, 20, 10, 0, tzinfo=timezone.utc)
@@ -177,11 +178,12 @@ def _existing_record(
     metadata_hash: str | None = None,
     source_hash: str | None = None,
     is_active: bool = True,
+    owner_field: str = "expert_id",
 ) -> dict[str, object]:
     """构造 FakeVectorStore 的已存记录（V15 flat metadata 形态）。"""
 
     metadata = {
-        "expert_id": contract.expert_id,
+        owner_field: contract.expert_id,
         "chunk_type": contract.chunk_type,
         "source_table": contract.source.source_table,
         "source_field_id": contract.source.source_field_id,
@@ -206,7 +208,8 @@ def _existing_record(
 class FakeScopeVectorStore:
     """同时满足 VectorMutationPort（供 ContractConsumerCore）与 ScopeVectorStatePort。"""
 
-    def __init__(self) -> None:
+    def __init__(self, *, owner_field: str = "expert_id") -> None:
+        self.owner_field = owner_field
         self.existing: dict[str, dict[str, object]] = {}
         self.by_expert: dict[int, list[str]] = {}
         self.upsert_calls: list[list[ExpertChunkEmbeddingInput]] = []
@@ -220,7 +223,11 @@ class FakeScopeVectorStore:
         vid = str(record["vector_doc_id"])
         self.existing[vid] = record
         metadata = record.get("metadata", {})
-        expert_id = metadata.get("expert_id") if isinstance(metadata, dict) else None
+        expert_id = (
+            metadata.get(self.owner_field)
+            if isinstance(metadata, dict)
+            else None
+        )
         if isinstance(expert_id, int):
             self.by_expert.setdefault(expert_id, [])
             if vid not in self.by_expert[expert_id]:
@@ -299,7 +306,11 @@ class ReceiptSink:
         return ScopeHandoffReceipt(**kwargs)
 
 
-def _build_consumer(store: FakeScopeVectorStore) -> tuple[ScopeConsumer, FakeScopeVectorStore]:
+def _build_consumer(
+    store: FakeScopeVectorStore,
+    *,
+    scope_source_tables: dict[str, str] | None = None,
+) -> tuple[ScopeConsumer, FakeScopeVectorStore]:
     from rag_vector_store.chunking.contract_pipeline import EmbeddingEligibilityValidator
 
     core = ContractConsumerCore(
@@ -307,7 +318,10 @@ def _build_consumer(store: FakeScopeVectorStore) -> tuple[ScopeConsumer, FakeSco
         eligibility_skip_of=EmbeddingEligibilityValidator().get_skip_reason,
     )
     consumer = ScopeConsumer(
-        core=core, state_port=store, receipt_sink=ReceiptSink()
+        core=core,
+        state_port=store,
+        receipt_sink=ReceiptSink(),
+        scope_source_tables=scope_source_tables,
     )
     return consumer, store
 
@@ -550,6 +564,71 @@ class TestStaleDownsize:
         assert [item.vector_doc_id for item in receipt.desired_results] == [
             base.vector_doc_id
         ]
+
+
+class TestResumeOwnerIsolation:
+    def test_resume_metadata_update_and_stale_disable_use_resume_id(self):
+        resume_id = 700001
+        scope = impact_scope_from_target(
+            target_type="profile",
+            expert_id=resume_id,
+            dataset_spec=RESUME_SPEC,
+        )
+        expert_contract = _profile_chunks(eid=resume_id)[0]
+        desired = expert_contract.model_copy(
+            update={
+                "vector_doc_id": (
+                    f"resume:{resume_id}:profile_summary:{resume_id}:0"
+                ),
+                "metadata_hash": "d" * 64,
+                "source": expert_contract.source.model_copy(
+                    update={
+                        "source_table": scope.source_table,
+                        "source_field_id": scope.source_field_id,
+                    }
+                ),
+            }
+        )
+        stale = desired.model_copy(
+            update={
+                "vector_doc_id": (
+                    f"resume:{resume_id}:profile_summary:{resume_id}:1"
+                ),
+            }
+        )
+        store = FakeScopeVectorStore(owner_field="resume_id")
+        store.seed(
+            _existing_record(
+                contract=desired,
+                metadata_hash="c" * 64,
+                owner_field="resume_id",
+            )
+        )
+        store.seed(
+            _existing_record(
+                contract=stale,
+                owner_field="resume_id",
+            )
+        )
+        consumer, _ = _build_consumer(
+            store,
+            scope_source_tables={
+                "profile": RESUME_SPEC.profile_source_label,
+                "employment": RESUME_SPEC.employment_table,
+                "project": RESUME_SPEC.project_table,
+            },
+        )
+
+        receipt = consumer.process(_make_request(scope, [desired]))
+
+        assert receipt.status == "committed"
+        assert receipt.metadata_only_count == 1
+        assert receipt.disable_count == 1
+        assert store.update_calls == [[desired]]
+        assert store.disable_calls == [[stale.vector_doc_id]]
+        desired_metadata = store.existing[desired.vector_doc_id]["metadata"]
+        assert desired_metadata["resume_id"] == resume_id
+        assert "expert_id" not in desired_metadata
 
 
 # ---------------------------------------------------------------------------

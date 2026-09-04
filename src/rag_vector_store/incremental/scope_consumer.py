@@ -50,6 +50,7 @@ from typing import Protocol, runtime_checkable
 
 from expert_contracts import ExpertChunkEmbeddingInput
 
+from .._utils import single_line_truncate
 from ..ingestion.errors import VectorIngestionError
 from ..ingestion.models import VectorExpertList, VectorQueryResult
 from .consumer_core import (
@@ -175,6 +176,11 @@ class ScopeVectorStatePort(Protocol):
         - ``get_vectors`` 拿 record（含 metadata JSON 与投影后的三 Hash）。
     """
 
+    @property
+    def owner_field(self) -> str:
+        """返回当前领域在 flat metadata 中使用的 owner 字段。"""
+        ...
+
     def list_vectors_by_expert(self, expert_id: int) -> VectorExpertList:
         """按专家列出 Milvus 中全部 vector_doc_id（仅轻量字段）。"""
         ...
@@ -285,6 +291,7 @@ def _expected_scope_invariants(
 def _filter_active_scope(
     *,
     scope: ScopeView,
+    owner_field: str,
     records: list[dict[str, object]],
     missing: list[str],
 ) -> tuple[list[_ScopeActiveState] | None, str | None, bool]:
@@ -312,9 +319,17 @@ def _filter_active_scope(
             is_active = _extract_bool(metadata, "is_active")
             if not is_active:
                 continue
-            expert_id_raw = metadata.get("expert_id")
-            if isinstance(expert_id_raw, bool) or not isinstance(expert_id_raw, int) or expert_id_raw < 1:
-                return None, "active_state_invalid：metadata.expert_id 非法", False
+            owner_id_raw = metadata.get(owner_field)
+            if (
+                isinstance(owner_id_raw, bool)
+                or not isinstance(owner_id_raw, int)
+                or owner_id_raw < 1
+            ):
+                return (
+                    None,
+                    f"active_state_invalid：metadata.{owner_field} 非法",
+                    False,
+                )
             chunk_type = _extract_str(metadata, "chunk_type")
             source_table = _extract_str(metadata, "source_table")
             source_field_id = _extract_str(metadata, "source_field_id")
@@ -322,7 +337,7 @@ def _filter_active_scope(
             return None, f"active_state_invalid：{error}", False
         if not _in_scope(
             scope=scope,
-            expert_id=expert_id_raw,
+            expert_id=owner_id_raw,
             chunk_type=chunk_type,
             source_table=source_table,
             source_field_id=source_field_id,
@@ -331,22 +346,13 @@ def _filter_active_scope(
         active.append(
             _ScopeActiveState(
                 vector_doc_id=vector_doc_id,
-                expert_id=expert_id_raw,
+                expert_id=owner_id_raw,
                 chunk_type=chunk_type,
                 source_table=source_table,
                 source_field_id=source_field_id,
             )
         )
     return active, None, False
-
-
-def _single_line_truncate(value: str, limit: int = 512) -> str:
-    """归一为单行并截断到限制长度（满足 Receipt error_message 约束）。"""
-
-    flat = " ".join(value.splitlines())
-    if len(flat) > limit:
-        flat = flat[:limit]
-    return flat
 
 
 # ---------------------------------------------------------------------------
@@ -375,6 +381,10 @@ class ScopeConsumer:
         self._core = core
         self._state_port = state_port
         self._receipt_sink = receipt_sink
+        owner_field = state_port.owner_field
+        if not isinstance(owner_field, str) or not owner_field.strip():
+            raise ValueError("state_port.owner_field 必须是非空字符串")
+        self._owner_field = owner_field.strip()
         resolved_tables = dict(scope_source_tables or _DEFAULT_SCOPE_SOURCE_TABLES)
         if set(resolved_tables) != {"profile", "employment", "project"}:
             raise ValueError(
@@ -399,7 +409,7 @@ class ScopeConsumer:
                 status="rejected",
                 result_code=f"scope_invalid:{scope.scope_type}",
                 error_type=ERROR_CODE_SCOPE_UNSUPPORTED_TYPE,
-                error_message=_single_line_truncate(str(error)),
+                error_message=single_line_truncate(str(error)),
             )
 
         # 阶段 0：查询该专家全部 vector_doc_id，再取 metadata 做 scope 精确过滤。
@@ -411,7 +421,7 @@ class ScopeConsumer:
                 status="failed",
                 result_code="scope_query_failed",
                 error_type=ERROR_CODE_SCOPE_QUERY_FAILED,
-                error_message=_single_line_truncate(f"list_vectors_by_expert 失败：{error}"),
+                error_message=single_line_truncate(f"list_vectors_by_expert 失败：{error}"),
                 retryable=True,
             )
         active_states, query_error, retryable = self._load_active_scope(
@@ -425,7 +435,7 @@ class ScopeConsumer:
                 status=status,
                 result_code=("scope_query_failed" if retryable else "scope_active_state_invalid"),
                 error_type=(ERROR_CODE_SCOPE_QUERY_FAILED if retryable else ERROR_CODE_SCOPE_ACTIVE_STATE_INVALID),
-                error_message=_single_line_truncate(query_error),
+                error_message=single_line_truncate(query_error),
                 counts=_Counts(),
                 disable_count=0,
                 retryable=retryable,
@@ -466,7 +476,7 @@ class ScopeConsumer:
             stale_result = stale_results[0]
             if stale_result.status != "committed":
                 stale_error = (
-                    _single_line_truncate(
+                    single_line_truncate(
                         f"stale_disable_failed（desired 已完成）：{stale_result.reason or ''}"
                     ),
                     stale_result.retryable,
@@ -515,7 +525,10 @@ class ScopeConsumer:
         except VectorIngestionError as error:
             return None, f"get_vectors 失败：{error}", True
         active, error, retryable = _filter_active_scope(
-            scope=scope, records=query.records, missing=query.missing
+            scope=scope,
+            owner_field=self._owner_field,
+            records=query.records,
+            missing=query.missing,
         )
         return active, error, retryable
 
@@ -536,22 +549,22 @@ class ScopeConsumer:
         failed_retryable = False
         for result in results:
             if result.status == "rejected":
-                rejected_msg = rejected_msg or _single_line_truncate(
+                rejected_msg = rejected_msg or single_line_truncate(
                     f"{result.vector_doc_id}: {result.reason or result.error_code or ''}"
                 )
             elif result.status == "failed":
-                failed_msg = failed_msg or _single_line_truncate(
+                failed_msg = failed_msg or single_line_truncate(
                     f"{result.vector_doc_id}: {result.reason or result.error_code or ''}"
                 )
                 failed_retryable = failed_retryable or result.retryable
             elif result.status not in ("committed", "skipped"):
                 # planned/未知 → fail-closed rejected
-                rejected_msg = rejected_msg or _single_line_truncate(
+                rejected_msg = rejected_msg or single_line_truncate(
                     f"{result.vector_doc_id}: 非 desired 收敛终态 {result.status}"
                 )
             elif result.status == "skipped" and result.result_code != RESULT_CODE_UNCHANGED_SKIPPED:
                 # duplicate_superseded/upsert_skipped 不作为正式 desired 成功
-                rejected_msg = rejected_msg or _single_line_truncate(
+                rejected_msg = rejected_msg or single_line_truncate(
                     f"{result.vector_doc_id}: desired 落选 {result.result_code}"
                 )
         if rejected_msg is not None:

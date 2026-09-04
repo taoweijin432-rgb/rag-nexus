@@ -49,6 +49,7 @@ def _settings(*, enabled: bool = True, same_schema: bool = False) -> Settings:
 class _SpyVectorService:
     """仅用于注入的向量服务占位；不暴露任何业务方法。"""
 
+    owner_field = "expert_id"
 
 
 class TestFactoryGates:

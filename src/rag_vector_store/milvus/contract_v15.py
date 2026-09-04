@@ -41,8 +41,8 @@ from typing import Any
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from ..core.adapters import VectorStorageAdapter
-from ..core.expert import ExpertContractAdapter, ResumeContractAdapter
 from ..core.flat_metadata import merge_flat_metadata
+from ..domains import ExpertContractAdapter, ResumeContractAdapter
 from .schemas.contract_v15 import (
     V15_CONTRACT_VECTOR_DIMENSION,
     V15_VECTOR_DOC_ID_MAX_BYTES,

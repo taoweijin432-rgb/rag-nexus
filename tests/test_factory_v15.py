@@ -111,6 +111,7 @@ class FakeV15MilvusClient:
         self.description: dict[str, Any] | None = None
         self.index_params = FakeIndexParams()
         self.rows: dict[str, dict[str, Any]] = {}
+        self.create_calls: list[dict[str, Any]] = []
         self.upsert_calls: list[dict[str, Any]] = []
         self.query_calls: list[dict[str, Any]] = []
 
@@ -120,6 +121,9 @@ class FakeV15MilvusClient:
     def describe_collection(self, collection_name: str) -> dict[str, Any]:
         assert self.description is not None
         return self.description
+
+    def get_collection_stats(self, collection_name: str) -> dict[str, int]:
+        return {"row_count": len(self.rows)}
 
     def prepare_index_params(self) -> FakeIndexParams:
         return self.index_params
@@ -146,6 +150,7 @@ class FakeV15MilvusClient:
         }
 
     def create_collection(self, **kwargs: Any) -> None:
+        self.create_calls.append(kwargs)
         self.exists = True
 
     def upsert(self, **kwargs: Any) -> dict[str, Any]:
@@ -220,6 +225,32 @@ def test_factory_default_uses_v15_repository() -> None:
     assert isinstance(ingestion, VectorIngestionService)
     assert isinstance(ingestion.repository, ContractMilvusV15VectorRepository)
     assert isinstance(ingestion.row_mapper, MilvusV15RowMapper)
+    assert ingestion.repository._allow_collection_creation is False
+
+
+def test_factory_repository_refuses_to_create_missing_collection() -> None:
+    ingestion = create_vector_ingestion_service(
+        milvus_settings=_settings(),
+        embedding_worker=_worker(),
+    )
+    client = FakeV15MilvusClient(exists=False)
+    ingestion.repository._client = client
+
+    with pytest.raises(RuntimeError, match="禁止自动创建"):
+        ingestion.repository.initialize(1024)
+
+    assert client.create_calls == []
+
+
+def test_explicit_schema_profile_warns_during_compatibility_period() -> None:
+    with pytest.warns(DeprecationWarning, match="schema_profile 参数已弃用"):
+        ingestion = create_vector_ingestion_service(
+            milvus_settings=_settings(),
+            embedding_worker=_worker(),
+            schema_profile="v15",
+        )
+
+    assert isinstance(ingestion.repository, ContractMilvusV15VectorRepository)
 
 
 def test_reconciliation_default_uses_v15_repository() -> None:

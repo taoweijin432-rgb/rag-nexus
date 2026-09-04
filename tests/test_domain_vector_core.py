@@ -5,8 +5,10 @@ Fixture 只使用测试专用的通用记录，不引入专家或 Resume 业务�
 
 from __future__ import annotations
 
+import ast
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -198,6 +200,38 @@ class FakeLifecycleRepository(FakeRepository):
             return None
         return {"record": self.row}
 
+    def get_many_by_vector_doc_ids(
+        self,
+        vector_doc_ids: list[str],
+        *,
+        include_embedding: bool = True,
+    ) -> dict[str, dict[str, object]]:
+        return {
+            vector_doc_id: {"record": self.row}
+            for vector_doc_id in vector_doc_ids
+            if self.row is not None and self.row.vector_doc_id == vector_doc_id
+        }
+
+
+class FakeBatchLifecycleRepository(FakeRepository):
+    def __init__(self, rows: list[EmbeddedRecord]) -> None:
+        super().__init__()
+        self.rows = {row.vector_doc_id: row for row in rows}
+        self.read_calls: list[list[str]] = []
+
+    def get_many_by_vector_doc_ids(
+        self,
+        vector_doc_ids: list[str],
+        *,
+        include_embedding: bool = True,
+    ) -> dict[str, dict[str, object]]:
+        self.read_calls.append(list(vector_doc_ids))
+        return {
+            vector_doc_id: {"record": self.rows[vector_doc_id]}
+            for vector_doc_id in vector_doc_ids
+            if vector_doc_id in self.rows
+        }
+
 
 class FakeRowMapper:
     def from_row(self, row: dict[str, object]) -> EmbeddedRecord:
@@ -348,9 +382,148 @@ def test_generic_lifecycle_rejects_metadata_identity_change() -> None:
         lifecycle.update_metadata([InputRecord("a", "alpha:1", "new")])
 
 
+def test_generic_lifecycle_batches_metadata_updates_after_full_validation() -> None:
+    adapter = FakeAdapter("owner_a", "alpha:", "a")
+    old_rows = [
+        EmbeddedRecord(
+            owner="a",
+            vector_doc_id=f"alpha:{index}",
+            text=f"text-{index}",
+            embedding=(1.0, 2.0, 3.0),
+            embedded_at="old-time",
+        )
+        for index in range(401)
+    ]
+    repository = FakeBatchLifecycleRepository(old_rows)
+    lifecycle = DomainVectorLifecycleService(
+        repository,
+        FakeRowMapper(),
+        adapter,
+        expected_dimension=3,
+        formal_model_space_id="test-model:3:v1",
+    )
+
+    result = lifecycle.update_metadata(
+        [
+            InputRecord(
+                "a",
+                f"alpha:{index}",
+                f"text-{index}",
+                metadata_hash=f"metadata-{index}",
+            )
+            for index in range(401)
+        ]
+    )
+
+    assert len(result.results) == 401
+    assert len(repository.read_calls) == 1
+    assert [len(batch) for batch in repository.calls] == [200, 200, 1]
+
+
+def test_generic_lifecycle_batches_disable_updates() -> None:
+    adapter = FakeAdapter("owner_a", "alpha:", "a")
+    old_rows = [
+        EmbeddedRecord(
+            owner="a",
+            vector_doc_id=f"alpha:{index}",
+            text=f"text-{index}",
+            embedding=(1.0, 2.0, 3.0),
+        )
+        for index in range(401)
+    ]
+    repository = FakeBatchLifecycleRepository(old_rows)
+    lifecycle = DomainVectorLifecycleService(
+        repository,
+        FakeRowMapper(),
+        adapter,
+        expected_dimension=3,
+        formal_model_space_id="test-model:3:v1",
+    )
+
+    result = lifecycle.disable_vectors(
+        [f"alpha:{index}" for index in range(401)]
+    )
+
+    assert result.deleted_count == 401
+    assert len(repository.read_calls) == 1
+    assert [len(batch) for batch in repository.calls] == [200, 200, 1]
+    assert all(not record.active for batch in repository.calls for record in batch)
+
+
+def test_generic_lifecycle_identity_failure_has_zero_writes() -> None:
+    adapter = FakeAdapter("owner_a", "alpha:", "a")
+    repository = FakeBatchLifecycleRepository(
+        [
+            EmbeddedRecord(
+                owner="a",
+                vector_doc_id="alpha:1",
+                text="same",
+                embedding=(1.0, 2.0, 3.0),
+            ),
+            EmbeddedRecord(
+                owner="a",
+                vector_doc_id="alpha:2",
+                text="old",
+                embedding=(1.0, 2.0, 3.0),
+            ),
+        ]
+    )
+    lifecycle = DomainVectorLifecycleService(
+        repository,
+        FakeRowMapper(),
+        adapter,
+        expected_dimension=3,
+        formal_model_space_id="test-model:3:v1",
+    )
+
+    with pytest.raises(ValueError, match="chunk_text"):
+        lifecycle.update_metadata(
+            [
+                InputRecord("a", "alpha:1", "same"),
+                InputRecord("a", "alpha:2", "new"),
+            ]
+        )
+
+    assert repository.calls == []
+
+
 def test_generic_adapter_protocol_does_not_require_expert_type() -> None:
     # 运行时结构检查：测试 Adapter 满足协议所需的领域无关属性，且没有专家字段。
     assert isinstance(FakeAdapter("owner", "x:", "x"), VectorContractAdapter)
+
+
+def test_core_modules_do_not_import_expert_contracts() -> None:
+    core_dir = (
+        Path(__file__).resolve().parents[1]
+        / "src"
+        / "rag_vector_store"
+        / "core"
+    )
+    for path in core_dir.glob("*.py"):
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                assert all(
+                    not alias.name.startswith("expert_contracts")
+                    for alias in node.names
+                ), f"{path.name} 不得直接导入 expert_contracts"
+            elif isinstance(node, ast.ImportFrom):
+                assert not (
+                    node.module
+                    and node.module.startswith("expert_contracts")
+                ), f"{path.name} 不得直接导入 expert_contracts"
+
+
+def test_retired_work_item_runtime_is_not_publicly_exported() -> None:
+    from rag_vector_store import incremental
+
+    retired = (
+        "V15WorkItemConsumer",
+        "V15WorkItemContractAdapter",
+        "V15VectorizationWorkItem",
+        "MySQLV15VectorizationRepository",
+    )
+    assert all(not hasattr(incremental, name) for name in retired)
 
 
 class FakeConsumerStore:

@@ -24,8 +24,8 @@ from rag_vector_store import (
     create_resume_vector_ingestion_service,
 )
 from rag_vector_store.core.embedding import DomainEmbeddingWorker
-from rag_vector_store.core.expert import ResumeContractAdapter
 from rag_vector_store.core.ingestion import DomainIngestionService
+from rag_vector_store.domains import ResumeContractAdapter
 from rag_vector_store.milvus.contract_v15 import (
     MilvusV15RowMapper,
     ResumeMilvusV15RowMapper,
@@ -112,6 +112,24 @@ class FakeResumeRepository:
         if not include_embedding:
             result.pop("embedding", None)
         return result
+
+    def get_many_by_vector_doc_ids(
+        self,
+        vector_doc_ids: list[str],
+        *,
+        include_embedding: bool = True,
+    ) -> dict[str, dict[str, object]]:
+        return {
+            vector_doc_id: row
+            for vector_doc_id in vector_doc_ids
+            if (
+                row := self.get_by_vector_doc_id(
+                    vector_doc_id,
+                    include_embedding=include_embedding,
+                )
+            )
+            is not None
+        }
 
     def query_by_owner_id(
         self,
@@ -304,6 +322,7 @@ def test_resume_factory_binds_resume_profile_and_collection() -> None:
     assert isinstance(resume_service, ResumeVectorIngestionService)
     assert resume_service.repository._owner_field == "resume_id"
     assert resume_service.repository._vector_doc_id_prefix == "resume:"
+    assert resume_service.repository._allow_collection_creation is False
     assert isinstance(resume_service.row_mapper, ResumeMilvusV15RowMapper)
     assert (
         resume_service.repository.settings.collection_name

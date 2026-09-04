@@ -144,6 +144,7 @@ class FakeV15MilvusClient:
         self.upsert_response: object = _DEFAULT_UPSERT_RESPONSE
         self.delete_response: object = _DEFAULT_DELETE_RESPONSE
         self.model_space_batches: list[object] | None = None
+        self.row_count_override: int | None = None
         self.last_query_iterator: FakeQueryIterator | None = None
 
     def has_collection(self, collection_name: str) -> bool:
@@ -153,6 +154,15 @@ class FakeV15MilvusClient:
         if self.description is None:
             raise AssertionError("测试未配置 Collection description")
         return self.description
+
+    def get_collection_stats(self, collection_name: str) -> dict[str, int]:
+        if self.row_count_override is not None:
+            return {"row_count": self.row_count_override}
+        if self.model_space_batches:
+            first = self.model_space_batches[0]
+            if isinstance(first, list):
+                return {"row_count": len(first)}
+        return {"row_count": len(self.rows)}
 
     def prepare_index_params(self) -> FakeIndexParams:
         return self.index_params
@@ -207,13 +217,12 @@ class FakeV15MilvusClient:
 
     def query(self, **kwargs: Any) -> list[dict[str, Any]]:
         self.query_calls.append(kwargs)
-        # model-space 采样校验：业务代码用 output_fields=["metadata"] +
-        # filter='vector_doc_id != ""' + limit=N 采样既有 Entity。
+        # model-space 采样校验：业务代码读取 vector_doc_id + metadata。
         # 优先返回测试显式配置的 model_space_batches[0]，保持与旧
         # query_iterator 测试数据准备方式兼容。
         output_fields = kwargs.get("output_fields")
         if (
-            output_fields == ["metadata"]
+            output_fields == ["vector_doc_id", "metadata"]
             and self.model_space_batches
         ):
             sampled = self.model_space_batches[0]
@@ -514,10 +523,10 @@ def test_v15_upsert_model_space_check_reads_flat_metadata() -> None:
     repository.upsert_batch(chunks)  # 模型空间一致，不应抛异常
 
     scan_call = client.query_calls[0]
-    # 限量采样校验 filter 基于一级 PK vector_doc_id（不引用任何不存在的 V15 scalar）。
+    # 小 Collection 直接检查全部 Entity。
     assert scan_call["filter"] == 'vector_doc_id != ""'
     # model-space validation 仍从 metadata JSON 读取模型空间字段。
-    assert scan_call["output_fields"] == ["metadata"]
+    assert scan_call["output_fields"] == ["vector_doc_id", "metadata"]
 
 
 def test_v15_upsert_model_space_mismatch_fails_closed() -> None:
@@ -540,6 +549,33 @@ def test_v15_upsert_model_space_mismatch_fails_closed() -> None:
     with pytest.raises(ValueError, match="model-space"):
         repository.upsert_batch(chunks)
     assert client.upsert_calls == []
+
+
+def test_v15_large_collection_uses_random_model_space_sample() -> None:
+    chunks = embedded_contract_chunks()
+    client = FakeV15MilvusClient(exists=True)
+    repository = make_v15_repository(client)
+    client.description = v15_description(repository)
+    client.row_count_override = 100_000
+    client.model_space_batches = [
+        [
+            {
+                "vector_doc_id": "expert:1:profile_summary:1:0",
+                "metadata": {
+                    "embedding_model_alias": "alibaba-bailian:text-embedding-v4",
+                    "embedding_model_version": "v1",
+                    "embedding_dim": 1024,
+                },
+            }
+        ]
+    ]
+
+    repository.upsert_batch(chunks)
+
+    scan_call = client.query_calls[0]
+    assert scan_call["filter"].startswith("RANDOM_SAMPLE(")
+    assert scan_call["limit"] == 500
+    assert scan_call["output_fields"] == ["vector_doc_id", "metadata"]
 
 
 # ---------------------------------------------------------------------------
@@ -581,6 +617,27 @@ def test_v15_get_by_vector_doc_id_without_embedding() -> None:
 
     assert "embedding" not in client.query_calls[0]["output_fields"]
     assert "embedding" not in row
+
+
+def test_v15_get_many_batches_primary_key_queries_by_200() -> None:
+    client = FakeV15MilvusClient(exists=True)
+    repository = make_v15_repository(client)
+    vector_doc_ids = [
+        f"expert:1:profile_summary:{index}:0"
+        for index in range(401)
+    ]
+
+    result = repository.get_many_by_vector_doc_ids(
+        vector_doc_ids,
+        include_embedding=False,
+    )
+
+    assert result == {}
+    assert [len(call["ids"]) for call in client.query_calls] == [200, 200, 1]
+    assert all(
+        "embedding" not in call["output_fields"]
+        for call in client.query_calls
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1009,15 +1066,14 @@ def test_v15_repository_uses_v15_builder_behind_initialize() -> None:
 
 
 # ---------------------------------------------------------------------------
-# V15 继承能力与 search 能力占位
+# V15 不暴露未实现的 search 能力
 # ---------------------------------------------------------------------------
 
 
-def test_v15_search_not_connected_yet() -> None:
+def test_v15_repository_does_not_expose_unimplemented_search() -> None:
     repository = make_v15_repository()
-    assert repository.supports_search is False
-    with pytest.raises(NotImplementedError, match="检索通路尚未接通"):
-        repository.search([0.1] * 1024)
+    assert not hasattr(repository, "search")
+    assert not hasattr(repository, "supports_search")
 
 
 # ---------------------------------------------------------------------------
@@ -1032,6 +1088,7 @@ def test_v15_model_space_cache_skips_scan_on_second_upsert() -> None:
     client = FakeV15MilvusClient(exists=True)
     repository = make_v15_repository(client)
     client.description = v15_description(repository)
+    _seed_rows(repository, client, chunks)
 
     repository.upsert_batch(chunks)
     scans_before = sum(

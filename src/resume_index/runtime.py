@@ -25,10 +25,6 @@ from rag_vector_store import (
     create_resume_vector_ingestion_service,
 )
 
-# 兼容旧测试和外部注入点：该名称现在指向固定的 Resume Factory，
-# 不再创建 Expert Profile。
-create_vector_ingestion_service = create_resume_vector_ingestion_service
-
 from .config import ResumeSettings
 from .pipeline import ResumeIndexPipeline
 from .preflight import ResumeSourcePreflightResult, run_resume_source_preflight
@@ -133,7 +129,7 @@ def resolve_resume_vector_service(
         _require_resume_vector_service(settings, vector_service)
         return vector_service
     milvus_settings = _resume_milvus_settings(settings, base=base_milvus_settings)
-    return create_vector_ingestion_service(milvus_settings=milvus_settings)
+    return create_resume_vector_ingestion_service(milvus_settings=milvus_settings)
 
 
 def _resume_milvus_settings(

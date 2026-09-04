@@ -37,8 +37,8 @@ from ..config import MilvusSettings
 from ..embedding_adapters.company_cloud import CompanyCloudEmbeddingModel
 from ..ingestion.factory import (
     SchemaProfile,
+    _resolve_schema_profile,
     create_vector_ingestion_service,
-    validate_schema_profile,
 )
 from ..milvus.contract_v15 import MilvusV15RowMapper
 from ..milvus.repository_v15 import ContractMilvusV15VectorRepository
@@ -61,7 +61,7 @@ def create_full_vector_reconciliation_service(
     expected_dimension: int = EXPECTED_EMBEDDING_DIMENSION,
     formal_model_space_id: str = FORMAL_EMBEDDING_MODEL_SPACE_ID,
     delete_batch_size: int = _DELETE_BATCH_SIZE,
-    schema_profile: SchemaProfile = "v15",
+    schema_profile: SchemaProfile | None = None,
 ) -> FullVectorReconciliationService:
     """从环境配置（或注入组件）组装完整的 ``FullVectorReconciliationService``。
 
@@ -73,8 +73,9 @@ def create_full_vector_reconciliation_service(
         组装 ``FullVectorReconciliationService``。
 
     Args:
-        schema_profile: 持久化 profile，唯一允许 ``v15``（默认）。
-            ``v15`` 时 reconciliation 与 ingestion 共享同一个
+        schema_profile: 一个发布周期的兼容参数；省略时固定使用 ``v15``。
+            显式传入 ``v15`` 仍可运行但会产生 ``DeprecationWarning``。
+            V15 下 reconciliation 与 ingestion 共享同一个
             ``ContractMilvusV15VectorRepository`` 实例。
             显式传 ``v14`` 会 fail-closed（V14 已退役）。
 
@@ -82,7 +83,7 @@ def create_full_vector_reconciliation_service(
     每个参数语义与 ``create_vector_ingestion_service()`` 一致。
     """
 
-    validate_schema_profile(schema_profile)
+    _resolve_schema_profile(schema_profile)
 
     if validator is None:
         validator = ContractValidator()
@@ -95,7 +96,7 @@ def create_full_vector_reconciliation_service(
         row_mapper=row_mapper,
         expected_dimension=expected_dimension,
         formal_model_space_id=formal_model_space_id,
-        schema_profile=schema_profile,
+        schema_profile=None,
     )
     return FullVectorReconciliationService(
         ingestion.repository,

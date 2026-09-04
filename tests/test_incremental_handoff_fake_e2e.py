@@ -316,6 +316,8 @@ class FakeArtifactRepo:
 class FakeVectorStore:
     """维护 active Contract/hash 状态；只暴露五方法，无物理删除/检查点/Work Item。"""
 
+    owner_field = "expert_id"
+
     def __init__(self) -> None:
         self.existing: dict[str, dict[str, object]] = {}
         self.by_expert: dict[int, list[str]] = {}

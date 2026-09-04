@@ -77,6 +77,7 @@ class _VectorRepository:
 
 class _VectorService:
     repository = _VectorRepository()
+    owner_field = "resume_id"
 
 
 def _task(new_task) -> SourceSyncTask:

@@ -6,10 +6,11 @@ Resume 类型。专家 Facade 负责把这里的领域无关结果映射回既�
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Generic, Protocol, TypeVar
 
+from .._utils import batched, dedupe_nonempty_strings
 from ..model_space import build_model_space_id
 from ..models import MutationResult
 from .adapters import VectorContractAdapter
@@ -20,12 +21,12 @@ EmbeddedT = TypeVar("EmbeddedT")
 
 
 class DomainLifecycleRepository(Protocol[EmbeddedT]):
-    def get_by_vector_doc_id(
+    def get_many_by_vector_doc_ids(
         self,
-        vector_doc_id: str,
+        vector_doc_ids: Sequence[str],
         *,
         include_embedding: bool = True,
-    ) -> dict[str, object] | None:
+    ) -> Mapping[str, Mapping[str, object]]:
         ...
 
     def upsert_batch(self, records: Sequence[EmbeddedT]) -> MutationResult:
@@ -60,6 +61,8 @@ class DomainDeletionResult:
 class DomainVectorLifecycleService(Generic[InputT, PreparedT, EmbeddedT]):
     """承载 metadata-only 与逻辑下线的通用核心。"""
 
+    _MUTATION_BATCH_SIZE = 200
+
     def __init__(
         self,
         repository: DomainLifecycleRepository[EmbeddedT],
@@ -76,17 +79,19 @@ class DomainVectorLifecycleService(Generic[InputT, PreparedT, EmbeddedT]):
         self.formal_model_space_id = formal_model_space_id
 
     def disable_vectors(self, vector_doc_ids: Sequence[str]) -> DomainDeletionResult:
-        cleaned = _dedupe(
+        cleaned = dedupe_nonempty_strings(
             vector_doc_ids,
             prefix=self.adapter.id_prefix(),
         )
+        old_rows = self.repository.get_many_by_vector_doc_ids(
+            cleaned,
+            include_embedding=True,
+        )
         disabled_count = 0
         not_found_count = 0
+        pending: list[EmbeddedT] = []
         for vector_doc_id in cleaned:
-            old_row = self.repository.get_by_vector_doc_id(
-                vector_doc_id,
-                include_embedding=True,
-            )
+            old_row = old_rows.get(vector_doc_id)
             if old_row is None:
                 not_found_count += 1
                 continue
@@ -97,9 +102,11 @@ class DomainVectorLifecycleService(Generic[InputT, PreparedT, EmbeddedT]):
                 disabled_count += 1
                 continue
             new_chunk = self.adapter.with_active(old_chunk, False)
-            mutation = self.repository.upsert_batch([new_chunk])
-            self._validate_mutation([new_chunk], mutation)
+            pending.append(new_chunk)
             disabled_count += 1
+        for batch in batched(pending, size=self._MUTATION_BATCH_SIZE):
+            mutation = self.repository.upsert_batch(batch)
+            self._validate_mutation(batch, mutation)
         return DomainDeletionResult(
             requested_count=len(cleaned),
             deleted_count=disabled_count,
@@ -110,18 +117,30 @@ class DomainVectorLifecycleService(Generic[InputT, PreparedT, EmbeddedT]):
         self,
         chunks: Iterable[InputT],
     ) -> DomainLifecycleResult:
-        items: list[DomainLifecycleItem] = []
-        for chunk in chunks:
+        source = list(chunks)
+        prepared_by_id: dict[str, PreparedT] = {}
+        ordered_ids: list[str] = []
+        for chunk in source:
             if not self.adapter.is_input(chunk):
                 raise TypeError("update_metadata 只接受当前领域 Contract")
             vector_doc_id = self.adapter.vector_doc_id(chunk)
+            if vector_doc_id in prepared_by_id:
+                raise ValueError("update_metadata 一个批次不能包含重复 vector_doc_id")
             validated = self.adapter.validate(chunk)
             if not self.adapter.is_prepared(validated):
                 raise TypeError("Contract Adapter 返回了非法 Prepared Contract")
-            old_row = self.repository.get_by_vector_doc_id(
-                vector_doc_id,
-                include_embedding=True,
-            )
+            prepared_by_id[vector_doc_id] = validated
+            ordered_ids.append(vector_doc_id)
+
+        old_rows = self.repository.get_many_by_vector_doc_ids(
+            ordered_ids,
+            include_embedding=True,
+        )
+        items: list[DomainLifecycleItem] = []
+        pending: list[EmbeddedT] = []
+        for vector_doc_id in ordered_ids:
+            validated = prepared_by_id[vector_doc_id]
+            old_row = old_rows.get(vector_doc_id)
             if old_row is None:
                 items.append(
                     DomainLifecycleItem(
@@ -166,14 +185,16 @@ class DomainVectorLifecycleService(Generic[InputT, PreparedT, EmbeddedT]):
             )
             if not self.adapter.is_embedded(new_chunk):
                 raise TypeError("Contract Adapter 返回了非法 Embedded Contract")
-            mutation = self.repository.upsert_batch([new_chunk])
-            self._validate_mutation([new_chunk], mutation)
+            pending.append(new_chunk)
             items.append(
                 DomainLifecycleItem(
                     vector_doc_id=vector_doc_id,
                     status="metadata_updated",
                 )
             )
+        for batch in batched(pending, size=self._MUTATION_BATCH_SIZE):
+            mutation = self.repository.upsert_batch(batch)
+            self._validate_mutation(batch, mutation)
         return DomainLifecycleResult(results=items)
 
     def _metadata_gate_error(self, old_chunk: EmbeddedT) -> str | None:
@@ -225,27 +246,6 @@ class DomainVectorLifecycleService(Generic[InputT, PreparedT, EmbeddedT]):
             raise ValueError("Repository affected_count 与请求数量不一致")
         if mutation.primary_keys != expected_ids:
             raise ValueError("Repository 返回的 primary_keys 与请求主键不一致")
-
-
-def _dedupe(
-    vector_doc_ids: Sequence[str],
-    *,
-    prefix: str | None = None,
-) -> list[str]:
-    cleaned: list[str] = []
-    seen: set[str] = set()
-    for vector_doc_id in vector_doc_ids:
-        if not isinstance(vector_doc_id, str) or not vector_doc_id.strip():
-            raise ValueError("vector_doc_id 必须是非空字符串")
-        normalized = vector_doc_id.strip()
-        if prefix is not None and not normalized.startswith(prefix):
-            raise ValueError(
-                f"vector_doc_id {normalized!r} 不符合当前领域前缀 {prefix!r}"
-            )
-        if normalized not in seen:
-            seen.add(normalized)
-            cleaned.append(normalized)
-    return cleaned
 
 
 def _required_space_text(space: dict[str, object], key: str) -> str:

@@ -33,6 +33,7 @@ from pymilvus.exceptions import MilvusException
 
 from expert_contracts.models import ContractPreparedChunk, ExpertChunkEmbeddingInput
 
+from .._utils import safe_error_message
 from ..chunking.contract_pipeline import (
     ContractValidationError,
     ContractValidator,
@@ -55,13 +56,6 @@ _DELETE_BATCH_SIZE = 200
 # 这些在具体调用边界统一转换为 ``VectorMilvusError``；不包含 AttributeError /
 # AssertionError 等程序 bug（避免掩盖真实代码缺陷）。
 _MILVUS_BOUNDARY_TYPES = (ValueError, TypeError, RuntimeError, MilvusException)
-
-
-def _safe_message(error: Exception) -> str:
-    """构造不含内部细节的安全错误摘要（类型 + 截断消息）。"""
-
-    text = str(error)
-    return f"{type(error).__name__}: {text[:200]}"
 
 
 @dataclass(frozen=True)
@@ -278,7 +272,7 @@ class FullVectorReconciliationService:
         try:
             self.repository.assert_destructive_maintenance_allowed()
         except _MILVUS_BOUNDARY_TYPES as error:
-            raise VectorMilvusError(_safe_message(error)) from error
+            raise VectorMilvusError(safe_error_message(error)) from error
 
         embedded = 0
         metadata_updated = 0
@@ -353,7 +347,7 @@ class FullVectorReconciliationService:
             try:
                 record = self.validator.validate(chunk)
             except (ContractValidationError, TypeError) as error:
-                raise VectorContractError(_safe_message(error)) from error
+                raise VectorContractError(safe_error_message(error)) from error
             reason = self.eligibility_validator.get_skip_reason(record)
             if reason is not None:
                 skipped_count += 1
@@ -422,7 +416,7 @@ class FullVectorReconciliationService:
         try:
             existing_rows = self.repository.list_all_vector_activity_states()
         except _MILVUS_BOUNDARY_TYPES as error:
-            raise VectorMilvusError(_safe_message(error)) from error
+            raise VectorMilvusError(safe_error_message(error)) from error
 
         active: dict[str, tuple[str, str]] = {}
         inactive_count = 0

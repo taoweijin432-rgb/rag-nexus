@@ -87,6 +87,24 @@ class FakeMilvusRepository:
             return {k: v for k, v in row.items() if k != "embedding"}
         return dict(row)
 
+    def get_many_by_vector_doc_ids(
+        self,
+        vector_doc_ids: Sequence[str],
+        *,
+        include_embedding: bool = True,
+    ) -> dict[str, dict[str, Any]]:
+        return {
+            vector_doc_id: row
+            for vector_doc_id in vector_doc_ids
+            if (
+                row := self.get_by_vector_doc_id(
+                    vector_doc_id,
+                    include_embedding=include_embedding,
+                )
+            )
+            is not None
+        }
+
     def upsert_batch(
         self,
         records: Sequence[EmbeddedContractPreparedChunk],

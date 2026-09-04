@@ -24,6 +24,7 @@ from pymilvus.exceptions import MilvusException
 
 from expert_contracts.models import ExpertChunkEmbeddingInput
 
+from .._utils import dedupe_nonempty_strings, safe_error_message
 from ..chunking.contract_ingestion import (
     ContractBatchIngestionService,
     ContractIngestionError,
@@ -36,9 +37,9 @@ from ..chunking.contract_pipeline import (
     EmbeddingEligibilityError,
 )
 from ..core.adapters import VectorContractAdapter
-from ..core.expert import ExpertContractAdapter
 from ..core.hash_state import project_hash_fields
 from ..core.lifecycle import DomainVectorLifecycleService
+from ..domains import ExpertContractAdapter
 from ..embedding_adapters.company_cloud import CompanyCloudEmbeddingError
 from ..milvus.contract_v15 import MilvusV15RowMapper
 from ..milvus.repository import ContractMilvusRepositoryBase
@@ -59,14 +60,6 @@ from .models import (
     VectorQueryResult,
     VectorResumeList,
 )
-
-
-def _safe_message(error: Exception) -> str:
-    """构造不含内部细节的安全错误摘要（类型 + 截断消息）。"""
-
-    text = str(error)
-    return f"{type(error).__name__}: {text[:200]}"
-
 
 # 底层异常分类（不含无边界 except Exception）：
 #   - Contract 层：ContractValidationError / EmbeddingEligibilityError（-> VectorContractError）
@@ -90,13 +83,13 @@ def _guard_call(fn, *args: Any, **kwargs: Any) -> Any:
     except VectorIngestionError:
         raise
     except (ContractValidationError, EmbeddingEligibilityError) as error:
-        raise VectorContractError(_safe_message(error)) from error
+        raise VectorContractError(safe_error_message(error)) from error
     except ContractIngestionError as error:
-        raise VectorIngestionError(_safe_message(error)) from error
+        raise VectorIngestionError(safe_error_message(error)) from error
     except CompanyCloudEmbeddingError as error:
-        raise VectorEmbeddingError(_safe_message(error)) from error
+        raise VectorEmbeddingError(safe_error_message(error)) from error
     except (ValueError, TypeError, RuntimeError, MilvusException) as error:
-        raise VectorMilvusError(_safe_message(error)) from error
+        raise VectorMilvusError(safe_error_message(error)) from error
 
 
 def _guard_errors(func):
@@ -114,13 +107,13 @@ def _guard_errors(func):
         except VectorIngestionError:
             raise
         except (ContractValidationError, EmbeddingEligibilityError, ValueError, TypeError) as error:
-            raise VectorContractError(_safe_message(error)) from error
+            raise VectorContractError(safe_error_message(error)) from error
         except ContractIngestionError as error:
-            raise VectorIngestionError(_safe_message(error)) from error
+            raise VectorIngestionError(safe_error_message(error)) from error
         except CompanyCloudEmbeddingError as error:
-            raise VectorEmbeddingError(_safe_message(error)) from error
+            raise VectorEmbeddingError(safe_error_message(error)) from error
         except (RuntimeError, MilvusException) as error:
-            raise VectorMilvusError(_safe_message(error)) from error
+            raise VectorMilvusError(safe_error_message(error)) from error
 
     return wrapper
 
@@ -131,15 +124,15 @@ class _GuardedLifecycleRepository:
     def __init__(self, repository: Any) -> None:
         self.repository = repository
 
-    def get_by_vector_doc_id(
+    def get_many_by_vector_doc_ids(
         self,
-        vector_doc_id: str,
+        vector_doc_ids: Sequence[str],
         *,
         include_embedding: bool = True,
-    ) -> dict[str, object] | None:
+    ) -> dict[str, dict[str, object]]:
         return _guard_call(
-            self.repository.get_by_vector_doc_id,
-            vector_doc_id,
+            self.repository.get_many_by_vector_doc_ids,
+            vector_doc_ids,
             include_embedding=include_embedding,
         )
 
@@ -155,29 +148,6 @@ class _GuardedLifecycleRowMapper:
 
     def from_row(self, row: dict[str, object]) -> Any:
         return _guard_call(self.row_mapper.from_row, row)
-
-
-def _dedupe(
-    vector_doc_ids: Sequence[str],
-    *,
-    prefix: str | None = None,
-) -> list[str]:
-    """按输入顺序去重并校验主键，返回清理后的 ID 列表。"""
-
-    cleaned: list[str] = []
-    seen: set[str] = set()
-    for vector_doc_id in vector_doc_ids:
-        if not isinstance(vector_doc_id, str) or not vector_doc_id.strip():
-            raise VectorContractError("vector_doc_id 必须是非空字符串")
-        normalized = vector_doc_id.strip()
-        if prefix is not None and not normalized.startswith(prefix):
-            raise VectorContractError(
-                f"vector_doc_id {normalized!r} 不符合当前领域前缀 {prefix!r}"
-            )
-        if normalized not in seen:
-            seen.add(normalized)
-            cleaned.append(normalized)
-    return cleaned
 
 
 class VectorIngestionService:
@@ -235,6 +205,12 @@ class VectorIngestionService:
             expected_dimension=self.expected_dimension,
             formal_model_space_id=self.formal_model_space_id,
         )
+
+    @property
+    def owner_field(self) -> str:
+        """返回当前领域写入 flat metadata 的 owner 字段。"""
+
+        return self._adapter.owner_field()
 
     # ------------------------------------------------------------------
     # 1. upsert_chunks
@@ -337,18 +313,20 @@ class VectorIngestionService:
         （不误判为全同 Skip，不调用 Embedding）。
         """
 
-        cleaned = _dedupe(
+        cleaned = dedupe_nonempty_strings(
             vector_doc_ids,
             prefix=self._adapter.id_prefix(),
+            error_factory=VectorContractError,
         )
         records: list[dict[str, object]] = []
         missing: list[str] = []
+        rows = _guard_call(
+            self.repository.get_many_by_vector_doc_ids,
+            cleaned,
+            include_embedding=False,
+        )
         for vid in cleaned:
-            row = _guard_call(
-                self.repository.get_by_vector_doc_id,
-                vid,
-                include_embedding=False,
-            )
+            row = rows.get(vid)
             if row is None:
                 missing.append(vid)
             else:

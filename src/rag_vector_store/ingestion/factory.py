@@ -16,7 +16,8 @@ ContractBatchIngestionService / Validator / RowMapper），只调用
 
 from __future__ import annotations
 
-from typing import Any, Literal
+import warnings
+from typing import Any, Literal, cast
 
 from ..chunking.contract_ingestion import ContractBatchIngestionService
 from ..chunking.contract_pipeline import (
@@ -26,11 +27,15 @@ from ..chunking.contract_pipeline import (
 )
 from ..config import MilvusSettings
 from ..core.embedding import DomainEmbeddingWorker
-from ..core.expert import ExpertContractAdapter, ResumeContractAdapter
 from ..core.ingestion import DomainIngestionService
+from ..domains import ExpertContractAdapter, ResumeContractAdapter
 from ..embedding_adapters.company_cloud import CompanyCloudEmbeddingModel
 from ..milvus.contract_v15 import MilvusV15RowMapper, ResumeMilvusV15RowMapper
-from ..milvus.repository_v15 import RESUME_V15_PROFILE, ContractMilvusV15VectorRepository
+from ..milvus.repository_v15 import (
+    EXPERT_V15_PROFILE,
+    RESUME_V15_PROFILE,
+    ContractMilvusV15VectorRepository,
+)
 from ..model_space import FORMAL_EMBEDDING_MODEL_SPACE_ID
 from .vector_ingestion import ResumeVectorIngestionService, VectorIngestionService
 
@@ -170,7 +175,8 @@ def _build_repository(
         return ContractMilvusV15VectorRepository(
             milvus_settings,
             vector_dimension=expected_dimension,
-            profile=profile,
+            allow_collection_creation=False,
+            profile=profile or EXPERT_V15_PROFILE,
         )
     # 理论不可达：_validate_schema_profile 已拦截非法 profile。
     raise ValueError(f"未支持的 schema_profile {schema_profile!r}")
@@ -188,6 +194,25 @@ def validate_schema_profile(schema_profile: str) -> None:
         raise ValueError(
             f"schema_profile 必须为 'v15'，收到 {schema_profile!r}"
         )
+
+
+def _resolve_schema_profile(
+    schema_profile: SchemaProfile | None,
+    *,
+    stacklevel: int = 3,
+) -> SchemaProfile:
+    """解析兼容期参数；未传时固定使用唯一 V15 Profile。"""
+
+    if schema_profile is None:
+        return "v15"
+    validate_schema_profile(schema_profile)
+    warnings.warn(
+        "schema_profile 参数已弃用；V15 是唯一持久化 Profile，"
+        "请移除显式 schema_profile 参数",
+        DeprecationWarning,
+        stacklevel=stacklevel,
+    )
+    return cast(SchemaProfile, schema_profile)
 
 
 # 保留内部旧名称，避免已有测试或同包代码直接引用时产生不必要的断裂。
@@ -223,7 +248,7 @@ def create_vector_ingestion_service(
     row_mapper: MilvusV15RowMapper | None = None,
     expected_dimension: int = EXPECTED_EMBEDDING_DIMENSION,
     formal_model_space_id: str = FORMAL_EMBEDDING_MODEL_SPACE_ID,
-    schema_profile: SchemaProfile = "v15",
+    schema_profile: SchemaProfile | None = None,
 ) -> VectorIngestionService:
     """从环境配置组装完整的 ``VectorIngestionService``。
 
@@ -234,8 +259,9 @@ def create_vector_ingestion_service(
         ``VectorIngestionService``。
 
     Args:
-        schema_profile: 持久化 profile，唯一允许 ``v15``（默认）。
-            ``v15`` 时使用 ``ContractMilvusV15VectorRepository``，且未显式传入
+        schema_profile: 一个发布周期的兼容参数；省略时固定使用 ``v15``。
+            显式传入 ``v15`` 仍可运行但会产生 ``DeprecationWarning``；
+            使用 ``ContractMilvusV15VectorRepository``，且未显式传入
             ``row_mapper`` 时自动跟随为 ``MilvusV15RowMapper``。
             显式传入 ``v14`` 会 fail-closed 抛 ``ValueError``（V14 已退役）。
             该参数只控制持久化结构，不改变 ``collection_name``。
@@ -248,9 +274,9 @@ def create_vector_ingestion_service(
     其余关键字用于测试 / 自定义组装，未注入项自动从环境读取。
     """
 
-    validate_schema_profile(schema_profile)
-    _validate_repository_profile(repository, schema_profile)
-    _validate_row_mapper_profile(row_mapper, schema_profile)
+    resolved_profile = _resolve_schema_profile(schema_profile)
+    _validate_repository_profile(repository, resolved_profile)
+    _validate_row_mapper_profile(row_mapper, resolved_profile)
 
     if validator is None:
         validator = ContractValidator()
@@ -267,7 +293,7 @@ def create_vector_ingestion_service(
         repository = _build_repository(
             milvus_settings=milvus_settings,
             expected_dimension=expected_dimension,
-            schema_profile=schema_profile,
+            schema_profile=resolved_profile,
         )
     resolved_row_mapper = _resolve_row_mapper(row_mapper, repository)
     ingestion_service = ContractBatchIngestionService(
@@ -295,11 +321,11 @@ def create_resume_vector_ingestion_service(
     row_mapper: Any | None = None,
     expected_dimension: int = EXPECTED_EMBEDDING_DIMENSION,
     formal_model_space_id: str = FORMAL_EMBEDDING_MODEL_SPACE_ID,
-    schema_profile: SchemaProfile = "v15",
+    schema_profile: SchemaProfile | None = None,
 ) -> ResumeVectorIngestionService:
     """构造固定绑定 Resume Profile 的向量化服务。"""
 
-    validate_schema_profile(schema_profile)
+    resolved_profile = _resolve_schema_profile(schema_profile)
     _validate_resume_repository_profile(repository)
     _validate_resume_row_mapper(row_mapper)
     if validator is None:
@@ -322,7 +348,7 @@ def create_resume_vector_ingestion_service(
         repository = _build_repository(
             milvus_settings=milvus_settings,
             expected_dimension=expected_dimension,
-            schema_profile=schema_profile,
+            schema_profile=resolved_profile,
             profile=RESUME_V15_PROFILE,
         )
     if row_mapper is None:

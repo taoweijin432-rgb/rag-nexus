@@ -92,7 +92,7 @@ def test_runtime_preflights_before_constructing_explicit_resume_collection(
         return object()
 
     monkeypatch.setattr(
-        "resume_index.runtime.create_vector_ingestion_service",
+        "resume_index.runtime.create_resume_vector_ingestion_service",
         fake_create_service,
     )
     base = MilvusSettings(
