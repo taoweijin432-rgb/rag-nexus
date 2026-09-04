@@ -465,7 +465,7 @@ class FakeIngestionService:
             ]
         )
 
-    def delete_vectors(self, vector_doc_ids: list[str]) -> VectorDeletionResult:
+    def disable_vectors(self, vector_doc_ids: list[str]) -> VectorDeletionResult:
         ids = list(vector_doc_ids)
         self.delete_calls.append(ids)
         if self.delete_error is not None:
@@ -970,8 +970,8 @@ def test_ingestion_vector_embedding_error_passes_through_unchanged() -> None:
         make_positive_service(repo, ing).apply_positive_changes([record])
 
 
-def test_ingestion_vector_error_is_not_swallowed_by_delete() -> None:
-    """delete_vectors 阶段已抛出的 VectorMilvusError 不被 swallow。"""
+def test_ingestion_vector_error_is_not_swallowed_by_disable() -> None:
+    """disable_vectors 阶段已抛出的 VectorMilvusError 不被 swallow。"""
 
     desired = default_records(1)
     desired_row = existing_row(

@@ -298,7 +298,7 @@ class TestNoExternalCalls:
         assert runtime.vector_service is spy
         assert called["v"] == 0
 
-    def test_lazy_construction_uses_v15_profile(self, monkeypatch):
+    def test_lazy_construction_uses_default_v15_profile(self, monkeypatch):
         captured = {}
 
         def _fake(*a, **kw):
@@ -310,7 +310,8 @@ class TestNoExternalCalls:
         settings = _settings()
         runtime = build_incremental_handoff_runtime(
             settings, max_attempts=2, retry_delay_seconds=30)
-        assert captured["schema_profile"] == "v15"
+        # V15 已是唯一 Profile，内部调用不再显式传递弃用参数。
+        assert captured["schema_profile"] is None
         assert isinstance(runtime.vector_service, _SpyVectorService)
 
 

@@ -10,7 +10,7 @@
     ``FullVectorReconciliationService.repository``。因此：
 
         - ``repository.list_all_vector_activity_states()``（读库 / 计算 stale 与终验）
-        - ``ingestion.upsert_chunks / update_metadata / delete_vectors``（写库）
+        - ``ingestion.upsert_chunks / update_metadata / disable_vectors``（写库）
 
     必然作用于同一个 Milvus Collection，从结构上杜绝「读 Collection A、
     写 Collection B」的错配。
@@ -66,8 +66,8 @@ def create_full_vector_reconciliation_service(
     """从环境配置（或注入组件）组装完整的 ``FullVectorReconciliationService``。
 
     依赖链：
-        ``CompanyCloudEmbeddingModel.from_env()`` -> ``ContractEmbeddingWorker``
-        -> ``ContractBatchIngestionService``；``MilvusSettings.from_env()`` ->
+        ``CompanyCloudEmbeddingModel.from_env()`` -> ``DomainEmbeddingWorker``
+        -> ``DomainIngestionService``；``MilvusSettings.from_env()`` ->
         ``schema_profile`` 对应的 Milvus Repository。全部经由
         ``create_vector_ingestion_service()`` 构建，随后以其内部同一 repository
         组装 ``FullVectorReconciliationService``。
@@ -96,7 +96,6 @@ def create_full_vector_reconciliation_service(
         row_mapper=row_mapper,
         expected_dimension=expected_dimension,
         formal_model_space_id=formal_model_space_id,
-        schema_profile=None,
     )
     return FullVectorReconciliationService(
         ingestion.repository,

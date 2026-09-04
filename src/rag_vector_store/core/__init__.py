@@ -5,6 +5,8 @@
 仅保留一个发布周期的兼容转发。
 """
 
+import warnings
+
 from .adapters import (
     VectorConsumerContractAdapter,
     VectorContractAdapter,
@@ -67,6 +69,11 @@ def __getattr__(name: str) -> object:
     """延迟兼容旧包级 Adapter 导入，避免普通 core import 加载领域 Contract。"""
 
     if name in {"ExpertContractAdapter", "ResumeContractAdapter"}:
+        warnings.warn(
+            f"rag_vector_store.core.{name} 已弃用；请从 rag_vector_store.domains 导入",
+            DeprecationWarning,
+            stacklevel=2,
+        )
         from .. import domains
 
         return getattr(domains, name)

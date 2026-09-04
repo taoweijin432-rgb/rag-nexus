@@ -32,6 +32,7 @@ from rag_vector_store import (
     create_vector_ingestion_service,
 )
 from rag_vector_store.chunking.contract_ingestion import ContractBatchIngestionService
+from rag_vector_store.core.ingestion import DomainIngestionService
 from rag_vector_store.milvus import ContractMilvusV15VectorRepository
 from rag_vector_store.milvus.contract_v15 import MilvusV15RowMapper
 
@@ -334,7 +335,8 @@ def test_ingestion_v15_assembles_chain() -> None:
         embedding_worker=_worker(),
         schema_profile="v15",
     )
-    assert isinstance(ingestion.ingestion, ContractBatchIngestionService)
+    assert isinstance(ingestion.ingestion, DomainIngestionService)
+    assert not isinstance(ingestion.ingestion, ContractBatchIngestionService)
     assert ingestion.ingestion.repository is ingestion.repository
     # 公共 API 语义保持不变
     for method in (

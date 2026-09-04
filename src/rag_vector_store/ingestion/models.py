@@ -1,7 +1,7 @@
 """VectorIngestionService 的公共返回结果模型。
 
-这些模型是未来 ``upsert_chunks`` / ``update_metadata`` / ``delete_vectors`` /
-``get_vectors`` / ``list_vectors_by_expert`` 方法的稳定返回契约。
+这些模型是 ``upsert_chunks`` / ``update_metadata`` / ``disable_vectors`` /
+``get_vectors`` / ``list_vectors_by_owner`` 方法的稳定返回契约。
 
 设计约束：
     - 不暴露 pymilvus / Embedding 内部对象。
@@ -20,8 +20,6 @@ VectorItemStatus = Literal[
     "embedded",
     "metadata_updated",
     "skipped",
-    "deleted",
-    "not_found",
     "failed",
 ]
 
@@ -33,8 +31,6 @@ class VectorItemResult(BaseModel):
         - ``embedded``：upsert_chunks 成功写入新向量。
         - ``metadata_updated``：update_metadata 复用旧向量更新 metadata。
         - ``skipped``：Eligibility 跳过（is_active=false / rejected）。
-        - ``deleted``：delete_vectors 实际删除。
-        - ``not_found``：delete_vectors / get_vectors 目标不存在。
         - ``failed``：update_metadata 安全门失败或未知失败。
     """
 
@@ -81,16 +77,12 @@ class VectorIngestionResult(BaseModel):
         return sum(item.status == "skipped" for item in self.results)
 
     @property
-    def not_found_count(self) -> int:
-        return sum(item.status == "not_found" for item in self.results)
-
-    @property
     def failed_count(self) -> int:
         return sum(item.status == "failed" for item in self.results)
 
 
 class VectorDeletionResult(BaseModel):
-    """``delete_vectors`` 的删除结果。"""
+    """逻辑下线结果；保留历史字段名以兼容现有序列化契约。"""
 
     model_config = ConfigDict(extra="forbid")
 
@@ -131,8 +123,26 @@ class VectorQueryResult(BaseModel):
         return self
 
 
+class VectorOwnerList(BaseModel):
+    """按当前领域 owner 列出全部 ``vector_doc_id`` 的通用结果。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    owner_id: int = Field(ge=1)
+    vector_doc_ids: list[str] = Field(default_factory=list)
+    count: int = Field(default=0, ge=0)
+
+    @model_validator(mode="after")
+    def validate_count(self) -> VectorOwnerList:
+        """``count`` 必须等于 ``vector_doc_ids`` 长度。"""
+
+        if self.count != len(self.vector_doc_ids):
+            raise ValueError("count 必须等于 vector_doc_ids 的长度")
+        return self
+
+
 class VectorExpertList(BaseModel):
-    """``list_vectors_by_expert`` 的按专家查询结果。"""
+    """已弃用的专家专用列表结果；请使用 ``VectorOwnerList``。"""
 
     model_config = ConfigDict(extra="forbid")
 
@@ -150,7 +160,7 @@ class VectorExpertList(BaseModel):
 
 
 class VectorResumeList(BaseModel):
-    """``list_vectors_by_resume`` 的按 Resume 查询结果。"""
+    """已弃用的 Resume 专用列表结果；请使用 ``VectorOwnerList``。"""
 
     model_config = ConfigDict(extra="forbid")
 
@@ -173,6 +183,7 @@ __all__ = [
     "VectorIngestionResult",
     "VectorItemResult",
     "VectorItemStatus",
+    "VectorOwnerList",
     "VectorQueryResult",
     "VectorResumeList",
 ]

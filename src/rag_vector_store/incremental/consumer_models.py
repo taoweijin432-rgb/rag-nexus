@@ -16,36 +16,30 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 # 基础字面量
 # ---------------------------------------------------------------------------
 #: Consumer 支持的操作标签；本地定义以保持核心不依赖历史 Work Item 模块。
-ConsumerOperation = Literal["upsert", "metadata_update", "disable"]
+ConsumerOperation = Literal["upsert", "disable"]
 
-#: Consumer 终态。planned 表示 plan_only 规划结果。
-ConsumerExecutionStatus = Literal[
-    "committed", "skipped", "rejected", "failed", "planned"
-]
+#: Consumer 终态。
+ConsumerExecutionStatus = Literal["committed", "skipped", "rejected", "failed"]
 
 # ---------------------------------------------------------------------------
 # 动作常量（执行轨迹，供审计与测试断言）
 # ---------------------------------------------------------------------------
 CONSUMER_ACTION_FETCH_EXISTING = "fetch_existing"
 CONSUMER_ACTION_ADAPT_UPSERT = "adapt_upsert"
-CONSUMER_ACTION_SYNTHESIZE_FROM_STORED = "synthesize_from_stored"
 CONSUMER_ACTION_METADATA_ONLY_UPDATE = "metadata_only_update"
 CONSUMER_ACTION_EMBEDDING_UPSERT = "embedding_upsert"
 CONSUMER_ACTION_SKIP_UNCHANGED = "skip_unchanged"
 CONSUMER_ACTION_DISABLE_TARGETS = "disable_targets"
-CONSUMER_ACTION_DISABLE_STALE_TARGETS = "disable_stale_targets"
 CONSUMER_ACTION_ADAPT_DISABLE = "adapt_disable"
 
 _KNOWN_ACTIONS = frozenset(
     {
         CONSUMER_ACTION_FETCH_EXISTING,
         CONSUMER_ACTION_ADAPT_UPSERT,
-        CONSUMER_ACTION_SYNTHESIZE_FROM_STORED,
         CONSUMER_ACTION_METADATA_ONLY_UPDATE,
         CONSUMER_ACTION_EMBEDDING_UPSERT,
         CONSUMER_ACTION_SKIP_UNCHANGED,
         CONSUMER_ACTION_DISABLE_TARGETS,
-        CONSUMER_ACTION_DISABLE_STALE_TARGETS,
         CONSUMER_ACTION_ADAPT_DISABLE,
     }
 )
@@ -61,8 +55,6 @@ RESULT_CODE_METADATA_UPDATED = "metadata_updated"
 RESULT_CODE_TARGETS_DISABLED = "targets_disabled"
 #: 双 hash 全等且实体活跃，跳过写入。
 RESULT_CODE_UNCHANGED_SKIPPED = "unchanged_skipped"
-#: 同批同 id 重复输入中被更高事件序者压制。
-RESULT_CODE_DUPLICATE_SUPERSEDED = "duplicate_superseded"
 #: 防御分支：ingestion 层对本可嵌入输入返回 skipped（正常链路不应触达）。
 RESULT_CODE_UPSERT_SKIPPED = "upsert_skipped"
 
@@ -71,24 +63,13 @@ ConsumerResultCode = Literal[
     "metadata_updated",
     "targets_disabled",
     "unchanged_skipped",
-    "duplicate_superseded",
     "upsert_skipped",
 ]
 
 #: metadata_update 安全门失败：已存向量模型空间/维度与正式配置不一致。
 ERROR_CODE_MODEL_SPACE_MISMATCH = "model_space_mismatch"
-#: Contract 适配失败（确定性输入非法）。
-ERROR_CODE_CONTRACT_ADAPTATION_FAILED = "contract_adaptation_failed"
-#: disable 目标集合适配失败（确定性输入非法）。
-ERROR_CODE_DISABLE_ADAPTATION_FAILED = "disable_adaptation_failed"
 #: 已存记录状态提取失败（缺 hash 或字段形态非法）。
 ERROR_CODE_EXISTING_STATE_INVALID = "existing_state_invalid"
-#: 旧 source_event_id 被拦截。
-ERROR_CODE_STALE_SOURCE_EVENT_ID = "stale_source_event_id"
-#: metadata_update 目标不存在（无 chunk_text 可用，禁止降级重嵌）。
-ERROR_CODE_METADATA_TARGET_MISSING = "metadata_target_missing"
-#: metadata_update 已存 chunk_text 为空（无法构造完整 Contract）。
-ERROR_CODE_METADATA_STORED_TEXT_MISSING = "metadata_stored_text_missing"
 #: metadata-only 一致性门抛出 VectorContractError。
 ERROR_CODE_METADATA_ONLY_INCONSISTENT = "metadata_only_inconsistent"
 #: upsert 阶段 Contract 校验失败。
@@ -100,7 +81,6 @@ ERROR_CODE_METADATA_UPDATE_INFRA_FAILED = "metadata_update_infra_failed"
 ERROR_CODE_UPSERT_INFRA_FAILED = "upsert_infra_failed"
 ERROR_CODE_ELIGIBILITY_DISABLE_FAILED = "eligibility_disable_failed"
 ERROR_CODE_DISABLE_INFRA_FAILED = "disable_infra_failed"
-ERROR_CODE_STALE_DISABLE_FAILED = "stale_disable_failed"
 
 # ---------------------------------------------------------------------------
 # P5.2 范围 Consumer 稳定错误码（scope 层收敛失败，不语义复用核心错误码）
@@ -125,7 +105,7 @@ class ExecutionResult(BaseModel):
     - ``rejected`` / ``failed`` 必须携带稳定 ``error_code`` 且不得携带
       ``result_code``、``embedding_performed`` 或 ``metadata_only``。
     - ``committed`` / ``skipped`` 必须携带 ``result_code`` 且不得携带
-      ``error_code``；``planned`` 二者皆无。
+      ``error_code``。
     - ``embedding_performed=True`` 只能出现在实际发生 Embedding 的提交路径
       （收到 embedded 确认）；``metadata_only=True`` 只能出现在成功的
       metadata-only 提交路径；二者互斥。
@@ -142,7 +122,7 @@ class ExecutionResult(BaseModel):
     reason: str | None = None
     actions: tuple[str, ...] = Field(default=(), frozen=True)
     disabled_ids: tuple[str, ...] = ()
-    #: 正向/中性结果的稳定分类码；rejected/failed/planned 下必须为 None。
+    #: 正向/中性结果的稳定分类码；rejected/failed 下必须为 None。
     result_code: ConsumerResultCode | None = None
     #: 失败类结果的稳定错误码；其余状态必须为 None。
     error_code: str | None = None
@@ -165,8 +145,6 @@ class ExecutionResult(BaseModel):
                 raise ValueError("rejected 结果必须携带稳定的 error_code")
             if self.retryable:
                 raise ValueError("rejected 结果是确定性拒绝，不允许 retryable=True")
-        elif self.status == "planned":
-            pass
         else:
             # committed / skipped
             if self.result_code is None:
@@ -197,33 +175,24 @@ class ExecutionResult(BaseModel):
 __all__ = [
     "CONSUMER_ACTION_ADAPT_DISABLE",
     "CONSUMER_ACTION_ADAPT_UPSERT",
-    "CONSUMER_ACTION_DISABLE_STALE_TARGETS",
     "CONSUMER_ACTION_DISABLE_TARGETS",
     "CONSUMER_ACTION_EMBEDDING_UPSERT",
     "CONSUMER_ACTION_FETCH_EXISTING",
     "CONSUMER_ACTION_METADATA_ONLY_UPDATE",
     "CONSUMER_ACTION_SKIP_UNCHANGED",
-    "CONSUMER_ACTION_SYNTHESIZE_FROM_STORED",
-    "ERROR_CODE_CONTRACT_ADAPTATION_FAILED",
-    "ERROR_CODE_DISABLE_ADAPTATION_FAILED",
     "ERROR_CODE_DISABLE_INFRA_FAILED",
     "ERROR_CODE_ELIGIBILITY_DISABLE_FAILED",
     "ERROR_CODE_EXISTING_QUERY_FAILED",
     "ERROR_CODE_EXISTING_STATE_INVALID",
     "ERROR_CODE_METADATA_ONLY_INCONSISTENT",
-    "ERROR_CODE_METADATA_STORED_TEXT_MISSING",
-    "ERROR_CODE_METADATA_TARGET_MISSING",
     "ERROR_CODE_METADATA_UPDATE_INFRA_FAILED",
     "ERROR_CODE_MODEL_SPACE_MISMATCH",
     "ERROR_CODE_SCOPE_ACTIVE_STATE_INVALID",
     "ERROR_CODE_SCOPE_QUERY_FAILED",
     "ERROR_CODE_SCOPE_STALE_DISABLE_FAILED",
     "ERROR_CODE_SCOPE_UNSUPPORTED_TYPE",
-    "ERROR_CODE_STALE_DISABLE_FAILED",
-    "ERROR_CODE_STALE_SOURCE_EVENT_ID",
     "ERROR_CODE_UPSERT_CONTRACT_FAILED",
     "ERROR_CODE_UPSERT_INFRA_FAILED",
-    "RESULT_CODE_DUPLICATE_SUPERSEDED",
     "RESULT_CODE_EMBEDDED",
     "RESULT_CODE_METADATA_UPDATED",
     "RESULT_CODE_TARGETS_DISABLED",

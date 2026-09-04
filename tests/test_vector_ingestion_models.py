@@ -5,7 +5,7 @@ from __future__ import annotations
 import pytest
 from pydantic import ValidationError
 
-from rag_vector_store import (
+from rag_vector_store.ingestion import (
     VectorContractError,
     VectorDeletionResult,
     VectorEmbeddingError,
@@ -15,6 +15,7 @@ from rag_vector_store import (
     VectorIngestionResult,
     VectorItemResult,
     VectorMilvusError,
+    VectorOwnerList,
     VectorQueryResult,
 )
 
@@ -48,8 +49,6 @@ def test_vector_item_result_accepts_all_statuses() -> None:
         "embedded",
         "metadata_updated",
         "skipped",
-        "deleted",
-        "not_found",
         "failed",
     ):
         item = VectorItemResult(
@@ -76,15 +75,14 @@ def test_vector_ingestion_result_counts() -> None:
                 status=status,
             )
             for i, status in enumerate(
-                ["embedded", "metadata_updated", "skipped", "not_found", "failed"]
+                ["embedded", "metadata_updated", "skipped", "failed"]
             )
         ]
     )
-    assert result.total_count == 5
+    assert result.total_count == 4
     assert result.embedded_count == 1
     assert result.metadata_updated_count == 1
     assert result.skipped_count == 1
-    assert result.not_found_count == 1
     assert result.failed_count == 1
 
 
@@ -182,6 +180,13 @@ def test_vector_expert_list_defaults() -> None:
     result = VectorExpertList(expert_id=900001)
     assert result.vector_doc_ids == []
     assert result.count == 0
+
+
+def test_vector_owner_list_validates_generic_owner_identity() -> None:
+    result = VectorOwnerList(owner_id=900001, vector_doc_ids=["a"], count=1)
+    assert result.owner_id == 900001
+    with pytest.raises(ValidationError):
+        VectorOwnerList(owner_id=900001, vector_doc_ids=["a"], count=0)
 
 
 def test_vector_ingestion_error_is_base() -> None:

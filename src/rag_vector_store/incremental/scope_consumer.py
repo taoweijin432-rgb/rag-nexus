@@ -16,7 +16,7 @@
 职责：
 
     - 只读查询该 scope 的当前 active 向量状态（复用
-      ``list_vectors_by_expert`` + ``get_vectors``）；
+      ``list_vectors_by_owner`` + ``get_vectors``）；
     - 把 desired Contracts 包成 :class:`ContractUpsertIntent`（不携带 stale），
       一次调用 ``ContractConsumerCore.process`` 收敛；不复制三 Hash / metadata-only /
       重新激活判定逻辑；
@@ -52,7 +52,7 @@ from expert_contracts import ExpertChunkEmbeddingInput
 
 from .._utils import single_line_truncate
 from ..ingestion.errors import VectorIngestionError
-from ..ingestion.models import VectorExpertList, VectorQueryResult
+from ..ingestion.models import VectorOwnerList, VectorQueryResult
 from .consumer_core import (
     ContractConsumerCore,
     ContractDisableInput,
@@ -172,7 +172,7 @@ class ScopeVectorStatePort(Protocol):
     """范围当前向量状态的只读查询端口（生产注入 ``VectorIngestionService``）。
 
     复用既有公开方法，不新增向量能力：
-        - ``list_vectors_by_expert`` 拿该专家全部 vector_doc_id；
+        - ``list_vectors_by_owner`` 按当前领域 owner 拿全部 vector_doc_id；
         - ``get_vectors`` 拿 record（含 metadata JSON 与投影后的三 Hash）。
     """
 
@@ -181,8 +181,8 @@ class ScopeVectorStatePort(Protocol):
         """返回当前领域在 flat metadata 中使用的 owner 字段。"""
         ...
 
-    def list_vectors_by_expert(self, expert_id: int) -> VectorExpertList:
-        """按专家列出 Milvus 中全部 vector_doc_id（仅轻量字段）。"""
+    def list_vectors_by_owner(self, owner_id: int) -> VectorOwnerList:
+        """按当前领域 owner 列出 Milvus 中全部 vector_doc_id。"""
         ...
 
     def get_vectors(self, vector_doc_ids: list[str]) -> VectorQueryResult:
@@ -376,14 +376,14 @@ class ScopeConsumer:
 
         # 阶段 0：查询该专家全部 vector_doc_id，再取 metadata 做 scope 精确过滤。
         try:
-            listing = self._state_port.list_vectors_by_expert(scope.expert_id)
+            listing = self._state_port.list_vectors_by_owner(scope.expert_id)
         except VectorIngestionError as error:
             return self._receipt(
                 request,
                 status="failed",
                 result_code="scope_query_failed",
                 error_type=ERROR_CODE_SCOPE_QUERY_FAILED,
-                error_message=single_line_truncate(f"list_vectors_by_expert 失败：{error}"),
+                error_message=single_line_truncate(f"list_vectors_by_owner 失败：{error}"),
                 retryable=True,
             )
         active_vector_doc_ids, query_error, retryable = self._load_active_scope(
@@ -504,9 +504,9 @@ class ScopeConsumer:
     ) -> _DesiredBlock | None:
         """分类 desired 结果；任一 rejected→整体 rejected，任一 failed→整体 failed。
 
-        正式 desired 收敛成功只接受 embedded/metadata_updated/unchanged_skipped；
-        targets_disabled/upsert_skipped/duplicate_superseded/planned 不作为正式
-        desired 成功，fail-closed 转 rejected。
+        正式 desired 收敛成功只接受 embedded、metadata_updated、
+        targets_disabled（Eligibility 下线）和 unchanged_skipped。
+        防御性 upsert_skipped 不作为正式 desired 成功，fail-closed 转 rejected。
         """
 
         counts = self._summarize(results)
@@ -524,12 +524,12 @@ class ScopeConsumer:
                 )
                 failed_retryable = failed_retryable or result.retryable
             elif result.status not in ("committed", "skipped"):
-                # planned/未知 → fail-closed rejected
+                # 类型系统之外的未知状态 → fail-closed rejected。
                 rejected_msg = rejected_msg or single_line_truncate(
                     f"{result.vector_doc_id}: 非 desired 收敛终态 {result.status}"
                 )
             elif result.status == "skipped" and result.result_code != RESULT_CODE_UNCHANGED_SKIPPED:
-                # duplicate_superseded/upsert_skipped 不作为正式 desired 成功
+                # upsert_skipped 是防御性结果，不作为正式 desired 成功。
                 rejected_msg = rejected_msg or single_line_truncate(
                     f"{result.vector_doc_id}: desired 落选 {result.result_code}"
                 )

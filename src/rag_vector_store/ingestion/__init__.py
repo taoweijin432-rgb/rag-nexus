@@ -25,6 +25,7 @@ from .models import (
     VectorIngestionResult,
     VectorItemResult,
     VectorItemStatus,
+    VectorOwnerList,
     VectorQueryResult,
     VectorResumeList,
 )
@@ -43,6 +44,7 @@ __all__ = [
     "VectorItemResult",
     "VectorItemStatus",
     "VectorMilvusError",
+    "VectorOwnerList",
     "VectorQueryResult",
     "VectorResumeList",
     "create_resume_vector_ingestion_service",

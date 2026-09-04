@@ -13,9 +13,9 @@ from expert_index.ports import ExpertBatchSyncInput
 from expert_index.vector_sync import ExpertVectorSynchronizer
 from rag_vector_store import (
     VectorDeletionResult,
-    VectorExpertList,
     VectorIngestionResult,
     VectorItemResult,
+    VectorOwnerList,
     VectorQueryResult,
 )
 
@@ -46,13 +46,13 @@ class FakeVectorStore:
         self.metadata_calls: list[list[ExpertChunkEmbeddingInput]] = []
         self.delete_calls: list[list[str]] = []
 
-    def list_vectors_by_expert(self, expert_id: int) -> VectorExpertList:
+    def list_vectors_by_owner(self, owner_id: int) -> VectorOwnerList:
         ids = [
             vector_doc_id
             for vector_doc_id, row in self.rows.items()
-            if row["expert_id"] == expert_id
+            if row["expert_id"] == owner_id
         ]
-        return VectorExpertList(expert_id=expert_id, vector_doc_ids=ids, count=len(ids))
+        return VectorOwnerList(owner_id=owner_id, vector_doc_ids=ids, count=len(ids))
 
     def get_vectors(self, vector_doc_ids: list[str]) -> VectorQueryResult:
         return VectorQueryResult(
@@ -96,7 +96,7 @@ class FakeVectorStore:
             ]
         )
 
-    def delete_vectors(self, vector_doc_ids: list[str]) -> VectorDeletionResult:
+    def disable_vectors(self, vector_doc_ids: list[str]) -> VectorDeletionResult:
         self.delete_calls.append(list(vector_doc_ids))
         deleted = sum(item in self.rows for item in vector_doc_ids)
         return VectorDeletionResult(

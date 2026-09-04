@@ -14,11 +14,11 @@ from rag_vector_store import (
     FORMAL_EMBEDDING_MODEL_ALIAS,
     CompanyCloudEmbeddingModel,
 )
-from rag_vector_store.config import MySQLSettings
 from tests.support.expert_chunk_text_reader import (
     ExpertChunkTextTestReader,
     FlatTestChunk,
 )
+from tests.support.mysql_connection import database_config_from_test_env
 
 
 @dataclass(frozen=True)
@@ -95,7 +95,7 @@ def test_expert_chunk_text_to_real_embedding_and_fake_repository() -> None:
     """验证临时测试表的五条数据只经 Flat DTO 进入真实 Embedding。"""
 
     _require_real_runtime_configuration()
-    reader = ExpertChunkTextTestReader(MySQLSettings.from_env())
+    reader = ExpertChunkTextTestReader(database_config_from_test_env())
     chunks = reader.read()
 
     assert len(chunks) == 5

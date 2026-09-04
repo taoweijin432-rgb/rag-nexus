@@ -39,12 +39,6 @@ V15_CONTRACT_VECTOR_DIMENSION = FORMAL_EMBEDDING_DIMENSION
 # chunk_text 的 Milvus VARCHAR 字节容量沿用 ContractValidator 的 UTF-8
 # 上限（8192 bytes），保证任意合法 Contract chunk_text 都能落库。
 
-# V15 不保留任何 scalar index：expert_id / content_hash / metadata_hash 均已
-# 进入 flat metadata JSON，本阶段冻结纯 4 字段 persistence correctness。
-# JSON path index / per-expert query 性能在真实 V15 E2E 后单独评估。
-V15_SCALAR_INDEX_FIELDS: tuple[str, ...] = ()
-
-
 def v15_milvus_field_specs(
     vector_dimension: int = V15_CONTRACT_VECTOR_DIMENSION,
 ) -> tuple[MilvusFieldSpec, ...]:

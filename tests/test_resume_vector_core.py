@@ -23,10 +23,11 @@ from rag_vector_store import (
     ResumeVectorIngestionService,
     VectorContractError,
     create_resume_vector_ingestion_service,
+    create_vector_ingestion_service,
 )
 from rag_vector_store.core.embedding import DomainEmbeddingWorker
 from rag_vector_store.core.ingestion import DomainIngestionService
-from rag_vector_store.domains import ResumeContractAdapter
+from rag_vector_store.domains import ExpertContractAdapter, ResumeContractAdapter
 from rag_vector_store.milvus.contract_v15 import (
     MilvusV15RowMapper,
     ResumeMilvusV15RowMapper,
@@ -266,9 +267,19 @@ def test_resume_metadata_only_and_disable_are_embedding_free_and_idempotent() ->
     assert len(repository.upsert_calls) == calls_after_first_disable
     assert repository.rows[record.vector_doc_id]["metadata"]["is_active"] is False
 
-    listed = service.list_vectors_by_resume(123)
-    assert listed.resume_id == 123
+    listed = service.list_vectors_by_owner(123)
+    assert listed.owner_id == 123
     assert listed.vector_doc_ids == [record.vector_doc_id]
+
+
+def test_resume_legacy_owner_list_warns_and_delegates() -> None:
+    service, _model, _repository = _resume_service()
+
+    with pytest.warns(DeprecationWarning, match="list_vectors_by_resume 已弃用"):
+        listed = service.list_vectors_by_resume(123)
+
+    assert listed.resume_id == 123
+    assert listed.vector_doc_ids == []
 
 
 def test_resume_service_rejects_expert_namespace_for_reads_and_disable() -> None:
@@ -387,6 +398,52 @@ def test_resume_factory_rejects_expert_repository_and_mapper() -> None:
             milvus_settings=settings,
             embedding_worker=object(),
             row_mapper=MilvusV15RowMapper(),
+        )
+
+
+def test_factories_reject_cross_domain_repository_mapper_and_worker() -> None:
+    expert_settings = MilvusSettings(
+        collection_name="expert_candidates_v15_contract",
+    )
+    resume_settings = MilvusSettings(
+        collection_name="resume_candidates_v2_test",
+    )
+    resume_repository = ContractMilvusV15VectorRepository(
+        resume_settings,
+        1024,
+        profile=RESUME_V15_PROFILE,
+    )
+    resume_worker = DomainEmbeddingWorker(
+        FakeEmbeddingModel(),
+        ResumeContractAdapter(),
+        expected_dimension=1024,
+    )
+    expert_worker = DomainEmbeddingWorker(
+        FakeEmbeddingModel(),
+        ExpertContractAdapter(),
+        expected_dimension=1024,
+    )
+
+    with pytest.raises(ValueError, match="Expert Profile"):
+        create_vector_ingestion_service(
+            repository=resume_repository,
+            embedding_worker=expert_worker,
+        )
+    with pytest.raises(TypeError, match="MilvusV15RowMapper"):
+        create_vector_ingestion_service(
+            milvus_settings=expert_settings,
+            embedding_worker=expert_worker,
+            row_mapper=ResumeMilvusV15RowMapper(),
+        )
+    with pytest.raises(ValueError, match="Expert 身份空间"):
+        create_vector_ingestion_service(
+            milvus_settings=expert_settings,
+            embedding_worker=resume_worker,
+        )
+    with pytest.raises(ValueError, match="Resume 身份空间"):
+        create_resume_vector_ingestion_service(
+            milvus_settings=resume_settings,
+            embedding_worker=expert_worker,
         )
 
 

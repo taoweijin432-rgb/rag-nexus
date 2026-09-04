@@ -13,8 +13,8 @@ from typing import TYPE_CHECKING, Protocol
 from expert_contracts import ExpertChunkEmbeddingInput
 from rag_vector_store import (
     VectorDeletionResult,
-    VectorExpertList,
     VectorIngestionResult,
+    VectorOwnerList,
     VectorQueryResult,
 )
 
@@ -43,7 +43,7 @@ class VectorStorePort(Protocol):
         chunks: Sequence[ExpertChunkEmbeddingInput],
     ) -> VectorIngestionResult: ...
 
-    def delete_vectors(
+    def disable_vectors(
         self,
         vector_doc_ids: Sequence[str],
     ) -> VectorDeletionResult: ...
@@ -53,7 +53,7 @@ class VectorStorePort(Protocol):
         vector_doc_ids: Sequence[str],
     ) -> VectorQueryResult: ...
 
-    def list_vectors_by_expert(self, expert_id: int) -> VectorExpertList: ...
+    def list_vectors_by_owner(self, owner_id: int) -> VectorOwnerList: ...
 
 
 class ExpertVectorSyncPort(Protocol):

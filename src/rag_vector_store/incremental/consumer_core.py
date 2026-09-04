@@ -43,28 +43,20 @@ from ..ingestion.models import (
 )
 from .consumer_models import (
     CONSUMER_ACTION_ADAPT_UPSERT,
-    CONSUMER_ACTION_DISABLE_STALE_TARGETS,
     CONSUMER_ACTION_DISABLE_TARGETS,
     CONSUMER_ACTION_EMBEDDING_UPSERT,
     CONSUMER_ACTION_FETCH_EXISTING,
     CONSUMER_ACTION_METADATA_ONLY_UPDATE,
     CONSUMER_ACTION_SKIP_UNCHANGED,
-    CONSUMER_ACTION_SYNTHESIZE_FROM_STORED,
-    ERROR_CODE_CONTRACT_ADAPTATION_FAILED,
     ERROR_CODE_DISABLE_INFRA_FAILED,
     ERROR_CODE_ELIGIBILITY_DISABLE_FAILED,
     ERROR_CODE_EXISTING_QUERY_FAILED,
     ERROR_CODE_EXISTING_STATE_INVALID,
     ERROR_CODE_METADATA_ONLY_INCONSISTENT,
-    ERROR_CODE_METADATA_STORED_TEXT_MISSING,
-    ERROR_CODE_METADATA_TARGET_MISSING,
     ERROR_CODE_METADATA_UPDATE_INFRA_FAILED,
     ERROR_CODE_MODEL_SPACE_MISMATCH,
-    ERROR_CODE_STALE_DISABLE_FAILED,
-    ERROR_CODE_STALE_SOURCE_EVENT_ID,
     ERROR_CODE_UPSERT_CONTRACT_FAILED,
     ERROR_CODE_UPSERT_INFRA_FAILED,
-    RESULT_CODE_DUPLICATE_SUPERSEDED,
     RESULT_CODE_EMBEDDED,
     RESULT_CODE_METADATA_UPDATED,
     RESULT_CODE_TARGETS_DISABLED,
@@ -73,18 +65,6 @@ from .consumer_models import (
     ConsumerOperation,
     ExecutionResult,
 )
-
-
-class SourceEventOrderView(Protocol):
-    """只读的事件顺序查询缝隙（非 StateStorePort，零写入）。
-
-    生产实现由最终确认的唯一状态表适配层提供；测试使用 Fake。核心仅在输入
-    携带 ``source_event_id`` 且本视图有记录时做旧事件拦截。
-    """
-
-    def last_applied_source_event_id(self, vector_doc_id: str) -> int | None:
-        """返回该 vector_doc_id 最近一次成功应用的 source_event_id；未知为 None。"""
-        ...
 
 
 class VectorMutationPort(Protocol):
@@ -121,14 +101,6 @@ class VectorMutationPort(Protocol):
 # 标准 Contract 输入 / Disable 输入（核心的唯一入口形态）
 # ---------------------------------------------------------------------------
 @dataclass(frozen=True)
-class AdaptedContract:
-    """适配产物：完整正式契约 + Eligibility 预判（None 表示允许 Embedding）。"""
-
-    contract: Any
-    eligibility_skip_reason: str | None = None
-
-
-@dataclass(frozen=True)
 class ContractUpsertIntent:
     """标准 upsert 意图：调用方已完成 Contract 适配（含 Eligibility 预判）。
 
@@ -138,28 +110,10 @@ class ContractUpsertIntent:
 
     contract: Any
     eligibility_skip_reason: str | None = None
-    stale_vector_doc_ids: tuple[str, ...] = ()
-    source_event_id: int | None = None
 
     @property
     def vector_doc_id(self) -> str:
         return self.contract.vector_doc_id
-
-
-@dataclass(frozen=True)
-class ContractMetadataUpdateIntent:
-    """标准 metadata_update 意图：目标 id + 从已存实体构造 Contract 的工厂。
-
-    metadata_update 意图不携带 chunk_text，metadata-only 更新必须复用已存正文：
-    核心先读取已存记录，再以 ``(stored_chunk_text, stored_content_hash)`` 调用
-    :attr:`adapt_from_stored` 构造完整 Contract。工厂失败抛出
-    :class:`ContractSynthesisError`（确定性拒绝），绝不伪造哈希或文本。
-    """
-
-    vector_doc_id: str
-    adapt_from_stored: Callable[[str, str], AdaptedContract]
-    stale_vector_doc_ids: tuple[str, ...] = ()
-    source_event_id: int | None = None
 
 
 @dataclass(frozen=True)
@@ -172,65 +126,10 @@ class ContractDisableInput:
 
     vector_doc_id: str
     target_vector_doc_ids: tuple[str, ...] = ()
-    source_event_id: int | None = None
-
-
-@dataclass(frozen=True)
-class PreRejectedInput:
-    """调用方已确定性失败的输入透传载体。
-
-    核心先执行旧事件拦截（保持既有判定顺序），未命中拦截时按携带的稳定
-    error_code 原样产出 rejected 结果。
-    """
-
-    vector_doc_id: str
-    operation: ConsumerOperation
-    detail: str
-    error_code: str
-    source_event_id: int | None = None
 
 
 #: 核心入口接受的输入联合类型。
-ContractConsumerInput = (
-    ContractUpsertIntent
-    | ContractMetadataUpdateIntent
-    | ContractDisableInput
-    | PreRejectedInput
-)
-
-
-class ContractSynthesisError(ValueError):
-    """metadata_update 工厂从已存实体构造 Contract 失败（确定性拒绝）。"""
-
-
-def resolve_winner_indices(
-    keys: Sequence[tuple[str, int | None]],
-) -> dict[int, int]:
-    """批内同 vector_doc_id 幂等裁决，返回 ``下标 -> 胜出下标`` 映射。
-
-    规则：source_event_id 最高者胜（None 视为最低）；并列时取输入顺序靠后者
-    ——同一事件重复投递时后到的覆盖先到的，与"最后写入获胜"一致。非胜出
-    下标映射到其所属的最终胜者下标。兼容入口与核心共用本实现。
-    """
-
-
-    def _rank(index: int) -> tuple[int, int]:
-        event = keys[index][1]
-        return (event if event is not None else -1, index)
-
-    best: dict[str, int] = {}
-    for index, (vector_doc_id, _event) in enumerate(keys):
-        current = best.get(vector_doc_id)
-        if current is None or _rank(index) >= _rank(current):
-            best[vector_doc_id] = index
-    winner_indices = set(best.values())
-    mapping: dict[int, int] = {}
-    for index, (vector_doc_id, _event) in enumerate(keys):
-        if index in winner_indices:
-            mapping[index] = index
-        else:
-            mapping[index] = best[vector_doc_id]
-    return mapping
+ContractConsumerInput = ContractUpsertIntent | ContractDisableInput
 
 
 class _AttributeContractAdapter:
@@ -274,27 +173,6 @@ class _AdapterEligibilityBinding:
         return self.adapter.skip_reason(value)
 
 
-def duplicate_superseded_result(
-    *,
-    vector_doc_id: str,
-    operation: ConsumerOperation,
-    winner_index: int | None,
-) -> ExecutionResult:
-    """构造批内落选者的幂等跳过结果（不执行任何动作）。"""
-
-    detail = f"（输入序号 {winner_index}）" if winner_index is not None else ""
-    return ExecutionResult(
-        vector_doc_id=vector_doc_id,
-        operation=operation,
-        status="skipped",
-        result_code=RESULT_CODE_DUPLICATE_SUPERSEDED,
-        reason=(
-            "duplicate_superseded：同 vector_doc_id 存在更新事件"
-            f"{detail}，本条按幂等规则落选，不执行"
-        ),
-    )
-
-
 @dataclass(frozen=True)
 class _ExistingVectorState:
     """增量判定所需的已存实体轻量状态（严格 fail-closed 提取）。
@@ -327,16 +205,6 @@ def _dedupe_keep_order(values: Sequence[str]) -> list[str]:
             seen.add(value)
             ordered.append(value)
     return ordered
-
-
-def validation_error_summary(error: Exception) -> str:
-    """提取 pydantic 校验错误的简明摘要（供拒绝原因透出）。"""
-
-    parts = [
-        f"{'.'.join(str(p) for p in item.get('loc', ()))}: {item.get('msg', '')}"
-        for item in getattr(error, "errors", list)()
-    ]
-    return "；".join(part for part in parts if part) or str(error)
 
 
 def _extract_existing_state(record: dict[str, object]) -> _ExistingVectorState:
@@ -383,36 +251,28 @@ class ContractConsumerCore:
 
     参数：
         ``vector_store``：满足 :class:`VectorMutationPort` 的向量能力入口。
-        ``event_order``：可选只读事件顺序视图，用于 source_event_id 旧事件拦截；
-          未提供时不拦截（生产由后续唯一状态表适配层接入）。
         ``eligibility_skip_of``：可选的 Eligibility 预判函数，把一条正式 Contract 映射为
           skip reason（``None`` 表示允许 Embedding）。正式范围 Consumer 经
           :meth:`process_contracts` 调用时内部复用该函数，避免调用方复制 Eligibility 规则；
           生产注入 ``EmbeddingEligibilityValidator().get_skip_reason``。
 
     入口：
-        :meth:`process` 接收标准 Contract/Disable 输入序列。批内先做幂等裁决：
-        同 ``vector_doc_id`` 取 source_event_id 最高者（并列取输入靠后者），落选者
-        记 skipped(duplicate_superseded)，胜者按输入顺序执行并逐条返回结果。
+        :meth:`process` 接收标准 Contract/Disable 输入序列。批内
+        ``vector_doc_id`` 必须唯一，重复输入会在任何写入前 fail-closed。
 
         :meth:`process_contracts` 接收正式 ``ExpertChunkEmbeddingInput`` 序列：内部对每条
         调用 ``eligibility_skip_of`` 得到 skip reason，包成 :class:`ContractUpsertIntent`
         后委托 :meth:`process`。不携带 stale（范围 Consumer 在收敛后单独计算并下线 stale）。
-
-        ``plan_only=True`` 时只生成执行计划（status=planned），除 ``get_vectors``
-        只读查询外不触发任何写入动作。
     """
 
     def __init__(
         self,
         *,
         vector_store: VectorMutationPort,
-        event_order: SourceEventOrderView | None = None,
         eligibility_skip_of: Callable[[Any], str | None] | None = None,
         contract_adapter: VectorConsumerContractAdapter | None = None,
     ) -> None:
         self._vector_store = vector_store
-        self._event_order = event_order
         self._eligibility_skip_of = (
             _AdapterEligibilityBinding(contract_adapter, eligibility_skip_of)
             if contract_adapter is not None
@@ -433,35 +293,19 @@ class ContractConsumerCore:
     def process(
         self,
         inputs: Sequence[ContractConsumerInput],
-        *,
-        plan_only: bool = False,
     ) -> list[ExecutionResult]:
         """按输入顺序消费一批标准输入并返回逐条执行结果。"""
 
-        keys = [(item.vector_doc_id, item.source_event_id) for item in inputs]
-        winner_by_index = resolve_winner_indices(keys)
-        results: list[ExecutionResult] = []
-        for index, item in enumerate(inputs):
-            winner_index = winner_by_index.get(index)
-            if winner_index != index:
-                results.append(
-                    duplicate_superseded_result(
-                        vector_doc_id=item.vector_doc_id,
-                        operation=self._operation_of(item),
-                        winner_index=(
-                            winner_index if winner_index is not None else None
-                        ),
-                    )
-                )
-                continue
-            results.append(self._process_one(item, plan_only=plan_only))
-        return results
+        vector_doc_ids = [item.vector_doc_id for item in inputs]
+        if any(not isinstance(value, str) or not value.strip() for value in vector_doc_ids):
+            raise ValueError("Consumer 输入必须包含非空 vector_doc_id")
+        if len(vector_doc_ids) != len(set(vector_doc_ids)):
+            raise ValueError("Consumer 批次不能包含重复 vector_doc_id")
+        return [self._process_one(item) for item in inputs]
 
     def process_contracts(
         self,
         contracts: Sequence[Any],
-        *,
-        plan_only: bool = False,
     ) -> list[ExecutionResult]:
         """面向正式 Contract 的入口：内部做 Eligibility 预判后委托 :meth:`process`。
 
@@ -476,8 +320,8 @@ class ContractConsumerCore:
         ``None`` 放行 ineligible desired）。兼容入口 :meth:`process` 不受此约束
         （调用方自行构造 intent 并预填 skip reason）。
 
-        不携带 ``stale_vector_doc_ids``：范围 Consumer 在 desired 全部收敛后单独计算并
-        下线 stale（见 :mod:`scope_consumer`）。
+        stale 由范围 Consumer 在 desired 全部收敛后单独计算并下线
+        （见 :mod:`scope_consumer`）。
         """
 
         if self._eligibility_skip_of is None:
@@ -495,19 +339,7 @@ class ContractConsumerCore:
             intents.append(
                 ContractUpsertIntent(contract=contract, eligibility_skip_reason=skip_reason)
             )
-        return self.process(intents, plan_only=plan_only)
-
-    @staticmethod
-    def _operation_of(item: ContractConsumerInput) -> ConsumerOperation:
-        """推断输入对应的操作标签（仅用于落选结果的展示）。"""
-
-        if isinstance(item, ContractUpsertIntent):
-            return "upsert"
-        if isinstance(item, ContractMetadataUpdateIntent):
-            return "metadata_update"
-        if isinstance(item, PreRejectedInput):
-            return item.operation
-        return "disable"
+        return self.process(intents)
 
     # ------------------------------------------------------------------
     # 单条处理
@@ -515,54 +347,15 @@ class ContractConsumerCore:
     def _process_one(
         self,
         item: ContractConsumerInput,
-        *,
-        plan_only: bool,
     ) -> ExecutionResult:
-        stale_reason = self._stale_event_reason(item)
-        if stale_reason is not None:
-            return ExecutionResult(
-                vector_doc_id=item.vector_doc_id,
-                operation=self._operation_of(item),
-                status="rejected",
-                reason=stale_reason,
-                error_code=ERROR_CODE_STALE_SOURCE_EVENT_ID,
-            )
-        if isinstance(item, PreRejectedInput):
-            return ExecutionResult(
-                vector_doc_id=item.vector_doc_id,
-                operation=item.operation,
-                status="rejected",
-                reason=item.detail,
-                error_code=item.error_code,
-            )
         if isinstance(item, ContractUpsertIntent):
             return self._handle_upsert_like(
                 contract=item.contract,
                 op="upsert",
                 eligibility_skip_reason=item.eligibility_skip_reason,
-                stale_ids=item.stale_vector_doc_ids,
                 actions=[],
-                plan_only=plan_only,
             )
-        if isinstance(item, ContractMetadataUpdateIntent):
-            return self._handle_metadata_update(item, plan_only=plan_only)
-        return self._handle_disable(item, plan_only=plan_only)
-
-    def _stale_event_reason(self, item: ContractConsumerInput) -> str | None:
-        """旧 source_event_id 拦截；返回拒绝原因（None 表示放行）。"""
-
-        incoming = item.source_event_id
-        if self._event_order is None or incoming is None:
-            return None
-        last = self._event_order.last_applied_source_event_id(item.vector_doc_id)
-        if last is None:
-            return None
-        if incoming < last:
-            return (
-                f"stale_source_event_id：incoming={incoming} < "
-                f"last_applied={last}，旧事件不得覆盖新事件"
-            )
-        return None
+        return self._handle_disable(item)
 
     def _load_record(
         self,
@@ -601,19 +394,12 @@ class ContractConsumerCore:
         contract: Any,
         op: ConsumerOperation,
         eligibility_skip_reason: str | None,
-        stale_ids: tuple[str, ...],
         actions: list[str],
-        plan_only: bool,
-        preloaded_state: _ExistingVectorState | None = None,
-        state_loaded: bool = False,
     ) -> ExecutionResult:
-        """差分判定与执行主体：Eligibility → 读取已存 → 差分 → 执行计划。
+        """差分判定与执行主体：Eligibility → 读取已存 → 差分 → 执行。
 
-        Contract 适配已由调用方完成（兼容入口的适配器端口或直接构造 intent），
+        Contract 适配已由调用方完成，
         此处登记 adapt_upsert 动作以保持执行轨迹完整。
-        ``preloaded_state``/``state_loaded`` 由 metadata_update 合成路径传入以
-        复用已读取的已存状态（None 且 loaded=True 表示确认不存在），避免重复
-        查询；普通 upsert 路径两者取默认值自行查询。
         """
 
         adapter = self._contract_adapter
@@ -624,37 +410,32 @@ class ContractConsumerCore:
         if eligibility_skip_reason is not None:
             return self._execute_eligibility_disable(
                 vector_doc_id=vid,
-                stale_ids=stale_ids,
                 op=op,
                 skip_reason=eligibility_skip_reason,
                 actions=tuple(actions),
-                plan_only=plan_only,
             )
 
-        if not state_loaded:
-            record, failure = self._load_record(vid, op)
-            if failure is not None:
-                return failure.model_copy(update={"actions": tuple(actions)})
-            if record is None:
-                preloaded_state = None
-                state_loaded = True
-            else:
-                try:
-                    preloaded_state = _extract_existing_state(record)
-                    state_loaded = True
-                except _ExistingStateError as error:
-                    return ExecutionResult(
-                        vector_doc_id=vid,
-                        operation=op,
-                        status="rejected",
-                        reason=f"existing_state_invalid：{error}",
-                        error_code=ERROR_CODE_EXISTING_STATE_INVALID,
-                        actions=tuple(actions),
-                    )
+        record, failure = self._load_record(vid, op)
+        if failure is not None:
+            return failure.model_copy(update={"actions": tuple(actions)})
+        if record is None:
+            existing_state = None
+        else:
+            try:
+                existing_state = _extract_existing_state(record)
+            except _ExistingStateError as error:
+                return ExecutionResult(
+                    vector_doc_id=vid,
+                    operation=op,
+                    status="rejected",
+                    reason=f"existing_state_invalid：{error}",
+                    error_code=ERROR_CODE_EXISTING_STATE_INVALID,
+                    actions=tuple(actions),
+                )
         actions.append(CONSUMER_ACTION_FETCH_EXISTING)
 
         mode = self._decide_text_mode(
-            preloaded_state,
+            existing_state,
             adapter.content_hash(contract),
             adapter.metadata_hash(contract),
             adapter.source_hash(contract),
@@ -663,16 +444,8 @@ class ContractConsumerCore:
             contract=contract,
             mode=mode,
             actions=actions,
-            plan_only=plan_only,
             op=op,
         )
-        if result.status in ("committed", "skipped"):
-            result = self._apply_stale_disables(
-                main_vector_doc_id=vid,
-                stale_ids=stale_ids,
-                main_result=result,
-                plan_only=plan_only,
-            )
         return result
 
     @staticmethod
@@ -722,19 +495,9 @@ class ContractConsumerCore:
         contract: Any,
         mode: str,
         actions: list[str],
-        plan_only: bool,
         op: ConsumerOperation,
     ) -> ExecutionResult:
-        """执行差分计划；plan_only 下只登记将要执行的动作。"""
-
-        if plan_only:
-            return ExecutionResult(
-                vector_doc_id=self._contract_adapter.vector_doc_id(contract),
-                operation=op,
-                status="planned",
-                reason="plan_only：仅生成执行计划，未触发任何写入",
-                actions=tuple(actions) + (mode,),
-            )
+        """执行三 Hash 差分计划。"""
 
         if mode == CONSUMER_ACTION_SKIP_UNCHANGED:
             return ExecutionResult(
@@ -888,25 +651,14 @@ class ContractConsumerCore:
         self,
         *,
         vector_doc_id: str,
-        stale_ids: tuple[str, ...],
         op: ConsumerOperation,
         skip_reason: str,
         actions: tuple[str, ...],
-        plan_only: bool,
     ) -> ExecutionResult:
-        """Eligibility 不通过 → 目标集合逻辑下线（正确性要求，非 skip）。"""
+        """Eligibility 不通过 → 当前目标逻辑下线（正确性要求，非 skip）。"""
 
-        targets = _dedupe_keep_order([vector_doc_id, *stale_ids])
-        planned_actions = actions + (CONSUMER_ACTION_DISABLE_TARGETS,)
-        if plan_only:
-            return ExecutionResult(
-                vector_doc_id=vector_doc_id,
-                operation=op,
-                status="planned",
-                reason=f"eligibility_disable：{skip_reason} → 逻辑下线目标集合",
-                actions=planned_actions,
-                disabled_ids=tuple(targets),
-            )
+        targets = [vector_doc_id]
+        disable_actions = actions + (CONSUMER_ACTION_DISABLE_TARGETS,)
         try:
             deletion = self._vector_store.disable_vectors(targets)
         except VectorIngestionError as error:
@@ -917,7 +669,7 @@ class ContractConsumerCore:
                 reason=f"eligibility_disable_failed：{skip_reason}；{error}",
                 error_code=ERROR_CODE_ELIGIBILITY_DISABLE_FAILED,
                 retryable=True,
-                actions=planned_actions,
+                actions=disable_actions,
             )
         return ExecutionResult(
             vector_doc_id=vector_doc_id,
@@ -928,86 +680,8 @@ class ContractConsumerCore:
                 f"eligibility_disable：{skip_reason}；已下线 "
                 f"{deletion.deleted_count} 条，未命中 {deletion.not_found_count} 条"
             ),
-            actions=planned_actions,
+            actions=disable_actions,
             disabled_ids=tuple(targets),
-        )
-
-    # ------------------------------------------------------------------
-    # metadata_update：取回已存原文后经工厂构造 Contract
-    # ------------------------------------------------------------------
-    def _handle_metadata_update(
-        self,
-        intent: ContractMetadataUpdateIntent,
-        *,
-        plan_only: bool,
-    ) -> ExecutionResult:
-        """metadata-update 主体：读旧实体 → 工厂构造完整 Contract → 复用主体判定。
-
-        目标不存在时没有可 Embedding 的文本、无法回退全量 upsert，只能确定性
-        rejected；工厂构造失败同样确定性 rejected（绝不伪造文本或哈希）。
-        只有目标存在且构造成功时才进入共享差分主体。
-        """
-
-        record, failure = self._load_record(intent.vector_doc_id, "metadata_update")
-        actions = [CONSUMER_ACTION_FETCH_EXISTING]
-        if failure is not None:
-            return failure.model_copy(update={"actions": tuple(actions)})
-        if record is None:
-            return ExecutionResult(
-                vector_doc_id=intent.vector_doc_id,
-                operation="metadata_update",
-                status="rejected",
-                reason=(
-                    "metadata_target_missing：Milvus 无此 vector_doc_id，"
-                    "metadata-only 更新缺少可复用的 chunk_text，无法构造 Contract"
-                ),
-                error_code=ERROR_CODE_METADATA_TARGET_MISSING,
-                actions=tuple(actions),
-            )
-        try:
-            state = _extract_existing_state(record)
-        except _ExistingStateError as error:
-            return ExecutionResult(
-                vector_doc_id=intent.vector_doc_id,
-                operation="metadata_update",
-                status="rejected",
-                reason=f"existing_state_invalid：{error}",
-                error_code=ERROR_CODE_EXISTING_STATE_INVALID,
-                actions=tuple(actions),
-            )
-        stored_text = record.get("chunk_text")
-        if not isinstance(stored_text, str) or not stored_text.strip():
-            return ExecutionResult(
-                vector_doc_id=intent.vector_doc_id,
-                operation="metadata_update",
-                status="rejected",
-                reason="metadata_stored_text_missing：已存实体缺少非空 chunk_text",
-                error_code=ERROR_CODE_METADATA_STORED_TEXT_MISSING,
-                actions=tuple(actions),
-            )
-
-        try:
-            adapted = intent.adapt_from_stored(stored_text, state.content_hash)
-        except ContractSynthesisError as error:
-            return ExecutionResult(
-                vector_doc_id=intent.vector_doc_id,
-                operation="metadata_update",
-                status="rejected",
-                reason=f"contract_adaptation_failed：{error}",
-                error_code=ERROR_CODE_CONTRACT_ADAPTATION_FAILED,
-                actions=tuple(actions),
-            )
-        actions.append(CONSUMER_ACTION_SYNTHESIZE_FROM_STORED)
-
-        return self._handle_upsert_like(
-            contract=adapted.contract,
-            op="metadata_update",
-            eligibility_skip_reason=adapted.eligibility_skip_reason,
-            stale_ids=intent.stale_vector_doc_ids,
-            actions=actions,
-            plan_only=plan_only,
-            preloaded_state=state,
-            state_loaded=True,
         )
 
     # ------------------------------------------------------------------
@@ -1016,22 +690,11 @@ class ContractConsumerCore:
     def _handle_disable(
         self,
         item: ContractDisableInput,
-        *,
-        plan_only: bool,
     ) -> ExecutionResult:
         """disable 主体：按给定 id 集合调用逻辑下线（无物理删除）。"""
 
         ids = tuple(_dedupe_keep_order([item.vector_doc_id, *item.target_vector_doc_ids]))
         actions = [CONSUMER_ACTION_DISABLE_TARGETS]
-        if plan_only:
-            return ExecutionResult(
-                vector_doc_id=item.vector_doc_id,
-                operation="disable",
-                status="planned",
-                reason="plan_only：仅规划逻辑下线，不触发写入",
-                actions=tuple(actions),
-                disabled_ids=ids,
-            )
         try:
             deletion = self._vector_store.disable_vectors(list(ids))
         except VectorIngestionError as error:
@@ -1057,103 +720,11 @@ class ContractConsumerCore:
             disabled_ids=ids,
         )
 
-    # ------------------------------------------------------------------
-    # stale 子块：与主操作解耦的独立逻辑下线
-    # ------------------------------------------------------------------
-    def _apply_stale_disables(
-        self,
-        *,
-        main_vector_doc_id: str,
-        stale_ids: tuple[str, ...],
-        main_result: ExecutionResult,
-        plan_only: bool,
-    ) -> ExecutionResult:
-        """主操作收敛后独立处理 stale 子块；stale 失败不回滚主操作效果。
-
-        主操作成功后若 stale 列表非空，则单独走逻辑下线；stale 下线失败时整体
-        记 failed（可重试），reason 注明主操作已完成——重放时主路径因 hash 幂等
-        自然收敛，仅补做 stale 下线。主操作为 skipped 且 stale 全部下线成功时，
-        结果升级为 committed（存在实际写入效果，result_code 改记 targets_disabled）。
-        """
-
-        stales = [
-            vid
-            for vid in _dedupe_keep_order(stale_ids)
-            if vid != main_vector_doc_id
-        ]
-        if not stales:
-            return main_result
-        planned_actions = main_result.actions + (CONSUMER_ACTION_DISABLE_STALE_TARGETS,)
-        base_reason = main_result.reason or ""
-        if plan_only:
-            return main_result.model_copy(
-                update={
-                    "actions": planned_actions,
-                    "reason": (
-                        f"{base_reason}；stale 子块待下线: {stales}"
-                        if base_reason
-                        else f"stale 子块待下线: {stales}"
-                    ),
-                },
-            )
-        try:
-            deletion = self._vector_store.disable_vectors(stales)
-        except VectorIngestionError as error:
-            # 显式重建以强制执行字段不变量（failed 必须携带 error_code、
-            # 不得残留 result_code / embedding / metadata 标记）。
-            return ExecutionResult(
-                vector_doc_id=main_result.vector_doc_id,
-                operation=main_result.operation,
-                status="failed",
-                reason=(
-                    f"{base_reason or 'main_done'}；"
-                    f"stale_disable_failed（主操作已完成，重放仅补 stale）: {error}"
-                ),
-                actions=planned_actions,
-                disabled_ids=main_result.disabled_ids,
-                error_code=ERROR_CODE_STALE_DISABLE_FAILED,
-                retryable=True,
-            )
-        merged_disabled = tuple(
-            _dedupe_keep_order([*main_result.disabled_ids, *stales])
-        )
-        stale_note = (
-            f"stale 已下线 {deletion.deleted_count} 条，"
-            f"未命中 {deletion.not_found_count} 条"
-        )
-        if main_result.status != "skipped":
-            # 非 skip 主操作保持原状态，仅合并 reason / 动作 / disabled_ids。
-            return main_result.model_copy(
-                update={
-                    "reason": f"{base_reason}；{stale_note}" if base_reason else stale_note,
-                    "actions": planned_actions,
-                    "disabled_ids": merged_disabled,
-                },
-            )
-        # skip 升级为 committed：净效果是纯逻辑下线，分类码改记 targets_disabled。
-        return ExecutionResult(
-            vector_doc_id=main_result.vector_doc_id,
-            operation=main_result.operation,
-            status="committed",
-            result_code=RESULT_CODE_TARGETS_DISABLED,
-            reason=f"{base_reason}；{stale_note}" if base_reason else stale_note,
-            actions=planned_actions,
-            disabled_ids=merged_disabled,
-        )
-
 
 __all__ = [
-    "AdaptedContract",
     "ContractConsumerCore",
     "ContractConsumerInput",
     "ContractDisableInput",
-    "ContractMetadataUpdateIntent",
-    "ContractSynthesisError",
     "ContractUpsertIntent",
-    "PreRejectedInput",
-    "SourceEventOrderView",
     "VectorMutationPort",
-    "duplicate_superseded_result",
-    "resolve_winner_indices",
-    "validation_error_summary",
 ]

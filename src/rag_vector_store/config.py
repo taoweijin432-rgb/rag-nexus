@@ -1,4 +1,4 @@
-"""从环境变量加载 Milvus 和 MySQL 配置。
+"""从环境变量加载 Milvus 配置。
 
 配置模块只负责把进程环境转换为强类型设置，不创建连接、不读取数据库，也不
 改变现有 ``.env``。凭据通过 ``SecretStr``/连接参数传递，错误诊断不能回显密钥。
@@ -128,90 +128,6 @@ class MilvusSettings(BaseModel):
         return cls(**values)
 
 
-class MySQLSettings(BaseModel):
-    """供只读 MySQL 连接基础设施使用的配置。
-
-    数据库名称、用户名和密码不提供业务默认值。缺少这些环境变量时，验证脚本应
-    报告 BLOCKED，而不是猜测本地数据库身份或连接目标；本配置本身不负责选择
-    只读事务或执行任何 SQL。
-    """
-
-    model_config = ConfigDict(extra="forbid")
-
-    host: str = Field(default="127.0.0.1", min_length=1)
-    port: int = Field(default=3306, ge=1, le=65535)
-    database: str | None = Field(default=None, min_length=1)
-    user: str | None = Field(default=None, min_length=1)
-    password: SecretStr | None = None
-
-    @classmethod
-    def from_env(cls, environ: Mapping[str, str] | None = None) -> MySQLSettings:
-        """从 MYSQL_* 环境变量读取配置，不加载或修改 .env 文件。
-
-        同事的 expert_index 仍以 DB_*/SOURCE_DB_* 命名；这里保留
-        MYSQL_* 作为 Task2 的清晰边界，同时接受这些已有变量作为回退，
-        使 Reader 可以直接复用同事的 DatabaseConfig 配置而不复制一套环境协议。
-        """
-
-        env = os.environ if environ is None else environ
-        port = _first_optional(env, "MYSQL_PORT", "SOURCE_DB_PORT", "DB_PORT")
-        values: dict[str, Any] = {
-            "host": _first(
-                env,
-                "MYSQL_HOST",
-                "SOURCE_DB_HOST",
-                "DB_HOST",
-                default="127.0.0.1",
-            ),
-            "database": _first_optional(
-                env,
-                "MYSQL_DATABASE",
-                "SOURCE_DB_NAME",
-                "DB_NAME",
-            ),
-            "user": _first_optional(
-                env,
-                "MYSQL_USER",
-                "SOURCE_DB_USER",
-                "DB_USER",
-            ),
-            "password": (
-                SecretStr(password)
-                if (
-                    password := _first_optional(
-                        env,
-                        "MYSQL_PASSWORD",
-                        "SOURCE_DB_PASSWORD",
-                        "DB_PASSWORD",
-                    )
-                ) is not None
-                else None
-            ),
-        }
-        if port is not None:
-            try:
-                values["port"] = int(port)
-            except ValueError as exc:
-                raise ValueError("MYSQL_PORT 必须是整数") from exc
-        return cls(**values)
-
-    @property
-    def connector_kwargs(self) -> dict[str, Any]:
-        """返回 PyMySQL 与同事 DatabaseConfig 共用的基础连接参数。"""
-
-        kwargs: dict[str, Any] = {
-            "host": self.host,
-            "port": self.port,
-        }
-        if self.database is not None:
-            kwargs["database"] = self.database
-        if self.user is not None:
-            kwargs["user"] = self.user
-        if self.password is not None:
-            kwargs["password"] = self.password.get_secret_value()
-        return kwargs
-
-
 def _get(env: Mapping[str, str], name: str, default: str) -> str:
     value = env.get(name)
     return default if value is None or not value.strip() else value
@@ -220,23 +136,3 @@ def _get(env: Mapping[str, str], name: str, default: str) -> str:
 def _optional(env: Mapping[str, str], name: str) -> str | None:
     value = env.get(name)
     return None if value is None or not value.strip() else value
-
-
-def _first(
-    env: Mapping[str, str],
-    *names: str,
-    default: str,
-) -> str:
-    for name in names:
-        value = env.get(name)
-        if value is not None and value.strip():
-            return value
-    return default
-
-
-def _first_optional(env: Mapping[str, str], *names: str) -> str | None:
-    for name in names:
-        value = env.get(name)
-        if value is not None and value.strip():
-            return value
-    return None

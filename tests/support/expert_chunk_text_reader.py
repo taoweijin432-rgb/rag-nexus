@@ -12,8 +12,9 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from typing import Any
 
-from rag_vector_store.config import MySQLSettings
-from rag_vector_store.mysql.connection import MySQLConnection
+from expert_index.config import DatabaseConfig
+
+from .mysql_connection import TestMySQLConnection
 
 
 @dataclass(frozen=True)
@@ -40,7 +41,7 @@ class ExpertChunkTextTestReader:
 
     def __init__(
         self,
-        settings: MySQLSettings,
+        settings: DatabaseConfig,
         *,
         connector_factory: Callable[..., Any] | None = None,
     ) -> None:
@@ -56,7 +57,7 @@ class ExpertChunkTextTestReader:
         ):
             raise ValueError("limit 必须是正整数或 None")
 
-        with MySQLConnection(
+        with TestMySQLConnection(
             self.settings,
             connector_factory=self.connector_factory,
         ) as connection:

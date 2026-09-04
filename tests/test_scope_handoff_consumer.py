@@ -41,9 +41,9 @@ from rag_vector_store.incremental.scope_consumer import ScopeConsumer
 from rag_vector_store.ingestion.errors import VectorIngestionError
 from rag_vector_store.ingestion.models import (
     VectorDeletionResult,
-    VectorExpertList,
     VectorIngestionResult,
     VectorItemResult,
+    VectorOwnerList,
     VectorQueryResult,
 )
 from resume_index.dataset import RESUME_SPEC
@@ -233,11 +233,11 @@ class FakeScopeVectorStore:
             if vid not in self.by_expert[expert_id]:
                 self.by_expert[expert_id].append(vid)
 
-    def list_vectors_by_expert(self, expert_id: int) -> VectorExpertList:
-        return VectorExpertList(
-            expert_id=expert_id,
-            vector_doc_ids=list(self.by_expert.get(expert_id, [])),
-            count=len(self.by_expert.get(expert_id, [])),
+    def list_vectors_by_owner(self, owner_id: int) -> VectorOwnerList:
+        return VectorOwnerList(
+            owner_id=owner_id,
+            vector_doc_ids=list(self.by_expert.get(owner_id, [])),
+            count=len(self.by_expert.get(owner_id, [])),
         )
 
     def get_vectors(self, vector_doc_ids: Sequence[str]) -> VectorQueryResult:

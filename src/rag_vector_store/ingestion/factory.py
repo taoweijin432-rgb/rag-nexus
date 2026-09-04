@@ -1,7 +1,7 @@
 """VectorIngestionService 的生产配置工厂。
 
 调用方无需直接构造内部分层依赖（Embedding Worker / Milvus Repository /
-ContractBatchIngestionService / Validator / RowMapper），只调用
+DomainIngestionService / Validator / RowMapper），只调用
 ``create_vector_ingestion_service()`` 即可从环境变量组装完整服务。
 
 持久化 profile：
@@ -19,10 +19,8 @@ from __future__ import annotations
 import warnings
 from typing import Any, Literal, cast
 
-from ..chunking.contract_ingestion import ContractBatchIngestionService
 from ..chunking.contract_pipeline import (
     EXPECTED_EMBEDDING_DIMENSION,
-    ContractEmbeddingWorker,
     ContractValidator,
 )
 from ..config import MilvusSettings
@@ -90,6 +88,30 @@ def _validate_repository_profile(
         )
 
 
+def _validate_expert_repository_profile(repository: Any) -> None:
+    """Expert Factory 拒绝明确绑定其他身份空间的 Repository。"""
+
+    if repository is None:
+        return
+    profile = getattr(repository, "profile", None)
+    if profile is None:
+        # 保留测试用 duck-typed Repository 注入能力；正式 Repository 都有 Profile。
+        return
+    owner_field = getattr(profile, "owner_field", None)
+    id_prefix = getattr(profile, "vector_doc_id_prefix", None)
+    if owner_field != "expert_id" or id_prefix != "expert:":
+        raise ValueError(
+            "Expert Factory 要求 Repository 绑定 Expert Profile "
+            "(owner_field='expert_id', vector_doc_id_prefix='expert:')"
+        )
+    adapter_cls = getattr(profile, "contract_adapter_cls", None)
+    if adapter_cls is not None and adapter_cls is not ExpertContractAdapter:
+        raise ValueError("Expert Factory 要求 Repository 使用 ExpertContractAdapter")
+    mapper_cls = getattr(profile, "row_mapper_cls", None)
+    if mapper_cls is not None and mapper_cls is not MilvusV15RowMapper:
+        raise ValueError("Expert Factory 要求 Repository 使用 MilvusV15RowMapper")
+
+
 def _validate_row_mapper_profile(
     row_mapper: Any,
     schema_profile: SchemaProfile,
@@ -117,6 +139,40 @@ def _validate_row_mapper_profile(
         raise ValueError(
             "显式传入的 row_mapper 不符合 V15 持久化 profile；"
             "请使用 MilvusV15RowMapper"
+        )
+
+
+def _validate_expert_row_mapper(row_mapper: Any) -> None:
+    """Expert Factory 拒绝明确的 Resume V15 RowMapper。"""
+
+    if isinstance(row_mapper, ResumeMilvusV15RowMapper):
+        raise TypeError(
+            "Expert Factory 要求使用 MilvusV15RowMapper，"
+            "禁止复用 ResumeMilvusV15RowMapper"
+        )
+
+
+def _validate_worker_identity(
+    embedding_worker: Any,
+    *,
+    domain_name: str,
+    owner_field: str,
+    id_prefix: str,
+) -> None:
+    """显式 Worker 暴露 Adapter 时，必须与 Factory 的固定身份空间一致。"""
+
+    if embedding_worker is None:
+        return
+    worker_adapter = getattr(embedding_worker, "adapter", None)
+    if worker_adapter is None:
+        # 兼容既有测试替身和不公开 Adapter 的旧 Worker。
+        return
+    if (
+        worker_adapter.owner_field() != owner_field
+        or worker_adapter.id_prefix() != id_prefix
+    ):
+        raise ValueError(
+            f"{domain_name} Factory 拒绝非 {domain_name} 身份空间的 Embedding Worker"
         )
 
 
@@ -238,7 +294,7 @@ def create_vector_ingestion_service(
     embedding_model: CompanyCloudEmbeddingModel | None = None,
     milvus_settings: MilvusSettings | None = None,
     repository: ContractMilvusV15VectorRepository | None = None,
-    embedding_worker: ContractEmbeddingWorker | None = None,
+    embedding_worker: Any | None = None,
     validator: ContractValidator | None = None,
     row_mapper: MilvusV15RowMapper | None = None,
     expected_dimension: int = EXPECTED_EMBEDDING_DIMENSION,
@@ -248,8 +304,8 @@ def create_vector_ingestion_service(
     """从环境配置组装完整的 ``VectorIngestionService``。
 
     依赖链：
-        ``CompanyCloudEmbeddingModel.from_env()`` -> ``ContractEmbeddingWorker``
-        -> ``ContractBatchIngestionService``；``MilvusSettings.from_env()`` ->
+        ``CompanyCloudEmbeddingModel.from_env()`` -> ``DomainEmbeddingWorker``
+        -> ``DomainIngestionService``；``MilvusSettings.from_env()`` ->
         ``schema_profile`` 对应的 Milvus Repository。全部汇聚到
         ``VectorIngestionService``。
 
@@ -271,16 +327,31 @@ def create_vector_ingestion_service(
 
     resolved_profile = _resolve_schema_profile(schema_profile)
     _validate_repository_profile(repository, resolved_profile)
+    _validate_expert_repository_profile(repository)
     _validate_row_mapper_profile(row_mapper, resolved_profile)
+    _validate_expert_row_mapper(row_mapper)
+    _validate_worker_identity(
+        embedding_worker,
+        domain_name="Expert",
+        owner_field="expert_id",
+        id_prefix="expert:",
+    )
 
     if validator is None:
-        validator = ContractValidator()
+        validator = getattr(embedding_worker, "validator", None) or ContractValidator()
+    eligibility_validator = getattr(
+        embedding_worker,
+        "eligibility_validator",
+        None,
+    )
+    adapter = ExpertContractAdapter(validator, eligibility_validator)
     if embedding_worker is None:
         if embedding_model is None:
             embedding_model = CompanyCloudEmbeddingModel.from_env()
-        embedding_worker = ContractEmbeddingWorker(
+        embedding_worker = DomainEmbeddingWorker(
             embedding_model,
-            validator=validator,
+            adapter,
+            expected_dimension=expected_dimension,
         )
     if repository is None:
         if milvus_settings is None:
@@ -291,9 +362,10 @@ def create_vector_ingestion_service(
             schema_profile=resolved_profile,
         )
     resolved_row_mapper = _resolve_row_mapper(row_mapper, repository)
-    ingestion_service = ContractBatchIngestionService(
+    ingestion_service = DomainIngestionService(
         embedding_worker,
         repository,
+        adapter,
     )
     return VectorIngestionService(
         ingestion_service=ingestion_service,
@@ -302,7 +374,7 @@ def create_vector_ingestion_service(
         row_mapper=resolved_row_mapper,
         expected_dimension=expected_dimension,
         formal_model_space_id=formal_model_space_id,
-        adapter=ExpertContractAdapter(validator, getattr(embedding_worker, "eligibility_validator", None)),
+        adapter=adapter,
     )
 
 
@@ -323,6 +395,12 @@ def create_resume_vector_ingestion_service(
     resolved_profile = _resolve_schema_profile(schema_profile)
     _validate_resume_repository_profile(repository)
     _validate_resume_row_mapper(row_mapper)
+    _validate_worker_identity(
+        embedding_worker,
+        domain_name="Resume",
+        owner_field="resume_id",
+        id_prefix="resume:",
+    )
     if validator is None:
         validator = ContractValidator()
     if embedding_model is None and embedding_worker is None:

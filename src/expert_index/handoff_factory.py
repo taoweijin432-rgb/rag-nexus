@@ -13,7 +13,7 @@
 3. ``schema_profile`` 必须是 ``"v15"``，其余（含 ``"v14"``）立即 fail-closed；
 4. ``max_attempts``/``retry_delay_seconds`` 显式校验；
 5. 缺失 ``vector_service`` 时才惰性调用
-   ``create_vector_ingestion_service(schema_profile="v15")``，**绝不调用
+   ``create_vector_ingestion_service()``，**绝不调用
    ``initialize()``**（本层只组装、不连库/不连 Milvus）。
 
 依赖注入边界（不重复实现业务判断）：
@@ -136,7 +136,7 @@ def build_incremental_handoff_runtime(
     :param schema_profile: 持久化 profile，唯一允许 ``"v15"``（默认）。
         ``"v14"`` 或其他值立即 fail-closed 抛 ``ValueError``。
     :param vector_service: 可选的已构造 ``VectorIngestionService`` 实例（测试注入）。
-        为 ``None`` 时惰性调用 ``create_vector_ingestion_service(schema_profile="v15")``，
+        为 ``None`` 时惰性调用 ``create_vector_ingestion_service()``，
         **绝不调用 ``initialize()``**。
     :param max_attempts: ``HandoffOrchestrator`` 的可重试上限，显式传入不猜默认。
     :param retry_delay_seconds: ``HandoffOrchestrator`` 的重试冷却秒数，显式传入。
@@ -182,7 +182,7 @@ def build_incremental_handoff_runtime(
         # 缺失时由其自身 fail-closed，本层不补默认。
         from rag_vector_store import create_vector_ingestion_service
 
-        vector_service = create_vector_ingestion_service(schema_profile="v15")
+        vector_service = create_vector_ingestion_service()
 
     # 局部导入下游业务核心（避免顶层环依赖）。
     from rag_vector_store.chunking.contract_pipeline import EmbeddingEligibilityValidator

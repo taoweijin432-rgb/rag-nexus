@@ -36,7 +36,6 @@ from rag_vector_store.milvus.contract_v15 import (
 )
 from rag_vector_store.milvus.schemas.contract_v15 import (
     V15_CHUNK_TEXT_MAX_BYTES,
-    V15_SCALAR_INDEX_FIELDS,
     V15_VECTOR_DOC_ID_MAX_BYTES,
     build_v15_schema,
 )
@@ -142,7 +141,6 @@ def test_v15_index_specs_only_vector_index() -> None:
     assert specs[0].metric_type == "COSINE"
     assert specs[0].index_name == "embedding_vector"
     # 不再有 expert_id INVERTED / 任何 scalar index
-    assert V15_SCALAR_INDEX_FIELDS == ()
 
 
 def test_v15_index_specs_do_not_include_any_scalar_field() -> None:

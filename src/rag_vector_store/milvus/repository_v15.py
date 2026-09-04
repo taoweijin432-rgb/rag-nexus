@@ -29,9 +29,9 @@ V15 物理 Schema（4 字段，dynamic=False）：
       重建 chunk_text/metadata → 同 PK upsert（不重新 Embedding）；
     - disable / get：按 PK ``vector_doc_id``；Repository 不提供物理删除。
 
-``query_by_expert_id`` 是迁移期兼容路径（``expert_index`` 仍依赖
-``list_vectors_by_expert(expert_id)``）：V15 通过 flat metadata JSON path
-``metadata["expert_id"] == N`` 查询，不把 expert_id 重新提升为一级字段。
+``query_by_expert_id`` 仅保留为迁移期兼容路径；正式调用统一使用
+``query_by_owner_id``，由 Profile 决定 flat metadata JSON 中的 owner 字段，
+且不会把 owner 重新提升为一级字段。
 ``list_all_vector_states`` 物理读取 ``["vector_doc_id", "metadata"]``，再从
 metadata 提取 ``content_hash`` / ``metadata_hash`` —— 这是纯 4 字段设计明确
 接受的 tradeoff，不为了优化而重新增加 hash scalar。
@@ -46,6 +46,7 @@ Embedding、Task State；不创建真实 Collection（是否创建由调用方�
 from __future__ import annotations
 
 import json
+import warnings
 from collections.abc import Mapping, Sequence
 from typing import Any
 
@@ -110,7 +111,7 @@ class ContractMilvusV15VectorRepository(ContractMilvusRepositoryBase):
     """V15 精简 Contract Collection 的 Repository 类型。
 
     构造参数、initialize / upsert_batch / get_by_vector_doc_id /
-    query_by_expert_id / list_all_vector_states /
+    query_by_owner_id / query_by_expert_id（兼容）/ list_all_vector_states /
     assert_destructive_maintenance_allowed / close 的语义与基类一致；差异只体现
     在持久化 profile 上（见模块 docstring）。
 
@@ -258,14 +259,19 @@ class ContractMilvusV15VectorRepository(ContractMilvusRepositoryBase):
             - V15 的 ``expert_id`` 位于 flat metadata JSON，因此过滤表达式为
               ``metadata["expert_id"] == N``（JSON path filter，不把 expert_id
               提升成一级字段，也不新增 scalar projection）；
-            - 默认只返回 ``vector_doc_id``（``list_vectors_by_expert`` 的唯一
-              消费字段），不拉取 embedding / chunk_text / 整包 metadata。
+            - 默认只返回 ``vector_doc_id``，不拉取 embedding / chunk_text /
+              整包 metadata。
             - 禁止把 ``expert_id`` / ``content_hash`` / ``metadata_hash`` 作为
               一级 output field 请求（V15 不存在这些字段，fail-closed）。
 
         公共 API 语义不变：返回行始终包含 ``vector_doc_id``。
         """
 
+        warnings.warn(
+            "query_by_expert_id 已弃用；请使用 query_by_owner_id",
+            DeprecationWarning,
+            stacklevel=2,
+        )
         return self.query_by_owner_id(expert_id, output_fields=output_fields)
 
     def query_by_owner_id(

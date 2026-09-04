@@ -66,9 +66,9 @@ class ExpertVectorSynchronizer:
         metadata_updated_count, fallback = self._update_metadata(diff.to_update)
         embedded_count += self._upsert(fallback)
 
-        deletion = self.store.delete_vectors(diff.stale_ids)
+        deletion = self.store.disable_vectors(diff.stale_ids)
         if deletion.requested_count != len(diff.stale_ids):
-            raise VectorSyncError("delete_vectors 返回的 requested_count 与请求不一致")
+            raise VectorSyncError("disable_vectors 返回的 requested_count 与请求不一致")
 
         return ExpertVectorSyncResult(
             expert_id=diff.expert_id,
@@ -126,10 +126,10 @@ class ExpertVectorSynchronizer:
         # 阶段 4：逐专家删除陈旧向量并汇总结果
         results: list[ExpertVectorSyncResult] = []
         for diff in diffs:
-            deletion = self.store.delete_vectors(diff.stale_ids)
+            deletion = self.store.disable_vectors(diff.stale_ids)
             if deletion.requested_count != len(diff.stale_ids):
                 raise VectorSyncError(
-                    "delete_vectors 返回的 requested_count 与请求不一致"
+                    "disable_vectors 返回的 requested_count 与请求不一致"
                 )
             embedded_count = (
                 sum(1 for r in diff.to_upsert if r.vector_doc_id in first_embedded_vids)
@@ -181,7 +181,7 @@ class ExpertVectorSynchronizer:
             if item.is_active and item.metadata.verification_status != "rejected"
         }
 
-        listed = self.store.list_vectors_by_expert(expert_id)
+        listed = self.store.list_vectors_by_owner(expert_id)
         existing_ids = set(listed.vector_doc_ids)
         query = self.store.get_vectors(sorted(existing_ids)) if existing_ids else None
         existing_by_id = self._existing_rows(query.records if query is not None else [])

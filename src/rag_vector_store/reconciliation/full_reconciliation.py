@@ -317,7 +317,7 @@ class FullVectorReconciliationService:
         size = self.delete_batch_size
         for start in range(0, len(stale_ids), size):
             batch = stale_ids[start : start + size]
-            result = self.ingestion.delete_vectors(batch)
+            result = self.ingestion.disable_vectors(batch)
             total_deleted += result.deleted_count
         return total_deleted
 

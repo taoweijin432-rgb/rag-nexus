@@ -10,9 +10,8 @@ from __future__ import annotations
 import hashlib
 import re
 from collections.abc import Callable, Iterable, Mapping
-from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, TypeAlias
 
 from pydantic import ValidationError
 
@@ -24,7 +23,11 @@ from expert_contracts.models import (
 )
 
 from ..constants import FORMAL_EMBEDDING_DIMENSION
-from ..core.embedding import DomainEmbeddingWorker
+from ..core.embedding import (
+    DomainEmbeddingResult,
+    DomainEmbeddingWorker,
+    DomainSkippedVector,
+)
 from ..domains import ExpertContractAdapter
 from ..embedding import EmbeddingModel
 from ..milvus.compatibility import compare_schema_specs
@@ -57,32 +60,13 @@ class EmbeddingEligibilityError(ValueError):
     """记录通过契约校验，但不允许进入正式向量化链路。"""
 
 
-@dataclass(frozen=True)
-class SkippedContractChunk:
-    """未进入向量消费的契约记录及安全原因（以 vector_doc_id 定位）。"""
-
-    vector_doc_id: str
-    reason: str
-
-
-@dataclass(frozen=True)
-class ContractEmbeddingResult:
-    """一批正式输入契约的向量化结果。"""
-
-    embedded_chunks: list[EmbeddedContractPreparedChunk]
-    skipped_chunks: list[SkippedContractChunk]
-
-    @property
-    def eligible_count(self) -> int:
-        """返回实际进入 Embedding 调用的记录数。"""
-
-        return len(self.embedded_chunks)
-
-    @property
-    def skipped_count(self) -> int:
-        """返回因资格条件未满足而跳过的记录数。"""
-
-        return len(self.skipped_chunks)
+# 专家公共名称保留兼容，但运行时直接使用通用领域结果，避免在专家 Facade 与
+# 通用核心之间逐项复制同构对象。
+SkippedContractChunk = DomainSkippedVector
+ContractEmbeddingResult: TypeAlias = DomainEmbeddingResult[
+    ContractPreparedChunk,
+    EmbeddedContractPreparedChunk,
+]
 
 
 class ContractValidator:
@@ -133,8 +117,8 @@ class ContractValidator:
         - chunk_text：非空、无回车/控制字符、按 chunk_type 上限、char_count 一致、
           UTF-8 字节量；
         - content_hash：按实际 chunk_text 重算 SHA-256 并比对；
-        - PII / 控制字符：PII 模式与禁止字符检测（Embedding 前执行，避免敏感
-          信息进入外部模型）；
+        - 控制字符：检测禁止字符；PII 清洗与检测属于上游数据处理边界，
+          本 Validator 不重复执行 PII 扫描；
         - 时间跨字段约束：is_current=true 时 end_month 必须为 null；
         - origin_type × chunk_type、verification_status × chunk_type 填充规则；
         - recommendation 字段适用性：eligible_for_recommendation 只能出现在
@@ -383,17 +367,7 @@ class ContractEmbeddingWorker:
             - 模型返回数量/维度/有限性在构造输出对象前 fail-closed 校验。
         """
 
-        result = self._domain_worker.embed(records)
-        return ContractEmbeddingResult(
-            embedded_chunks=result.embedded_chunks,
-            skipped_chunks=[
-                SkippedContractChunk(
-                    vector_doc_id=item.vector_doc_id,
-                    reason=item.reason,
-                )
-                for item in result.skipped_chunks
-            ],
-        )
+        return self._domain_worker.embed(records)
 
 
 def expected_contract_output_fields(

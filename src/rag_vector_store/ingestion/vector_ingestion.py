@@ -1,13 +1,15 @@
 """VectorIngestionService：rag_vector_store 面向上游的唯一稳定 Python 向量能力入口。
 
 职责：
-    - ``upsert_chunks``：正式 Chunk 向量化并写入 Milvus（复用 ContractBatchIngestionService）。
+    - ``upsert_chunks``：正式 Chunk 向量化并写入 Milvus（默认复用通用
+      ``DomainIngestionService``）。
     - ``disable_vectors``：按 vector_doc_id 逻辑下线向量（保留实体与向量，仅置 is_active=false）。
     - ``delete_vectors``：在线删除入口；自 T2-1 起统一委派给 ``disable_vectors``，
       不再触发物理删除（保持原签名与返回类型，上游 Port 无感知）。
     - ``get_vectors``：批量查询 Milvus 记录（不含 embedding）。
     - ``update_metadata``：metadata-only 更新，复用旧向量，不调用 Embedding。
-    - ``list_vectors_by_expert``：按专家列出轻量 vector_doc_id。
+    - ``list_vectors_by_owner``：按当前领域 owner 列出轻量 vector_doc_id。
+    - ``delete_vectors``、领域专用列表方法只保留一个发布周期的兼容转发。
 
 不职责：
     - 不实现上游业务更新编排（sync_expert / update_item_data / 时间筛选 / Vector State / FastAPI）。
@@ -17,6 +19,7 @@
 from __future__ import annotations
 
 import functools
+import warnings
 from collections.abc import Sequence
 from typing import Any
 
@@ -59,6 +62,7 @@ from .models import (
     VectorExpertList,
     VectorIngestionResult,
     VectorItemResult,
+    VectorOwnerList,
     VectorQueryResult,
     VectorResumeList,
 )
@@ -122,7 +126,7 @@ def _guard_errors(func):
 
 
 class _GuardedLifecycleRepository:
-    """把专家 Facade 的底层异常分类边界传给通用生命周期核心。"""
+    """把领域 Facade 的底层异常分类边界传给通用生命周期核心。"""
 
     def __init__(self, repository: Any) -> None:
         self.repository = repository
@@ -154,7 +158,7 @@ class _GuardedLifecycleRowMapper:
 
 
 class VectorIngestionService:
-    """统一编排 Chunk 向量化、写入、更新、删除与查询的 Facade。
+    """统一编排 Chunk 向量化、写入、更新、逻辑下线与查询的 Facade。
 
     依赖：
         - ``ingestion_service``（或 ``embedding_worker`` + ``repository``）：upsert 编排。
@@ -225,7 +229,7 @@ class VectorIngestionService:
     ) -> VectorIngestionResult:
         """正式 Chunk 全集向量化并写入 Milvus。
 
-        内部复用 ``ContractBatchIngestionService.ingest_batch``：
+        内部复用当前注入的通用 ingestion service：
         Contract 校验 → Eligibility → Embedding → Milvus upsert。
         非法公共输入（非 Contract 记录）直接判为 ``VectorContractError``。
         """
@@ -284,6 +288,11 @@ class VectorIngestionService:
         空输入安全返回，去重保序，重复执行幂等。
         """
 
+        warnings.warn(
+            "delete_vectors 已弃用；当前删除语义为逻辑下线，请使用 disable_vectors",
+            DeprecationWarning,
+            stacklevel=2,
+        )
         return self.disable_vectors(vector_doc_ids)
 
     # ------------------------------------------------------------------
@@ -371,43 +380,46 @@ class VectorIngestionService:
         )
 
     # ------------------------------------------------------------------
-    # 5. list_vectors_by_expert
+    # 5. list_vectors_by_owner（正式接口）及领域兼容入口
     # ------------------------------------------------------------------
     @_guard_errors
-    def list_vectors_by_expert(
-        self,
-        expert_id: int,
-    ) -> VectorExpertList:
-        """按专家列出该专家在 Milvus 的全部 vector_doc_id（仅轻量字段）。"""
-
-        if isinstance(expert_id, bool) or not isinstance(expert_id, int) or expert_id < 1:
-            raise VectorContractError(
-                f"expert_id 必须是正整数，收到 {expert_id!r}"
-            )
-
-        rows = self._list_vectors_by_owner(expert_id)
-        vector_doc_ids = [str(row["vector_doc_id"]) for row in rows]
-        return VectorExpertList(
-            expert_id=expert_id,
-            vector_doc_ids=vector_doc_ids,
-            count=len(vector_doc_ids),
-        )
-
-    def _list_vectors_by_owner(
+    def list_vectors_by_owner(
         self,
         owner_id: int,
-    ) -> list[dict[str, object]]:
-        """按当前 Adapter/Profile 的 owner 查询向量主键。"""
+    ) -> VectorOwnerList:
+        """按当前 Adapter/Profile 的 owner 列出全部 vector_doc_id。"""
 
         if isinstance(owner_id, bool) or not isinstance(owner_id, int) or owner_id < 1:
             raise VectorContractError(
                 f"owner_id 必须是正整数，收到 {owner_id!r}"
             )
-        query_by_owner = getattr(self.repository, "query_by_owner_id", None)
-        if callable(query_by_owner):
-            return _guard_call(query_by_owner, owner_id)
-        # 保留 Expert Fake/兼容 Repository 的既有接口。
-        return _guard_call(self.repository.query_by_expert_id, owner_id)
+
+        rows = _guard_call(self.repository.query_by_owner_id, owner_id)
+        vector_doc_ids = [str(row["vector_doc_id"]) for row in rows]
+        return VectorOwnerList(
+            owner_id=owner_id,
+            vector_doc_ids=vector_doc_ids,
+            count=len(vector_doc_ids),
+        )
+
+    @_guard_errors
+    def list_vectors_by_expert(
+        self,
+        expert_id: int,
+    ) -> VectorExpertList:
+        """已弃用的专家专用查询入口。"""
+
+        warnings.warn(
+            "list_vectors_by_expert 已弃用；请使用 list_vectors_by_owner",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        listing = self.list_vectors_by_owner(expert_id)
+        return VectorExpertList(
+            expert_id=expert_id,
+            vector_doc_ids=listing.vector_doc_ids,
+            count=listing.count,
+        )
 
 
 class ResumeVectorIngestionService(VectorIngestionService):
@@ -420,16 +432,16 @@ class ResumeVectorIngestionService(VectorIngestionService):
     ) -> VectorResumeList:
         """按 Resume owner 查询其全部 vector_doc_id。"""
 
-        if isinstance(resume_id, bool) or not isinstance(resume_id, int) or resume_id < 1:
-            raise VectorContractError(
-                f"resume_id 必须是正整数，收到 {resume_id!r}"
-            )
-        rows = self._list_vectors_by_owner(resume_id)
-        vector_doc_ids = [str(row["vector_doc_id"]) for row in rows]
+        warnings.warn(
+            "list_vectors_by_resume 已弃用；请使用 list_vectors_by_owner",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        listing = self.list_vectors_by_owner(resume_id)
         return VectorResumeList(
             resume_id=resume_id,
-            vector_doc_ids=vector_doc_ids,
-            count=len(vector_doc_ids),
+            vector_doc_ids=listing.vector_doc_ids,
+            count=listing.count,
         )
 
     @_guard_errors
@@ -439,16 +451,16 @@ class ResumeVectorIngestionService(VectorIngestionService):
     ) -> VectorExpertList:
         """兼容现有 ExpertVectorSynchronizer 的 Resume owner 查询入口。"""
 
-        if isinstance(expert_id, bool) or not isinstance(expert_id, int) or expert_id < 1:
-            raise VectorContractError(
-                f"resume_id 必须是正整数，收到 {expert_id!r}"
-            )
-        rows = self._list_vectors_by_owner(expert_id)
-        vector_doc_ids = [str(row["vector_doc_id"]) for row in rows]
+        warnings.warn(
+            "Resume.list_vectors_by_expert 已弃用；请使用 list_vectors_by_owner",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        listing = self.list_vectors_by_owner(expert_id)
         return VectorExpertList(
             expert_id=expert_id,
-            vector_doc_ids=vector_doc_ids,
-            count=len(vector_doc_ids),
+            vector_doc_ids=listing.vector_doc_ids,
+            count=listing.count,
         )
 
 

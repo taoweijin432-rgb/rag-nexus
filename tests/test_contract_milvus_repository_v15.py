@@ -672,11 +672,11 @@ def test_v15_get_many_batches_primary_key_queries_by_200() -> None:
 
 
 # ---------------------------------------------------------------------------
-# 7. V15 query_by_expert_id 使用 metadata["expert_id"] JSON path
+# 7. V15 query_by_owner_id 使用 Profile 的 metadata owner JSON path
 # ---------------------------------------------------------------------------
 
 
-def test_v15_query_by_expert_id_uses_metadata_json_path() -> None:
+def test_v15_query_by_owner_id_uses_metadata_json_path() -> None:
     chunks = embedded_contract_chunks()
     client = FakeV15MilvusClient(exists=True)
     repository = make_v15_repository(client)
@@ -684,11 +684,11 @@ def test_v15_query_by_expert_id_uses_metadata_json_path() -> None:
     _seed_rows(repository, client, chunks)
     target_expert_id = chunks[0].expert_id
 
-    rows = repository.query_by_expert_id(target_expert_id)
+    rows = repository.query_by_owner_id(target_expert_id)
 
     scan_call = client.query_iterator_calls[0]
     assert scan_call["filter"] == f'metadata["expert_id"] == {target_expert_id}'
-    # 默认只返回 vector_doc_id（list_vectors_by_expert 的唯一消费字段）
+    # 默认只返回 vector_doc_id（通用 owner 列表接口的唯一消费字段）
     assert scan_call["output_fields"] == ["vector_doc_id"]
     # 不请求 embedding / chunk_text / 整包 metadata
     assert "embedding" not in scan_call["output_fields"]
@@ -699,18 +699,27 @@ def test_v15_query_by_expert_id_uses_metadata_json_path() -> None:
     assert all("vector_doc_id" in row for row in rows)
 
 
-def test_v15_query_by_expert_id_rejects_top_level_hash_fields() -> None:
+def test_v15_query_by_owner_id_rejects_top_level_hash_fields() -> None:
     repository = make_v15_repository()
     with pytest.raises(ValueError, match="一级字段"):
-        repository.query_by_expert_id(
+        repository.query_by_owner_id(
             1,
             output_fields=["vector_doc_id", "content_hash"],
         )
     with pytest.raises(ValueError, match="一级字段"):
-        repository.query_by_expert_id(
+        repository.query_by_owner_id(
             1,
             output_fields=["expert_id"],
         )
+
+
+def test_v15_query_by_expert_id_warns_and_delegates() -> None:
+    repository = make_v15_repository(FakeV15MilvusClient(exists=True))
+
+    with pytest.warns(DeprecationWarning, match="query_by_expert_id 已弃用"):
+        rows = repository.query_by_expert_id(1)
+
+    assert rows == []
 
 
 # ---------------------------------------------------------------------------

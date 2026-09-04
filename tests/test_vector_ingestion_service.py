@@ -121,13 +121,13 @@ class FakeMilvusRepository:
             primary_keys=[r.vector_doc_id for r in records],
         )
 
-    def query_by_expert_id(
+    def query_by_owner_id(
         self,
-        expert_id: int,
+        owner_id: int,
         *,
         output_fields: Sequence[str] | None = None,
     ) -> list[dict[str, object]]:
-        self.query_calls.append(expert_id)
+        self.query_calls.append(owner_id)
         if self.query_error is not None:
             raise self.query_error
         fields = (
@@ -142,7 +142,7 @@ class FakeMilvusRepository:
                 if field in row
             }
             for row in self.rows.values()
-            if _row_expert_id(row) == expert_id
+            if _row_expert_id(row) == owner_id
         ]
 
 
@@ -327,7 +327,8 @@ def test_delete_vectors_success() -> None:
         repo.rows[c.vector_doc_id] = MilvusV15RowMapper().to_row(c)
     ids = [c.vector_doc_id for c in chunks]
 
-    result = service.delete_vectors(ids)
+    with pytest.warns(DeprecationWarning, match="delete_vectors 已弃用"):
+        result = service.delete_vectors(ids)
 
     assert isinstance(result, VectorDeletionResult)
     assert result.requested_count == len(ids)
@@ -912,7 +913,8 @@ def test_list_vectors_by_expert() -> None:
     for c in chunks:
         repo.rows[c.vector_doc_id] = MilvusV15RowMapper().to_row(c)
 
-    result = service.list_vectors_by_expert(900001)
+    with pytest.warns(DeprecationWarning, match="list_vectors_by_expert 已弃用"):
+        result = service.list_vectors_by_expert(900001)
 
     assert result.expert_id == 900001
     assert result.count == len(chunks)

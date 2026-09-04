@@ -66,9 +66,9 @@ from rag_vector_store.incremental.scope_consumer import ScopeConsumer
 from rag_vector_store.ingestion.errors import VectorMilvusError
 from rag_vector_store.ingestion.models import (
     VectorDeletionResult,
-    VectorExpertList,
     VectorIngestionResult,
     VectorItemResult,
+    VectorOwnerList,
     VectorQueryResult,
 )
 
@@ -338,9 +338,9 @@ class FakeVectorStore:
             if vid not in self.by_expert[eid]:
                 self.by_expert[eid].append(vid)
 
-    def list_vectors_by_expert(self, expert_id: int) -> VectorExpertList:
-        vids = list(self.by_expert.get(expert_id, []))
-        return VectorExpertList(expert_id=expert_id, vector_doc_ids=vids, count=len(vids))
+    def list_vectors_by_owner(self, owner_id: int) -> VectorOwnerList:
+        vids = list(self.by_expert.get(owner_id, []))
+        return VectorOwnerList(owner_id=owner_id, vector_doc_ids=vids, count=len(vids))
 
     def get_vectors(self, vector_doc_ids) -> VectorQueryResult:
         self.get_calls.append(list(vector_doc_ids))
@@ -650,8 +650,8 @@ class TestNToMStaleDisable:
             "metadata_hash": base.metadata_hash,
             "source_hash": base.source.source_hash,
         })
-        # by_expert 已含该 expert；list_vectors_by_expert 会返回两个
-        assert len(store.list_vectors_by_expert(700001).vector_doc_ids) == 2
+        # by_expert 已含该 owner；通用查询会返回两个
+        assert len(store.list_vectors_by_owner(700001).vector_doc_ids) == 2
 
         # 重新走编排：desired 仍只有 chunk_index=0，同 family 的 chunk_index=1 应被逻辑下线
         task_repo.state = _task()
@@ -729,7 +729,7 @@ class TestExpertDeletionScanNewerThanSourceVersion:
             },
             "content_hash": "ch1", "metadata_hash": "mh1", "source_hash": "sh1",
         })
-        assert len(store.list_vectors_by_expert(700001).vector_doc_ids) == 2
+        assert len(store.list_vectors_by_owner(700001).vector_doc_ids) == 2
 
         source = FakeSourceAdapter()
         # scan_updated_at > updated_at，deleted_at 非空
