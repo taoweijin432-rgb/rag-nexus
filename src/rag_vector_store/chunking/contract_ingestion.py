@@ -1,4 +1,4 @@
-"""正式 Contract 4.0.0 的单条与批量向量化、入库编排。
+"""正式 Contract 4.1.0 的单条与批量向量化、入库编排。
 
 编排层所有身份统一使用 ``vector_doc_id``（幂等键），彻底移除对 ``chunk_id``
 的依赖。Eligibility 与向量化统一由 ``ContractEmbeddingWorker`` 执行，本模块只负责
@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+import warnings
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from typing import Literal, Protocol
@@ -17,8 +18,8 @@ from expert_contracts.models import (
 )
 
 from ..core.embedding import DomainEmbeddingResult, DomainSkippedVector
-from ..core.expert import ExpertContractAdapter
 from ..core.ingestion import DomainIngestionError, DomainIngestionService
+from ..domains import ExpertContractAdapter
 from ..models import MutationResult
 from .contract_pipeline import (
     ContractEmbeddingResult,
@@ -250,6 +251,12 @@ class ContractIngestionService:
             - fail-closed：Worker/Repository 结果身份或数量不一致时抛异常。
         """
 
+        warnings.warn(
+            "ContractIngestionService.ingest_one 已弃用；"
+            "请使用 ContractBatchIngestionService.ingest_batch",
+            DeprecationWarning,
+            stacklevel=2,
+        )
         try:
             result = self._domain_ingestion.ingest_one(record)
         except DomainIngestionError as exc:
@@ -270,7 +277,7 @@ class ContractBatchIngestionService:
         - 任何需要一次性消费多条 ``ExpertChunkEmbeddingInput`` 的场景。
 
     输入：
-        Iterable[ExpertChunkEmbeddingInput] —— 每条已符合 Contract 4.0.0 结构，
+        Iterable[ExpertChunkEmbeddingInput] —— 每条已符合 Contract 4.1.0 结构，
         但尚未经过消费端 Validator / Eligibility / Embedding。
 
     主要调用：

@@ -1,4 +1,4 @@
-"""专家 Chunk 4.0.0 契约的校验、资格判断与向量化消费链。
+"""专家 Chunk 4.1.0 契约的校验、资格判断与向量化消费链。
 
 本模块负责把正式 Contract 校验成可消费记录、执行 Eligibility 判断，并把唯一的
 ``chunk_text`` 交给 EmbeddingModel。它不负责输入 Mapping 适配、MySQL 连接、任务
@@ -25,7 +25,7 @@ from expert_contracts.models import (
 
 from ..constants import FORMAL_EMBEDDING_DIMENSION
 from ..core.embedding import DomainEmbeddingWorker
-from ..core.expert import ExpertContractAdapter
+from ..domains import ExpertContractAdapter
 from ..embedding import EmbeddingModel
 from ..milvus.schemas.contract_v15 import v15_milvus_field_specs
 
@@ -49,7 +49,7 @@ _FORBIDDEN_TEXT_PATTERN = re.compile(
 
 
 class ContractValidationError(ValueError):
-    """输入记录不符合 4.0.0 数据契约。"""
+    """输入记录不符合 4.1.0 数据契约。"""
 
 
 class EmbeddingEligibilityError(ValueError):

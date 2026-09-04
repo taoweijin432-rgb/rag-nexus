@@ -1,19 +1,9 @@
-"""V15 增量向量化持久化层、Work Item 适配与 Consumer 业务核心（Phase 0 / 2 / 3A+）。
+"""正式范围增量消费核心。
 
-提供 Batch / Work Item 的 MySQL 状态持久化与状态机、Work Item 到正式 V15
-Contract 的薄适配，以及无状态持久化的通用消费链路：标准 Contract / Disable
-输入 → ContractConsumerCore → ExecutionResult；V15WorkItemConsumer 保留为
-Work Item 兼容入口。Consumer 只返回结构化 ``ExecutionResult``：不调用 Embedding
-实现、不做物理删除、不扫描业务源表、不生成 chunk_text，也不新增任何状态存储
-端口；状态流转由后续唯一状态表适配层负责。
+当前运行边界为 ``ScopeHandoffRequest → ScopeConsumer → ContractConsumerCore``。
+历史 V15 Work Item 运行时已退役；既有 SQL 迁移与数据库表仅保留审计和重放历史。
 """
 
-from .consumer import (
-    SourceEventOrderView,
-    V15WorkItemConsumer,
-    VectorMutationPort,
-    WorkItemAdapterPort,
-)
 from .consumer_core import (
     AdaptedContract,
     ContractConsumerCore,
@@ -23,6 +13,8 @@ from .consumer_core import (
     ContractSynthesisError,
     ContractUpsertIntent,
     PreRejectedInput,
+    SourceEventOrderView,
+    VectorMutationPort,
     duplicate_superseded_result,
     resolve_winner_indices,
 )
@@ -66,32 +58,6 @@ from .consumer_models import (
     ConsumerResultCode,
     ExecutionResult,
 )
-from .contract_adapter import (
-    DisableWorkItem,
-    V15WorkItemContractAdapter,
-    WorkItemContractAdaptation,
-    WorkItemContractAdapterError,
-)
-from .models import (
-    ALLOWED_SOURCE_TABLES,
-    APPENDABLE_BATCH_STATUSES,
-    BATCH_FINAL_STATUSES,
-    V15BatchStatus,
-    V15VectorizationBatch,
-    V15VectorizationWorkItem,
-    V15WorkItemCreateResult,
-    V15WorkItemInput,
-    V15WorkItemOperation,
-    V15WorkItemStatus,
-)
-from .repository import (
-    MySQLV15VectorizationRepository,
-    V15BatchNotFoundError,
-    V15PersistenceError,
-    V15TransitionError,
-    V15WorkItemNotFoundError,
-    vector_doc_id_hash,
-)
 from .scope_consumer import (
     ScopeConsumer,
     ScopeHandoffReceiptView,
@@ -102,9 +68,6 @@ from .scope_consumer import (
 )
 
 __all__ = [
-    "ALLOWED_SOURCE_TABLES",
-    "APPENDABLE_BATCH_STATUSES",
-    "BATCH_FINAL_STATUSES",
     "CONSUMER_ACTION_ADAPT_DISABLE",
     "CONSUMER_ACTION_ADAPT_UPSERT",
     "CONSUMER_ACTION_DISABLE_STALE_TARGETS",
@@ -149,9 +112,7 @@ __all__ = [
     "ContractMetadataUpdateIntent",
     "ContractSynthesisError",
     "ContractUpsertIntent",
-    "DisableWorkItem",
     "ExecutionResult",
-    "MySQLV15VectorizationRepository",
     "PreRejectedInput",
     "ScopeConsumer",
     "ScopeHandoffReceiptView",
@@ -160,24 +121,7 @@ __all__ = [
     "ScopeVectorStatePort",
     "ScopeView",
     "SourceEventOrderView",
-    "V15BatchNotFoundError",
-    "V15BatchStatus",
-    "V15PersistenceError",
-    "V15TransitionError",
-    "V15VectorizationBatch",
-    "V15VectorizationWorkItem",
-    "V15WorkItemConsumer",
-    "V15WorkItemContractAdapter",
-    "V15WorkItemCreateResult",
-    "V15WorkItemInput",
-    "V15WorkItemNotFoundError",
-    "V15WorkItemOperation",
-    "V15WorkItemStatus",
     "VectorMutationPort",
-    "WorkItemAdapterPort",
-    "WorkItemContractAdaptation",
-    "WorkItemContractAdapterError",
     "duplicate_superseded_result",
     "resolve_winner_indices",
-    "vector_doc_id_hash",
 ]

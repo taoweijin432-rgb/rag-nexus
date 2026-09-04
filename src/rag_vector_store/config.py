@@ -13,7 +13,7 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, SecretStr, model_validator
 
-# 运行时只允许正式 Contract v2；旧兼容模式已退役。
+# 运行时只允许正式 Contract 4.1.0；旧兼容模式已退役。
 SchemaMode = Literal["contract"]
 
 # 唯一正式 V15 Collection；历史 dev/v14/e2e 名称只作数据保留，不再是运行目标。

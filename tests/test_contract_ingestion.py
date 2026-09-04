@@ -1,4 +1,4 @@
-"""Contract 4.0.0 编排层的单条/批量 ingestion 单元测试。
+"""Contract 4.1.0 编排层的单条/批量 ingestion 单元测试。
 
 总流程以 ``vector_doc_id`` 为唯一身份，彻底不依赖 ``chunk_id``。覆盖单条、
 批量、skip 语义、fail-closed 身份校验与“不循环调用单条入口”的批次行为。
@@ -96,7 +96,7 @@ def _sha(text: str) -> str:
 
 
 def make_record(index: int = 0) -> ExpertChunkEmbeddingInput:
-    """构造 4.0.0 的最小合法内存记录（以 vector_doc_id 为身份，无 chunk_id）。"""
+    """构造 4.1.0 的最小合法内存记录（以 vector_doc_id 为身份，无 chunk_id）。"""
 
     text = "[专家能力概述]\n虚构测试专家具备知识检索系统建设经验。"
     # 用可回查的 source_field_id 区分不同记录，chunk_index 保持 0 < chunk_total，
@@ -221,6 +221,15 @@ def with_batch_worker(
 
 
 # ---- Single Ingestion ----
+
+def test_single_ingestion_entry_warns_during_compatibility_period() -> None:
+    service, _model, _repository = make_service()
+
+    with pytest.warns(DeprecationWarning, match="ingest_one 已弃用"):
+        result = service.ingest_one(make_record())
+
+    assert result.status == "embedded"
+
 
 def test_single_eligible_embeds_and_reports_vector_doc_id() -> None:
     service, model, repository = make_service()

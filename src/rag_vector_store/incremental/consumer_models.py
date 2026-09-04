@@ -1,9 +1,9 @@
 """Consumer 结构化结果模型与稳定结果码（D2A 抽取后的共享层）。
 
 本模块只承载 Consumer 对外的结构化产物定义：状态、动作、result_code、
-error_code 与 ``ExecutionResult``。它不依赖任何 Work Item 行模型、仓储或
-外部系统类型；``ContractConsumerCore`` 与兼容入口 ``V15WorkItemConsumer``
-共同复用本模块。状态持久化语义仍由未来的唯一状态表适配层负责。
+error_code 与 ``ExecutionResult``。它不依赖任何历史 Work Item 行模型或仓储，
+由正式 ``ContractConsumerCore`` 与范围 Consumer 共同复用。状态持久化语义
+仍由上游唯一状态表适配层负责。
 """
 
 from __future__ import annotations
@@ -15,8 +15,7 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 # ---------------------------------------------------------------------------
 # 基础字面量
 # ---------------------------------------------------------------------------
-#: Consumer 支持的操作标签。取值集合与持久化层 V15WorkItemOperation 一致，
-#: 但此处刻意本地定义，保证核心链路不依赖 Work Item 行模型模块。
+#: Consumer 支持的操作标签；本地定义以保持核心不依赖历史 Work Item 模块。
 ConsumerOperation = Literal["upsert", "metadata_update", "disable"]
 
 #: Consumer 终态。planned 表示 plan_only 规划结果。

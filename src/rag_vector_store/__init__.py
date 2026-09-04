@@ -1,4 +1,4 @@
-"""正式 Expert Chunk Contract v2 的向量化与 Milvus 公共 API。"""
+"""正式 Expert Chunk Contract 4.1.0 的向量化与 Milvus 公共 API。"""
 
 from expert_contracts import (
     EXPERT_CHUNK_CONTRACT_VERSION,
@@ -75,7 +75,7 @@ from .model_space import (
     FORMAL_EMBEDDING_PROVIDER,
     build_model_space_id,
 )
-from .models import MutationResult, SearchHit
+from .models import MutationResult
 from .reconciliation import (
     FullVectorReconciliationResult,
     FullVectorReconciliationService,
@@ -129,7 +129,6 @@ __all__ = [
     "ProjectMetadata",
     "ResumeMilvusV15RowMapper",
     "ResumeVectorIngestionService",
-    "SearchHit",
     "SkippedContractChunk",
     "VectorContractError",
     "VectorDeletionResult",

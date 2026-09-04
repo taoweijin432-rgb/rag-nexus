@@ -1,14 +1,14 @@
-"""ContractConsumerCore：Work Item 无关的增量消费判定与执行核心（D2A）。
+"""ContractConsumerCore：正式增量消费判定与执行核心。
 
 核心输入是**标准 Contract 输入 / Disable 输入**，不再依赖 V15 Work Item 行模型：
 
     标准 Contract 输入 / Disable 输入 → ContractConsumerCore → ExecutionResult
-    （Work Item 行模型 → V15WorkItemConsumer 兼容入口 → 本核心）
+    （Scope Handoff → ScopeConsumer → 本核心）
 
 职责边界：
     - 只实现「Contract 输入 → 差分判定 → 调用既有向量能力 → 结构化结果」；
     - 不实现任何任务状态持久化：不新增 StateStorePort、不连接 MySQL、
-      不写 ``v15_vectorization_work_item`` 或公共状态表；
+      不写公共状态表；
     - 不做 retry / lease / requeue（后续唯一状态表适配层的职责）；
     - 不感知 Embedding 实现（藏于 ``upsert_chunks`` 编排内）、不做物理删除、
       不生成 chunk_text。
@@ -150,7 +150,7 @@ class ContractUpsertIntent:
 class ContractMetadataUpdateIntent:
     """标准 metadata_update 意图：目标 id + 从已存实体构造 Contract 的工厂。
 
-    Work Item 契约禁止携带 chunk_text，metadata-only 更新必须复用已存正文：
+    metadata_update 意图不携带 chunk_text，metadata-only 更新必须复用已存正文：
     核心先读取已存记录，再以 ``(stored_chunk_text, stored_content_hash)`` 调用
     :attr:`adapt_from_stored` 构造完整 Contract。工厂失败抛出
     :class:`ContractSynthesisError`（确定性拒绝），绝不伪造哈希或文本。
