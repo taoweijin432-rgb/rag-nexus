@@ -26,6 +26,10 @@ class DomainSkippedVector:
     reason: str
 
 
+class DomainEmbeddingError(RuntimeError):
+    """Embedding 返回结果不符合通用 Worker 协议。"""
+
+
 @dataclass(frozen=True)
 class DomainEmbeddingResult(Generic[PreparedT, EmbeddedT]):
     """通用 Worker 输出。"""
@@ -98,27 +102,46 @@ class DomainEmbeddingWorker(Generic[InputT, PreparedT, EmbeddedT]):
             return DomainEmbeddingResult(embedded_chunks=[], skipped_chunks=skipped)
 
         texts = [self.adapter.chunk_text(record) for record in eligible]
-        raw_embeddings = list(self.embedding_model.embed(texts))
+        raw_result = self.embedding_model.embed(texts)
+        try:
+            raw_embeddings = list(raw_result)
+        except (TypeError, ValueError) as error:
+            raise DomainEmbeddingError("Embedding 返回值必须是可迭代的向量集合") from error
         if len(raw_embeddings) != len(eligible):
-            raise ValueError("Embedding 返回数量与符合资格的输入记录数量不一致")
+            raise DomainEmbeddingError(
+                "Embedding 返回数量与符合资格的输入记录数量不一致"
+            )
 
         embedded_at = _format_embedded_at(self.clock())
         embedded: list[EmbeddedT] = []
         for prepared, raw_embedding in zip(eligible, raw_embeddings):
-            embedding = validate_embedding_vector(
-                raw_embedding,
-                expected_dimension=self.expected_dimension,
-                label=f"vector_doc_id {self.adapter.vector_doc_id(prepared)!r} 的 Embedding",
-            )
-            item = self.adapter.attach_embedding(
-                prepared,
-                embedding,
-                embedding_model_alias=self.embedding_model_alias,
-                embedding_model_version=self.embedding_model_version,
-                embedded_at=embedded_at,
-            )
+            try:
+                embedding = validate_embedding_vector(
+                    raw_embedding,
+                    expected_dimension=self.expected_dimension,
+                    label=(
+                        f"vector_doc_id "
+                        f"{self.adapter.vector_doc_id(prepared)!r} 的 Embedding"
+                    ),
+                )
+            except (TypeError, ValueError) as error:
+                raise DomainEmbeddingError(str(error)) from error
+            try:
+                item = self.adapter.attach_embedding(
+                    prepared,
+                    embedding,
+                    embedding_model_alias=self.embedding_model_alias,
+                    embedding_model_version=self.embedding_model_version,
+                    embedded_at=embedded_at,
+                )
+            except (TypeError, ValueError) as error:
+                raise DomainEmbeddingError(
+                    "Contract Adapter 无法回填合法 Embedded Contract"
+                ) from error
             if not self.adapter.is_embedded(item):
-                raise TypeError("Contract Adapter 返回了非法 Embedded Contract")
+                raise DomainEmbeddingError(
+                    "Contract Adapter 返回了非法 Embedded Contract"
+                )
             embedded.append(item)
         return DomainEmbeddingResult(
             embedded_chunks=embedded,
@@ -147,6 +170,7 @@ def _utc_now() -> datetime:
 
 
 __all__ = [
+    "DomainEmbeddingError",
     "DomainEmbeddingResult",
     "DomainEmbeddingWorker",
     "DomainSkippedVector",

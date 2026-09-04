@@ -27,6 +27,7 @@ from ..constants import FORMAL_EMBEDDING_DIMENSION
 from ..core.embedding import DomainEmbeddingWorker
 from ..domains import ExpertContractAdapter
 from ..embedding import EmbeddingModel
+from ..milvus.compatibility import compare_schema_specs
 from ..milvus.schemas.contract_v15 import v15_milvus_field_specs
 
 EXPECTED_EMBEDDING_DIMENSION = FORMAL_EMBEDDING_DIMENSION
@@ -426,61 +427,46 @@ def compare_contract_output_schema(
     都只返回差异，由 Repository 或验证脚本阻止写入，不尝试自动迁移现有 Collection。
     """
 
-    expected = expected_contract_output_fields(vector_dimension)
-    actual = {
-        field.get("name"): field
-        for field in description.get("fields", [])
-        if isinstance(field, Mapping) and field.get("name")
-    }
-    missing_fields = sorted(set(expected) - set(actual))
-    incompatible_fields: dict[str, dict[str, object]] = {}
+    comparison = compare_schema_specs(
+        description,
+        v15_milvus_field_specs(vector_dimension),
+    )
+    result = comparison.as_dict()
+    changed_fields = result.get("changed_fields")
+    result["incompatible_fields"] = _legacy_incompatible_fields(changed_fields)
+    return result
 
-    for field_name in sorted(set(expected).intersection(actual)):
-        expected_field = expected[field_name]
-        actual_field = actual[field_name]
+
+def _legacy_incompatible_fields(
+    changed_fields: object,
+) -> dict[str, dict[str, object]]:
+    """保留旧比较入口的字段差异键，同时复用正式 Gate 的判断结果。"""
+
+    if not isinstance(changed_fields, Mapping):
+        return {}
+    incompatible: dict[str, dict[str, object]] = {}
+    for field_name, change in changed_fields.items():
+        if not isinstance(field_name, str) or not isinstance(change, Mapping):
+            continue
+        expected = change.get("expected")
+        actual = change.get("actual")
+        if not isinstance(expected, Mapping) or not isinstance(actual, Mapping):
+            continue
         differences: dict[str, object] = {}
-        actual_datatype = _milvus_datatype_name(actual_field.get("type"))
-        if actual_datatype != expected_field["datatype"]:
-            differences["datatype"] = {
-                "expected": expected_field["datatype"],
-                "actual": actual_datatype,
-            }
-
-        expected_nullable = bool(expected_field.get("nullable", False))
-        actual_nullable = bool(actual_field.get("nullable", False))
-        if actual_nullable != expected_nullable:
-            differences["nullable"] = {
-                "expected": expected_nullable,
-                "actual": actual_nullable,
-            }
-
-        params = actual_field.get("params") or {}
-        expected_dim = expected_field.get("dim")
-        if expected_dim is not None and _as_int(params.get("dim")) != expected_dim:
-            differences["dim"] = {
-                "expected": expected_dim,
-                "actual": _as_int(params.get("dim")),
-            }
-
-        expected_max_length = _as_int(expected_field.get("max_length"))
-        actual_max_length = _as_int(params.get("max_length"))
-        if (
-            expected_max_length is not None
-            and actual_max_length is not None
-            and actual_max_length < expected_max_length
-        ):
+        for key in ("datatype", "nullable", "primary_key", "dim"):
+            if expected.get(key) != actual.get(key):
+                differences[key] = {
+                    "expected": expected.get(key),
+                    "actual": actual.get(key),
+                }
+        if expected.get("max_length") != actual.get("max_length"):
             differences["max_length"] = {
-                "minimum": expected_max_length,
-                "actual": actual_max_length,
+                "minimum": expected.get("max_length"),
+                "actual": actual.get("max_length"),
             }
         if differences:
-            incompatible_fields[field_name] = differences
-
-    return {
-        "compatible": not missing_fields and not incompatible_fields,
-        "missing_fields": missing_fields,
-        "incompatible_fields": incompatible_fields,
-    }
+            incompatible[field_name] = differences
+    return incompatible
 
 
 def _required_model_text(model: EmbeddingModel, attribute: str) -> str:
@@ -506,34 +492,3 @@ def _safe_validation_message(exc: ValidationError) -> str:
         location = ".".join(str(item) for item in error["loc"])
         messages.append(f"{location}: {error['msg']}")
     return "；".join(messages)
-
-
-def _milvus_datatype_name(value: object) -> str:
-    """兼容 PyMilvus 枚举、整数和字符串形式的数据类型。"""
-
-    name = getattr(value, "name", None)
-    if isinstance(name, str):
-        return name.upper()
-    if isinstance(value, int) and not isinstance(value, bool):
-        try:
-            from pymilvus import DataType
-
-            return DataType(value).name.upper()
-        except (ImportError, ValueError):
-            return str(value)
-    text = str(value).upper()
-    for datatype in ("FLOAT_VECTOR", "VARCHAR", "INT64", "BOOL", "JSON"):
-        if datatype in text:
-            return datatype
-    return text
-
-
-def _as_int(value: object) -> int | None:
-    """将 Milvus Schema 参数安全转换为整数。"""
-
-    if isinstance(value, bool):
-        return None
-    try:
-        return int(value)  # type: ignore[arg-type]
-    except (TypeError, ValueError):
-        return None

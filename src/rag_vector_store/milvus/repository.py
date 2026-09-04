@@ -82,7 +82,7 @@ class ContractMilvusRepositoryBase:
         vector_dimension: int | None = None,
         *,
         client: Any | None = None,
-        allow_collection_creation: bool = True,
+        allow_collection_creation: bool = False,
         profile: VectorRepositoryProfile[Any],
     ) -> None:
         if settings.schema_mode != "contract":
@@ -98,8 +98,8 @@ class ContractMilvusRepositoryBase:
         if not isinstance(profile, VectorRepositoryProfile):
             raise TypeError("profile 必须是 VectorRepositoryProfile")
         self._profile = profile
-        self._contract_row_mapper = self._row_mapper_cls()
-        self._contract_adapter = self._contract_adapter_cls()
+        self._contract_row_mapper = profile.row_mapper_cls()
+        self._contract_adapter = profile.contract_adapter_cls()
         self._lock = Lock()
         # 模型空间一致性缓存：同一 Repository 生命周期内，同一个
         # (embedding_model_alias, embedding_model_version, embedding_dim) 只校验
@@ -111,60 +111,10 @@ class ContractMilvusRepositoryBase:
             self._set_vector_dimension(vector_dimension)
 
     @property
-    def client(self) -> Any:
-        """暴露延迟创建的 SDK client，供高级集成场景使用。"""
-
-        return self._get_client()
-
-    @property
     def profile(self) -> VectorRepositoryProfile[Any]:
         """返回当前实例唯一、不可变的持久化 Profile。"""
 
         return self._profile
-
-    @property
-    def _schema_field_specs(self) -> Any:
-        return self._profile._schema_field_specs
-
-    @property
-    def _schema_builder(self) -> Any:
-        return self._profile._schema_builder
-
-    @property
-    def _index_specs_fn(self) -> Any:
-        return self._profile._index_specs_fn
-
-    @property
-    def _row_mapper_cls(self) -> Any:
-        return self._profile._row_mapper_cls
-
-    @property
-    def _full_scan_filter(self) -> str:
-        return self._profile._full_scan_filter
-
-    @property
-    def _model_space_fields(self) -> tuple[str, ...]:
-        return self._profile._model_space_fields
-
-    @property
-    def _contract_adapter_cls(self) -> Any:
-        return self._profile._contract_adapter_cls
-
-    @property
-    def _owner_field(self) -> str:
-        return self._profile._owner_field
-
-    @property
-    def _vector_doc_id_prefix(self) -> str:
-        return self._profile._vector_doc_id_prefix
-
-    @property
-    def _owner_filter_fn(self) -> Any:
-        return self._profile._owner_filter_fn
-
-    @property
-    def _owner_output_fields(self) -> tuple[str, ...]:
-        return self._profile._owner_output_fields
 
     def contract_schema_summary(
         self,
@@ -173,7 +123,10 @@ class ContractMilvusRepositoryBase:
         """返回正式契约 Milvus Schema 摘要，不连接或修改 Milvus。"""
 
         dimension = self._resolve_vector_dimension(vector_dimension)
-        return [spec.summary() for spec in self._schema_field_specs(dimension)]
+        return [
+            spec.summary()
+            for spec in self.profile.schema_field_specs(dimension)
+        ]
 
     def compare_contract_schema(
         self,
@@ -185,7 +138,7 @@ class ContractMilvusRepositoryBase:
         dimension = self._resolve_vector_dimension(vector_dimension)
         return compare_schema_specs(
             description,
-            self._schema_field_specs(dimension),
+            self.profile.schema_field_specs(dimension),
         ).as_dict()
 
     def expected_index_summary(self) -> dict[str, object]:
@@ -200,7 +153,7 @@ class ContractMilvusRepositoryBase:
 
         return [
             spec.summary(include_name=True)
-            for spec in self._index_specs_fn(self.settings)
+            for spec in self.profile.index_specs_fn(self.settings)
         ]
 
     def compare_contract_indexes(self, client: Any | None = None) -> dict[str, object]:
@@ -231,7 +184,7 @@ class ContractMilvusRepositoryBase:
         return compare_contract_indexes_definition(
             index_names,
             descriptions,
-            self._index_specs_fn(self.settings),
+            self.profile.index_specs_fn(self.settings),
         ).as_dict()
 
     def assert_destructive_maintenance_allowed(
@@ -466,14 +419,14 @@ class ContractMilvusRepositoryBase:
 
         cleaned = dedupe_nonempty_strings(
             vector_doc_ids,
-            prefix=self._vector_doc_id_prefix,
+            prefix=self.profile.vector_doc_id_prefix,
         )
         if not cleaned:
             return {}
 
         dimension = self._resolve_vector_dimension(None)
         output_fields = [
-            spec.name for spec in self._schema_field_specs(dimension)
+            spec.name for spec in self.profile.schema_field_specs(dimension)
         ]
         if not include_embedding:
             output_fields.remove("embedding")
@@ -519,7 +472,7 @@ class ContractMilvusRepositoryBase:
         fields = list(
             output_fields
             if output_fields is not None
-            else self._owner_output_fields
+            else self.profile.owner_output_fields
         )
         if not fields or any(
             not isinstance(field, str) or not field.strip() for field in fields
@@ -529,7 +482,7 @@ class ContractMilvusRepositoryBase:
             collection_name=self.settings.collection_name,
             batch_size=1000,
             limit=-1,
-            filter=self._owner_filter_fn(owner_id),
+            filter=self.profile.owner_filter_fn(owner_id),
             output_fields=fields,
             consistency_level="Strong",
             **self._timeout_kwargs(),
@@ -549,7 +502,9 @@ class ContractMilvusRepositoryBase:
                     vector_doc_id = projected.get("vector_doc_id")
                     if vector_doc_id is not None and (
                         not isinstance(vector_doc_id, str)
-                        or not vector_doc_id.startswith(self._vector_doc_id_prefix)
+                        or not vector_doc_id.startswith(
+                            self.profile.vector_doc_id_prefix
+                        )
                     ):
                         raise RuntimeError(
                             "Milvus owner 查询返回了不属于当前 Profile 的 "
@@ -599,7 +554,7 @@ class ContractMilvusRepositoryBase:
             collection_name=self.settings.collection_name,
             batch_size=1000,
             limit=-1,
-            filter=self._full_scan_filter,
+            filter=self.profile.full_scan_filter,
             output_fields=fields,
             consistency_level="Strong",
             **self._timeout_kwargs(),
@@ -754,8 +709,8 @@ class ContractMilvusRepositoryBase:
             collection_name=self.settings.collection_name,
             batch_size=1000,
             limit=-1,
-            filter=self._full_scan_filter,
-            output_fields=list(self._model_space_fields),
+            filter=self.profile.full_scan_filter,
+            output_fields=list(self.profile.model_space_fields),
             consistency_level="Strong",
             **self._timeout_kwargs(),
         )
@@ -803,12 +758,12 @@ class ContractMilvusRepositoryBase:
     def _build_schema(self, vector_dimension: int | None) -> Any:
         """构造 profile 指定的 Contract Schema，不修改任何已有 Collection。"""
 
-        return self._schema_builder(self.settings, vector_dimension)
+        return self.profile.schema_builder(self.settings, vector_dimension)
 
     def _build_index_params(self, client: Any) -> Any:
         return build_index_params(
             client,
-            self._index_specs_fn(self.settings),
+            self.profile.index_specs_fn(self.settings),
         )
 
     def _validate_existing_collection(self, description: Mapping[str, Any]) -> None:
@@ -863,8 +818,8 @@ class ContractMilvusRepositoryBase:
     def _validate_identity_profile(self, records: Sequence[Any]) -> None:
         """验证 owner、Metadata 和主键前缀属于同一个 Repository Profile。"""
 
-        owner_field = self._owner_field
-        prefix = self._vector_doc_id_prefix
+        owner_field = self.profile.owner_field
+        prefix = self.profile.vector_doc_id_prefix
         if self._contract_adapter.owner_field() != owner_field:
             raise ValueError("Contract Adapter 与 Repository Profile 的 owner 字段不一致")
         if self._contract_adapter.id_prefix() != prefix:

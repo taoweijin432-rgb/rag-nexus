@@ -11,6 +11,7 @@ from .adapters import (
     VectorStorageAdapter,
 )
 from .embedding import (
+    DomainEmbeddingError,
     DomainEmbeddingResult,
     DomainEmbeddingWorker,
     DomainSkippedVector,
@@ -39,6 +40,7 @@ __all__ = [
     "DomainBatchIngestionResult",
     "DomainBatchIngestionService",
     "DomainDeletionResult",
+    "DomainEmbeddingError",
     "DomainEmbeddingResult",
     "DomainEmbeddingWorker",
     "DomainIngestionError",

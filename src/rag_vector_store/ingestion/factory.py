@@ -49,13 +49,14 @@ def _repository_is_v15(repository: Any) -> bool:
     """判断 repository 对象是否属于 V15 持久化 profile。
 
     优先用类型判断（正式 V15 Repository 类型）；对 duck-typed fake 回退到
-    V15 profile 特征（``_row_mapper_cls``）。无法识别的一律视为非 V15，
+    公开 Profile 的 V15 ``row_mapper_cls`` 特征。无法识别的一律视为非 V15，
     由调用方按需 fail-closed。
     """
 
     if isinstance(repository, ContractMilvusV15VectorRepository):
         return True
-    return getattr(repository, "_row_mapper_cls", None) in {
+    profile = getattr(repository, "profile", None)
+    return getattr(profile, "row_mapper_cls", None) in {
         MilvusV15RowMapper,
         ResumeMilvusV15RowMapper,
     }
@@ -78,8 +79,10 @@ def _validate_repository_profile(
     if repository is None:
         return
     is_v15 = _repository_is_v15(repository)
-    if schema_profile == "v15" and not is_v15 and hasattr(
-        repository, "_schema_field_specs"
+    if (
+        schema_profile == "v15"
+        and not is_v15
+        and getattr(repository, "profile", None) is not None
     ):
         raise ValueError(
             "schema_profile='v15' 与显式注入的非 V15 repository 冲突；"
@@ -117,34 +120,25 @@ def _validate_row_mapper_profile(
         )
 
 
-def _profile_value(repository: Any, name: str) -> Any:
-    """读取 Repository 实例或其不可变 Profile 上的配置值。"""
-
-    value = getattr(repository, name, None)
-    if value is not None:
-        return value
-    profile = getattr(repository, "_profile", None)
-    return getattr(profile, name, None)
-
-
 def _validate_resume_repository_profile(repository: Any) -> None:
     """Resume Factory 只接受明确绑定 Resume 身份空间的 Repository。"""
 
     if repository is None:
         return
-    owner_field = _profile_value(repository, "_owner_field")
-    id_prefix = _profile_value(repository, "_vector_doc_id_prefix")
+    profile = getattr(repository, "profile", None)
+    owner_field = getattr(profile, "owner_field", None)
+    id_prefix = getattr(profile, "vector_doc_id_prefix", None)
     if owner_field != "resume_id" or id_prefix != "resume:":
         raise ValueError(
             "Resume Factory 要求 Repository 绑定 Resume Profile "
             "(owner_field='resume_id', vector_doc_id_prefix='resume:')"
         )
-    adapter_cls = _profile_value(repository, "_contract_adapter_cls")
+    adapter_cls = getattr(profile, "contract_adapter_cls", None)
     if adapter_cls is not None and adapter_cls is not ResumeContractAdapter:
         raise ValueError(
             "Resume Factory 要求 Repository 使用 ResumeContractAdapter"
         )
-    mapper_cls = _profile_value(repository, "_row_mapper_cls")
+    mapper_cls = getattr(profile, "row_mapper_cls", None)
     if mapper_cls is not None and mapper_cls is not ResumeMilvusV15RowMapper:
         raise ValueError(
             "Resume Factory 要求 Repository 使用 ResumeMilvusV15RowMapper"
@@ -231,7 +225,8 @@ def _resolve_row_mapper(
 
     if row_mapper is not None:
         return row_mapper
-    mapper_cls = getattr(repository, "_row_mapper_cls", MilvusV15RowMapper)
+    profile = getattr(repository, "profile", None)
+    mapper_cls = getattr(profile, "row_mapper_cls", MilvusV15RowMapper)
     mapper = mapper_cls()
     if not hasattr(mapper, "to_row") or not hasattr(mapper, "from_row"):
         raise ValueError("Repository profile 未提供合法 RowMapper")
@@ -280,16 +275,16 @@ def create_vector_ingestion_service(
 
     if validator is None:
         validator = ContractValidator()
-    if embedding_model is None:
-        embedding_model = CompanyCloudEmbeddingModel.from_env()
     if embedding_worker is None:
+        if embedding_model is None:
+            embedding_model = CompanyCloudEmbeddingModel.from_env()
         embedding_worker = ContractEmbeddingWorker(
             embedding_model,
             validator=validator,
         )
-    if milvus_settings is None:
-        milvus_settings = MilvusSettings.from_env()
     if repository is None:
+        if milvus_settings is None:
+            milvus_settings = MilvusSettings.from_env()
         repository = _build_repository(
             milvus_settings=milvus_settings,
             expected_dimension=expected_dimension,
@@ -342,9 +337,9 @@ def create_resume_vector_ingestion_service(
             adapter,
             expected_dimension=expected_dimension,
         )
-    if milvus_settings is None:
-        milvus_settings = MilvusSettings.from_env()
     if repository is None:
+        if milvus_settings is None:
+            milvus_settings = MilvusSettings.from_env()
         repository = _build_repository(
             milvus_settings=milvus_settings,
             expected_dimension=expected_dimension,

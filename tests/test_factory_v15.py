@@ -18,6 +18,7 @@ import json
 from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
+from unittest.mock import patch
 
 import pytest
 
@@ -240,6 +241,35 @@ def test_factory_repository_refuses_to_create_missing_collection() -> None:
         ingestion.repository.initialize(1024)
 
     assert client.create_calls == []
+
+
+def test_factory_injected_worker_does_not_read_embedding_environment() -> None:
+    with patch(
+        "rag_vector_store.ingestion.factory.CompanyCloudEmbeddingModel.from_env",
+        side_effect=AssertionError("不应读取 Embedding 环境配置"),
+    ) as from_env:
+        ingestion = create_vector_ingestion_service(
+            milvus_settings=_settings(),
+            embedding_worker=_worker(),
+        )
+
+    assert isinstance(ingestion, VectorIngestionService)
+    from_env.assert_not_called()
+
+
+def test_factory_injected_repository_does_not_read_milvus_environment() -> None:
+    repository = ContractMilvusV15VectorRepository(_settings(), 1024)
+    with patch(
+        "rag_vector_store.ingestion.factory.MilvusSettings.from_env",
+        side_effect=AssertionError("不应读取 Milvus 环境配置"),
+    ) as from_env:
+        ingestion = create_vector_ingestion_service(
+            repository=repository,
+            embedding_worker=_worker(),
+        )
+
+    assert ingestion.repository is repository
+    from_env.assert_not_called()
 
 
 def test_explicit_schema_profile_warns_during_compatibility_period() -> None:

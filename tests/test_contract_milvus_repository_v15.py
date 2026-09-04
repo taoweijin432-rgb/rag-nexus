@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import Mapping, Sequence
+from dataclasses import FrozenInstanceError
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -370,12 +371,42 @@ def test_v15_repository_profile_defaults_point_to_v15_symbols() -> None:
     """V15 Repository 的持久化 profile 必须指向 V15 符号（不串线）。"""
 
     repository = make_v15_repository()
-    assert repository._schema_field_specs is v15_milvus_field_specs
-    assert repository._row_mapper_cls is MilvusV15RowMapper
-    assert repository._index_specs_fn is index_specs_v15
-    assert repository._full_scan_filter == 'vector_doc_id != ""'
-    assert repository._model_space_fields == ("metadata",)
+    assert repository.profile.schema_field_specs is v15_milvus_field_specs
+    assert repository.profile.row_mapper_cls is MilvusV15RowMapper
+    assert repository.profile.index_specs_fn is index_specs_v15
+    assert repository.profile.full_scan_filter == 'vector_doc_id != ""'
+    assert repository.profile.model_space_fields == ("metadata",)
     assert isinstance(repository._contract_row_mapper, MilvusV15RowMapper)
+
+
+def test_v15_repository_does_not_expose_raw_milvus_client() -> None:
+    """业务调用方不能绕过 Repository 直接取得原始 PyMilvus Client。"""
+
+    repository = make_v15_repository()
+
+    assert not hasattr(repository, "client")
+
+
+def test_v15_repository_profile_is_public_and_read_only() -> None:
+    repository = make_v15_repository()
+
+    assert repository.profile.owner_field == "expert_id"
+    with pytest.raises(FrozenInstanceError):
+        repository.profile.owner_field = "resume_id"  # type: ignore[misc]
+
+
+def test_v15_repository_default_refuses_to_create_missing_collection() -> None:
+    client = FakeV15MilvusClient(exists=False)
+    repository = ContractMilvusV15VectorRepository(
+        v15_settings(),
+        1024,
+        client=client,
+    )
+
+    with pytest.raises(RuntimeError, match="禁止自动创建"):
+        repository.initialize(1024)
+
+    assert client.create_calls == []
 
 
 # ---------------------------------------------------------------------------
@@ -1020,16 +1051,16 @@ def test_v15_profile_symbols_are_stable() -> None:
 
     v15_repo = make_v15_repository()
 
-    assert v15_repo._schema_field_specs is v15_milvus_field_specs
-    assert v15_repo._row_mapper_cls is MilvusV15RowMapper
-    assert v15_repo._index_specs_fn is index_specs_v15
-    assert v15_repo._full_scan_filter == 'vector_doc_id != ""'
+    assert v15_repo.profile.schema_field_specs is v15_milvus_field_specs
+    assert v15_repo.profile.row_mapper_cls is MilvusV15RowMapper
+    assert v15_repo.profile.index_specs_fn is index_specs_v15
+    assert v15_repo.profile.full_scan_filter == 'vector_doc_id != ""'
     # V15 full-scan filter 不引用任何不存在的 V15 scalar。
-    assert "metadata" not in v15_repo._full_scan_filter
-    assert "metadata[" not in v15_repo._full_scan_filter
-    assert "expert_id" not in v15_repo._full_scan_filter
-    assert "embedding_dim" not in v15_repo._full_scan_filter
-    assert v15_repo._model_space_fields == ("metadata",)
+    assert "metadata" not in v15_repo.profile.full_scan_filter
+    assert "metadata[" not in v15_repo.profile.full_scan_filter
+    assert "expert_id" not in v15_repo.profile.full_scan_filter
+    assert "embedding_dim" not in v15_repo.profile.full_scan_filter
+    assert v15_repo.profile.model_space_fields == ("metadata",)
 
 
 def test_v15_schema_field_set_is_4_fields() -> None:

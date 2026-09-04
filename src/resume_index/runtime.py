@@ -159,8 +159,9 @@ def _require_resume_vector_service(
         raise DatabaseBoundaryError(
             "显式 vector_service 未绑定 RESUME_MILVUS_COLLECTION_NAME，已拒绝启动"
         )
-    owner_field = getattr(repository, "_owner_field", None)
-    id_prefix = getattr(repository, "_vector_doc_id_prefix", None)
+    profile = getattr(repository, "profile", None)
+    owner_field = getattr(profile, "owner_field", None)
+    id_prefix = getattr(profile, "vector_doc_id_prefix", None)
     if owner_field != "resume_id" or id_prefix != "resume:":
         raise DatabaseBoundaryError(
             "显式 vector_service 未绑定 Resume Profile（resume_id/resume:），"

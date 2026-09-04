@@ -69,31 +69,31 @@ __all__ = [
 ]
 
 EXPERT_V15_PROFILE = VectorRepositoryProfile(
-    _schema_field_specs=v15_milvus_field_specs,
-    _schema_builder=build_v15_schema,
-    _index_specs_fn=index_specs_v15,
-    _row_mapper_cls=MilvusV15RowMapper,
-    _full_scan_filter='vector_doc_id != ""',
-    _model_space_fields=("metadata",),
-    _contract_adapter_cls=ExpertContractAdapter,
-    _owner_field="expert_id",
-    _vector_doc_id_prefix="expert:",
-    _owner_filter_fn=lambda owner_id: f'metadata["expert_id"] == {int(owner_id)}',
-    _owner_output_fields=("vector_doc_id",),
+    schema_field_specs=v15_milvus_field_specs,
+    schema_builder=build_v15_schema,
+    index_specs_fn=index_specs_v15,
+    row_mapper_cls=MilvusV15RowMapper,
+    full_scan_filter='vector_doc_id != ""',
+    model_space_fields=("metadata",),
+    contract_adapter_cls=ExpertContractAdapter,
+    owner_field="expert_id",
+    vector_doc_id_prefix="expert:",
+    owner_filter_fn=lambda owner_id: f'metadata["expert_id"] == {int(owner_id)}',
+    owner_output_fields=("vector_doc_id",),
 )
 
 RESUME_V15_PROFILE = VectorRepositoryProfile(
-    _schema_field_specs=v15_milvus_field_specs,
-    _schema_builder=build_v15_schema,
-    _index_specs_fn=index_specs_v15,
-    _row_mapper_cls=ResumeMilvusV15RowMapper,
-    _full_scan_filter='vector_doc_id != ""',
-    _model_space_fields=("metadata",),
-    _contract_adapter_cls=ResumeContractAdapter,
-    _owner_field="resume_id",
-    _vector_doc_id_prefix="resume:",
-    _owner_filter_fn=lambda owner_id: f'metadata["resume_id"] == {int(owner_id)}',
-    _owner_output_fields=("vector_doc_id",),
+    schema_field_specs=v15_milvus_field_specs,
+    schema_builder=build_v15_schema,
+    index_specs_fn=index_specs_v15,
+    row_mapper_cls=ResumeMilvusV15RowMapper,
+    full_scan_filter='vector_doc_id != ""',
+    model_space_fields=("metadata",),
+    contract_adapter_cls=ResumeContractAdapter,
+    owner_field="resume_id",
+    vector_doc_id_prefix="resume:",
+    owner_filter_fn=lambda owner_id: f'metadata["resume_id"] == {int(owner_id)}',
+    owner_output_fields=("vector_doc_id",),
 )
 
 # 限量采样行数：V15 Collection 规模增长后，upsert 前的既有 model-space
@@ -123,7 +123,7 @@ class ContractMilvusV15VectorRepository(ContractMilvusRepositoryBase):
         vector_dimension: int | None = None,
         *,
         client: Any | None = None,
-        allow_collection_creation: bool = True,
+        allow_collection_creation: bool = False,
         profile: VectorRepositoryProfile[Any] = EXPERT_V15_PROFILE,
     ) -> None:
         super().__init__(
@@ -148,7 +148,7 @@ class ContractMilvusV15VectorRepository(ContractMilvusRepositoryBase):
         flat = row.get("metadata")
         if not isinstance(flat, Mapping):
             raise TypeError("Milvus V15 行缺少合法 metadata JSON 对象")
-        if self._owner_field == "resume_id":
+        if self.profile.owner_field == "resume_id":
             if "resume_id" not in flat:
                 raise ValueError(
                     "Resume Collection 既有 Entity 缺少 metadata['resume_id']，"
@@ -209,7 +209,7 @@ class ContractMilvusV15VectorRepository(ContractMilvusRepositoryBase):
             self._validated_model_space = requested
             return
         if row_count <= _MODEL_SPACE_SAMPLE_LIMIT:
-            sample_filter = self._full_scan_filter
+            sample_filter = self.profile.full_scan_filter
         else:
             # 目标候选数约为上限的两倍，再由 limit 截断到500条；最低比例避免
             # 超大 Collection 因浮点下溢形成空采样。
@@ -222,7 +222,7 @@ class ContractMilvusV15VectorRepository(ContractMilvusRepositoryBase):
         rows = client.query(
             collection_name=self.settings.collection_name,
             filter=sample_filter,
-            output_fields=["vector_doc_id", *self._model_space_fields],
+            output_fields=["vector_doc_id", *self.profile.model_space_fields],
             limit=_MODEL_SPACE_SAMPLE_LIMIT,
             consistency_level="Strong",
             **self._timeout_kwargs(),
@@ -289,7 +289,7 @@ class ContractMilvusV15VectorRepository(ContractMilvusRepositoryBase):
         ):
             raise ValueError("output_fields 必须是非空字符串序列")
         forbidden_fields = set(_V15_FORBIDDEN_TOP_LEVEL_FIELDS)
-        forbidden_fields.add(self._owner_field)
+        forbidden_fields.add(self.profile.owner_field)
         for forbidden in forbidden_fields:
             if forbidden in fields:
                 raise ValueError(
@@ -340,7 +340,7 @@ class ContractMilvusV15VectorRepository(ContractMilvusRepositoryBase):
             collection_name=self.settings.collection_name,
             batch_size=1000,
             limit=-1,
-            filter=self._full_scan_filter,
+            filter=self.profile.full_scan_filter,
             output_fields=fields,
             consistency_level="Strong",
             **self._timeout_kwargs(),
@@ -427,7 +427,7 @@ class ContractMilvusV15VectorRepository(ContractMilvusRepositoryBase):
             collection_name=self.settings.collection_name,
             batch_size=1000,
             limit=-1,
-            filter=self._full_scan_filter,
+            filter=self.profile.full_scan_filter,
             output_fields=["vector_doc_id", "metadata"],
             consistency_level="Strong",
             **self._timeout_kwargs(),

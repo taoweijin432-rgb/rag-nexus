@@ -14,6 +14,7 @@ from typing import Any
 import pytest
 
 from rag_vector_store.core import (
+    DomainEmbeddingError,
     DomainEmbeddingResult,
     DomainEmbeddingWorker,
     DomainIngestionError,
@@ -259,6 +260,42 @@ def test_generic_worker_only_embeds_eligible_text() -> None:
     assert [item.vector_doc_id for item in result.embedded_chunks] == ["alpha:1"]
     assert result.skipped_chunks == [DomainSkippedVector("alpha:2", "inactive")]
     assert result.embedded_chunks[0].embedded_at.startswith("2026-01-01T00:00:00")
+
+
+def test_generic_worker_rejects_embedding_count_mismatch() -> None:
+    adapter = FakeAdapter("owner_a", "alpha:", "a")
+
+    class WrongCountModel(FakeModel):
+        def embed(self, texts: list[str]) -> list[list[float]]:
+            self.calls.append(list(texts))
+            return []
+
+    worker = DomainEmbeddingWorker(
+        WrongCountModel(),
+        adapter,
+        expected_dimension=3,
+    )
+
+    with pytest.raises(DomainEmbeddingError, match="数量"):
+        worker.embed([InputRecord("a", "alpha:1", "first")])
+
+
+def test_generic_worker_rejects_embedding_dimension_mismatch() -> None:
+    adapter = FakeAdapter("owner_a", "alpha:", "a")
+
+    class WrongDimensionModel(FakeModel):
+        def embed(self, texts: list[str]) -> list[list[float]]:
+            self.calls.append(list(texts))
+            return [[1.0, 2.0] for _ in texts]
+
+    worker = DomainEmbeddingWorker(
+        WrongDimensionModel(),
+        adapter,
+        expected_dimension=3,
+    )
+
+    with pytest.raises(DomainEmbeddingError, match="dimension mismatch"):
+        worker.embed([InputRecord("a", "alpha:1", "first")])
 
 
 def test_generic_ingestion_rejects_cross_owner_result() -> None:

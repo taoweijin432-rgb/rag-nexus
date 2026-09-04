@@ -37,7 +37,9 @@ from ..chunking.contract_pipeline import (
     EmbeddingEligibilityError,
 )
 from ..core.adapters import VectorContractAdapter
+from ..core.embedding import DomainEmbeddingError
 from ..core.hash_state import project_hash_fields
+from ..core.ingestion import DomainIngestionError
 from ..core.lifecycle import DomainVectorLifecycleService
 from ..domains import ExpertContractAdapter
 from ..embedding_adapters.company_cloud import CompanyCloudEmbeddingError
@@ -63,8 +65,9 @@ from .models import (
 
 # 底层异常分类（不含无边界 except Exception）：
 #   - Contract 层：ContractValidationError / EmbeddingEligibilityError（-> VectorContractError）
-#   - Ingestion 层：ContractIngestionError（-> VectorIngestionError）
-#   - Embedding 层：CompanyCloudEmbeddingError（-> VectorEmbeddingError）
+#   - Ingestion 层：ContractIngestionError / DomainIngestionError（-> VectorIngestionError）
+#   - Embedding 层：CompanyCloudEmbeddingError / DomainEmbeddingError
+#     （-> VectorEmbeddingError）
 #   - Milvus 层：ValueError（含 pydantic.ValidationError）/ TypeError / RuntimeError /
 #     MilvusException（-> VectorMilvusError）
 
@@ -84,9 +87,9 @@ def _guard_call(fn, *args: Any, **kwargs: Any) -> Any:
         raise
     except (ContractValidationError, EmbeddingEligibilityError) as error:
         raise VectorContractError(safe_error_message(error)) from error
-    except ContractIngestionError as error:
+    except (ContractIngestionError, DomainIngestionError) as error:
         raise VectorIngestionError(safe_error_message(error)) from error
-    except CompanyCloudEmbeddingError as error:
+    except (CompanyCloudEmbeddingError, DomainEmbeddingError) as error:
         raise VectorEmbeddingError(safe_error_message(error)) from error
     except (ValueError, TypeError, RuntimeError, MilvusException) as error:
         raise VectorMilvusError(safe_error_message(error)) from error
@@ -108,9 +111,9 @@ def _guard_errors(func):
             raise
         except (ContractValidationError, EmbeddingEligibilityError, ValueError, TypeError) as error:
             raise VectorContractError(safe_error_message(error)) from error
-        except ContractIngestionError as error:
+        except (ContractIngestionError, DomainIngestionError) as error:
             raise VectorIngestionError(safe_error_message(error)) from error
-        except CompanyCloudEmbeddingError as error:
+        except (CompanyCloudEmbeddingError, DomainEmbeddingError) as error:
             raise VectorEmbeddingError(safe_error_message(error)) from error
         except (RuntimeError, MilvusException) as error:
             raise VectorMilvusError(safe_error_message(error)) from error

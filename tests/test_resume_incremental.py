@@ -23,6 +23,7 @@ from expert_index.scanner import (
     map_poll_candidate_to_task,
 )
 from rag_vector_store import MilvusSettings
+from rag_vector_store.milvus.repository_v15 import RESUME_V15_PROFILE
 from resume_index.config import ResumeSettings
 from resume_index.dataset import RESUME_SPEC
 from resume_index.incremental_runtime import build_resume_incremental_runtime
@@ -71,8 +72,7 @@ def _preflight(settings: ResumeSettings) -> ResumeSourcePreflightResult:
 
 class _VectorRepository:
     settings = MilvusSettings(collection_name="resume_candidates_v15_contract")
-    _owner_field = "resume_id"
-    _vector_doc_id_prefix = "resume:"
+    profile = RESUME_V15_PROFILE
 
 
 class _VectorService:

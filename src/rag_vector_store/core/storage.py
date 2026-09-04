@@ -31,17 +31,17 @@ class VectorRepositoryProfile(Generic[EmbeddedT]):
     动态切换领域、Collection 或 Contract 类型。
     """
 
-    _schema_field_specs: Any
-    _schema_builder: Any
-    _index_specs_fn: Any
-    _row_mapper_cls: type[VectorRowMapper[EmbeddedT]]
-    _full_scan_filter: str
-    _model_space_fields: tuple[str, ...]
-    _contract_adapter_cls: type[Any]
-    _owner_field: str
-    _vector_doc_id_prefix: str
-    _owner_filter_fn: Callable[[Any], str]
-    _owner_output_fields: tuple[str, ...]
+    schema_field_specs: Any
+    schema_builder: Any
+    index_specs_fn: Any
+    row_mapper_cls: type[VectorRowMapper[EmbeddedT]]
+    full_scan_filter: str
+    model_space_fields: tuple[str, ...]
+    contract_adapter_cls: type[Any]
+    owner_field: str
+    vector_doc_id_prefix: str
+    owner_filter_fn: Callable[[Any], str]
+    owner_output_fields: tuple[str, ...]
 
 
 __all__ = ["VectorRepositoryProfile", "VectorRowMapper"]

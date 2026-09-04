@@ -1,4 +1,4 @@
-"""ContractValidator / EmbeddingEligibilityValidator 的 4.0.0 消费单元测试。
+"""ContractValidator / EmbeddingEligibilityValidator 的 4.1.0 消费单元测试。
 
 覆盖：三类 chunk_type × origin_type × verification_status 填充合法性、
 非 profile 的 eligible_for_recommendation 约束、Eligibility 只保留
@@ -21,6 +21,8 @@ from rag_vector_store.chunking.contract_pipeline import (
     ContractValidationError,
     ContractValidator,
     EmbeddingEligibilityValidator,
+    compare_contract_output_schema,
+    expected_contract_output_fields,
 )
 
 
@@ -150,6 +152,30 @@ def _validator() -> ContractValidator:
 
 def _eligibility() -> EmbeddingEligibilityValidator:
     return EmbeddingEligibilityValidator()
+
+
+def _contract_schema_description(vector_dimension: int) -> dict[str, object]:
+    fields: list[dict[str, object]] = []
+    for name, expected in expected_contract_output_fields(vector_dimension).items():
+        params = {
+            key: expected[key]
+            for key in ("max_length", "dim")
+            if expected[key] is not None
+        }
+        fields.append(
+            {
+                "name": name,
+                "type": expected["datatype"],
+                "nullable": expected["nullable"],
+                "is_primary": expected["primary_key"],
+                "params": params,
+            }
+        )
+    return {
+        "auto_id": False,
+        "enable_dynamic_field": False,
+        "fields": fields,
+    }
 
 
 # ---- 合法 + eligible ----
@@ -292,6 +318,64 @@ def test_worker_embeds_eligible_and_uses_vector_doc_id() -> None:
     embedded = result.embedded_chunks[0]
     assert embedded.vector_doc_id == record.vector_doc_id
     assert not hasattr(embedded, "chunk_id")
+
+
+# ---- Schema 比较：旧公开入口复用正式 Compatibility Gate ----
+
+
+def test_contract_schema_comparison_accepts_exact_v15_schema() -> None:
+    result = compare_contract_output_schema(
+        _contract_schema_description(4),
+        vector_dimension=4,
+    )
+
+    assert result["compatible"] is True
+    assert result["missing_fields"] == []
+    assert result["unexpected_fields"] == []
+    assert result["changed_fields"] == {}
+    assert result["collection_options"] == {}
+    assert result["incompatible_fields"] == {}
+
+
+def test_contract_schema_comparison_rejects_unexpected_fields_and_options() -> None:
+    description = _contract_schema_description(4)
+    fields = description["fields"]
+    assert isinstance(fields, list)
+    fields.append(
+        {
+            "name": "legacy_expert_id",
+            "type": "INT64",
+            "nullable": False,
+            "is_primary": False,
+            "params": {},
+        }
+    )
+    description["enable_dynamic_field"] = True
+
+    result = compare_contract_output_schema(description, vector_dimension=4)
+
+    assert result["compatible"] is False
+    assert result["unexpected_fields"] == ["legacy_expert_id"]
+    assert result["collection_options"] == {
+        "enable_dynamic_field": {"expected": False, "actual": True}
+    }
+
+
+def test_contract_schema_comparison_reports_primary_key_mismatch() -> None:
+    description = _contract_schema_description(4)
+    fields = description["fields"]
+    assert isinstance(fields, list)
+    vector_doc_id = next(field for field in fields if field["name"] == "vector_doc_id")
+    vector_doc_id["is_primary"] = False
+
+    result = compare_contract_output_schema(description, vector_dimension=4)
+
+    assert result["compatible"] is False
+    assert result["incompatible_fields"] == {
+        "vector_doc_id": {
+            "primary_key": {"expected": True, "actual": False}
+        }
+    }
 
 
 # ---- 正式表 NULLABLE 字段不因旧 v2 必填规则 fail ----

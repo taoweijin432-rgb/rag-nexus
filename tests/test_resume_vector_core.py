@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 from typing import Any
+from unittest.mock import patch
 
 import pytest
 
@@ -80,9 +81,6 @@ class FakeEmbeddingModel:
 
 class FakeResumeRepository:
     """保存 V15 行的内存 Repository，模拟四字段 Milvus 读写。"""
-
-    _owner_field = "resume_id"
-    _vector_doc_id_prefix = "resume:"
 
     def __init__(self, mapper: ResumeMilvusV15RowMapper) -> None:
         self.mapper = mapper
@@ -284,12 +282,12 @@ def test_resume_service_rejects_expert_namespace_for_reads_and_disable() -> None
 
 
 def test_repository_profiles_have_distinct_owner_filters_and_prefixes() -> None:
-    assert EXPERT_V15_PROFILE._owner_field == "expert_id"
-    assert EXPERT_V15_PROFILE._vector_doc_id_prefix == "expert:"
-    assert RESUME_V15_PROFILE._owner_field == "resume_id"
-    assert RESUME_V15_PROFILE._vector_doc_id_prefix == "resume:"
-    assert EXPERT_V15_PROFILE._owner_filter_fn(7) == 'metadata["expert_id"] == 7'
-    assert RESUME_V15_PROFILE._owner_filter_fn(7) == 'metadata["resume_id"] == 7'
+    assert EXPERT_V15_PROFILE.owner_field == "expert_id"
+    assert EXPERT_V15_PROFILE.vector_doc_id_prefix == "expert:"
+    assert RESUME_V15_PROFILE.owner_field == "resume_id"
+    assert RESUME_V15_PROFILE.vector_doc_id_prefix == "resume:"
+    assert EXPERT_V15_PROFILE.owner_filter_fn(7) == 'metadata["expert_id"] == 7'
+    assert RESUME_V15_PROFILE.owner_filter_fn(7) == 'metadata["resume_id"] == 7'
 
 
 def test_resume_repository_rejects_legacy_expert_owner_during_model_space_gate() -> None:
@@ -320,14 +318,55 @@ def test_resume_factory_binds_resume_profile_and_collection() -> None:
         ),
     )
     assert isinstance(resume_service, ResumeVectorIngestionService)
-    assert resume_service.repository._owner_field == "resume_id"
-    assert resume_service.repository._vector_doc_id_prefix == "resume:"
+    assert resume_service.repository.profile.owner_field == "resume_id"
+    assert resume_service.repository.profile.vector_doc_id_prefix == "resume:"
     assert resume_service.repository._allow_collection_creation is False
     assert isinstance(resume_service.row_mapper, ResumeMilvusV15RowMapper)
     assert (
         resume_service.repository.settings.collection_name
         == "resume_candidates_v2_test"
     )
+
+
+def test_resume_factory_injected_worker_does_not_read_embedding_environment() -> None:
+    adapter = ResumeContractAdapter()
+    worker = DomainEmbeddingWorker(
+        FakeEmbeddingModel(),
+        adapter,
+        expected_dimension=1024,
+    )
+    with patch(
+        "rag_vector_store.ingestion.factory.CompanyCloudEmbeddingModel.from_env",
+        side_effect=AssertionError("不应读取 Embedding 环境配置"),
+    ) as from_env:
+        service = create_resume_vector_ingestion_service(
+            milvus_settings=MilvusSettings(
+                collection_name="resume_candidates_v2_test",
+            ),
+            embedding_worker=worker,
+        )
+
+    assert isinstance(service, ResumeVectorIngestionService)
+    from_env.assert_not_called()
+
+
+def test_resume_factory_injected_repository_does_not_read_milvus_environment() -> None:
+    repository = ContractMilvusV15VectorRepository(
+        MilvusSettings(collection_name="resume_candidates_v2_test"),
+        1024,
+        profile=RESUME_V15_PROFILE,
+    )
+    with patch(
+        "rag_vector_store.ingestion.factory.MilvusSettings.from_env",
+        side_effect=AssertionError("不应读取 Milvus 环境配置"),
+    ) as from_env:
+        service = create_resume_vector_ingestion_service(
+            repository=repository,
+            embedding_worker=object(),
+        )
+
+    assert service.repository is repository
+    from_env.assert_not_called()
 
 
 def test_resume_factory_rejects_expert_repository_and_mapper() -> None:

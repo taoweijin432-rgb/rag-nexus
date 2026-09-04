@@ -22,12 +22,14 @@ from rag_vector_store import (
     VectorContractError,
     VectorDeletionResult,
     VectorEmbeddingError,
+    VectorIngestionError,
     VectorIngestionResult,
     VectorIngestionService,
     VectorMilvusError,
     VectorQueryResult,
 )
 from rag_vector_store.chunking.contract_pipeline import ContractEmbeddingWorker
+from rag_vector_store.core import DomainEmbeddingError, DomainIngestionError
 from rag_vector_store.model_space import build_model_space_id
 
 FIXTURE_PATH = (
@@ -261,6 +263,37 @@ def test_upsert_chunks_converts_embedding_error() -> None:
     )
     with pytest.raises(VectorEmbeddingError):
         service.upsert_chunks(input_records())
+
+
+def test_upsert_chunks_converts_domain_embedding_error() -> None:
+    repo = FakeMilvusRepository()
+
+    class StubIngestion:
+        def ingest_batch(self, records: Sequence[Any]) -> Any:
+            raise DomainEmbeddingError("Embedding 返回数量不一致")
+
+    service = VectorIngestionService(
+        ingestion_service=StubIngestion(),  # type: ignore[arg-type]
+        repository=repo,  # type: ignore[arg-type]
+    )
+    with pytest.raises(VectorEmbeddingError):
+        service.upsert_chunks(input_records())
+
+
+def test_upsert_chunks_converts_domain_ingestion_error() -> None:
+    repo = FakeMilvusRepository()
+
+    class StubIngestion:
+        def ingest_batch(self, records: Sequence[Any]) -> Any:
+            raise DomainIngestionError("worker result mismatch")
+
+    service = VectorIngestionService(
+        ingestion_service=StubIngestion(),  # type: ignore[arg-type]
+        repository=repo,  # type: ignore[arg-type]
+    )
+    with pytest.raises(VectorIngestionError) as excinfo:
+        service.upsert_chunks(input_records())
+    assert type(excinfo.value) is VectorIngestionError
 
 
 def test_upsert_chunks_converts_milvus_error() -> None:

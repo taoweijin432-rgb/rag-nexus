@@ -190,36 +190,8 @@ class ScopeVectorStatePort(Protocol):
         ...
 
 
-# ---------------------------------------------------------------------------
-# 作用域内 active 状态记录
-# ---------------------------------------------------------------------------
-class _ScopeActiveState:
-    """scope 过滤后某条已存 active 向量的轻量状态。"""
-
-    __slots__ = ("chunk_type", "expert_id", "source_field_id", "source_table", "vector_doc_id")
-
-    def __init__(
-        self,
-        *,
-        vector_doc_id: str,
-        expert_id: int,
-        chunk_type: str,
-        source_table: str,
-        source_field_id: str,
-    ) -> None:
-        self.vector_doc_id = vector_doc_id
-        self.expert_id = expert_id
-        self.chunk_type = chunk_type
-        self.source_table = source_table
-        self.source_field_id = source_field_id
-
-
 class _ScopeStateError(ValueError):
     """scope active 状态提取失败（字段缺失/类型非法），确定性。"""
-
-
-class _ScopeQueryError(Exception):
-    """scope 查询基础设施失败，可重试。"""
 
 
 def _extract_str(metadata: dict[str, object], field: str) -> str:
@@ -260,8 +232,6 @@ def _in_scope(
         return False
     if source_table != scope.source_table:
         return False
-    if scope.scope_type == "profile":
-        return source_field_id == scope.source_field_id
     return source_field_id == scope.source_field_id
 
 
@@ -294,7 +264,7 @@ def _filter_active_scope(
     owner_field: str,
     records: list[dict[str, object]],
     missing: list[str],
-) -> tuple[list[_ScopeActiveState] | None, str | None, bool]:
+) -> tuple[list[str] | None, str | None, bool]:
     """从 get_vectors 记录中提取属于当前 scope 且 active 的状态。
 
     返回 (active|None, error_message_if_invalid, is_retryable)。
@@ -307,7 +277,7 @@ def _filter_active_scope(
 
     if missing:
         return None, f"scope_query_failed：get_vectors 未命中 listing 声明存在的 {len(missing)} 条记录", True
-    active: list[_ScopeActiveState] = []
+    active_vector_doc_ids: list[str] = []
     for record in records:
         metadata = record.get("metadata")
         if not isinstance(metadata, dict):
@@ -343,16 +313,8 @@ def _filter_active_scope(
             source_field_id=source_field_id,
         ):
             continue
-        active.append(
-            _ScopeActiveState(
-                vector_doc_id=vector_doc_id,
-                expert_id=owner_id_raw,
-                chunk_type=chunk_type,
-                source_table=source_table,
-                source_field_id=source_field_id,
-            )
-        )
-    return active, None, False
+        active_vector_doc_ids.append(vector_doc_id)
+    return active_vector_doc_ids, None, False
 
 
 # ---------------------------------------------------------------------------
@@ -424,7 +386,7 @@ class ScopeConsumer:
                 error_message=single_line_truncate(f"list_vectors_by_expert 失败：{error}"),
                 retryable=True,
             )
-        active_states, query_error, retryable = self._load_active_scope(
+        active_vector_doc_ids, query_error, retryable = self._load_active_scope(
             scope=scope,
             vector_doc_ids=list(listing.vector_doc_ids),
         )
@@ -440,7 +402,7 @@ class ScopeConsumer:
                 disable_count=0,
                 retryable=retryable,
             )
-        assert active_states is not None  # query_error 已 return，此处必非 None
+        assert active_vector_doc_ids is not None  # query_error 已 return，此处必非 None
 
         # 阶段 1：把 desired Contracts 交核心做 Eligibility 预判 + 三 Hash 差分收敛。
         # 通过 core.process_contracts 复用 Eligibility 规则（不复制），不携带 stale。
@@ -463,7 +425,11 @@ class ScopeConsumer:
 
         # 阶段 2：desired 全部收敛后计算 stale = scope 内 active IDs − desired IDs，
         # 经核心执行单个 ContractDisableInput 逻辑下线（不复制 disable 逻辑）。
-        stale_ids = sorted(vid for vid in (s.vector_doc_id for s in active_states) if vid not in desired_ids)
+        stale_ids = sorted(
+            vector_doc_id
+            for vector_doc_id in active_vector_doc_ids
+            if vector_doc_id not in desired_ids
+        )
         desired_disable_count = self._desired_disable_count(desired_results)
         stale_error: tuple[str, bool] | None = None
         stale_success_count = 0
@@ -515,7 +481,7 @@ class ScopeConsumer:
         *,
         scope: ScopeView,
         vector_doc_ids: list[str],
-    ) -> tuple[list[_ScopeActiveState] | None, str | None, bool]:
+    ) -> tuple[list[str] | None, str | None, bool]:
         """读取 scope 内 active 向量状态。返回 (active|None, error, retryable)。"""
 
         if not vector_doc_ids:
