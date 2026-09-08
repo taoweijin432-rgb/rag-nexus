@@ -1,11 +1,8 @@
 """向量化领域无关内核。
 
 本包只依赖稳定的协议和基础模型，不依赖 ``expert_contracts`` 或任何具体业务
-领域。领域 Adapter 位于 ``rag_vector_store.domains``；旧 ``core.expert`` 路径
-仅保留一个发布周期的兼容转发。
+领域。领域 Adapter 位于 ``rag_vector_store.domains``。
 """
-
-import warnings
 
 from .adapters import (
     VectorConsumerContractAdapter,
@@ -24,7 +21,6 @@ from .guards import require_adapter_input
 from .hash_state import HASH_FIELDS, project_hash_fields, read_hash_field
 from .ingestion import (
     DomainBatchIngestionResult,
-    DomainBatchIngestionService,
     DomainIngestionError,
     DomainIngestionResult,
     DomainIngestionService,
@@ -40,7 +36,6 @@ from .storage import VectorRepositoryProfile, VectorRowMapper
 __all__ = [
     "HASH_FIELDS",
     "DomainBatchIngestionResult",
-    "DomainBatchIngestionService",
     "DomainDeletionResult",
     "DomainEmbeddingError",
     "DomainEmbeddingResult",
@@ -63,18 +58,3 @@ __all__ = [
     "require_adapter_input",
     "validate_embedding_vector",
 ]
-
-
-def __getattr__(name: str) -> object:
-    """延迟兼容旧包级 Adapter 导入，避免普通 core import 加载领域 Contract。"""
-
-    if name in {"ExpertContractAdapter", "ResumeContractAdapter"}:
-        warnings.warn(
-            f"rag_vector_store.core.{name} 已弃用；请从 rag_vector_store.domains 导入",
-            DeprecationWarning,
-            stacklevel=2,
-        )
-        from .. import domains
-
-        return getattr(domains, name)
-    raise AttributeError(name)

@@ -11,13 +11,12 @@ import hashlib
 import re
 from collections.abc import Callable, Iterable, Mapping
 from datetime import datetime, timezone
-from typing import Any, TypeAlias
+from typing import Any
 
 from pydantic import ValidationError
 
 from expert_contracts.models import (
     ContractPreparedChunk,
-    EmbeddedContractPreparedChunk,
     EmploymentMetadata,
     ExpertChunkEmbeddingInput,
 )
@@ -63,10 +62,9 @@ class EmbeddingEligibilityError(ValueError):
 # 专家公共名称保留兼容，但运行时直接使用通用领域结果，避免在专家 Facade 与
 # 通用核心之间逐项复制同构对象。
 SkippedContractChunk = DomainSkippedVector
-ContractEmbeddingResult: TypeAlias = DomainEmbeddingResult[
-    ContractPreparedChunk,
-    EmbeddedContractPreparedChunk,
-]
+# 运行时别名必须指向实际类，不能使用带参数的 typing.TypeAlias；
+# Consumer/测试可安全通过 isinstance(result, ContractEmbeddingResult) 检查。
+ContractEmbeddingResult = DomainEmbeddingResult
 
 
 class ContractValidator:
@@ -277,8 +275,7 @@ class ContractEmbeddingWorker:
     """只把通过校验且符合资格的 ``chunk_text`` 交给 EmbeddingModel。
 
     调用时机：
-        - ``ContractIngestionService.ingest_one``（单条路径）；
-        - ``ContractBatchIngestionService.ingest_batch``（批量路径）；
+        - ``DomainIngestionService.ingest_batch``（批量入库路径）；
         - 上游内存同步的预检复用其内部 Validator。
 
     输入：
@@ -328,11 +325,15 @@ class ContractEmbeddingWorker:
             eligibility_validator or EmbeddingEligibilityValidator()
         )
         self.clock = clock or _utc_now
+        self.adapter = ExpertContractAdapter(
+            self.validator,
+            self.eligibility_validator,
+        )
         # 专家入口保留原有公开属性和结果模型；实际校验、资格判断、Embedding
         # 与回填委托给不绑定领域的核心，未来领域只需提供自己的 Adapter。
         self._domain_worker = DomainEmbeddingWorker(
             embedding_model,
-            ExpertContractAdapter(self.validator, self.eligibility_validator),
+            self.adapter,
             embedding_model_alias=self.embedding_model_alias,
             embedding_model_version=self.embedding_model_version,
             expected_dimension=self.expected_dimension,

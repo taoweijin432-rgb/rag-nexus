@@ -6,7 +6,6 @@ PyMilvus。具体能力在首次访问对应导出时按需加载。
 
 from __future__ import annotations
 
-import warnings
 from importlib import import_module
 from typing import TYPE_CHECKING, Any
 
@@ -26,14 +25,8 @@ _LAZY_EXPORTS: dict[str, tuple[str, str]] = {
         ".chunking",
         "EXPECTED_EMBEDDING_DIMENSION",
     ),
-    "ContractBatchIngestionResult": (".chunking", "ContractBatchIngestionResult"),
-    "ContractBatchIngestionService": (".chunking", "ContractBatchIngestionService"),
     "ContractEmbeddingResult": (".chunking", "ContractEmbeddingResult"),
     "ContractEmbeddingWorker": (".chunking", "ContractEmbeddingWorker"),
-    "ContractIngestionError": (".chunking", "ContractIngestionError"),
-    "ContractIngestionResult": (".chunking", "ContractIngestionResult"),
-    "ContractIngestionService": (".chunking", "ContractIngestionService"),
-    "ContractRepository": (".chunking", "ContractRepository"),
     "ContractValidationError": (".chunking", "ContractValidationError"),
     "ContractValidator": (".chunking", "ContractValidator"),
     "EmbeddingEligibilityError": (".chunking", "EmbeddingEligibilityError"),
@@ -61,23 +54,21 @@ _LAZY_EXPORTS: dict[str, tuple[str, str]] = {
         ".ingestion",
         "ResumeVectorIngestionService",
     ),
-    "VectorContractError": (".ingestion", "VectorContractError"),
-    "VectorDeletionResult": (".ingestion", "VectorDeletionResult"),
-    "VectorEmbeddingError": (".ingestion", "VectorEmbeddingError"),
-    "VectorExpertList": (".ingestion", "VectorExpertList"),
+    "VectorContractError": (".ingestion.errors", "VectorContractError"),
+    "VectorDeletionResult": (".ingestion.models", "VectorDeletionResult"),
+    "VectorEmbeddingError": (".ingestion.errors", "VectorEmbeddingError"),
     "VectorInconsistentStateError": (
-        ".ingestion",
+        ".ingestion.errors",
         "VectorInconsistentStateError",
     ),
-    "VectorIngestionError": (".ingestion", "VectorIngestionError"),
-    "VectorIngestionResult": (".ingestion", "VectorIngestionResult"),
+    "VectorIngestionError": (".ingestion.errors", "VectorIngestionError"),
+    "VectorIngestionResult": (".ingestion.models", "VectorIngestionResult"),
     "VectorIngestionService": (".ingestion", "VectorIngestionService"),
-    "VectorItemResult": (".ingestion", "VectorItemResult"),
-    "VectorItemStatus": (".ingestion", "VectorItemStatus"),
-    "VectorMilvusError": (".ingestion", "VectorMilvusError"),
-    "VectorOwnerList": (".ingestion", "VectorOwnerList"),
-    "VectorQueryResult": (".ingestion", "VectorQueryResult"),
-    "VectorResumeList": (".ingestion", "VectorResumeList"),
+    "VectorItemResult": (".ingestion.models", "VectorItemResult"),
+    "VectorItemStatus": (".ingestion.models", "VectorItemStatus"),
+    "VectorMilvusError": (".ingestion.errors", "VectorMilvusError"),
+    "VectorOwnerList": (".ingestion.models", "VectorOwnerList"),
+    "VectorQueryResult": (".ingestion.models", "VectorQueryResult"),
     "create_resume_vector_ingestion_service": (
         ".ingestion",
         "create_resume_vector_ingestion_service",
@@ -144,11 +135,6 @@ _LAZY_EXPORTS: dict[str, tuple[str, str]] = {
     ),
 }
 
-_DEPRECATED_EXPORTS = {
-    "VectorExpertList": "VectorExpertList 已弃用；请使用 VectorOwnerList",
-    "VectorResumeList": "VectorResumeList 已弃用；请使用 VectorOwnerList",
-}
-
 __all__ = [
     "EXPECTED_EMBEDDING_DIMENSION",
     "EXPERT_CHUNK_CONTRACT_VERSION",
@@ -163,17 +149,11 @@ __all__ = [
     "CompanyCloudEmbeddingError",
     "CompanyCloudEmbeddingModel",
     "CompanyCloudEmbeddingSettings",
-    "ContractBatchIngestionResult",
-    "ContractBatchIngestionService",
     "ContractEmbeddingResult",
     "ContractEmbeddingWorker",
-    "ContractIngestionError",
-    "ContractIngestionResult",
-    "ContractIngestionService",
     "ContractMilvusRepositoryBase",
     "ContractMilvusV15VectorRepository",
     "ContractPreparedChunk",
-    "ContractRepository",
     "ContractV15RowMapper",
     "ContractValidationError",
     "ContractValidator",
@@ -200,7 +180,6 @@ __all__ = [
     "VectorContractError",
     "VectorDeletionResult",
     "VectorEmbeddingError",
-    "VectorExpertList",
     "VectorInconsistentStateError",
     "VectorIngestionError",
     "VectorIngestionResult",
@@ -210,7 +189,6 @@ __all__ = [
     "VectorMilvusError",
     "VectorOwnerList",
     "VectorQueryResult",
-    "VectorResumeList",
     "build_model_space_id",
     "compare_contract_output_schema",
     "create_full_vector_reconciliation_service",
@@ -226,9 +204,6 @@ def __getattr__(name: str) -> Any:
     target = _LAZY_EXPORTS.get(name)
     if target is None:
         raise AttributeError(name)
-    warning = _DEPRECATED_EXPORTS.get(name)
-    if warning is not None:
-        warnings.warn(warning, DeprecationWarning, stacklevel=2)
     module_name, attribute = target
     module = import_module(module_name, __name__)
     value = getattr(module, attribute)
@@ -257,14 +232,8 @@ if TYPE_CHECKING:
 
     from .chunking import (
         EXPECTED_EMBEDDING_DIMENSION,
-        ContractBatchIngestionResult,
-        ContractBatchIngestionService,
         ContractEmbeddingResult,
         ContractEmbeddingWorker,
-        ContractIngestionError,
-        ContractIngestionResult,
-        ContractIngestionService,
-        ContractRepository,
         ContractValidationError,
         ContractValidator,
         EmbeddingEligibilityError,
@@ -285,7 +254,6 @@ if TYPE_CHECKING:
         VectorContractError,
         VectorDeletionResult,
         VectorEmbeddingError,
-        VectorExpertList,
         VectorInconsistentStateError,
         VectorIngestionError,
         VectorIngestionResult,
@@ -295,7 +263,6 @@ if TYPE_CHECKING:
         VectorMilvusError,
         VectorOwnerList,
         VectorQueryResult,
-        VectorResumeList,
         create_resume_vector_ingestion_service,
         create_vector_ingestion_service,
     )

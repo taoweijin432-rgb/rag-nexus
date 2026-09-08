@@ -9,7 +9,6 @@ from rag_vector_store.ingestion import (
     VectorContractError,
     VectorDeletionResult,
     VectorEmbeddingError,
-    VectorExpertList,
     VectorInconsistentStateError,
     VectorIngestionError,
     VectorIngestionResult,
@@ -156,37 +155,36 @@ def test_vector_query_result_rejects_non_dict_record() -> None:
         VectorQueryResult(records=[["not-a-dict"]])
 
 
-def test_vector_expert_list_valid() -> None:
-    result = VectorExpertList(
-        expert_id=900001,
-        vector_doc_ids=["a", "b"],
-        count=2,
-    )
-    assert result.expert_id == 900001
-    assert result.vector_doc_ids == ["a", "b"]
-    assert result.count == 2
-
-
-def test_vector_expert_list_count_mismatch() -> None:
-    with pytest.raises(ValidationError):
-        VectorExpertList(
-            expert_id=900001,
-            vector_doc_ids=["a", "b"],
-            count=3,
-        )
-
-
-def test_vector_expert_list_defaults() -> None:
-    result = VectorExpertList(expert_id=900001)
-    assert result.vector_doc_ids == []
-    assert result.count == 0
-
-
 def test_vector_owner_list_validates_generic_owner_identity() -> None:
     result = VectorOwnerList(owner_id=900001, vector_doc_ids=["a"], count=1)
     assert result.owner_id == 900001
     with pytest.raises(ValidationError):
         VectorOwnerList(owner_id=900001, vector_doc_ids=["a"], count=0)
+
+
+@pytest.mark.parametrize("owner_id", [True, 1.0, "900001", 0])
+def test_vector_owner_list_rejects_non_strict_owner_id(owner_id: object) -> None:
+    with pytest.raises(ValidationError):
+        VectorOwnerList(owner_id=owner_id, vector_doc_ids=[], count=0)  # type: ignore[arg-type]
+
+
+def test_vector_owner_list_rejects_duplicate_or_blank_ids() -> None:
+    with pytest.raises(ValidationError):
+        VectorOwnerList(owner_id=1, vector_doc_ids=["a", "a"], count=2)
+    with pytest.raises(ValidationError):
+        VectorOwnerList(owner_id=1, vector_doc_ids=[" "], count=1)
+
+
+def test_vector_query_result_rejects_duplicate_or_overlapping_ids() -> None:
+    with pytest.raises(ValidationError):
+        VectorQueryResult(
+            records=[{"vector_doc_id": "a"}, {"vector_doc_id": "a"}]
+        )
+    with pytest.raises(ValidationError):
+        VectorQueryResult(
+            records=[{"vector_doc_id": "a"}],
+            missing=["a"],
+        )
 
 
 def test_vector_ingestion_error_is_base() -> None:

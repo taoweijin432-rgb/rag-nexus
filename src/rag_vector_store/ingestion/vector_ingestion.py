@@ -4,12 +4,10 @@
     - ``upsert_chunks``：正式 Chunk 向量化并写入 Milvus（默认复用通用
       ``DomainIngestionService``）。
     - ``disable_vectors``：按 vector_doc_id 逻辑下线向量（保留实体与向量，仅置 is_active=false）。
-    - ``delete_vectors``：在线删除入口；自 T2-1 起统一委派给 ``disable_vectors``，
-      不再触发物理删除（保持原签名与返回类型，上游 Port 无感知）。
+    - 物理删除接口已移除；仅提供 ``disable_vectors`` 逻辑下线。
     - ``get_vectors``：批量查询 Milvus 记录（不含 embedding）。
     - ``update_metadata``：metadata-only 更新，复用旧向量，不调用 Embedding。
     - ``list_vectors_by_owner``：按当前领域 owner 列出轻量 vector_doc_id。
-    - ``delete_vectors``、领域专用列表方法只保留一个发布周期的兼容转发。
 
 不职责：
     - 不实现上游业务更新编排（sync_expert / update_item_data / 时间筛选 / Vector State / FastAPI）。
@@ -19,7 +17,6 @@
 from __future__ import annotations
 
 import functools
-import warnings
 from collections.abc import Sequence
 from typing import Any
 
@@ -28,10 +25,6 @@ from pymilvus.exceptions import MilvusException
 from expert_contracts.models import ExpertChunkEmbeddingInput
 
 from .._utils import dedupe_nonempty_strings, safe_error_message
-from ..chunking.contract_ingestion import (
-    ContractBatchIngestionService,
-    ContractIngestionError,
-)
 from ..chunking.contract_pipeline import (
     EXPECTED_EMBEDDING_DIMENSION,
     ContractEmbeddingWorker,
@@ -42,9 +35,9 @@ from ..chunking.contract_pipeline import (
 from ..core.adapters import VectorContractAdapter
 from ..core.embedding import DomainEmbeddingError
 from ..core.hash_state import project_hash_fields
-from ..core.ingestion import DomainIngestionError
+from ..core.ingestion import DomainIngestionError, DomainIngestionService
 from ..core.lifecycle import DomainVectorLifecycleService
-from ..domains import ExpertContractAdapter
+from ..domains import ExpertContractAdapter, ResumeContractAdapter
 from ..embedding_adapters.company_cloud import CompanyCloudEmbeddingError
 from ..milvus.contract_v15 import MilvusV15RowMapper
 from ..milvus.repository import ContractMilvusRepositoryBase
@@ -59,17 +52,15 @@ from .errors import (
 )
 from .models import (
     VectorDeletionResult,
-    VectorExpertList,
     VectorIngestionResult,
     VectorItemResult,
     VectorOwnerList,
     VectorQueryResult,
-    VectorResumeList,
 )
 
 # 底层异常分类（不含无边界 except Exception）：
 #   - Contract 层：ContractValidationError / EmbeddingEligibilityError（-> VectorContractError）
-#   - Ingestion 层：ContractIngestionError / DomainIngestionError（-> VectorIngestionError）
+#   - Ingestion 层：DomainIngestionError（-> VectorIngestionError）
 #   - Embedding 层：CompanyCloudEmbeddingError / DomainEmbeddingError
 #     （-> VectorEmbeddingError）
 #   - Milvus 层：ValueError（含 pydantic.ValidationError）/ TypeError / RuntimeError /
@@ -91,7 +82,7 @@ def _guard_call(fn, *args: Any, **kwargs: Any) -> Any:
         raise
     except (ContractValidationError, EmbeddingEligibilityError) as error:
         raise VectorContractError(safe_error_message(error)) from error
-    except (ContractIngestionError, DomainIngestionError) as error:
+    except DomainIngestionError as error:
         raise VectorIngestionError(safe_error_message(error)) from error
     except (CompanyCloudEmbeddingError, DomainEmbeddingError) as error:
         raise VectorEmbeddingError(safe_error_message(error)) from error
@@ -115,7 +106,7 @@ def _guard_errors(func):
             raise
         except (ContractValidationError, EmbeddingEligibilityError, ValueError, TypeError) as error:
             raise VectorContractError(safe_error_message(error)) from error
-        except (ContractIngestionError, DomainIngestionError) as error:
+        except DomainIngestionError as error:
             raise VectorIngestionError(safe_error_message(error)) from error
         except (CompanyCloudEmbeddingError, DomainEmbeddingError) as error:
             raise VectorEmbeddingError(safe_error_message(error)) from error
@@ -179,16 +170,6 @@ class VectorIngestionService:
         expected_dimension: int = EXPECTED_EMBEDDING_DIMENSION,
         formal_model_space_id: str = FORMAL_EMBEDDING_MODEL_SPACE_ID,
     ) -> None:
-        if ingestion_service is None:
-            if embedding_worker is None:
-                raise ValueError(
-                    "必须提供 ingestion_service 或 embedding_worker"
-                )
-            ingestion_service = ContractBatchIngestionService(
-                embedding_worker,
-                repository,
-            )
-        self.ingestion = ingestion_service
         self.repository = repository
         self.validator = validator or ContractValidator()
         # 默认 Mapper 固定为 V15，禁止静默回退到已退役的 V14 Mapper；
@@ -196,8 +177,11 @@ class VectorIngestionService:
         self.row_mapper = row_mapper if row_mapper is not None else MilvusV15RowMapper()
         self.expected_dimension = expected_dimension
         self.formal_model_space_id = formal_model_space_id
+        worker = getattr(ingestion_service, "embedding_worker", None)
+        if worker is None:
+            worker = embedding_worker
         eligibility_validator = getattr(
-            getattr(ingestion_service, "embedding_worker", None),
+            worker,
             "eligibility_validator",
             None,
         )
@@ -205,6 +189,17 @@ class VectorIngestionService:
             self.validator,
             eligibility_validator,
         )
+        if ingestion_service is None:
+            if embedding_worker is None:
+                raise ValueError(
+                    "必须提供 ingestion_service 或 embedding_worker"
+                )
+            ingestion_service = DomainIngestionService(
+                embedding_worker,
+                repository,
+                self._adapter,
+            )
+        self.ingestion = ingestion_service
         self._lifecycle = DomainVectorLifecycleService(
             _GuardedLifecycleRepository(repository),
             _GuardedLifecycleRowMapper(self.row_mapper),
@@ -245,7 +240,7 @@ class VectorIngestionService:
         return VectorIngestionResult(results=items)
 
     # ------------------------------------------------------------------
-    # 2. disable_vectors / delete_vectors（统一逻辑下线）
+    # 2. disable_vectors（逻辑下线）
     # ------------------------------------------------------------------
     @_guard_errors
     def disable_vectors(
@@ -273,27 +268,6 @@ class VectorIngestionService:
             deleted_count=result.deleted_count,
             not_found_count=result.not_found_count,
         )
-
-    @_guard_errors
-    def delete_vectors(
-        self,
-        vector_doc_ids: Sequence[str],
-    ) -> VectorDeletionResult:
-        """按 vector_doc_id 集合下线 Milvus 向量（在线删除入口）。
-
-        自 T2-1 起在线删除语义统一为逻辑下线：本方法只委派
-        ``disable_vectors``（保留实体与向量，仅置 is_active=false），
-        Repository 已移除物理删除能力。
-        签名与返回类型不变，上游 ``VectorStorePort`` 调用方无感知；
-        空输入安全返回，去重保序，重复执行幂等。
-        """
-
-        warnings.warn(
-            "delete_vectors 已弃用；当前删除语义为逻辑下线，请使用 disable_vectors",
-            DeprecationWarning,
-            stacklevel=2,
-        )
-        return self.disable_vectors(vector_doc_ids)
 
     # ------------------------------------------------------------------
     # 3. get_vectors
@@ -380,7 +354,7 @@ class VectorIngestionService:
         )
 
     # ------------------------------------------------------------------
-    # 5. list_vectors_by_owner（正式接口）及领域兼容入口
+    # 5. list_vectors_by_owner（正式接口）
     # ------------------------------------------------------------------
     @_guard_errors
     def list_vectors_by_owner(
@@ -402,70 +376,72 @@ class VectorIngestionService:
             count=len(vector_doc_ids),
         )
 
-    @_guard_errors
-    def list_vectors_by_expert(
-        self,
-        expert_id: int,
-    ) -> VectorExpertList:
-        """已弃用的专家专用查询入口。"""
-
-        warnings.warn(
-            "list_vectors_by_expert 已弃用；请使用 list_vectors_by_owner",
-            DeprecationWarning,
-            stacklevel=2,
-        )
-        listing = self.list_vectors_by_owner(expert_id)
-        return VectorExpertList(
-            expert_id=expert_id,
-            vector_doc_ids=listing.vector_doc_ids,
-            count=listing.count,
-        )
-
-
 class ResumeVectorIngestionService(VectorIngestionService):
-    """Resume 领域 Facade，复用通用向量核心并暴露 Resume 语义查询。"""
+    """Resume 领域 Facade，复用通用向量核心并固定 Resume Adapter/Profile。"""
 
-    @_guard_errors
-    def list_vectors_by_resume(
+    def __init__(
         self,
-        resume_id: int,
-    ) -> VectorResumeList:
-        """按 Resume owner 查询其全部 vector_doc_id。"""
+        *,
+        ingestion_service: Any | None = None,
+        embedding_worker: ContractEmbeddingWorker | None = None,
+        repository: ContractMilvusRepositoryBase,
+        validator: ContractValidator | None = None,
+        row_mapper: Any | None = None,
+        adapter: VectorContractAdapter[Any, Any, Any] | None = None,
+        expected_dimension: int = EXPECTED_EMBEDDING_DIMENSION,
+        formal_model_space_id: str = FORMAL_EMBEDDING_MODEL_SPACE_ID,
+    ) -> None:
+        """构造固定 Resume 身份空间的 Facade。
 
-        warnings.warn(
-            "list_vectors_by_resume 已弃用；请使用 list_vectors_by_owner",
-            DeprecationWarning,
-            stacklevel=2,
-        )
-        listing = self.list_vectors_by_owner(resume_id)
-        return VectorResumeList(
-            resume_id=resume_id,
-            vector_doc_ids=listing.vector_doc_ids,
-            count=listing.count,
-        )
+        直接实例化 Resume Facade 时，不能沿用基类默认的 Expert Adapter。
+        如果调用方已经注入 ingestion service 或 worker，则优先复用其 Adapter，
+        但必须证明它属于 Resume 身份空间；否则创建默认 Resume Adapter。
+        """
 
-    @_guard_errors
-    def list_vectors_by_expert(
-        self,
-        expert_id: int,
-    ) -> VectorExpertList:
-        """兼容现有 ExpertVectorSynchronizer 的 Resume owner 查询入口。"""
+        bound_adapter = adapter
+        if bound_adapter is None:
+            bound_adapter = getattr(ingestion_service, "adapter", None)
+        if bound_adapter is None:
+            bound_adapter = getattr(embedding_worker, "adapter", None)
+        if bound_adapter is None:
+            bound_adapter = ResumeContractAdapter(validator)
 
-        warnings.warn(
-            "Resume.list_vectors_by_expert 已弃用；请使用 list_vectors_by_owner",
-            DeprecationWarning,
-            stacklevel=2,
-        )
-        listing = self.list_vectors_by_owner(expert_id)
-        return VectorExpertList(
-            expert_id=expert_id,
-            vector_doc_ids=listing.vector_doc_ids,
-            count=listing.count,
+        if (
+            bound_adapter.owner_field() != "resume_id"
+            or bound_adapter.id_prefix() != "resume:"
+        ):
+            raise ValueError(
+                "ResumeVectorIngestionService 必须绑定 Resume Adapter "
+                "(owner_field=resume_id, prefix=resume:)"
+            )
+
+        for component_name, component in (
+            ("ingestion_service", ingestion_service),
+            ("embedding_worker", embedding_worker),
+        ):
+            component_adapter = getattr(component, "adapter", None)
+            if component_adapter is not None and (
+                component_adapter.owner_field() != "resume_id"
+                or component_adapter.id_prefix() != "resume:"
+            ):
+                raise ValueError(
+                    f"ResumeVectorIngestionService 拒绝非 Resume {component_name}"
+                )
+
+        super().__init__(
+            ingestion_service=ingestion_service,
+            embedding_worker=embedding_worker,
+            repository=repository,
+            validator=validator,
+            row_mapper=row_mapper,
+            adapter=bound_adapter,
+            expected_dimension=expected_dimension,
+            formal_model_space_id=formal_model_space_id,
         )
 
 
 def _make_item_from_batch_item(item: Any) -> VectorItemResult:
-    """把 ``ContractIngestionResult`` 转换为公共 ``VectorItemResult``。"""
+    """把通用 ingestion 结果转换为公共 ``VectorItemResult``。"""
 
     if item.status == "embedded":
         return VectorItemResult(

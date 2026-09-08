@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import warnings
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from typing import Any, Generic, Literal, Protocol, TypeVar
@@ -241,28 +240,8 @@ class DomainIngestionService(Generic[InputT, PreparedT, EmbeddedT]):
             raise DomainIngestionError("Repository 返回的 primary_keys 与 embedded 记录不一致")
 
 
-class DomainBatchIngestionService(
-    DomainIngestionService[InputT, PreparedT, EmbeddedT]
-):
-    """已弃用的批量类名；行为完全委托 ``DomainIngestionService``。"""
-
-    def __init__(
-        self,
-        embedding_worker: DomainEmbeddingPort[InputT, PreparedT, EmbeddedT],
-        repository: DomainRepository[EmbeddedT],
-        adapter: VectorContractAdapter[InputT, PreparedT, EmbeddedT],
-    ) -> None:
-        warnings.warn(
-            "DomainBatchIngestionService 已弃用；请使用 DomainIngestionService",
-            DeprecationWarning,
-            stacklevel=2,
-        )
-        super().__init__(embedding_worker, repository, adapter)
-
-
 __all__ = [
     "DomainBatchIngestionResult",
-    "DomainBatchIngestionService",
     "DomainEmbeddingPort",
     "DomainIngestionError",
     "DomainIngestionResult",
