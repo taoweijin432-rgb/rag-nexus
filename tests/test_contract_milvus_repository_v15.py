@@ -7,7 +7,7 @@
     4. V15 upsert 使用 MilvusV15RowMapper，只产出 4 个物理字段；
     5. expert_id / content_hash / metadata_hash 已进入 metadata，不再是一级字段；
     6. V15 get 不请求历史一级字段；
-    7. V15 query_by_expert_id 使用 metadata["expert_id"] JSON path 过滤；
+    7. V15 query_by_owner_id 使用 Profile owner JSON path 过滤；
     8. V15 list_all_vector_states 物理读取 vector_doc_id+metadata，从 metadata
        提取两个 hash，公共返回语义保持 vector_doc_id/content_hash/metadata_hash；
     9. V15 full scan filter 不引用任何不存在的 V15 scalar；
@@ -711,15 +711,6 @@ def test_v15_query_by_owner_id_rejects_top_level_hash_fields() -> None:
             1,
             output_fields=["expert_id"],
         )
-
-
-def test_v15_query_by_expert_id_warns_and_delegates() -> None:
-    repository = make_v15_repository(FakeV15MilvusClient(exists=True))
-
-    with pytest.warns(DeprecationWarning, match="query_by_expert_id 已弃用"):
-        rows = repository.query_by_expert_id(1)
-
-    assert rows == []
 
 
 # ---------------------------------------------------------------------------

@@ -194,6 +194,57 @@ class _ScopeStateError(ValueError):
     """scope active 状态提取失败（字段缺失/类型非法），确定性。"""
 
 
+def _validate_owner_listing(
+    listing: object,
+    expected_owner_id: int,
+) -> str | None:
+    """校验 owner 列表结果，避免错误集合继续进入 stale 计算。"""
+
+    if not isinstance(listing, VectorOwnerList):
+        return "list_vectors_by_owner 返回值不是 VectorOwnerList"
+    if listing.owner_id != expected_owner_id:
+        return (
+            "list_vectors_by_owner 返回 owner_id 与请求不一致"
+        )
+    ids = listing.vector_doc_ids
+    if any(not isinstance(value, str) or not value.strip() for value in ids):
+        return "list_vectors_by_owner 返回空或非法 vector_doc_id"
+    if len(ids) != len(set(ids)):
+        return "list_vectors_by_owner 返回重复 vector_doc_id"
+    if listing.count != len(ids):
+        return "list_vectors_by_owner 返回 count 与 ID 数量不一致"
+    return None
+
+
+def _validate_query_result(
+    query: object,
+    requested_ids: list[str],
+) -> str | None:
+    """校验 get_vectors 返回集合必须与请求集合完全一致。"""
+
+    if not isinstance(query, VectorQueryResult):
+        return "get_vectors 返回值不是 VectorQueryResult"
+    requested = set(requested_ids)
+    record_ids = [
+        row.get("vector_doc_id")
+        for row in query.records
+    ]
+    if any(not isinstance(value, str) or not value.strip() for value in record_ids):
+        return "get_vectors 返回记录缺少合法 vector_doc_id"
+    if len(record_ids) != len(set(record_ids)):
+        return "get_vectors 返回重复 vector_doc_id"
+    missing = list(query.missing)
+    if len(missing) != len(set(missing)):
+        return "get_vectors 返回重复 missing vector_doc_id"
+    returned = set(record_ids)
+    missing_set = set(missing)
+    if returned & missing_set:
+        return "get_vectors records 与 missing 存在重复 ID"
+    if returned | missing_set != requested:
+        return "get_vectors 返回 ID 集合与请求不一致"
+    return None
+
+
 def _extract_str(metadata: dict[str, object], field: str) -> str:
     value = metadata.get(field)
     if not isinstance(value, str) or not value.strip():
@@ -386,6 +437,18 @@ class ScopeConsumer:
                 error_message=single_line_truncate(f"list_vectors_by_owner 失败：{error}"),
                 retryable=True,
             )
+        listing_error = _validate_owner_listing(listing, scope.expert_id)
+        if listing_error is not None:
+            return self._receipt(
+                request,
+                status="failed",
+                result_code="scope_query_failed",
+                error_type=ERROR_CODE_SCOPE_QUERY_FAILED,
+                error_message=single_line_truncate(listing_error),
+                counts=_Counts(),
+                disable_count=0,
+                retryable=True,
+            )
         active_vector_doc_ids, query_error, retryable = self._load_active_scope(
             scope=scope,
             vector_doc_ids=list(listing.vector_doc_ids),
@@ -490,6 +553,9 @@ class ScopeConsumer:
             query = self._state_port.get_vectors(vector_doc_ids)
         except VectorIngestionError as error:
             return None, f"get_vectors 失败：{error}", True
+        query_error = _validate_query_result(query, vector_doc_ids)
+        if query_error is not None:
+            return None, query_error, True
         active, error, retryable = _filter_active_scope(
             scope=scope,
             owner_field=self._owner_field,

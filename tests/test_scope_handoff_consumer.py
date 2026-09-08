@@ -23,6 +23,8 @@ from collections.abc import Sequence
 from datetime import datetime, timezone
 from pathlib import Path
 
+import pytest
+
 from expert_contracts import ExpertChunkEmbeddingInput
 from expert_index.chunk_builder import ChunkFactory
 from expert_index.config import DatabaseConfig, Settings
@@ -923,6 +925,63 @@ class TestMissingFailClosed:
         receipt = consumer.process(request)
         assert receipt.status == "failed"
         assert receipt.retryable is True
+        assert store.upsert_calls == []
+        assert store.disable_calls == []
+
+
+class TestScopeQueryResultAlignment:
+    def test_owner_listing_mismatch_returns_retryable_failed(self):
+        contract = _profile_chunks(eid=700001)[0]
+        store = FakeScopeVectorStore()
+        scope = impact_scope_from_target(target_type="profile", expert_id=700001)
+        request = _make_request(scope, [contract])
+
+        def wrong_owner(_owner_id: int) -> VectorOwnerList:
+            return VectorOwnerList.model_construct(
+                owner_id=700002,
+                vector_doc_ids=[],
+                count=0,
+            )
+
+        store.list_vectors_by_owner = wrong_owner  # type: ignore[assignment]
+        consumer, store = _build_consumer(store)
+        store.list_vectors_by_owner = wrong_owner  # type: ignore[assignment]
+
+        receipt = consumer.process(request)
+
+        assert receipt.status == "failed"
+        assert receipt.retryable is True
+        assert receipt.error_type == "scope_query_failed"
+        assert store.upsert_calls == []
+        assert store.disable_calls == []
+
+    @pytest.mark.parametrize("mode", ["extra", "missing"])
+    def test_query_id_set_mismatch_returns_retryable_failed(self, mode: str):
+        contract = _profile_chunks(eid=700001)[0]
+        store = FakeScopeVectorStore()
+        store.seed(_existing_record(contract=contract))
+        scope = impact_scope_from_target(target_type="profile", expert_id=700001)
+        request = _make_request(scope, [contract])
+
+        def malformed_query(vector_doc_ids):
+            if mode == "extra":
+                extra = dict(store.existing[contract.vector_doc_id])
+                extra["vector_doc_id"] = "expert:700001:profile_summary:extra:0"
+                return VectorQueryResult.model_construct(
+                    records=[store.existing[contract.vector_doc_id], extra],
+                    missing=[],
+                )
+            return VectorQueryResult.model_construct(records=[], missing=[])
+
+        store.get_vectors = malformed_query  # type: ignore[assignment]
+        consumer, store = _build_consumer(store)
+        store.get_vectors = malformed_query  # type: ignore[assignment]
+
+        receipt = consumer.process(request)
+
+        assert receipt.status == "failed"
+        assert receipt.retryable is True
+        assert receipt.error_type == "scope_query_failed"
         assert store.upsert_calls == []
         assert store.disable_calls == []
 

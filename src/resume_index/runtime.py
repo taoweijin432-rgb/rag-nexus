@@ -85,6 +85,8 @@ def build_resume_runtime(
         raise ValueError("vector_sync 与 vector_service 只能显式传入一个")
     if vector_service is not None:
         _require_resume_vector_service(settings, vector_service)
+    if vector_sync is not None:
+        _require_resume_vector_sync(settings, vector_sync)
 
     # Source 预检必须先于状态写入、Embedding 或 Milvus 客户端构造。
     preflight = preflight_runner(settings)
@@ -167,6 +169,20 @@ def _require_resume_vector_service(
             "显式 vector_service 未绑定 Resume Profile（resume_id/resume:），"
             "已拒绝启动"
         )
+
+
+def _require_resume_vector_sync(
+    settings: ResumeSettings,
+    vector_sync: ExpertVectorSyncPort,
+) -> None:
+    """校验直接注入的同步器底层确实使用 Resume 向量服务。"""
+
+    store = getattr(vector_sync, "store", None)
+    if store is None:
+        raise DatabaseBoundaryError(
+            "显式 vector_sync 缺少可验证的底层 Resume Vector Service，已拒绝启动"
+        )
+    _require_resume_vector_service(settings, store)
 
 
 __all__ = ["ResumeRuntime", "build_resume_runtime", "resolve_resume_vector_service"]

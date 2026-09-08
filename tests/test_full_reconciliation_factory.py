@@ -24,6 +24,7 @@ from rag_vector_store import (
 from rag_vector_store.chunking.contract_pipeline import ContractEmbeddingWorker
 from rag_vector_store.config import MilvusSettings
 from rag_vector_store.ingestion.vector_ingestion import VectorIngestionService
+from rag_vector_store.milvus.repository_v15 import EXPERT_V15_PROFILE
 
 
 class FakeEmbeddingModel:
@@ -44,6 +45,7 @@ class FakeRepository:
         self.settings = type(
             "FakeMilvusSettings", (), {"collection_name": collection_name}
         )()
+        self.profile = EXPERT_V15_PROFILE
 
 
 def _fake_worker() -> ContractEmbeddingWorker:
@@ -52,7 +54,7 @@ def _fake_worker() -> ContractEmbeddingWorker:
 
 
 def test_factory_assembles_full_service() -> None:
-    repo = FakeRepository("expert_candidates_v14_contract_dev")
+    repo = FakeRepository("expert_candidates_v15_contract_dev")
     service = create_full_vector_reconciliation_service(
         repository=repo,  # type: ignore[arg-type]
         embedding_worker=_fake_worker(),
@@ -71,20 +73,19 @@ def test_factory_assembles_full_service() -> None:
 def test_repository_and_ingestion_share_same_milvus_config() -> None:
     """核心安全约束：reader(读库)与写库共用同一 repository 对象与 Collection。"""
 
-    repo = FakeRepository("expert_candidates_v14_contract_dev")
+    repo = FakeRepository("expert_candidates_v15_contract_dev")
     service = create_full_vector_reconciliation_service(
         repository=repo,  # type: ignore[arg-type]
         embedding_worker=_fake_worker(),
     )
 
-    # ingest 内部（ContractBatchIngestionService + VectorIngestionService）
-    # 与 reconciliation 全部引用同一个 repository 对象。
+    # ingestion 与 reconciliation 全部引用同一个 repository 对象。
     assert service.ingestion.repository is service.repository
     assert service.repository is repo
     assert (
         service.ingestion.repository.settings.collection_name
         == service.repository.settings.collection_name
-        == "expert_candidates_v14_contract_dev"
+        == "expert_candidates_v15_contract_dev"
     )
 
 
@@ -95,13 +96,13 @@ def test_factory_consistent_config_without_explicit_repository() -> None:
         repository=None,
         embedding_worker=_fake_worker(),
         milvus_settings=MilvusSettings(
-            collection_name="expert_candidates_v14_contract_dev"
+            collection_name="expert_candidates_v15_contract_dev"
         ),
     )
 
     assert service.ingestion.repository is service.repository
     assert service.repository.settings.collection_name == (
-        "expert_candidates_v14_contract_dev"
+        "expert_candidates_v15_contract_dev"
     )
 
 
@@ -133,7 +134,7 @@ def test_top_level_public_imports() -> None:
 def test_create_vector_ingestion_service_unaffected() -> None:
     """现有 create_vector_ingestion_service() 行为保持不变。"""
 
-    repo = FakeRepository("expert_candidates_v14_contract_dev")
+    repo = FakeRepository("expert_candidates_v15_contract_dev")
     ingestion = create_vector_ingestion_service(
         repository=repo,  # type: ignore[arg-type]
         embedding_worker=_fake_worker(),
@@ -145,7 +146,7 @@ def test_create_vector_ingestion_service_unaffected() -> None:
 
 
 def test_delete_batch_size_forwarded() -> None:
-    repo = FakeRepository("expert_candidates_v14_contract_dev")
+    repo = FakeRepository("expert_candidates_v15_contract_dev")
     service = create_full_vector_reconciliation_service(
         repository=repo,  # type: ignore[arg-type]
         embedding_worker=_fake_worker(),

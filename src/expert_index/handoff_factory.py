@@ -10,9 +10,8 @@
 1. ``settings.incremental_scan.enabled`` 为 false 时立即抛
    :class:`IncrementalScanDisabledError`（复用 P3 已有异常），不构造任何下游依赖；
 2. :meth:`Settings.validate_index_write_boundary` 校验 Index/Source 物理 Schema 隔离；
-3. ``schema_profile`` 必须是 ``"v15"``，其余（含 ``"v14"``）立即 fail-closed；
-4. ``max_attempts``/``retry_delay_seconds`` 显式校验；
-5. 缺失 ``vector_service`` 时才惰性调用
+3. ``max_attempts``/``retry_delay_seconds`` 显式校验；
+4. 缺失 ``vector_service`` 时才惰性调用
    ``create_vector_ingestion_service()``，**绝不调用
    ``initialize()``**（本层只组装、不连库/不连 Milvus）。
 
@@ -122,7 +121,6 @@ class _ReceiptSinkAdapter:
 def build_incremental_handoff_runtime(
     settings: Settings,
     *,
-    schema_profile: str = "v15",
     vector_service: object | None = None,
     max_attempts: int,
     retry_delay_seconds: int,
@@ -133,8 +131,6 @@ def build_incremental_handoff_runtime(
     """组装正式增量 Handoff 闭环组件集合。
 
     :param settings: 已由 ``Settings.from_env`` 构造的配置对象。
-    :param schema_profile: 持久化 profile，唯一允许 ``"v15"``（默认）。
-        ``"v14"`` 或其他值立即 fail-closed 抛 ``ValueError``。
     :param vector_service: 可选的已构造 ``VectorIngestionService`` 实例（测试注入）。
         为 ``None`` 时惰性调用 ``create_vector_ingestion_service()``，
         **绝不调用 ``initialize()``**。
@@ -142,8 +138,7 @@ def build_incremental_handoff_runtime(
     :param retry_delay_seconds: ``HandoffOrchestrator`` 的重试冷却秒数，显式传入。
     :return: :class:`IncrementalHandoffRuntime`，持有全部组件实例。
     :raises IncrementalScanDisabledError: ``INCREMENTAL_ENABLED=false`` 时。
-    :raises ValueError: ``schema_profile`` 非 ``v15``，或重试参数非法，
-        或 Index/Source 物理 Schema 未隔离。
+    :raises ValueError: 重试参数非法，或 Index/Source 物理 Schema 未隔离。
     """
 
     # 1) 增量入口开关：未显式开启时拒绝组装任何下游依赖。
@@ -155,13 +150,7 @@ def build_incremental_handoff_runtime(
     # 2) Index/Source 物理 Schema 隔离（复用 Settings 校验）。
     settings.validate_index_write_boundary()
 
-    # 3) 持久化 profile 只允许 v15（V14 已退役）。
-    if schema_profile != "v15":
-        raise ValueError(
-            f"增量 Handoff 闭环只支持 schema_profile='v15'，拒绝 {schema_profile!r}"
-        )
-
-    # 4) 重试参数显式校验（与 HandoffOrchestrator 自身校验对齐）。
+    # 3) 重试参数显式校验（与 HandoffOrchestrator 自身校验对齐）。
     if (
         isinstance(max_attempts, bool)
         or not isinstance(max_attempts, int)
@@ -175,7 +164,7 @@ def build_incremental_handoff_runtime(
     ):
         raise ValueError("retry_delay_seconds 必须是正整数")
 
-    # 5) 缺失 vector_service 时才惰性构造；绝不调用 initialize()（本层只组装、不连库）。
+    # 4) 缺失 vector_service 时才惰性构造；绝不调用 initialize()（本层只组装、不连库）。
     if vector_service is None:
         # 局部导入，避免顶层形成 expert_index ↔ rag_vector_store 强耦合；
         # create_vector_ingestion_service 内部会从环境读取 Milvus/Embedding 配置，

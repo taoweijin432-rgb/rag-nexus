@@ -272,6 +272,112 @@ def test_new_contract_embeds_for_all_chunk_types(chunk_type: str) -> None:
     assert len(worker.calls) == 1
 
 
+class _MalformedDownstreamStore(FakeVectorStore):
+    """返回结构合法但与请求不对齐的下游结果。"""
+
+    def __init__(self, mode: str) -> None:
+        super().__init__()
+        self.mode = mode
+
+    def get_vectors(self, vector_doc_ids: Sequence[str]) -> VectorQueryResult:
+        if self.mode == "query_type":
+            return object()  # type: ignore[return-value]
+        if self.mode == "query_extra":
+            return VectorQueryResult(
+                records=[_stored_record("expert:999:employment:extra:0")],
+                missing=[],
+            )
+        return super().get_vectors(vector_doc_ids)
+
+    def upsert_chunks(
+        self,
+        chunks: Sequence[ExpertChunkEmbeddingInput],
+    ) -> VectorIngestionResult:
+        if self.mode == "upsert_empty":
+            return VectorIngestionResult(results=[])
+        if self.mode == "upsert_wrong_id":
+            return VectorIngestionResult(
+                results=[
+                    VectorItemResult(
+                        vector_doc_id="expert:999:employment:wrong:0",
+                        status="embedded",
+                    )
+                ]
+            )
+        return super().upsert_chunks(chunks)
+
+    def update_metadata(
+        self,
+        chunks: Sequence[ExpertChunkEmbeddingInput],
+    ) -> VectorIngestionResult:
+        if self.mode == "update_multiple":
+            return VectorIngestionResult(
+                results=[
+                    VectorItemResult(
+                        vector_doc_id=chunk.vector_doc_id,
+                        status="metadata_updated",
+                    )
+                    for chunk in chunks
+                ]
+                + [
+                    VectorItemResult(
+                        vector_doc_id="expert:999:employment:extra:0",
+                        status="metadata_updated",
+                    )
+                ]
+            )
+        return super().update_metadata(chunks)
+
+    def disable_vectors(
+        self,
+        vector_doc_ids: Sequence[str],
+    ) -> VectorDeletionResult:
+        if self.mode == "disable_count":
+            return VectorDeletionResult(
+                requested_count=0,
+                deleted_count=0,
+                not_found_count=0,
+            )
+        return super().disable_vectors(vector_doc_ids)
+
+
+def test_consumer_returns_retryable_failure_for_mismatched_upsert_result() -> None:
+    for mode in ("upsert_empty", "upsert_wrong_id"):
+        result = _core(_MalformedDownstreamStore(mode)).process([_intent()])[0]
+        assert result.status == "failed"
+        assert result.error_code == "downstream_result_mismatch"
+        assert result.retryable is True
+
+
+def test_consumer_returns_retryable_failure_for_mismatched_update_result() -> None:
+    store = _MalformedDownstreamStore("update_multiple")
+    template = _intent()
+    store.seed(_stored_record(template.vector_doc_id))
+    result = _core(store).process(
+        [_intent(metadata_hash="f" * 64)]
+    )[0]
+    assert result.status == "failed"
+    assert result.error_code == "downstream_result_mismatch"
+    assert result.retryable is True
+
+
+def test_consumer_returns_retryable_failure_for_mismatched_disable_count() -> None:
+    result = _core(_MalformedDownstreamStore("disable_count")).process(
+        [ContractDisableInput(vector_doc_id="expert:1:employment:1:0")]
+    )[0]
+    assert result.status == "failed"
+    assert result.error_code == "downstream_result_mismatch"
+    assert result.retryable is True
+
+
+def test_consumer_returns_retryable_failure_for_malformed_query_result() -> None:
+    for mode in ("query_type", "query_extra"):
+        result = _core(_MalformedDownstreamStore(mode)).process([_intent()])[0]
+        assert result.status == "failed"
+        assert result.error_code == "downstream_result_mismatch"
+        assert result.retryable is True
+
+
 def test_content_hash_change_reembeds() -> None:
     worker = FakeEmbeddingWorker()
     store = FakeVectorStore(embedding_worker=worker)

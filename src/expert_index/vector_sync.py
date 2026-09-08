@@ -7,11 +7,16 @@ Milvus Repository。
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 
 from expert_contracts import ExpertChunkEmbeddingInput
-from rag_vector_store import VectorIngestionResult, VectorItemResult
+from rag_vector_store import (
+    VectorIngestionResult,
+    VectorItemResult,
+    VectorOwnerList,
+    VectorQueryResult,
+)
 
 from .ports import ExpertBatchSyncInput, VectorStorePort
 
@@ -182,9 +187,13 @@ class ExpertVectorSynchronizer:
         }
 
         listed = self.store.list_vectors_by_owner(expert_id)
+        self._validate_owner_listing(listed, expert_id)
         existing_ids = set(listed.vector_doc_ids)
         query = self.store.get_vectors(sorted(existing_ids)) if existing_ids else None
-        existing_by_id = self._existing_rows(query.records if query is not None else [])
+        existing_by_id = self._existing_rows(
+            query,
+            expected_ids=existing_ids,
+        )
 
         to_upsert: list[ExpertChunkEmbeddingInput] = []
         to_update: list[ExpertChunkEmbeddingInput] = []
@@ -221,10 +230,63 @@ class ExpertVectorSynchronizer:
         return {item.vector_doc_id for item in records}
 
     @staticmethod
+    def _validate_owner_listing(
+        listing: object,
+        expected_owner_id: int,
+    ) -> None:
+        """校验 owner 列表，防止错误集合参与差分与 stale 计算。"""
+
+        if not isinstance(listing, VectorOwnerList):
+            raise VectorSyncError(
+                "list_vectors_by_owner 返回值不是 VectorOwnerList"
+            )
+        if listing.owner_id != expected_owner_id:
+            raise VectorSyncError(
+                "list_vectors_by_owner 返回 owner_id 与同步目标不一致"
+            )
+        ids = listing.vector_doc_ids
+        if any(not isinstance(value, str) or not value.strip() for value in ids):
+            raise VectorSyncError(
+                "list_vectors_by_owner 返回空或非法 vector_doc_id"
+            )
+        if len(ids) != len(set(ids)) or listing.count != len(ids):
+            raise VectorSyncError(
+                "list_vectors_by_owner 返回重复 ID 或 count 不一致"
+            )
+
+    @staticmethod
     def _existing_rows(
-        rows: Sequence[Mapping[str, object]],
+        query: object,
+        *,
+        expected_ids: set[str],
     ) -> dict[str, dict[str, str]]:
         """只提取增量判断需要的 ID 与两个哈希，并拒绝不完整返回。"""
+
+        if not isinstance(query, VectorQueryResult):
+            if expected_ids:
+                raise VectorSyncError(
+                    "get_vectors 返回值不是 VectorQueryResult"
+                )
+            return {}
+        rows = query.records
+        returned_ids = {
+            row.get("vector_doc_id")
+            for row in rows
+            if isinstance(row.get("vector_doc_id"), str)
+        }
+        missing_ids = set(query.missing)
+        if returned_ids | missing_ids != expected_ids:
+            raise VectorSyncError(
+                "get_vectors 返回 ID 集合与 list_vectors_by_owner 不一致"
+            )
+        if returned_ids & missing_ids:
+            raise VectorSyncError(
+                "get_vectors records 与 missing 存在重复 ID"
+            )
+        if missing_ids:
+            raise VectorSyncError(
+                "get_vectors 未命中 list_vectors_by_owner 声明存在的记录"
+            )
 
         result: dict[str, dict[str, str]] = {}
         for row in rows:

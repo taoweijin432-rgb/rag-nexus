@@ -10,7 +10,7 @@ import pytest
 
 from expert_contracts import ExpertChunkEmbeddingInput, adapt_expert_chunk_mapping
 from expert_index.ports import ExpertBatchSyncInput
-from expert_index.vector_sync import ExpertVectorSynchronizer
+from expert_index.vector_sync import ExpertVectorSynchronizer, VectorSyncError
 from rag_vector_store import (
     VectorDeletionResult,
     VectorIngestionResult,
@@ -298,3 +298,50 @@ def test_sync_expert_batch_rejects_non_batch_input() -> None:
     synchronizer = ExpertVectorSynchronizer(store)
     with pytest.raises(TypeError):
         synchronizer.sync_expert_batch([(900001, [])])  # type: ignore[list-item]
+
+
+def test_sync_expert_rejects_owner_listing_mismatch_before_mutation() -> None:
+    record = _records()[0]
+    store = FakeVectorStore({record.vector_doc_id: _row(record)})
+
+    def wrong_owner(_owner_id: int) -> VectorOwnerList:
+        return VectorOwnerList.model_construct(
+            owner_id=900002,
+            vector_doc_ids=[record.vector_doc_id],
+            count=1,
+        )
+
+    store.list_vectors_by_owner = wrong_owner  # type: ignore[assignment]
+
+    with pytest.raises(VectorSyncError, match="owner_id"):
+        ExpertVectorSynchronizer(store).sync_expert(900001, [record])
+
+    assert store.upsert_calls == []
+    assert store.metadata_calls == []
+    assert store.delete_calls == []
+
+
+@pytest.mark.parametrize("mode", ["extra", "missing"])
+def test_sync_expert_rejects_query_id_set_mismatch(
+    mode: str,
+) -> None:
+    record = _records()[0]
+    store = FakeVectorStore({record.vector_doc_id: _row(record)})
+    extra = _copy_with_source_id(record, "query-extra")
+
+    def malformed_query(vector_doc_ids: list[str]) -> VectorQueryResult:
+        if mode == "extra":
+            return VectorQueryResult.model_construct(
+                records=[_row(record), _row(extra)],
+                missing=[],
+            )
+        return VectorQueryResult.model_construct(records=[], missing=[])
+
+    store.get_vectors = malformed_query  # type: ignore[assignment]
+
+    with pytest.raises(VectorSyncError, match="ID 集合"):
+        ExpertVectorSynchronizer(store).sync_expert(900001, [record])
+
+    assert store.upsert_calls == []
+    assert store.metadata_calls == []
+    assert store.delete_calls == []

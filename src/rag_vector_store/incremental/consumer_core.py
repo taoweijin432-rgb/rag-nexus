@@ -49,6 +49,7 @@ from .consumer_models import (
     CONSUMER_ACTION_METADATA_ONLY_UPDATE,
     CONSUMER_ACTION_SKIP_UNCHANGED,
     ERROR_CODE_DISABLE_INFRA_FAILED,
+    ERROR_CODE_DOWNSTREAM_RESULT_MISMATCH,
     ERROR_CODE_ELIGIBILITY_DISABLE_FAILED,
     ERROR_CODE_EXISTING_QUERY_FAILED,
     ERROR_CODE_EXISTING_STATE_INVALID,
@@ -195,6 +196,10 @@ class _ExistingStateError(ValueError):
     """已存实体轻量状态提取失败（缺 hash / is_active 非 bool 等，确定性）。"""
 
 
+class _DownstreamResultMismatch(ValueError):
+    """下游结果无法与本次请求一一对应。"""
+
+
 def _dedupe_keep_order(values: Sequence[str]) -> list[str]:
     """按出现顺序去重。"""
 
@@ -296,12 +301,22 @@ class ContractConsumerCore:
     ) -> list[ExecutionResult]:
         """按输入顺序消费一批标准输入并返回逐条执行结果。"""
 
-        vector_doc_ids = [item.vector_doc_id for item in inputs]
+        if not isinstance(inputs, Sequence):
+            raise TypeError("Consumer 输入必须是 ContractConsumerInput 序列")
+        items = list(inputs)
+        if any(
+            not isinstance(item, (ContractUpsertIntent, ContractDisableInput))
+            for item in items
+        ):
+            raise TypeError(
+                "Consumer 输入只能是 ContractUpsertIntent 或 ContractDisableInput"
+            )
+        vector_doc_ids = [item.vector_doc_id for item in items]
         if any(not isinstance(value, str) or not value.strip() for value in vector_doc_ids):
             raise ValueError("Consumer 输入必须包含非空 vector_doc_id")
         if len(vector_doc_ids) != len(set(vector_doc_ids)):
             raise ValueError("Consumer 批次不能包含重复 vector_doc_id")
-        return [self._process_one(item) for item in inputs]
+        return [self._process_one(item) for item in items]
 
     def process_contracts(
         self,
@@ -375,14 +390,39 @@ class ContractConsumerCore:
                 error_code=ERROR_CODE_EXISTING_QUERY_FAILED,
                 retryable=True,
             )
-        record = next(
-            (
-                row
+        try:
+            if not isinstance(query, VectorQueryResult):
+                raise _DownstreamResultMismatch(
+                    "get_vectors 返回值不是 VectorQueryResult"
+                )
+            record_ids = [
+                row.get("vector_doc_id")
                 for row in query.records
-                if row.get("vector_doc_id") == vector_doc_id
-            ),
-            None,
-        )
+            ]
+            if any(not isinstance(value, str) for value in record_ids):
+                raise _DownstreamResultMismatch(
+                    "get_vectors records 缺少合法 vector_doc_id"
+                )
+            returned_ids = set(record_ids)
+            missing_ids = set(query.missing)
+            if returned_ids.union(missing_ids) != {vector_doc_id}:
+                raise _DownstreamResultMismatch(
+                    "get_vectors 返回的 ID 集合与请求不一致"
+                )
+            if returned_ids.intersection(missing_ids):
+                raise _DownstreamResultMismatch(
+                    "get_vectors records 与 missing 存在重复 ID"
+                )
+            record = query.records[0] if query.records else None
+        except _DownstreamResultMismatch as error:
+            return None, ExecutionResult(
+                vector_doc_id=vector_doc_id,
+                operation=operation,
+                status="failed",
+                reason=f"existing_query_result_mismatch：{error}",
+                error_code=ERROR_CODE_DOWNSTREAM_RESULT_MISMATCH,
+                retryable=True,
+            )
         return record, None
 
     # ------------------------------------------------------------------
@@ -549,6 +589,16 @@ class ContractConsumerCore:
                     error_code=ERROR_CODE_MODEL_SPACE_MISMATCH,
                     actions=tuple(actions),
                 )
+            if outcome == "result_mismatch":
+                return ExecutionResult(
+                    vector_doc_id=self._contract_adapter.vector_doc_id(contract),
+                    operation=op,
+                    status="failed",
+                    reason="metadata_update_result_mismatch：下游返回结果无法与请求对齐",
+                    error_code=ERROR_CODE_DOWNSTREAM_RESULT_MISMATCH,
+                    retryable=True,
+                    actions=tuple(actions),
+                )
             # outcome == "inconsistent"：确定性不一致 → rejected。
             return ExecutionResult(
                 vector_doc_id=self._contract_adapter.vector_doc_id(contract),
@@ -579,7 +629,13 @@ class ContractConsumerCore:
             result = self._vector_store.update_metadata([contract])
         except VectorContractError:
             return "inconsistent"
-        entry = result.results[0]
+        try:
+            entry = self._single_ingestion_result(
+                result,
+                self._contract_adapter.vector_doc_id(contract),
+            )
+        except _DownstreamResultMismatch:
+            return "result_mismatch"
         if entry.status == "metadata_updated":
             return "updated"
         if entry.status == "failed" and entry.recommendation == "call_upsert":
@@ -616,7 +672,21 @@ class ContractConsumerCore:
                 retryable=True,
                 actions=actions,
             )
-        entry = result.results[0]
+        try:
+            entry = self._single_ingestion_result(
+                result,
+                self._contract_adapter.vector_doc_id(contract),
+            )
+        except _DownstreamResultMismatch as error:
+            return ExecutionResult(
+                vector_doc_id=self._contract_adapter.vector_doc_id(contract),
+                operation=op,
+                status="failed",
+                reason=f"upsert_result_mismatch：{error}",
+                error_code=ERROR_CODE_DOWNSTREAM_RESULT_MISMATCH,
+                retryable=True,
+                actions=actions,
+            )
         if entry.status == "embedded":
             return ExecutionResult(
                 vector_doc_id=self._contract_adapter.vector_doc_id(contract),
@@ -671,6 +741,18 @@ class ContractConsumerCore:
                 retryable=True,
                 actions=disable_actions,
             )
+        try:
+            self._validate_disable_result(deletion, len(targets))
+        except _DownstreamResultMismatch as error:
+            return ExecutionResult(
+                vector_doc_id=vector_doc_id,
+                operation=op,
+                status="failed",
+                reason=f"eligibility_disable_result_mismatch：{error}",
+                error_code=ERROR_CODE_DOWNSTREAM_RESULT_MISMATCH,
+                retryable=True,
+                actions=disable_actions,
+            )
         return ExecutionResult(
             vector_doc_id=vector_doc_id,
             operation=op,
@@ -707,6 +789,18 @@ class ContractConsumerCore:
                 retryable=True,
                 actions=tuple(actions),
             )
+        try:
+            self._validate_disable_result(deletion, len(ids))
+        except _DownstreamResultMismatch as error:
+            return ExecutionResult(
+                vector_doc_id=item.vector_doc_id,
+                operation="disable",
+                status="failed",
+                reason=f"disable_result_mismatch：{error}",
+                error_code=ERROR_CODE_DOWNSTREAM_RESULT_MISMATCH,
+                retryable=True,
+                actions=tuple(actions),
+            )
         return ExecutionResult(
             vector_doc_id=item.vector_doc_id,
             operation="disable",
@@ -719,6 +813,45 @@ class ContractConsumerCore:
             actions=tuple(actions),
             disabled_ids=ids,
         )
+
+    @staticmethod
+    def _single_ingestion_result(
+        result: object,
+        expected_vector_doc_id: str,
+    ) -> Any:
+        """校验单条 upsert/update_metadata 返回结果。"""
+
+        if not isinstance(result, VectorIngestionResult):
+            raise _DownstreamResultMismatch(
+                "下游返回值不是 VectorIngestionResult"
+            )
+        if len(result.results) != 1:
+            raise _DownstreamResultMismatch(
+                f"期望 1 条结果，实际 {len(result.results)} 条"
+            )
+        entry = result.results[0]
+        if entry.vector_doc_id != expected_vector_doc_id:
+            raise _DownstreamResultMismatch(
+                "返回 vector_doc_id 与请求不一致"
+            )
+        return entry
+
+    @staticmethod
+    def _validate_disable_result(
+        result: object,
+        expected_requested_count: int,
+    ) -> VectorDeletionResult:
+        """校验逻辑下线结果的请求数量。"""
+
+        if not isinstance(result, VectorDeletionResult):
+            raise _DownstreamResultMismatch(
+                "下游返回值不是 VectorDeletionResult"
+            )
+        if result.requested_count != expected_requested_count:
+            raise _DownstreamResultMismatch(
+                "requested_count 与请求数量不一致"
+            )
+        return result
 
 
 __all__ = [

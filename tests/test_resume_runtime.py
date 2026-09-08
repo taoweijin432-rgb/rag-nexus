@@ -8,6 +8,7 @@ import pytest
 
 from expert_index.config import DatabaseBoundaryError
 from rag_vector_store import MilvusSettings
+from rag_vector_store.milvus.repository_v15 import RESUME_V15_PROFILE
 from resume_index.config import ResumeSettings
 from resume_index.preflight import ResumeSourcePreflightResult
 from resume_index.runtime import build_resume_runtime
@@ -53,11 +54,23 @@ def _preflight(settings: ResumeSettings) -> ResumeSourcePreflightResult:
 
 
 class FakeVectorSync:
+    def __init__(self) -> None:
+        self.store = FakeResumeVectorService()
+
     def sync_expert(self, *_args: object, **_kwargs: object):
         raise AssertionError("本测试不执行向量同步")
 
     def sync_expert_batch(self, *_args: object, **_kwargs: object):
         raise AssertionError("本测试不执行向量同步")
+
+
+class FakeResumeRepository:
+    settings = MilvusSettings(collection_name="resume_candidates_v15_contract")
+    profile = RESUME_V15_PROFILE
+
+
+class FakeResumeVectorService:
+    repository = FakeResumeRepository()
 
 
 def test_runtime_with_injected_vector_sync_keeps_safe_preflight_summary() -> None:

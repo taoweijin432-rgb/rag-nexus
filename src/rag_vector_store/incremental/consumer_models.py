@@ -30,7 +30,6 @@ CONSUMER_ACTION_METADATA_ONLY_UPDATE = "metadata_only_update"
 CONSUMER_ACTION_EMBEDDING_UPSERT = "embedding_upsert"
 CONSUMER_ACTION_SKIP_UNCHANGED = "skip_unchanged"
 CONSUMER_ACTION_DISABLE_TARGETS = "disable_targets"
-CONSUMER_ACTION_ADAPT_DISABLE = "adapt_disable"
 
 _KNOWN_ACTIONS = frozenset(
     {
@@ -40,7 +39,6 @@ _KNOWN_ACTIONS = frozenset(
         CONSUMER_ACTION_EMBEDDING_UPSERT,
         CONSUMER_ACTION_SKIP_UNCHANGED,
         CONSUMER_ACTION_DISABLE_TARGETS,
-        CONSUMER_ACTION_ADAPT_DISABLE,
     }
 )
 
@@ -81,6 +79,8 @@ ERROR_CODE_METADATA_UPDATE_INFRA_FAILED = "metadata_update_infra_failed"
 ERROR_CODE_UPSERT_INFRA_FAILED = "upsert_infra_failed"
 ERROR_CODE_ELIGIBILITY_DISABLE_FAILED = "eligibility_disable_failed"
 ERROR_CODE_DISABLE_INFRA_FAILED = "disable_infra_failed"
+# 下游返回数量、身份或查询集合与请求不一致（通常可重试）。
+ERROR_CODE_DOWNSTREAM_RESULT_MISMATCH = "downstream_result_mismatch"
 
 # ---------------------------------------------------------------------------
 # P5.2 范围 Consumer 稳定错误码（scope 层收敛失败，不语义复用核心错误码）
@@ -173,7 +173,6 @@ class ExecutionResult(BaseModel):
 
 
 __all__ = [
-    "CONSUMER_ACTION_ADAPT_DISABLE",
     "CONSUMER_ACTION_ADAPT_UPSERT",
     "CONSUMER_ACTION_DISABLE_TARGETS",
     "CONSUMER_ACTION_EMBEDDING_UPSERT",
@@ -181,6 +180,7 @@ __all__ = [
     "CONSUMER_ACTION_METADATA_ONLY_UPDATE",
     "CONSUMER_ACTION_SKIP_UNCHANGED",
     "ERROR_CODE_DISABLE_INFRA_FAILED",
+    "ERROR_CODE_DOWNSTREAM_RESULT_MISMATCH",
     "ERROR_CODE_ELIGIBILITY_DISABLE_FAILED",
     "ERROR_CODE_EXISTING_QUERY_FAILED",
     "ERROR_CODE_EXISTING_STATE_INVALID",

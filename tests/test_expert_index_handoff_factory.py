@@ -69,31 +69,6 @@ class TestFactoryGates:
                 settings, max_attempts=2, retry_delay_seconds=30)
         assert called["v"] == 0
 
-    def test_v14_profile_fail_closed(self, monkeypatch):
-        called = {"v": 0}
-
-        def _fail(*a, **kw):
-            called["v"] += 1
-            raise AssertionError("不应构造 vector_service")
-
-        monkeypatch.setattr(
-            "rag_vector_store.create_vector_ingestion_service", _fail)
-        settings = _settings()
-        with pytest.raises(ValueError, match="schema_profile"):
-            build_incremental_handoff_runtime(
-                settings, schema_profile="v14",
-                vector_service=_SpyVectorService(),
-                max_attempts=2, retry_delay_seconds=30)
-        assert called["v"] == 0
-
-    def test_unknown_profile_fail_closed(self):
-        settings = _settings()
-        with pytest.raises(ValueError, match="schema_profile"):
-            build_incremental_handoff_runtime(
-                settings, schema_profile="weird",
-                vector_service=_SpyVectorService(),
-                max_attempts=2, retry_delay_seconds=30)
-
     def test_same_schema_boundary_fail_closed(self):
         from expert_index.config import DatabaseBoundaryError
 
@@ -299,10 +274,7 @@ class TestNoExternalCalls:
         assert called["v"] == 0
 
     def test_lazy_construction_uses_default_v15_profile(self, monkeypatch):
-        captured = {}
-
         def _fake(*a, **kw):
-            captured["schema_profile"] = kw.get("schema_profile")
             return _SpyVectorService()
 
         monkeypatch.setattr(
@@ -310,8 +282,6 @@ class TestNoExternalCalls:
         settings = _settings()
         runtime = build_incremental_handoff_runtime(
             settings, max_attempts=2, retry_delay_seconds=30)
-        # V15 已是唯一 Profile，内部调用不再显式传递弃用参数。
-        assert captured["schema_profile"] is None
         assert isinstance(runtime.vector_service, _SpyVectorService)
 
 

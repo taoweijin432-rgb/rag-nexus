@@ -3,10 +3,10 @@
 本服务把上游传入的「完整 Chunk 快照」与当前 Milvus 现有向量做对账：
 
     - ``reconcile_all``：只读 dry-run，给出五类差异计数与少量 stale 采样，
-      不执行任何写入 / 删除 / Embedding。
+      不执行任何写入 / 逻辑下线 / Embedding。
     - ``apply_positive_changes``：在 dry-run 基础上真实执行正向变化
       （missing / content_changed → upsert，metadata_changed → update_metadata），
-      **绝不删除 stale**。
+      **绝不逻辑下线 stale**。
     - ``apply_full_reconciliation``：全库维护入口，在正向同步全部成功后
       重新读库，逻辑下线全部 active 多余实体，再做最终一致性验证
       （只比较当前有效集合：MySQL 当前有效 Chunk ↔ Milvus 中
@@ -20,8 +20,8 @@
 fail-closed：Contract 校验失败、Eligibility 异常、desired 重复
 vector_doc_id、Milvus 状态不可信、list 异常、safety preflight 失败、
 upsert / update_metadata 失败、结果中出现 failed、实际成功数量与计划不一致、
-删除批失败、最终一致性校验失败，任一情况直接抛异常；尤其任何正向同步
-失败都会**立即停止且不执行 stale 删除**。
+逻辑下线批失败、最终一致性校验失败，任一情况直接抛异常；尤其任何正向同步
+失败都会**立即停止且不执行 stale 下线**。
 """
 
 from __future__ import annotations
@@ -63,7 +63,7 @@ class _FullSyncPlan:
     """私有对账计划：dry-run 与正向同步共用的中间结果。
 
     完整 ``stale_ids`` 只保存在这里，**不进入公共 Result**（公共结果仅返回
-    统计与有限 sample），供后续 stale 删除阶段使用。
+    统计与有限 sample），供后续 stale 下线阶段使用。
     """
 
     input_count: int
@@ -111,7 +111,7 @@ class FullVectorReconciliationService:
         self,
         chunks: Sequence[ExpertChunkEmbeddingInput],
     ) -> FullVectorReconciliationResult:
-        """只读 dry-run：计算五类差异，不执行任何写入 / 删除 / Embedding。
+        """只读 dry-run：计算五类差异，不执行任何写入 / 逻辑下线 / Embedding。
 
         Returns:
             FullVectorReconciliationResult：差异计数与 stale 采样
@@ -134,10 +134,10 @@ class FullVectorReconciliationService:
             - missing / content_changed → ``VectorIngestionService.upsert_chunks``
             - metadata_changed → ``VectorIngestionService.update_metadata``
             - unchanged → 不操作
-            - stale → 本方法只统计，绝不删除
+            - stale → 本方法只统计，绝不逻辑下线
 
         任何失败（含 safety preflight 失败）立即 fail-closed，且**绝不**因失败
-        执行 stale delete。
+        执行 stale 逻辑下线。
 
         Returns:
             FullVectorReconciliationResult：差异计数 + 实际执行的
@@ -213,7 +213,7 @@ class FullVectorReconciliationService:
         ]
 
         # 6. 分批逻辑下线 stale；某一批失败即停止后续批次（已完成下线不回滚）。
-        deleted = self._delete_stale(stale_after_write)
+        disabled = self._disable_stale(stale_after_write)
 
         # 7. 下线后再读取并做最终一致性验证（只比较当前有效集合：
         #    active ID 集 == desired ID 集，且逐条 hash 一致；
@@ -245,7 +245,7 @@ class FullVectorReconciliationService:
         )
         return base.model_copy(
             update={
-                "deleted_count": deleted,
+                "deleted_count": disabled,
                 "final_existing_count": final_active_count,
                 "active_mismatch_count": 0,
                 "consistent": True,
@@ -262,7 +262,7 @@ class FullVectorReconciliationService:
     ) -> tuple[int, int]:
         """在任何写操作前过维护守卫并执行正向变化，返回 (embedded, metadata_updated)。
 
-        任一写入失败立即抛异常（fail-closed），不执行任何删除。
+        任一写入失败立即抛异常（fail-closed），不执行 stale 逻辑下线。
         """
 
         # 任何写操作前先通过维护 Collection 安全守卫（fail-closed）。
@@ -284,7 +284,7 @@ class FullVectorReconciliationService:
             upsert_result = self.ingestion.upsert_chunks(upsert_chunks)
             if upsert_result.failed_count != 0:
                 raise VectorInconsistentStateError(
-                    "reconcile 正向 upsert 出现失败项，已停止（不执行 stale delete）"
+                    "reconcile 正向 upsert 出现失败项，已停止（不执行 stale 下线）"
                 )
             if upsert_result.embedded_count != len(upsert_chunks):
                 raise VectorInconsistentStateError(
@@ -297,7 +297,7 @@ class FullVectorReconciliationService:
             metadata_result = self.ingestion.update_metadata(plan.metadata_changed)
             if metadata_result.failed_count != 0:
                 raise VectorInconsistentStateError(
-                    "reconcile update_metadata 出现失败项，已停止（不执行 stale delete）"
+                    "reconcile update_metadata 出现失败项，已停止（不执行 stale 下线）"
                 )
             if metadata_result.metadata_updated_count != len(plan.metadata_changed):
                 raise VectorInconsistentStateError(
@@ -309,17 +309,17 @@ class FullVectorReconciliationService:
 
         return embedded, metadata_updated
 
-    def _delete_stale(self, stale_ids: Sequence[str]) -> int:
-        """分批删除 stale；返回累计实际删除数。某批失败即停止，不回滚已完成删除。"""
+    def _disable_stale(self, stale_ids: Sequence[str]) -> int:
+        """分批逻辑下线 stale；返回累计下线数。某批失败即停止，不回滚已完成下线。"""
 
         assert self.ingestion is not None
-        total_deleted = 0
+        total_disabled = 0
         size = self.delete_batch_size
         for start in range(0, len(stale_ids), size):
             batch = stale_ids[start : start + size]
             result = self.ingestion.disable_vectors(batch)
-            total_deleted += result.deleted_count
-        return total_deleted
+            total_disabled += result.deleted_count
+        return total_disabled
 
     # ------------------------------------------------------------------
     # 私有 diff 算法（dry-run 与正向同步共用）

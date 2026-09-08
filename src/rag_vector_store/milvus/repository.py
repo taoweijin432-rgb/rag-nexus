@@ -45,8 +45,7 @@ class ContractMilvusRepositoryBase:
     """封装 Milvus 连接、Schema 管理和 CRUD 写操作的通用基类。
 
     调用方：
-        - ``ContractIngestionService.ingest_one`` / ``ContractBatchIngestionService.ingest_batch``
-          （通过 ``ContractRepository`` Protocol）；
+        - ``DomainIngestionService.ingest_batch``（通过通用 Repository Protocol）；
         - 验收/验证脚本（只读 gate、结构对比、PK 回查）。
 
     输入：
