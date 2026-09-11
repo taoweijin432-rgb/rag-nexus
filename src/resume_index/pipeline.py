@@ -248,14 +248,20 @@ class ResumeIndexPipeline:
         page_size: int = 200,
         max_resumes: int | None = None,
         batch_no: str | None = None,
+        worker_count: int = 1,
     ) -> ResumeBatchBuildResult:
-        """按 ``resume.id`` 固定上界运行全量或限定数量批次。"""
+        """按 ``resume.id`` 固定上界运行全量或限定数量批次。
+
+        ``worker_count`` 只并发执行来源读取、标准化和 Chunk/Contract 准备；向量批量
+        写入、明细终态和页级 Checkpoint 仍顺序提交，保证原批次可安全断点续跑。
+        """
 
         result = self._core.build_expert_batch(
             data_version=data_version,
             page_size=page_size,
             max_experts=max_resumes,
             batch_no=batch_no,
+            worker_count=worker_count,
         )
         return ResumeBatchBuildResult.from_internal(result)
 
@@ -264,11 +270,20 @@ class ResumeIndexPipeline:
         batch_id: int,
         *,
         page_size: int = 200,
+        worker_count: int = 1,
     ) -> ResumeBatchBuildResult:
-        """从原批次最后可靠的 ``resume.id`` 页边界继续执行。"""
+        """从原批次最后可靠的 ``resume.id`` 页边界继续执行。
+
+        并发度只影响本次续跑进程，不改变原批次的数据版本、固定上界、累计统计或已经
+        提交的物理游标，因此旧单线程批次可直接切换到多线程续跑。
+        """
 
         return ResumeBatchBuildResult.from_internal(
-            self._core.resume_expert_batch(batch_id, page_size=page_size)
+            self._core.resume_expert_batch(
+                batch_id,
+                page_size=page_size,
+                worker_count=worker_count,
+            )
         )
 
     def retry_failed_resumes(

@@ -130,6 +130,33 @@ def test_resume_cli_exposes_only_resume_commands() -> None:
     }
 
 
+def test_resume_cli_exposes_full_build_worker_count() -> None:
+    """新建和续跑全量批次都应显式暴露页内并发度。"""
+
+    parser = build_parser()
+    build_args = parser.parse_args(
+        [
+            "build-batch",
+            "--data-version",
+            "resume-v1",
+            "--worker-count",
+            "4",
+        ]
+    )
+    resume_args = parser.parse_args(
+        [
+            "resume-batch",
+            "--batch-id",
+            "2",
+            "--worker-count",
+            "3",
+        ]
+    )
+
+    assert build_args.worker_count == 4
+    assert resume_args.worker_count == 3
+
+
 def test_cli_prints_safe_json_summary(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],

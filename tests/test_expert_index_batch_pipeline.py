@@ -470,7 +470,11 @@ def test_resume_expert_batch_continues_after_last_complete_page_with_original_sc
         vector_embedded_count=2,
     )
 
-    result = _pipeline(source, repository).resume_expert_batch(701, page_size=1)
+    result = _pipeline(source, repository).resume_expert_batch(
+        701,
+        page_size=1,
+        worker_count=2,
+    )
 
     assert result.batch_id == 701
     assert result.batch_no == "original_interrupted_batch"
@@ -732,6 +736,25 @@ def test_build_expert_batch_rejects_invalid_page_size_before_source_access(
         _pipeline(source, repository).build_expert_batch(
             data_version="20260814_06",
             page_size=page_size,
+        )
+
+    assert source.upper_bound_calls == 0
+    assert repository.start_calls == []
+
+
+@pytest.mark.parametrize("worker_count", [0, 17, -1, True, 1.5])
+def test_build_expert_batch_rejects_invalid_worker_count_before_source_access(
+    worker_count: object,
+) -> None:
+    """非法并发度必须在固定上界查询和批次创建前失败。"""
+
+    source = FakeSource([ExpertCandidate(id=1, deleted_at=None)])
+    repository = FakeRepository()
+
+    with pytest.raises(ValueError, match="worker_count"):
+        _pipeline(source, repository).build_expert_batch(
+            data_version="20260911_01",
+            worker_count=worker_count,  # type: ignore[arg-type]
         )
 
     assert source.upper_bound_calls == 0

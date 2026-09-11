@@ -63,6 +63,12 @@ def build_parser() -> argparse.ArgumentParser:
     build_batch.add_argument("--page-size", type=int, default=200)
     build_batch.add_argument("--max-resumes", type=int)
     build_batch.add_argument("--batch-no")
+    build_batch.add_argument(
+        "--worker-count",
+        type=int,
+        default=1,
+        help="页内来源读取和 Chunk 准备线程数，范围 1~16，默认 1",
+    )
 
     resume_batch = subcommands.add_parser(
         "resume-batch",
@@ -70,6 +76,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     resume_batch.add_argument("--batch-id", type=int, required=True)
     resume_batch.add_argument("--page-size", type=int, default=200)
+    resume_batch.add_argument(
+        "--worker-count",
+        type=int,
+        default=1,
+        help="续跑时的页内准备线程数，不改变原批次游标和范围",
+    )
 
     retry_batch = subcommands.add_parser(
         "retry-batch",
@@ -136,6 +148,7 @@ def main(argv: list[str] | None = None) -> None:
             page_size=args.page_size,
             max_resumes=args.max_resumes,
             batch_no=args.batch_no,
+            worker_count=args.worker_count,
         )
         print(json.dumps(asdict(result), ensure_ascii=False, sort_keys=True))
     elif args.command == "resume-batch":
@@ -143,6 +156,7 @@ def main(argv: list[str] | None = None) -> None:
         result = _build_runtime(settings).pipeline.resume_batch(
             args.batch_id,
             page_size=args.page_size,
+            worker_count=args.worker_count,
         )
         print(json.dumps(asdict(result), ensure_ascii=False, sort_keys=True))
     elif args.command == "retry-batch":

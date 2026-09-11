@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
 from datetime import datetime
+from threading import Barrier, Lock, get_ident
 from typing import Any
 
 from expert_contracts import ExpertChunkEmbeddingInput
@@ -99,6 +100,23 @@ class FakeResumeSource:
         return next(item for item in self.candidates if item.resume_id == resume_id)
 
 
+class ConcurrentFakeResumeSource(FakeResumeSource):
+    """用屏障证明同一页的两个 Resume 来源快照确实由不同线程并发读取。"""
+
+    def __init__(self, candidates: list[ResumeCandidate]) -> None:
+        super().__init__(candidates)
+        self.read_barrier = Barrier(2)
+        self.read_thread_ids: set[int] = set()
+        self.read_thread_ids_lock = Lock()
+
+    def load_resume(self, resume_id: int) -> ExpertAggregate:
+        with self.read_thread_ids_lock:
+            self.read_thread_ids.add(get_ident())
+        # 单线程实现会在这里超时并使测试失败；两个 Worker 会同时到达后继续。
+        self.read_barrier.wait(timeout=2)
+        return super().load_resume(resume_id)
+
+
 class FakeRepository:
     def __init__(self) -> None:
         self.lock_modes: list[str] = []
@@ -108,6 +126,10 @@ class FakeRepository:
         self.running_ids: list[int] = []
         self.finished_ids: list[int] = []
         self.progress_cursor_ids: list[int] = []
+        self.write_thread_ids: set[int] = set()
+
+    def _record_write_thread(self) -> None:
+        self.write_thread_ids.add(get_ident())
 
     @contextmanager
     def build_lock(self, run_mode: str) -> Iterator[None]:
@@ -115,25 +137,31 @@ class FakeRepository:
         yield
 
     def start_batch(self, batch_no: str, run_mode: str, **kwargs: Any) -> int:
+        self._record_write_thread()
         self.start_calls.append((batch_no, run_mode, kwargs))
         return 501
 
     def finish_batch(self, batch_id: int, **kwargs: Any) -> None:
+        self._record_write_thread()
         self.finish_calls.append((batch_id, kwargs))
 
     def prepare_batch_items(self, batch_id: int, expert_ids: list[int]) -> None:
+        self._record_write_thread()
         assert batch_id == 501
         self.prepared_ids.extend(expert_ids)
 
     def mark_batch_item_running(self, batch_id: int, expert_id: int) -> None:
+        self._record_write_thread()
         assert batch_id == 501
         self.running_ids.append(expert_id)
 
     def finish_batch_item(self, batch_id: int, expert_id: int, **_kwargs: Any) -> None:
+        self._record_write_thread()
         assert batch_id == 501
         self.finished_ids.append(expert_id)
 
     def update_batch_progress(self, batch_id: int, **kwargs: Any) -> None:
+        self._record_write_thread()
         assert batch_id == 501
         self.progress_cursor_ids.append(kwargs["cursor_id"])
 
@@ -142,6 +170,7 @@ class FakeVectorSync:
     def __init__(self) -> None:
         self.calls: list[tuple[int, list[ExpertChunkEmbeddingInput]]] = []
         self.batch_calls: list[list[ExpertBatchSyncInput]] = []
+        self.batch_thread_ids: list[int] = []
 
     def sync_expert(
         self,
@@ -165,6 +194,7 @@ class FakeVectorSync:
         self,
         experts: Sequence[ExpertBatchSyncInput],
     ) -> list[ExpertVectorSyncResult]:
+        self.batch_thread_ids.append(get_ident())
         batch = list(experts)
         self.batch_calls.append(batch)
         return [self.sync_expert(item.expert_id, item.records) for item in batch]
@@ -275,3 +305,33 @@ def test_batch_uses_physical_cursor_but_persists_and_syncs_resume_id() -> None:
     ]
     assert len(vector_sync.batch_calls[0][0].records) == 1
     assert list(vector_sync.batch_calls[0][1].records) == []
+
+
+def test_batch_worker_count_prepares_resume_page_concurrently_and_commits_in_order() -> None:
+    """页内并发只加速领域准备，向量同步和可靠游标仍保持来源顺序。"""
+
+    source = ConcurrentFakeResumeSource(
+        [
+            ResumeCandidate(source_record_id=41, resume_id=70001, deleted_at=None),
+            ResumeCandidate(source_record_id=42, resume_id=70002, deleted_at=None),
+        ]
+    )
+    repository = FakeRepository()
+    vector_sync = FakeVectorSync()
+    coordinator_thread_id = get_ident()
+
+    result = _pipeline(source, repository, vector_sync).build_resume_batch(
+        data_version="resume-parallel-v1",
+        page_size=2,
+        batch_no="resume_parallel_test",
+        worker_count=2,
+    )
+
+    assert result.status == "success"
+    assert result.cursor_source_record_id == 42
+    assert len(source.read_thread_ids) == 2
+    assert [item.expert_id for item in vector_sync.batch_calls[0]] == [70001, 70002]
+    assert vector_sync.batch_thread_ids == [coordinator_thread_id]
+    assert repository.write_thread_ids == {coordinator_thread_id}
+    assert repository.finished_ids == [70001, 70002]
+    assert repository.progress_cursor_ids == [42]
