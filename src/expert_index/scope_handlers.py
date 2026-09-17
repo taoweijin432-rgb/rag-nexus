@@ -37,11 +37,11 @@ from .models import (
     impact_scope_from_target,
 )
 from .normalize import (
-    clean_text,
     normalize_aggregate,
     normalize_employment,
     normalize_profile,
     normalize_project,
+    normalize_serial_number,
 )
 from .validators import validate_chunks
 
@@ -262,8 +262,8 @@ def handle_employment_scope(
 
     当前工作记录有效：只生成该 ``source_field_id`` 的 ``0..M-1`` 分片；记录逻辑
     删除：返回 employment scope 空 desired；父专家已删除：升级为 expert scope 空
-    desired。``serial_number`` 复用 ``clean_text`` 规则（与 normalize_profile 一致），
-    不为取得该字段虚构完整 Profile 聚合，也不复制清洗逻辑。
+    desired。``serial_number`` 复用业务标识符规范化规则（与 normalize_profile
+    一致），不为取得该字段虚构完整 Profile 聚合，也不复制清洗逻辑。
     """
 
     _require_scope(facts, "employment")
@@ -285,7 +285,7 @@ def handle_employment_scope(
         build_batch_id=batch_id,
         dataset_spec=factory.dataset_spec,
     )
-    serial_number = clean_text(facts.expert.serial_number) or None
+    serial_number = normalize_serial_number(facts.expert.serial_number)
     chunks = factory.build_employment(serial_number, stage)
     return _prepared_result(
         facts, chunks, task_id=task_id, batch_id=batch_id, data_version=data_version
@@ -324,7 +324,7 @@ def handle_project_scope(
         build_batch_id=batch_id,
         dataset_spec=factory.dataset_spec,
     )
-    serial_number = clean_text(facts.expert.serial_number) or None
+    serial_number = normalize_serial_number(facts.expert.serial_number)
     chunks = factory.build_project(serial_number, stage)
     return _prepared_result(
         facts, chunks, task_id=task_id, batch_id=batch_id, data_version=data_version

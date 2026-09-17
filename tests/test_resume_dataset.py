@@ -33,7 +33,7 @@ def _aggregate(person_id: int = 70001) -> ExpertAggregate:
     return ExpertAggregate(
         profile=ExpertSource(
             id=person_id,
-            serial_number="RESUME-TEST-001",
+            serial_number="０１２３４５６７８９０１２３４５６",
             company="示例科技有限公司",
             job_status=1,
             job_name="项目经理",
@@ -197,3 +197,4 @@ def test_resume_spec_changes_only_dataset_source_labels() -> None:
         "resume_work_experience",
         "resume_project_experience",
     }
+    assert all(chunk.serial_number == "01234567890123456" for chunk in resume_chunks)

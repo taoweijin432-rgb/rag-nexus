@@ -375,6 +375,36 @@ class TestProjectScope:
 
 
 class TestIsolationAndStability:
+    def test_numeric_serial_number_matches_full_and_incremental_outputs(self):
+        """17 位业务编号在全量及两个经历增量范围中必须逐值一致。"""
+
+        expert = replace(_expert(), serial_number="０１２３４５６７８９０１２３４５６")
+        employment = _employment()
+        project = _project()
+        full = _call(
+            handle_expert_scope,
+            _expert_facts(expert, [employment], [project], [_education(1)]),
+        )
+        employment_incremental = _call(
+            handle_employment_scope,
+            _employment_facts(expert, employment),
+        )
+        project_incremental = _call(
+            handle_project_scope,
+            _project_facts(expert, project),
+        )
+
+        expected = "01234567890123456"
+        assert all(chunk.serial_number == expected for chunk in full.desired_chunks)
+        assert all(
+            chunk.serial_number == expected
+            for chunk in employment_incremental.desired_chunks
+        )
+        assert all(
+            chunk.serial_number == expected
+            for chunk in project_incremental.desired_chunks
+        )
+
     def test_employment_scope_excludes_other_families(self):
         # scope 只输出触发行；ScopedCurrentFacts employment 范围 shape 只允许单条触发行
         emp_target = _employment(9201)

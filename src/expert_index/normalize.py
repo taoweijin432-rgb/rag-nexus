@@ -142,6 +142,30 @@ def clean_text(value: Any) -> str:
     return text.strip(" \n，,；;：:")
 
 
+def normalize_serial_number(value: Any) -> str | None:
+    """把人员编号规范化为稳定的业务标识符。
+
+    参数 ``value`` 是专家表或简历表的 ``serial_number`` 原始值。该字段用于关联、
+    筛选和回查人员，不是可供检索的正文，因此不能调用 :func:`clean_text` 的 PII
+    删除规则；17 位纯数字编号会被通用银行卡规则误判并清空。
+
+    本函数只执行不会改变标识符语义的确定性处理：将值转为字符串、使用 NFKC 统一
+    全角字符、删除不可见控制符并去除首尾空白。常见空值占位符返回 ``None``。
+    不把编号转成整数，避免丢失前导零；也不猜测或改写编号内部格式。
+
+    Expert 与 Resume 的全量标准化及增量 Scope Handler 必须共同调用此函数，保证
+    相同源值在两种构建路径中输出完全一致。
+    """
+
+    if value is None:
+        return None
+    serial_number = unicodedata.normalize("NFKC", str(value))
+    serial_number = _INVISIBLE.sub("", serial_number).strip()
+    if serial_number.lower() in _EMPTY_VALUES:
+        return None
+    return serial_number
+
+
 def pii_hits(value: str) -> dict[str, int]:
     """检查清洗后文本是否仍含 PII，只返回类别及命中数量。
 
@@ -477,7 +501,7 @@ def normalize_profile(
     # 专业变化也能改变 source_hash；未列出的 PII 和备注字段不会影响索引增量判断。
     profile_allowed = {
         "expert_id": profile.id,
-        "serial_number": clean_text(profile.serial_number) or None,
+        "serial_number": normalize_serial_number(profile.serial_number),
         "company": company_raw,
         "job_status": profile.job_status,
         "role": role_raw,

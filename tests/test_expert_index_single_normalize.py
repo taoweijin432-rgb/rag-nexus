@@ -7,7 +7,10 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import datetime
+
+import pytest
 
 from expert_index.models import (
     EducationSource,
@@ -17,10 +20,12 @@ from expert_index.models import (
     ProjectSource,
 )
 from expert_index.normalize import (
+    clean_text,
     normalize_aggregate,
     normalize_employment,
     normalize_profile,
     normalize_project,
+    normalize_serial_number,
 )
 
 # ---------------------------------------------------------------------------
@@ -86,6 +91,24 @@ BB = 987654
 
 
 # ===========================================================================
+# serial_number：业务标识符规范化
+# ===========================================================================
+
+
+class TestNormalizeSerialNumber:
+    def test_numeric_identifier_is_not_removed_as_pii(self):
+        raw = " ０１２３４５６７８９０１２３４５６ "
+
+        # 相同数字作为正文会命中银行卡 PII；作为业务编号必须保留且统一为半角。
+        assert clean_text(raw) == ""
+        assert normalize_serial_number(raw) == "01234567890123456"
+
+    @pytest.mark.parametrize("value", [None, "", " null ", "--", "/"])
+    def test_empty_value_returns_none(self, value):
+        assert normalize_serial_number(value) is None
+
+
+# ===========================================================================
 # normalize_profile：教育排序与去重、来源时间
 # ===========================================================================
 
@@ -105,6 +128,13 @@ class TestNormalizeProfile:
         assert stage.major_names_raw == ("计算机", "人工智能")
         assert stage.data_version == DV
         assert stage.build_batch_id == BB
+
+    def test_profile_uses_business_identifier_normalization(self):
+        profile = replace(_profile(), serial_number="０１２３４５６７８９０１２３４５６")
+
+        stage = normalize_profile(profile, [], data_version=DV, build_batch_id=BB)
+
+        assert stage.serial_number == "01234567890123456"
 
     def test_education_id_asc_ordering_deterministic(self):
         # 乱序传入，应按 id ASC 重新排序；三所不同学校全部保留

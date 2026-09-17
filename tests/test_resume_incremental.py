@@ -186,7 +186,7 @@ def test_resume_employment_scope_builds_resume_source_labels() -> None:
         scope=scope,
         expert=ExpertSource(
             id=70001,
-            serial_number="RESUME-001",
+            serial_number="０１２３４５６７８９０１２３４５６",
             company="示例科技",
             job_status=1,
             job_name="项目经理",
@@ -225,6 +225,10 @@ def test_resume_employment_scope_builds_resume_source_labels() -> None:
     assert prepared.impact_scope.source_table == "resume_work_experience"
     assert prepared.desired_chunks
     assert {chunk.source_table for chunk in prepared.desired_chunks} == {"resume_work_experience"}
+    assert all(
+        chunk.serial_number == "01234567890123456"
+        for chunk in prepared.desired_chunks
+    )
 
 
 def test_resume_employment_allows_nullable_company_when_role_exists() -> None:
