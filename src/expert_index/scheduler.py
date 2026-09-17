@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import re
 from collections.abc import Iterable
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 
 from .models import PERSISTED_SOURCE_TABLES
@@ -23,6 +24,7 @@ __all__ = [
 ]
 
 _SAFE_OWNER = re.compile(r"^[A-Za-z0-9_.:-]+$")
+MAX_INCREMENTAL_SOURCE_WORKERS = 4
 
 
 @dataclass(frozen=True)
@@ -78,7 +80,12 @@ class IncrementalRoundResult:
 
 
 class IncrementalRoundScheduler:
-    """执行一次有限来源计划，不提供后台循环或并发 Worker。"""
+    """执行一次有限来源计划，可并发处理相互独立的来源表。
+
+    并发只发生在来源表之间；同一来源表仍由 ``SourceBatchCoordinator`` 按严格
+    FIFO 单任务执行。默认 ``worker_count=1`` 保持 Expert 现有行为，Resume 入口
+    可以显式提高到最多四个 Worker，与四张来源表一一对应。
+    """
 
     def __init__(
         self,
@@ -86,8 +93,9 @@ class IncrementalRoundScheduler:
         *,
         metrics: IncrementalMetrics | None = None,
         source_table_order: tuple[str, ...] = INCREMENTAL_SOURCE_TABLE_ORDER,
+        worker_count: int = 1,
     ) -> None:
-        """注入单来源协调器和可选的进程内指标记录器。"""
+        """注入单来源协调器、稳定表顺序和来源表级并发度。"""
 
         if not callable(getattr(source_batch_coordinator, "run_claimed_source_batch", None)):
             raise TypeError("source_batch_coordinator 缺少 run_claimed_source_batch")
@@ -102,6 +110,7 @@ class IncrementalRoundScheduler:
             raise ValueError("source_table_order 必须是已冻结且不重复的来源表顺序")
         self._metrics = metrics
         self._source_table_order = source_table_order
+        self._worker_count = _validate_worker_count(worker_count)
 
     def run_once(
         self,
@@ -124,24 +133,48 @@ class IncrementalRoundScheduler:
         if unknown:
             raise ValueError(f"调度计划包含当前数据集之外的来源表: {sorted(unknown)}")
         ordered = tuple(sorted(normalized, key=lambda plan: order[plan.source_table]))
-        outcomes: list[SourceBatchRunResult] = []
-        for plan in ordered:
-            try:
-                outcome = self._coordinator.run_claimed_source_batch(
-                    plan.source_table,
-                    plan.batch_id,
-                    plan.lease_owner,
-                    checkpoint_lock_version=plan.checkpoint_lock_version,
-                    task_claim_limit=1,
-                )
-            except Exception as error:  # noqa: BLE001 - 单来源失败隔离到摘要
-                # 不暴露数据库/来源正文；异常类名足够用于聚合和后续诊断。
-                outcome = _failed_source_result(plan, type(error).__name__)
-            outcomes.append(outcome)
+        if self._worker_count == 1 or len(ordered) <= 1:
+            # 默认串行路径保持 Expert 原有调用顺序和执行行为。
+            outcomes = [self._run_plan(plan) for plan in ordered]
+        else:
+            # 每个 plan 对应不同来源表、独立 Source Lease 和独立 Checkpoint。
+            # executor.map 按输入顺序返回结果，使摘要顺序不受线程完成先后影响。
+            with ThreadPoolExecutor(
+                max_workers=min(self._worker_count, len(ordered)),
+                thread_name_prefix="incremental-source",
+            ) as executor:
+                outcomes = list(executor.map(self._run_plan, ordered))
         result = _summarize(outcomes)
         if self._metrics is not None:
             self._metrics.record_round(result)
         return result
+
+    def _run_plan(self, plan: SourceBatchExecutionPlan) -> SourceBatchRunResult:
+        """隔离执行一个来源表计划，并把异常收敛为安全摘要。"""
+
+        try:
+            return self._coordinator.run_claimed_source_batch(
+                plan.source_table,
+                plan.batch_id,
+                plan.lease_owner,
+                checkpoint_lock_version=plan.checkpoint_lock_version,
+                task_claim_limit=1,
+            )
+        except Exception as error:  # noqa: BLE001 - 单来源失败隔离到摘要
+            # 不暴露数据库/来源正文；异常类名足够用于聚合和后续诊断。
+            return _failed_source_result(plan, type(error).__name__)
+
+
+def _validate_worker_count(worker_count: int) -> int:
+    """校验来源表级并发度，避免线程数超过冻结的四表边界。"""
+
+    if (
+        isinstance(worker_count, bool)
+        or not isinstance(worker_count, int)
+        or not 1 <= worker_count <= MAX_INCREMENTAL_SOURCE_WORKERS
+    ):
+        raise ValueError(f"worker_count 必须位于 1 到 {MAX_INCREMENTAL_SOURCE_WORKERS} 之间")
+    return worker_count
 
 
 def _failed_source_result(

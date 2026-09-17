@@ -14,14 +14,13 @@
 - 不解读 ``task.lease_until`` 的时区或与本机时间比较，全部由 Repository 以
   Index MySQL ``CURRENT_TIMESTAMP(6)`` + ``attempt_token`` + rowcount 权威判定。
 
-首期限制（用户冻结）：
+并发边界：
 
-- 只支持单进程、一次只运行一个 :class:`SourceBatchCoordinator`；不实现
-  ``run_forever``、多 Worker 或跨来源并发。
-- 不实现 ``GET_LOCK``、scope fence、generation 或新 Migration；不声称解决
-  跨来源旧 Artifact 防回退。
-- ``INCREMENTAL_ENABLED`` 保持关闭；跨来源 fencing 留作 P5.8/P9 上线前门禁。
-- 头部顺序依赖 P5.7A 已修复的 ``claim_source_sync_tasks`` 严格队头语义
+- 一个调用只处理一张来源表；同表任务始终按 ``limit=1`` 严格 FIFO 执行。
+- 上层 Scheduler 可以并发调用不同来源表。四表具有独立 Source Lease、Batch Source
+  和 Checkpoint；重叠人物范围由 Handoff 层现有 MySQL Scope Fence 串行保护。
+- 不实现同一来源表内的多任务并发，也不新增 generation 或数据库 Migration。
+- 头部顺序依赖 ``claim_source_sync_tasks`` 的严格队头语义
   （pending ``next_retry_at`` 未到时整批等待，不领取更晚 task）。
 
 失败语义（用户冻结规则）：

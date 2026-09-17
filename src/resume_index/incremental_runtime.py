@@ -40,6 +40,7 @@ def build_resume_incremental_runtime(
     max_attempts: int,
     retry_delay_seconds: int,
     task_lease_seconds: int,
+    source_worker_count: int = 1,
     source: MySQLResumeSourceAdapter | None = None,
     vector_service: VectorIngestionService | ResumeVectorIngestionService | None = None,
     base_milvus_settings: MilvusSettings | None = None,
@@ -55,6 +56,8 @@ def build_resume_incremental_runtime(
         Resume 专用 Source、Index、Collection 以及 ``RESUME_INCREMENTAL_*`` 设置。
     max_attempts, retry_delay_seconds, task_lease_seconds:
         任务自动重试上限、重试冷却秒数和任务租约秒数；均由 CLI 显式提供。
+    source_worker_count:
+        不同 Resume 来源表之间的并发度，范围 1~4；同一来源表内部保持严格 FIFO。
     source:
         可选 Resume Source Adapter。生产默认创建只读 Adapter，测试可注入 Fake。
     vector_service, base_milvus_settings:
@@ -88,6 +91,7 @@ def build_resume_incremental_runtime(
         max_attempts=max_attempts,
         retry_delay_seconds=retry_delay_seconds,
         task_lease_seconds=task_lease_seconds,
+        source_worker_count=source_worker_count,
         vector_service=resolved_vector_service,
         dataset_spec=RESUME_SPEC,
         source=resolved_source,

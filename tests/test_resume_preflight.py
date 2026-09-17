@@ -157,6 +157,47 @@ def test_resume_cli_exposes_full_build_worker_count() -> None:
     assert resume_args.worker_count == 3
 
 
+def test_resume_cli_exposes_incremental_source_worker_count() -> None:
+    """Resume Poll 单轮和常驻入口都应显式暴露来源表级并发度。"""
+
+    parser = build_parser()
+    once_args = parser.parse_args(
+        [
+            "incremental-once",
+            "--worker-id",
+            "resume-worker",
+            "--cycle-id",
+            "cycle-1",
+            "--max-attempts",
+            "4",
+            "--retry-delay-seconds",
+            "30",
+            "--task-lease-seconds",
+            "300",
+            "--worker-count",
+            "2",
+        ]
+    )
+    worker_args = parser.parse_args(
+        [
+            "incremental-worker",
+            "--worker-id",
+            "resume-worker",
+            "--max-attempts",
+            "4",
+            "--retry-delay-seconds",
+            "30",
+            "--task-lease-seconds",
+            "300",
+            "--worker-count",
+            "4",
+        ]
+    )
+
+    assert once_args.worker_count == 2
+    assert worker_args.worker_count == 4
+
+
 def test_cli_prints_safe_json_summary(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
@@ -325,6 +366,8 @@ def test_cli_incremental_once_uses_resume_poll_runtime(
             "30",
             "--task-lease-seconds",
             "120",
+            "--worker-count",
+            "2",
         ]
     )
 
@@ -333,6 +376,7 @@ def test_cli_incremental_once_uses_resume_poll_runtime(
         "max_attempts": 3,
         "retry_delay_seconds": 30,
         "task_lease_seconds": 120,
+        "source_worker_count": 2,
         "worker_id": "resume-worker-1",
         "cycle_id": "resume-cycle-1",
     }

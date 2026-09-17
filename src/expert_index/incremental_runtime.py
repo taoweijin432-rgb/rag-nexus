@@ -154,12 +154,17 @@ def build_incremental_runtime(
     max_attempts: int,
     retry_delay_seconds: int,
     task_lease_seconds: int,
+    source_worker_count: int = 1,
     vector_service: object | None = None,
     dataset_spec: DatasetSpec = EXPERT_SPEC,
     source: object | None = None,
     include_cdc_delete_processor: bool = True,
 ) -> IncrementalRuntime:
-    """组装普通 Poll 总编排入口，所有重试和 lease 参数必须显式传入。"""
+    """组装普通 Poll 总编排入口。
+
+    重试和 lease 参数必须显式传入。``source_worker_count`` 只控制不同来源表
+    之间的并发，默认 1 保持 Expert 现有串行行为；同表任务始终严格 FIFO。
+    """
 
     scanner = build_incremental_scan_coordinator(
         settings,
@@ -201,6 +206,7 @@ def build_incremental_runtime(
         IncrementalRoundScheduler(
             coordinator,
             source_table_order=dataset_spec.source_tables,
+            worker_count=source_worker_count,
         ),
     )
 

@@ -305,6 +305,7 @@ def test_resume_incremental_runtime_binds_four_resume_sources_without_cdc() -> N
         max_attempts=3,
         retry_delay_seconds=30,
         task_lease_seconds=120,
+        source_worker_count=3,
         source=source,
         vector_service=_VectorService(),  # type: ignore[arg-type]
         preflight_runner=_preflight,
@@ -314,6 +315,7 @@ def test_resume_incremental_runtime_binds_four_resume_sources_without_cdc() -> N
     assert scanner._dataset_spec is RESUME_SPEC
     assert scanner.scan_service.source_adapter is source
     assert scanner._dataset_spec.source_tables == RESUME_SPEC.source_tables
+    assert runtime.runtime.scheduler._worker_count == 3
     assert runtime.preflight.index_schema == "resume_index"
 
 

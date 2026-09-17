@@ -99,6 +99,13 @@ def build_parser() -> argparse.ArgumentParser:
     incremental_once.add_argument("--max-attempts", type=int, required=True)
     incremental_once.add_argument("--retry-delay-seconds", type=int, required=True)
     incremental_once.add_argument("--task-lease-seconds", type=int, required=True)
+    incremental_once.add_argument(
+        "--worker-count",
+        type=int,
+        choices=range(1, 5),
+        default=1,
+        help="不同来源表之间的并发度，范围 1~4；默认 1",
+    )
 
     incremental_worker = subcommands.add_parser(
         "incremental-worker",
@@ -110,6 +117,13 @@ def build_parser() -> argparse.ArgumentParser:
     incremental_worker.add_argument("--max-attempts", type=int, required=True)
     incremental_worker.add_argument("--retry-delay-seconds", type=int, required=True)
     incremental_worker.add_argument("--task-lease-seconds", type=int, required=True)
+    incremental_worker.add_argument(
+        "--worker-count",
+        type=int,
+        choices=range(1, 5),
+        default=1,
+        help="不同来源表之间的并发度，范围 1~4；默认 1",
+    )
     incremental_worker.add_argument("--max-cycles", type=int)
     return parser
 
@@ -173,6 +187,7 @@ def main(argv: list[str] | None = None) -> None:
             max_attempts=args.max_attempts,
             retry_delay_seconds=args.retry_delay_seconds,
             task_lease_seconds=args.task_lease_seconds,
+            source_worker_count=args.worker_count,
         ).run_once(args.worker_id, cycle_id=args.cycle_id)
         print(json.dumps(result.to_summary(), ensure_ascii=False, sort_keys=True))
     elif args.command == "incremental-worker":
@@ -182,6 +197,7 @@ def main(argv: list[str] | None = None) -> None:
             max_attempts=args.max_attempts,
             retry_delay_seconds=args.retry_delay_seconds,
             task_lease_seconds=args.task_lease_seconds,
+            source_worker_count=args.worker_count,
         )
         result = IncrementalWorker(
             runtime,
@@ -209,8 +225,9 @@ def _build_poll_runtime(
     max_attempts: int,
     retry_delay_seconds: int,
     task_lease_seconds: int,
+    source_worker_count: int,
 ) -> ResumeIncrementalRuntime:
-    """延迟组装 Resume Poll，其他命令不会导入或启动增量运行时。"""
+    """延迟组装 Resume Poll，并显式传入来源表级并发度。"""
 
     from .incremental_runtime import build_resume_incremental_runtime
 
@@ -219,6 +236,7 @@ def _build_poll_runtime(
         max_attempts=max_attempts,
         retry_delay_seconds=retry_delay_seconds,
         task_lease_seconds=task_lease_seconds,
+        source_worker_count=source_worker_count,
     )
 
 
