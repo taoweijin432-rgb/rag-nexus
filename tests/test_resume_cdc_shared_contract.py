@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from datetime import datetime, timezone
+from types import SimpleNamespace
 
 import pytest
 
@@ -21,7 +22,7 @@ from expert_index.cdc import (
     parse_canal_batch,
     prepare_cdc_delete_task,
 )
-from expert_index.models import SourceSyncTask
+from expert_index.models import PreparedChunkSet, SourceSyncTask, impact_scope_from_target
 from resume_index.dataset import RESUME_SPEC
 
 RESUME_DESTINATION = "company_resume"
@@ -70,6 +71,38 @@ def _resume_delete(table: str, *, row_id: int, resume_id: int) -> CanalBatch:
             ),
         ),
         RESUME_DESTINATION,
+    )
+
+
+def _resume_task(
+    task_id: int,
+    source_table: str,
+    source_record_id: int,
+    target_type: str,
+    *,
+    batch_id: int,
+    resume_id: int = 9001,
+) -> SourceSyncTask:
+    """构造只包含定位字段的 Resume CDC DELETE Task。"""
+
+    now = datetime.now(timezone.utc)
+    return SourceSyncTask(
+        task_id=task_id,
+        dedupe_key=f"{task_id:064x}",
+        batch_id=batch_id,
+        event_source="cdc",
+        source_table=source_table,
+        source_record_id=source_record_id,
+        source_updated_at=None,
+        expert_id=resume_id,
+        operation_type="delete",
+        target_type=target_type,
+        processing_stage="candidate",
+        sync_status="pending",
+        retry_count=0,
+        policy_version="1.3",
+        created_at=now,
+        updated_at=now,
     )
 
 
@@ -154,23 +187,12 @@ def test_resume_receiver_maps_child_delete_to_frozen_scope(
 def test_resume_profile_delete_does_not_require_row_id_to_equal_resume_id() -> None:
     """DELETE 范围校验允许 Resume 主档的物理 ID 与人物 ID 不同。"""
 
-    task = SourceSyncTask(
-        task_id=1,
-        dedupe_key="a" * 64,
+    task = _resume_task(
+        1,
+        "resume",
+        501,
+        "expert",
         batch_id=88,
-        event_source="cdc",
-        source_table="resume",
-        source_record_id=501,
-        source_updated_at=None,
-        expert_id=9001,
-        operation_type="delete",
-        target_type="expert",
-        processing_stage="candidate",
-        sync_status="pending",
-        retry_count=0,
-        policy_version="1.3",
-        created_at=datetime.now(timezone.utc),
-        updated_at=datetime.now(timezone.utc),
     )
 
     prepared = prepare_cdc_delete_task(
@@ -183,6 +205,95 @@ def test_resume_profile_delete_does_not_require_row_id_to_equal_resume_id() -> N
     assert prepared.impact_scope.scope_type == "expert"
     assert prepared.impact_scope.expert_id == 9001
     assert prepared.is_empty is True
+
+
+@pytest.mark.parametrize(
+    ("source_table", "target_type", "expected_chunk_type"),
+    [
+        ("resume_work_experience", "employment", "employment"),
+        ("resume_project_experience", "project", "project"),
+    ],
+)
+def test_resume_child_delete_keeps_resume_scope_source_table(
+    source_table: str,
+    target_type: str,
+    expected_chunk_type: str,
+) -> None:
+    """Resume 子表物理删除的空 desired 范围不得回退到 Expert 表标签。"""
+
+    task = _resume_task(
+        2,
+        source_table,
+        501,
+        target_type,
+        batch_id=89,
+    )
+
+    prepared = prepare_cdc_delete_task(
+        task,
+        object(),  # 工作/项目物理删除不读取已删除来源行。
+        object(),  # 空 desired 不调用 ChunkFactory。
+        dataset_spec=RESUME_SPEC,
+    )
+
+    scope = prepared.impact_scope
+    assert scope.scope_type == target_type
+    assert scope.expert_id == 9001
+    assert scope.chunk_type == expected_chunk_type
+    assert scope.source_table == source_table
+    assert scope.source_field_id == "501"
+    assert prepared.is_empty is True
+
+
+def test_resume_education_delete_keeps_resume_profile_scope(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Resume 教育物理删除重建 Profile 时继续使用 Resume 组合来源标签。"""
+
+    task = _resume_task(
+        3,
+        "resume_education_experience",
+        701,
+        "education",
+        batch_id=90,
+    )
+    resume_scope = impact_scope_from_target(
+        target_type="profile",
+        expert_id=9001,
+        dataset_spec=RESUME_SPEC,
+    )
+    facts = SimpleNamespace(
+        scope=resume_scope,
+        expert=SimpleNamespace(id=9001),
+    )
+    expected = PreparedChunkSet(
+        task_id=task.task_id,
+        batch_id=task.batch_id,
+        data_version=str(task.batch_id),
+        impact_scope=resume_scope,
+        desired_chunks=(),
+    )
+
+    class _Source:
+        def read_cdc_education_delete_facts(self, resume_id: int) -> object:
+            assert resume_id == 9001
+            return facts
+
+    def handle(current: object, _factory: object, **_kwargs: object) -> PreparedChunkSet:
+        assert current is facts
+        return expected
+
+    monkeypatch.setattr("expert_index.cdc.delete_scope.handle_profile_scope", handle)
+
+    prepared = prepare_cdc_delete_task(
+        task,
+        _Source(),  # type: ignore[arg-type]
+        object(),  # type: ignore[arg-type]
+        dataset_spec=RESUME_SPEC,
+    )
+
+    assert prepared is expected
+    assert prepared.impact_scope.source_table == RESUME_SPEC.profile_source_label
 
 
 def test_event_identity_namespace_can_be_isolated_by_destination() -> None:

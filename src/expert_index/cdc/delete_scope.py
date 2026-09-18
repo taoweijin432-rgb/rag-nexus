@@ -86,16 +86,36 @@ def prepare_cdc_delete_task(
         raise ValueError("CDC DELETE Task 缺少 expert_id")
     parent_deletes = frozenset(parent_delete_expert_ids)
     if expert_id in parent_deletes or task.source_table == dataset_spec.profile_table:
-        return _empty_prepared_set(task, target_type="expert")
+        return _empty_prepared_set(
+            task,
+            target_type="expert",
+            dataset_spec=dataset_spec,
+        )
     if task.source_table == dataset_spec.employment_table:
-        return _empty_prepared_set(task, target_type="employment")
+        return _empty_prepared_set(
+            task,
+            target_type="employment",
+            dataset_spec=dataset_spec,
+        )
     if task.source_table == dataset_spec.project_table:
-        return _empty_prepared_set(task, target_type="project")
+        return _empty_prepared_set(
+            task,
+            target_type="project",
+            dataset_spec=dataset_spec,
+        )
 
     facts = source.read_cdc_education_delete_facts(expert_id)
     if facts is None:
-        return _empty_prepared_set(task, target_type="expert")
-    expected_scope = impact_scope_from_target(target_type="profile", expert_id=expert_id)
+        return _empty_prepared_set(
+            task,
+            target_type="expert",
+            dataset_spec=dataset_spec,
+        )
+    expected_scope = impact_scope_from_target(
+        target_type="profile",
+        expert_id=expert_id,
+        dataset_spec=dataset_spec,
+    )
     if facts.scope != expected_scope or facts.expert.id != expert_id:
         raise ValueError("教育删除事实的专家或 Profile 范围与 CDC Task 不一致")
     return handle_profile_scope(
@@ -111,8 +131,13 @@ def _empty_prepared_set(
     task: SourceSyncTask,
     *,
     target_type: str,
+    dataset_spec: DatasetSpec,
 ) -> PreparedChunkSet:
-    """为专家或子记录物理删除构造明确的空 desired 集合。"""
+    """按当前数据集规格为物理删除构造明确的空 desired 集合。
+
+    ``impact_scope_from_target`` 默认使用 Expert 规格，因此 Resume 调用必须把
+    ``dataset_spec`` 继续向下传递，避免子表删除范围回退为 ``experts_*`` 标签。
+    """
 
     expert_id = task.expert_id
     if expert_id is None:
@@ -121,10 +146,9 @@ def _empty_prepared_set(
         target_type=target_type,
         expert_id=expert_id,
         source_field_id=(
-            str(task.source_record_id)
-            if target_type in {"employment", "project"}
-            else None
+            str(task.source_record_id) if target_type in {"employment", "project"} else None
         ),
+        dataset_spec=dataset_spec,
     )
     return PreparedChunkSet(
         task_id=task.task_id,
