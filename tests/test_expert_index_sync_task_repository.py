@@ -380,11 +380,34 @@ def test_list_cdc_expert_delete_ids_reads_only_matching_batch(
     assert expert_ids == frozenset({101, 102})
     sql, params = cursor.executed[0]
     assert "event_source='cdc'" in sql
-    assert "source_table='experts'" in sql
+    assert "source_table=%s" in sql
     assert "operation_type='delete'" in sql
-    assert params == (701,)
+    assert params == (701, "experts")
     assert connection.commit_count == 0
     assert connection.closed is True
+
+
+def test_list_cdc_profile_delete_ids_supports_independent_resume_identity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Resume 主档物理 ID 与 resume_id 不同，父删除集合仍使用人物身份。"""
+
+    cursor = RecordingCursor(
+        alls=[[{"source_record_id": 501, "expert_id": 9001}]]
+    )
+    connection = RecordingConnection(cursor)
+    _patch_connection(monkeypatch, connection)
+
+    resume_ids = _repository().list_cdc_profile_delete_ids(
+        702,
+        profile_source_table="resume",
+        require_matching_source_id=False,
+    )
+
+    assert resume_ids == frozenset({9001})
+    sql, params = cursor.executed[0]
+    assert "source_table=%s" in sql
+    assert params == (702, "resume")
 
 
 def test_list_cdc_expert_delete_ids_rejects_inconsistent_identity(

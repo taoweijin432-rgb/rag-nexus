@@ -24,6 +24,7 @@ from ..models import (
 
 MAX_SOURCE_SYNC_TASK_CLAIM_SIZE = 500
 _SAFE_IDENTIFIER_PATTERN = re.compile(r"^[A-Za-z0-9_.-]+$")
+_PROFILE_SOURCE_TABLES = frozenset({"experts", "resume"})
 # P5.6 原子落定接受的合法数据库阶段：Artifact 已持久化且下游已回执。
 # 不接受 validated（Artifact 可能尚未持久化，须先经 P5.3B artifact 路径）。
 _FINALIZABLE_STAGES = frozenset({"contract_ready", "handed_off"})
@@ -234,7 +235,30 @@ class MySQLSourceSyncTaskRepository:
         身份字段，不读取 Source、Artifact、Payload 或向量，也不修改任务状态。
         """
 
+        return self.list_cdc_profile_delete_ids(
+            batch_id,
+            profile_source_table="experts",
+            require_matching_source_id=True,
+        )
+
+    def list_cdc_profile_delete_ids(
+        self,
+        batch_id: int,
+        *,
+        profile_source_table: str,
+        require_matching_source_id: bool,
+    ) -> frozenset[int]:
+        """读取同一本地 Canal batch 中指定主档表的物理删除人物 ID。
+
+        Expert 主档 ``id`` 同时是人物身份，因此要求两个字段相等；Resume 主档
+        使用独立 ``resume_id``，调用方会关闭该相等约束，但两个值仍须为正整数。
+        """
+
         _validate_positive_integer("batch_id", batch_id)
+        if profile_source_table not in _PROFILE_SOURCE_TABLES:
+            raise ValueError("profile_source_table 不是受支持的主档来源表")
+        if not isinstance(require_matching_source_id, bool):
+            raise TypeError("require_matching_source_id 必须是 bool")
         connection = pymysql.connect(**self.config.as_kwargs(autocommit=True))
         try:
             with connection.cursor() as cursor:
@@ -243,21 +267,24 @@ class MySQLSourceSyncTaskRepository:
                     SELECT source_record_id, expert_id
                     FROM expert_index_sync_task
                     WHERE batch_id=%s AND event_source='cdc'
-                      AND source_table='experts' AND operation_type='delete'
+                      AND source_table=%s AND operation_type='delete'
                     ORDER BY id ASC
                     """,
-                    (batch_id,),
+                    (batch_id, profile_source_table),
                 )
                 rows = cursor.fetchall()
             expert_ids: set[int] = set()
             for row in rows:
                 source_record_id = int(row["source_record_id"])
                 expert_id = row.get("expert_id")
-                if expert_id is None or int(expert_id) != source_record_id:
+                if expert_id is None:
+                    raise RuntimeError("CDC 主档删除 Task 缺少人物身份")
+                resolved_expert_id = int(expert_id)
+                if require_matching_source_id and resolved_expert_id != source_record_id:
                     raise RuntimeError("CDC 专家删除 Task 的 source_record_id/expert_id 不一致")
-                if source_record_id < 1:
-                    raise RuntimeError("CDC 专家删除 Task 包含非法专家 ID")
-                expert_ids.add(source_record_id)
+                if source_record_id < 1 or resolved_expert_id < 1:
+                    raise RuntimeError("CDC 主档删除 Task 包含非法人物 ID")
+                expert_ids.add(resolved_expert_id)
             return frozenset(expert_ids)
         finally:
             connection.close()

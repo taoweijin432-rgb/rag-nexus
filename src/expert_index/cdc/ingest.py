@@ -13,19 +13,12 @@ from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from typing import Literal, Protocol
 
+from ..dataset import EXPERT_SPEC, DatasetSpec
 from ..models import NewSourceSyncTask
 from .parser import CanalChangeEvent, CanalParseIssue, parse_canal_batch
-from .protocol import CanalBatch, CanalClientPort
+from .protocol import CANAL_DESTINATION, CanalBatch, CanalClientPort
 
 CdcTaskReceiptStatus = Literal["created", "reused_pending", "reused_success"]
-_TARGET_TYPES = {
-    "experts": "expert",
-    "experts_work_experience": "employment",
-    "experts_project_experience": "project",
-    "experts_education_experience": "education",
-}
-
-
 class CdcIngestError(ValueError):
     """表示 CDC 身份或接收输入不满足安全契约。"""
 
@@ -87,6 +80,9 @@ class CdcBatchReceiver:
         *,
         identity_provider: CdcEventIdentityProvider,
         policy_version: str,
+        destination: str = CANAL_DESTINATION,
+        source_schema: str = "expert",
+        dataset_spec: DatasetSpec = EXPERT_SPEC,
     ) -> None:
         """注入明确的 CDC 身份策略；不提供未经冻结的默认身份算法。"""
 
@@ -96,8 +92,17 @@ class CdcBatchReceiver:
             raise ValueError("policy_version 必须是非空字符串")
         if len(policy_version) > 32:
             raise ValueError("policy_version 长度不能超过 32")
+        if not isinstance(destination, str) or not destination.strip():
+            raise ValueError("destination 必须是非空字符串")
+        if not isinstance(source_schema, str) or not source_schema.strip():
+            raise ValueError("source_schema 必须是非空字符串")
+        if not isinstance(dataset_spec, DatasetSpec):
+            raise TypeError("dataset_spec 必须是 DatasetSpec")
         self.identity_provider = identity_provider
         self.policy_version = policy_version
+        self.destination = destination
+        self.source_schema = source_schema
+        self.dataset_spec = dataset_spec
 
     def receive(
         self,
@@ -112,7 +117,12 @@ class CdcBatchReceiver:
             raise TypeError("local_batch_id 必须是正整数")
         if local_batch_id < 1:
             raise ValueError("local_batch_id 必须是正整数")
-        parsed = parse_canal_batch(batch)
+        parsed = parse_canal_batch(
+            batch,
+            destination=self.destination,
+            source_schema=self.source_schema,
+            dataset_spec=self.dataset_spec,
+        )
         if parsed.rollback_required:
             return CdcBatchReceiveResult(local_batch_id, (), (), parsed.ignored_count, parsed.issues)
 
@@ -175,7 +185,11 @@ class CdcBatchReceiver:
             raise CdcIngestError("identity_provider 必须返回非空 cdc_event_id")
         if len(cdc_event_id) > 256:
             raise CdcIngestError("cdc_event_id 长度不能超过 256")
-        target_type = _TARGET_TYPES[event.source_table]
+        target_type = (
+            "expert"
+            if event.source_table == self.dataset_spec.profile_table
+            else self.dataset_spec.target_type_for_source_table(event.source_table)
+        )
         dedupe_key = _task_dedupe_key(cdc_event_id, event, self.policy_version, target_type)
         task = NewSourceSyncTask(
             dedupe_key=dedupe_key,

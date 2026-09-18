@@ -233,8 +233,10 @@ def build_incremental_handoff_runtime(
     #     也不调用 Canal ACK。
     cdc_delete_processor = None
     if include_cdc_delete_processor:
-        if not isinstance(resolved_source, MySQLSourceAdapter):
-            raise TypeError("CDC Delete Processor 只能绑定 Expert MySQLSourceAdapter")
+        if not callable(
+            getattr(resolved_source, "read_cdc_education_delete_facts", None)
+        ):
+            raise TypeError("CDC Delete Processor 的 Source 缺少教育删除事实读取能力")
         cdc_delete_processor = CdcDeleteTaskProcessor(
             task_repository=task_repo,
             source=resolved_source,
@@ -243,6 +245,7 @@ def build_incremental_handoff_runtime(
             lease_seconds=settings.incremental_scan.lease_seconds,
             max_attempts=max_attempts,
             retry_delay_seconds=retry_delay_seconds,
+            dataset_spec=dataset_spec,
         )
 
     return IncrementalHandoffRuntime(

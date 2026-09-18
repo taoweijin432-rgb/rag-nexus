@@ -6,6 +6,7 @@ from collections.abc import Callable
 from typing import Protocol
 
 from ..chunk_builder import ChunkFactory
+from ..dataset import EXPERT_SPEC, DatasetSpec
 from ..handoff_orchestrator import HandoffOrchestrationResult
 from ..models import PreparedChunkSet, SourceSyncTask
 from ..repositories.sync_task import (
@@ -37,6 +38,14 @@ class CdcDeleteTaskRepositoryPort(Protocol):
         *,
         next_stage: str,
     ) -> SourceSyncTask: ...
+
+    def list_cdc_profile_delete_ids(
+        self,
+        batch_id: int,
+        *,
+        profile_source_table: str,
+        require_matching_source_id: bool,
+    ) -> frozenset[int]: ...
 
     def list_cdc_expert_delete_ids(self, batch_id: int) -> frozenset[int]: ...
 
@@ -93,6 +102,7 @@ class CdcDeleteTaskProcessor:
         lease_seconds: int,
         max_attempts: int,
         retry_delay_seconds: int,
+        dataset_spec: DatasetSpec = EXPERT_SPEC,
     ) -> None:
         """保存现有 P4/P5/P6 依赖并校验租约、重试参数。"""
 
@@ -110,6 +120,8 @@ class CdcDeleteTaskProcessor:
             or retry_delay_seconds < 1
         ):
             raise ValueError("retry_delay_seconds 必须是正整数")
+        if not isinstance(dataset_spec, DatasetSpec):
+            raise TypeError("dataset_spec 必须是 DatasetSpec")
         self._task_repository = task_repository
         self._source = source
         self._factory = factory
@@ -117,6 +129,7 @@ class CdcDeleteTaskProcessor:
         self._lease_seconds = lease_seconds
         self._max_attempts = max_attempts
         self._retry_delay_seconds = retry_delay_seconds
+        self._dataset_spec = dataset_spec
 
     def process_claimed(
         self,
@@ -205,12 +218,33 @@ class CdcDeleteTaskProcessor:
         self._validate_claimed_task(current, attempt_token)
         if current.processing_stage not in _PREPARATION_STAGE_INDEX:
             raise SourceSyncTaskStageConflictError("CDC DELETE Task 已越过 preparation 阶段")
-        parent_delete_ids = self._task_repository.list_cdc_expert_delete_ids(current.batch_id)
+        list_profile_deletes = getattr(
+            self._task_repository,
+            "list_cdc_profile_delete_ids",
+            None,
+        )
+        if callable(list_profile_deletes):
+            parent_delete_ids = list_profile_deletes(
+                current.batch_id,
+                profile_source_table=self._dataset_spec.profile_table,
+                require_matching_source_id=(
+                    self._dataset_spec.profile_identity_column == "id"
+                ),
+            )
+        elif self._dataset_spec == EXPERT_SPEC:
+            # 兼容只实现旧 Expert 端口的既有测试桩和外部适配器。Resume 必须
+            # 实现新端口，禁止错误回退到 ``experts`` 主档表。
+            parent_delete_ids = self._task_repository.list_cdc_expert_delete_ids(
+                current.batch_id
+            )
+        else:
+            raise TypeError("Resume CDC Task Repository 缺少主档删除查询能力")
         prepared = prepare_cdc_delete_task(
             current,
             self._source,
             self._factory,
             parent_delete_expert_ids=parent_delete_ids,
+            dataset_spec=self._dataset_spec,
         )
         self._task_repository.renew_source_sync_task_lease(
             current.task_id,

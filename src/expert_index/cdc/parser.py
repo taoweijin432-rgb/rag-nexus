@@ -10,6 +10,7 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 
+from ..dataset import EXPERT_SPEC, DatasetSpec
 from .protocol import (
     CANAL_DESTINATION,
     CANAL_SUBSCRIPTION,
@@ -19,14 +20,6 @@ from .protocol import (
 )
 
 _ROW_DATA = "ROWDATA"
-_LOCATOR_COLUMNS = {
-    "experts": frozenset({"id"}),
-    "experts_work_experience": frozenset({"id", "expert_id"}),
-    "experts_project_experience": frozenset({"id", "expert_id"}),
-    "experts_education_experience": frozenset({"id", "expert_id"}),
-}
-
-
 class CanalParserError(ValueError):
     """表示事件违反严格 CDC 输入契约。"""
 
@@ -175,12 +168,25 @@ class CanalParseResult:
         return bool(self.issues)
 
 
-def parse_canal_batch(batch: CanalBatch) -> CanalParseResult:
-    """解析 batch，忽略非删除事件并提取四表 DELETE 的 id/expert_id。"""
+def parse_canal_batch(
+    batch: CanalBatch,
+    *,
+    destination: str = CANAL_DESTINATION,
+    source_schema: str = "expert",
+    dataset_spec: DatasetSpec = EXPERT_SPEC,
+) -> CanalParseResult:
+    """解析 batch，忽略非删除事件并提取当前数据集的物理行及人物身份。
+
+    默认参数完整保留 Expert 既有行为。Resume 调用方必须显式传入自己的
+    ``destination``、来源 Schema 和 :class:`DatasetSpec`；主表 ``id`` 与
+    ``resume_id`` 因而可以分别承担物理行定位和人物身份。
+    """
+
+    _validate_parser_contract(destination, source_schema, dataset_spec)
 
     if batch.is_empty:
         return CanalParseResult((), 0, ())
-    if batch.destination != CANAL_DESTINATION:
+    if batch.destination != destination:
         raise CanalParserError("Canal destination 缺失或不匹配")
 
     delete_events: list[CanalChangeEvent] = []
@@ -203,7 +209,10 @@ def parse_canal_batch(batch: CanalBatch) -> CanalParseResult:
         if operation != "DELETE":
             issues.append(CanalParseIssue("unsupported_operation", entry_index))
             continue
-        if entry.source_schema != "expert" or entry.source_table not in _LOCATOR_COLUMNS:
+        if (
+            entry.source_schema != source_schema
+            or entry.source_table not in dataset_spec.checkpoint_source_tables
+        ):
             issues.append(CanalParseIssue("unsupported_source", entry_index))
             continue
         if not entry.rows:
@@ -224,7 +233,8 @@ def parse_canal_batch(batch: CanalBatch) -> CanalParseResult:
                 issues.append(CanalParseIssue("delete_after_image_not_empty", entry_index, row_index))
                 continue
             image = before
-            required = _LOCATOR_COLUMNS[entry.source_table]
+            identity_column = _identity_column(dataset_spec, entry.source_table)
+            required = frozenset({"id", identity_column})
             if not required.issubset(image):
                 issues.append(CanalParseIssue("missing_delete_locator", entry_index, row_index))
                 continue
@@ -232,14 +242,10 @@ def parse_canal_batch(batch: CanalBatch) -> CanalParseResult:
             if source_record_id is None:
                 issues.append(CanalParseIssue("invalid_source_record_id", entry_index, row_index))
                 continue
-            expert_id = None
-            if entry.source_table == "experts":
-                expert_id = source_record_id
-            else:
-                expert_id = _positive_int(image.get("expert_id"))
-                if expert_id is None:
-                    issues.append(CanalParseIssue("invalid_expert_id", entry_index, row_index))
-                    continue
+            expert_id = _positive_int(image.get(identity_column))
+            if expert_id is None:
+                issues.append(CanalParseIssue("invalid_expert_id", entry_index, row_index))
+                continue
             event = CanalChangeEvent(
                 source_schema=entry.source_schema,
                 source_table=entry.source_table,
@@ -256,6 +262,31 @@ def parse_canal_batch(batch: CanalBatch) -> CanalParseResult:
             delete_events.append(event)
 
     return CanalParseResult(tuple(delete_events), ignored_count, tuple(issues))
+
+
+def _validate_parser_contract(
+    destination: str,
+    source_schema: str,
+    dataset_spec: DatasetSpec,
+) -> None:
+    """在读取 Canal Payload 前验证调用方提供的隔离契约。"""
+
+    if not isinstance(destination, str) or not destination.strip():
+        raise ValueError("destination 必须是非空字符串")
+    if not isinstance(source_schema, str) or not source_schema.strip():
+        raise ValueError("source_schema 必须是非空字符串")
+    if not isinstance(dataset_spec, DatasetSpec):
+        raise TypeError("dataset_spec 必须是 DatasetSpec")
+
+
+def _identity_column(dataset_spec: DatasetSpec, source_table: str) -> str:
+    """返回 CDC Before Image 中承载全链路人物身份的列名。"""
+
+    if source_table == dataset_spec.profile_table:
+        return dataset_spec.profile_identity_column
+    if source_table in dataset_spec.checkpoint_source_tables:
+        return dataset_spec.child_identity_column
+    raise ValueError(f"{dataset_spec.name} 不支持来源表: {source_table}")
 
 
 def _columns_to_values(columns: tuple[Any, ...]) -> dict[str, Any] | None:

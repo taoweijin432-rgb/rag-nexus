@@ -9,6 +9,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from ..config import Settings
+from ..dataset import EXPERT_SPEC, DatasetSpec
 from ..handoff_factory import build_incremental_handoff_runtime
 from ..repositories.cdc_checkpoint import MySQLCdcCheckpointRepository
 from ..repositories.cdc_event import MySQLCdcBatchPersistence
@@ -27,7 +28,12 @@ class CdcRuntimeDisabledError(RuntimeError):
     """表示 CDC_ENABLED 未打开，拒绝组装真实消费运行时。"""
 
 
-def build_cdc_protocol_baseline(settings: Settings) -> CanalProtocolBaseline:
+def build_cdc_protocol_baseline(
+    settings: Settings,
+    *,
+    expected_destination: str = CANAL_DESTINATION,
+    expected_subscription: str = CANAL_SUBSCRIPTION,
+) -> CanalProtocolBaseline:
     """将显式部署配置转换为 CDC 协议门禁模型。
 
     ``production_ready`` 只有在真实 Probe、源连接和 ACK 测试均由部署人员确认后
@@ -40,9 +46,9 @@ def build_cdc_protocol_baseline(settings: Settings) -> CanalProtocolBaseline:
         unresolved.append("canal_server_version_mismatch")
     if config.server_mode.strip().casefold() != "tcp":
         unresolved.append("canal_server_mode_unconfirmed")
-    if config.destination != CANAL_DESTINATION:
+    if config.destination != expected_destination:
         unresolved.append("canal_destination_mismatch")
-    if config.subscription != CANAL_SUBSCRIPTION:
+    if config.subscription != expected_subscription:
         unresolved.append("canal_subscription_mismatch")
     if config.tcp_port != config.port:
         unresolved.append("canal_port_mismatch")
@@ -122,6 +128,10 @@ def build_cdc_runtime(
     retry_delay_seconds: int,
     task_lease_seconds: int,
     vector_service: object | None = None,
+    dataset_spec: DatasetSpec = EXPERT_SPEC,
+    source: object | None = None,
+    source_schema: str | None = None,
+    destination: str | None = None,
 ) -> CdcRuntime:
     """将真实 Client 接入已有 CDC Event/Task、P4/P5/P6 和 Checkpoint 组件。
 
@@ -138,21 +148,39 @@ def build_cdc_runtime(
         raise TypeError("protocol_baseline 必须是 CanalProtocolBaseline")
     if not settings.cdc_runtime.enabled:
         raise CdcRuntimeDisabledError("CDC_ENABLED=false，拒绝组装真实 Canal 消费运行时")
+    if not isinstance(dataset_spec, DatasetSpec):
+        raise TypeError("dataset_spec 必须是 DatasetSpec")
     settings.validate_index_write_boundary()
+    resolved_destination = destination or settings.cdc_runtime.destination
+    resolved_source_schema = source_schema or settings.source_db.database
+    if resolved_destination != settings.cdc_runtime.destination:
+        raise ValueError("CDC destination 与运行配置不一致")
+    if not isinstance(resolved_source_schema, str) or not resolved_source_schema.strip():
+        raise ValueError("source_schema 必须是非空字符串")
     handoff = build_incremental_handoff_runtime(
         settings,
         max_attempts=max_attempts,
         retry_delay_seconds=retry_delay_seconds,
         vector_service=vector_service,
+        dataset_spec=dataset_spec,
+        source=source,
     )
+    if handoff.cdc_delete_processor is None:  # pragma: no cover - 组装契约防御
+        raise RuntimeError("CDC 运行时缺少 DELETE Task Processor")
     receiver = CdcBatchReceiver(
         identity_provider=identity_provider,
         policy_version=settings.chunk_policy_version,
+        destination=resolved_destination,
+        source_schema=resolved_source_schema,
+        dataset_spec=dataset_spec,
     )
     coordinator = CdcBatchCoordinator(
         protocol_baseline=protocol_baseline,
         receiver=receiver,
-        persistence=MySQLCdcBatchPersistence(settings.index_db),
+        persistence=MySQLCdcBatchPersistence(
+            settings.index_db,
+            destination=resolved_destination,
+        ),
         task_repository=handoff.task_repo,
         task_processor=handoff.cdc_delete_processor,
         checkpoint_repository=MySQLCdcCheckpointRepository(settings.index_db),
