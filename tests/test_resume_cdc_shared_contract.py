@@ -5,6 +5,8 @@ from __future__ import annotations
 from collections.abc import Sequence
 from datetime import datetime, timezone
 
+import pytest
+
 from expert_index.cdc import (
     CANAL_DESTINATION,
     CanalBatch,
@@ -111,6 +113,42 @@ def test_resume_receiver_maps_profile_delete_to_expert_scope() -> None:
     assert task.source_record_id == 501
     assert task.expert_id == 9001
     assert task.target_type == "expert"
+
+
+@pytest.mark.parametrize(
+    ("source_table", "target_type"),
+    [
+        ("resume_work_experience", "employment"),
+        ("resume_project_experience", "project"),
+        ("resume_education_experience", "education"),
+    ],
+)
+def test_resume_receiver_maps_child_delete_to_frozen_scope(
+    source_table: str,
+    target_type: str,
+) -> None:
+    """三张 Resume 子表物理删除必须保留物理行 ID 和人物身份。"""
+
+    persistence = _Persistence()
+    receiver = CdcBatchReceiver(
+        identity_provider=lambda _event: f"resume-event-{source_table}",
+        policy_version="1.3",
+        destination=RESUME_DESTINATION,
+        source_schema="expert",
+        dataset_spec=RESUME_SPEC,
+    )
+
+    result = receiver.receive(
+        _resume_delete(source_table, row_id=501, resume_id=9001),
+        local_batch_id=88,
+        persistence=persistence,
+    )
+
+    task = result.plans[0].task
+    assert task.source_table == source_table
+    assert task.source_record_id == 501
+    assert task.expert_id == 9001
+    assert task.target_type == target_type
 
 
 def test_resume_profile_delete_does_not_require_row_id_to_equal_resume_id() -> None:

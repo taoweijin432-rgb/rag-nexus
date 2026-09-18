@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 from dataclasses import asdict
 from typing import TYPE_CHECKING
 
@@ -125,6 +126,19 @@ def build_parser() -> argparse.ArgumentParser:
         help="不同来源表之间的并发度，范围 1~4；默认 1",
     )
     incremental_worker.add_argument("--max-cycles", type=int)
+
+    cdc_worker = subcommands.add_parser(
+        "cdc-worker",
+        help="常驻消费 Resume Canal 物理删除；成功收敛后提交业务水位并 ACK",
+    )
+    cdc_worker.add_argument("--worker-id", required=True)
+    cdc_worker.add_argument("--batch-size", type=int, default=100)
+    cdc_worker.add_argument("--idle-sleep-seconds", type=float, default=5.0)
+    cdc_worker.add_argument("--error-sleep-seconds", type=float, default=10.0)
+    cdc_worker.add_argument("--max-attempts", type=int, required=True)
+    cdc_worker.add_argument("--retry-delay-seconds", type=int, required=True)
+    cdc_worker.add_argument("--task-lease-seconds", type=int, required=True)
+    cdc_worker.add_argument("--max-cycles", type=int)
     return parser
 
 
@@ -135,6 +149,9 @@ def main(argv: list[str] | None = None) -> None:
     """
 
     args = build_parser().parse_args(argv)
+    if args.command == "cdc-worker":
+        # canal-python 0.4 的旧 Protobuf 代码需要 Python 实现；必须在 SDK 懒加载前设置。
+        os.environ.setdefault("PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION", "python")
     if args.command == "preflight-source":
         settings = ResumeSettings.from_env()
         result = run_resume_source_preflight(settings)
@@ -209,6 +226,10 @@ def main(argv: list[str] | None = None) -> None:
             ),
         ).run()
         print(json.dumps(asdict(result), ensure_ascii=False, sort_keys=True))
+    elif args.command == "cdc-worker":
+        settings = ResumeSettings.from_env()
+        result = _run_resume_cdc_worker(settings, args)
+        print(json.dumps(asdict(result), ensure_ascii=False, sort_keys=True))
 
 
 def _build_runtime(settings: ResumeSettings) -> ResumeRuntime:
@@ -238,6 +259,69 @@ def _build_poll_runtime(
         task_lease_seconds=task_lease_seconds,
         source_worker_count=source_worker_count,
     )
+
+
+def _run_resume_cdc_worker(
+    settings: ResumeSettings,
+    args: argparse.Namespace,
+):
+    """组装并运行 Resume CDC Worker，退出时释放 destination 单实例锁。"""
+
+    from expert_index.cdc import (
+        CdcRuntimeDisabledError,
+        CdcWorkerConfig,
+        MySQLCdcLocalBatchIdProvider,
+        build_real_canal_client,
+        decode_canal_message,
+        run_cdc_worker,
+    )
+
+    from .cdc_runtime import (
+        build_resume_cdc_protocol_baseline,
+        build_resume_cdc_runtime,
+    )
+
+    config = settings.cdc_runtime
+    if not config.enabled:
+        raise CdcRuntimeDisabledError("RESUME_CDC_ENABLED=false，拒绝启动 Resume CDC Worker")
+    baseline = build_resume_cdc_protocol_baseline(settings)
+    # 协议门禁先于向量服务和 Canal Client 构造，防止未验证环境半启动。
+    baseline.require_production_ready()
+    client = build_real_canal_client(
+        host=config.host,
+        port=config.port,
+        destination=config.destination,
+        client_id=config.client_id,
+        subscription=config.subscription,
+        username=config.username,
+        password=config.password,
+        decoder=decode_canal_message,
+    )
+    runtime = build_resume_cdc_runtime(
+        settings,
+        client=client,
+        protocol_baseline=baseline,
+        max_attempts=args.max_attempts,
+        retry_delay_seconds=args.retry_delay_seconds,
+        task_lease_seconds=args.task_lease_seconds,
+    )
+    batch_ids = MySQLCdcLocalBatchIdProvider(
+        settings.index_db,
+        destination=config.destination,
+    )
+    try:
+        return run_cdc_worker(
+            runtime,
+            batch_ids,
+            config=CdcWorkerConfig(
+                batch_size=args.batch_size,
+                idle_sleep_seconds=args.idle_sleep_seconds,
+                error_sleep_seconds=args.error_sleep_seconds,
+                max_cycles=args.max_cycles,
+            ),
+        )
+    finally:
+        batch_ids.close()
 
 
 if __name__ == "__main__":
