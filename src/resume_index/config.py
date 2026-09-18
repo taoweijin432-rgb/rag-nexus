@@ -16,6 +16,7 @@ from expert_index.config import (
     DEFAULT_INCREMENTAL_BATCH_SIZE,
     DEFAULT_INCREMENTAL_LEASE_SECONDS,
     MAX_INCREMENTAL_BATCH_SIZE,
+    CdcRuntimeConfig,
     DatabaseBoundaryError,
     DatabaseConfig,
     DatabaseRole,
@@ -24,6 +25,24 @@ from expert_index.config import (
     load_env_file,
 )
 from rag_vector_store.config import DEFAULT_MILVUS_COLLECTION_NAME
+
+# Resume CDC 使用独立 Canal destination 与表订阅，禁止复用 Expert 的
+# ``company_expert`` 和 ``experts_*`` 契约。默认保持关闭，只有部署完成真实
+# Probe、ACK/重投验证后才允许由环境变量显式开启。
+RESUME_CANAL_DESTINATION = "company_resume"
+RESUME_CANAL_SUBSCRIPTION = (
+    r"expert\.(resume|resume_work_experience|resume_project_experience|"
+    r"resume_education_experience)"
+)
+
+
+def _default_resume_cdc_runtime() -> CdcRuntimeConfig:
+    """返回隔离且关闭的 Resume CDC 默认配置。"""
+
+    return CdcRuntimeConfig(
+        destination=RESUME_CANAL_DESTINATION,
+        subscription=RESUME_CANAL_SUBSCRIPTION,
+    )
 
 
 @dataclass(frozen=True)
@@ -84,6 +103,7 @@ class ResumeSettings:
     expert_index_target: PhysicalDatabaseTarget
     expert_milvus_collection_name: str
     incremental_scan: IncrementalScanConfig = field(default_factory=IncrementalScanConfig)
+    cdc_runtime: CdcRuntimeConfig = field(default_factory=_default_resume_cdc_runtime)
 
     def __post_init__(self) -> None:
         """任何构造方式都必须经过角色和物理目标隔离校验。"""
@@ -188,6 +208,56 @@ class ResumeSettings:
                 minimum=1,
             ),
         )
+        cdc_runtime = CdcRuntimeConfig(
+            enabled=_parse_boolean(
+                "RESUME_CDC_ENABLED",
+                values.get("RESUME_CDC_ENABLED", "0"),
+            ),
+            host=values.get("RESUME_CANAL_HOST", "127.0.0.1"),
+            port=_parse_tcp_port(
+                "RESUME_CANAL_PORT",
+                values.get("RESUME_CANAL_PORT", "11111"),
+            ),
+            destination=values.get(
+                "RESUME_CANAL_DESTINATION",
+                RESUME_CANAL_DESTINATION,
+            ),
+            client_id=values.get("RESUME_CANAL_CLIENT_ID", ""),
+            subscription=values.get(
+                "RESUME_CANAL_SUBSCRIPTION",
+                RESUME_CANAL_SUBSCRIPTION,
+            ),
+            username=values.get("RESUME_CANAL_USERNAME", ""),
+            password=values.get("RESUME_CANAL_PASSWORD", ""),
+            server_version=values.get("RESUME_CANAL_SERVER_VERSION", "1.1.8"),
+            server_mode=values.get("RESUME_CANAL_SERVER_MODE", "tcp"),
+            tcp_port=_parse_tcp_port(
+                "RESUME_CANAL_TCP_PORT",
+                values.get("RESUME_CANAL_TCP_PORT", "11111"),
+            ),
+            probe_batch_id=_parse_integer(
+                "RESUME_CDC_PROBE_BATCH_ID",
+                values.get("RESUME_CDC_PROBE_BATCH_ID", "0"),
+                minimum=0,
+            ),
+            probe_entry_count=_parse_integer(
+                "RESUME_CDC_PROBE_ENTRY_COUNT",
+                values.get("RESUME_CDC_PROBE_ENTRY_COUNT", "0"),
+                minimum=0,
+            ),
+            source_connected=_parse_boolean(
+                "RESUME_CDC_SOURCE_CONNECTED",
+                values.get("RESUME_CDC_SOURCE_CONNECTED", "0"),
+            ),
+            ack_confirmed=_parse_boolean(
+                "RESUME_CDC_ACK_CONFIRMED",
+                values.get("RESUME_CDC_ACK_CONFIRMED", "0"),
+            ),
+            protocol_ready=_parse_boolean(
+                "RESUME_CDC_PROTOCOL_READY",
+                values.get("RESUME_CDC_PROTOCOL_READY", "0"),
+            ),
+        )
 
         return cls(
             source_db=source_db,
@@ -200,13 +270,14 @@ class ResumeSettings:
             expert_index_target=expert_index_target,
             expert_milvus_collection_name=expert_collection,
             incremental_scan=incremental_scan,
+            cdc_runtime=cdc_runtime,
         )
 
     def to_processing_settings(self) -> Settings:
         """构造仅绑定 Resume Source/Index 的公共加工配置。
 
-        公共配置中的增量开关和分页参数只来自 ``RESUME_INCREMENTAL_*``，不会读取
-        Expert 的 ``INCREMENTAL_*``。CDC 保持默认关闭，Resume 首版不接入 Canal。
+        公共配置中的增量开关和分页参数只来自 ``RESUME_INCREMENTAL_*``，CDC 参数
+        只来自 ``RESUME_CDC_*``/``RESUME_CANAL_*``，均不会读取 Expert 同名配置。
         """
 
         self.validate_isolation_boundaries()
@@ -214,6 +285,7 @@ class ResumeSettings:
             source_db=self.source_db,
             index_db=self.index_db,
             incremental_scan=self.incremental_scan,
+            cdc_runtime=self.cdc_runtime,
         )
 
     def validate_isolation_boundaries(self) -> None:
@@ -257,6 +329,14 @@ class ResumeSettings:
         if resume_collection.casefold() == expert_collection.casefold():
             raise DatabaseBoundaryError(
                 "RESUME_MILVUS_COLLECTION_NAME 与 Expert Collection 相同，已拒绝串写"
+            )
+        if self.cdc_runtime.destination.strip() != RESUME_CANAL_DESTINATION:
+            raise DatabaseBoundaryError(
+                "RESUME_CANAL_DESTINATION 必须固定为 company_resume，已拒绝串接其他链路"
+            )
+        if self.cdc_runtime.subscription.strip() != RESUME_CANAL_SUBSCRIPTION:
+            raise DatabaseBoundaryError(
+                "RESUME_CANAL_SUBSCRIPTION 与冻结的四张 Resume 来源表不一致，已拒绝启动"
             )
 
 

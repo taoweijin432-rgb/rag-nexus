@@ -7,7 +7,7 @@
 -- 3. 为复用现有 Repository，控制表沿用内部 expert_index_* 表名；由于 Resume Index
 --    使用独立 Schema，不会与 Expert 控制表混用。
 -- 4. 控制表中的 expert_id 是现有内部技术字段，在 Resume 链路中固定承载 resume_id。
--- 5. Resume 首版只支持 Full/Poll，不创建 CDC Event 或 CDC Checkpoint 表。
+-- 5. CDC 控制表只保存事件位点、状态和任务关联，不保存来源行正文；CDC 默认关闭。
 
 -- 构建批次主表：保存运行边界、进度和下游动作计数，不保存 Resume 正文。
 CREATE TABLE IF NOT EXISTS expert_index_batch (
@@ -128,6 +128,77 @@ CREATE TABLE IF NOT EXISTS expert_index_batch_source (
     )
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
+-- Canal 交付给 Resume 处理链的最小事件记录。先幂等持久化，业务任务按 resume_id
+-- 回查四张来源表的当前快照；本表不保存完整 before/after、简历正文或 Chunk Text。
+CREATE TABLE IF NOT EXISTS expert_index_cdc_event (
+    id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+    cdc_event_id VARCHAR(256) NULL COMMENT '由冻结身份策略生成的 CDC 事件唯一标识',
+    local_batch_id BIGINT UNSIGNED NULL COMMENT 'Index 本地批次 ID，不是 Canal batch_id',
+    task_id BIGINT UNSIGNED NULL COMMENT '逻辑关联 expert_index_sync_task.id',
+    policy_version VARCHAR(32) NULL COMMENT 'CDC Task 身份使用的策略版本',
+    destination VARCHAR(128) NOT NULL COMMENT '固定为 Resume 独立 destination company_resume',
+    binlog_file VARCHAR(128) NOT NULL COMMENT '事件所在 MySQL Binlog 文件',
+    binlog_position BIGINT UNSIGNED NOT NULL COMMENT '事件在 Binlog 文件中的偏移量',
+    binlog_server_id BIGINT UNSIGNED NULL COMMENT 'Canal header server_id，仅用于协议审计',
+    row_index INT UNSIGNED NOT NULL COMMENT '同一 Binlog 事件内从 0 开始的行序号',
+    event_time DATETIME(6) NOT NULL COMMENT '来源 Binlog 事件发生时间',
+    source_schema VARCHAR(128) NOT NULL COMMENT '发生变化的来源 Schema',
+    source_table VARCHAR(128) NOT NULL COMMENT '发生变化的四张 Resume 来源表之一',
+    operation_type VARCHAR(16) NOT NULL COMMENT 'insert/update/delete',
+    source_record_id BIGINT UNSIGNED NOT NULL COMMENT '发生变化的来源表物理主键 id',
+    expert_id BIGINT UNSIGNED NULL COMMENT '内部兼容字段，Resume 链路中固定承载 resume_id',
+    status VARCHAR(16) NOT NULL DEFAULT 'pending'
+        COMMENT 'pending/running/retry/success/dead_letter',
+    attempt_count SMALLINT UNSIGNED NOT NULL DEFAULT 0 COMMENT '业务处理实际尝试次数',
+    error_type VARCHAR(128) NULL COMMENT '安全异常类型，不保存来源行内容',
+    error_message VARCHAR(512) NULL COMMENT '截断后的安全错误摘要，不保存 PII 或正文',
+    processed_at DATETIME(6) NULL COMMENT '事件完成处理或进入 Dead Letter 的时间',
+    created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+    updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6)
+        ON UPDATE CURRENT_TIMESTAMP(6),
+    PRIMARY KEY (id),
+    UNIQUE KEY uk_expert_cdc_event_id (cdc_event_id),
+    UNIQUE KEY uk_expert_cdc_event_position (
+        destination, binlog_file, binlog_position, row_index
+    ),
+    KEY idx_expert_cdc_event_queue (status, id),
+    KEY idx_expert_cdc_event_expert (expert_id, event_time),
+    KEY idx_expert_cdc_event_task (task_id, status),
+    CONSTRAINT chk_expert_cdc_event_table CHECK (
+        source_table IN (
+            'resume',
+            'resume_work_experience',
+            'resume_project_experience',
+            'resume_education_experience'
+        )
+    ),
+    CONSTRAINT chk_expert_cdc_event_operation CHECK (
+        operation_type IN ('insert', 'update', 'delete')
+    ),
+    CONSTRAINT chk_expert_cdc_event_status CHECK (
+        status IN ('pending', 'running', 'retry', 'success', 'dead_letter')
+    )
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+-- 已完成下游收敛的 Resume Canal 业务位点。该水位不代替 Canal Server Offset，
+-- Canal batch_id 也不作为跨重启身份。
+CREATE TABLE IF NOT EXISTS expert_index_cdc_checkpoint (
+    destination VARCHAR(128) NOT NULL COMMENT 'Resume 独立 Canal destination',
+    binlog_server_id BIGINT UNSIGNED NOT NULL COMMENT '已应用位点的 MySQL server_id',
+    binlog_file VARCHAR(128) NOT NULL COMMENT '已应用的 Binlog 文件',
+    binlog_position BIGINT UNSIGNED NOT NULL COMMENT '已应用的 Binlog 文件内位置',
+    last_local_batch_id BIGINT UNSIGNED NOT NULL COMMENT '最近提交的 Index 本地批次 ID',
+    lock_version BIGINT UNSIGNED NOT NULL DEFAULT 0 COMMENT 'CAS 乐观锁版本',
+    last_success_at DATETIME(6) NOT NULL COMMENT '最近一次成功提交的 Index MySQL 时间',
+    created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+    updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6)
+        ON UPDATE CURRENT_TIMESTAMP(6),
+    PRIMARY KEY (destination),
+    KEY idx_expert_cdc_checkpoint_position (
+        binlog_server_id, binlog_file, binlog_position
+    )
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
 -- 一条来源记录的标准处理任务。expert_id 在本 Schema 中固定表示 resume_id。
 CREATE TABLE IF NOT EXISTS expert_index_sync_task (
     id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
@@ -135,7 +206,7 @@ CREATE TABLE IF NOT EXISTS expert_index_sync_task (
         COMMENT '按冻结公式生成的 SHA-256 跨批次幂等键',
     batch_id BIGINT UNSIGNED NOT NULL COMMENT '逻辑关联 expert_index_batch.id',
     event_source VARCHAR(16) NOT NULL DEFAULT 'poll'
-        COMMENT 'poll/reconcile/replay，首版不接入 cdc',
+        COMMENT 'poll/cdc/reconcile/replay',
     source_table VARCHAR(128) NOT NULL COMMENT '发生变化的 Resume 来源表',
     source_record_id BIGINT UNSIGNED NOT NULL COMMENT '来源表物理主键 id',
     source_updated_at DATETIME(6) NULL COMMENT '扫描候选的来源 updated_at',
@@ -185,7 +256,7 @@ CREATE TABLE IF NOT EXISTS expert_index_sync_task (
         operation_type IN ('insert', 'update', 'delete')
     ),
     CONSTRAINT chk_expert_sync_task_event_source CHECK (
-        event_source IN ('poll', 'reconcile', 'replay')
+        event_source IN ('poll', 'cdc', 'reconcile', 'replay')
     ),
     CONSTRAINT chk_expert_sync_task_target CHECK (
         target_type IN ('expert', 'profile', 'employment', 'project', 'education')
