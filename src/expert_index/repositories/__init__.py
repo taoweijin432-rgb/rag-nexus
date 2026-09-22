@@ -12,6 +12,7 @@ from .batch import (
     FullBatchCheckpoint,
     MySQLBatchRepository,
 )
+from .batch_id import BatchIdAllocationError, MySQLBatchIdAllocator, allocate_batch_id
 from .batch_item import BatchItemSummary, MySQLBatchItemRepository
 from .build_lock import ConcurrentBuildError, MySQLBuildLockRepository
 from .cdc_checkpoint import MySQLCdcCheckpointRepository
@@ -37,6 +38,7 @@ from .sync_task import (
 __all__ = [
     "ArtifactPayloadConflictError",
     "ArtifactPayloadValidationError",
+    "BatchIdAllocationError",
     "BatchItemSummary",
     "BatchNotResumableError",
     "BatchNotRetryableError",
@@ -48,6 +50,7 @@ __all__ = [
     "DeadLetterRequeueResult",
     "FullBatchCheckpoint",
     "MySQLArtifactRepository",
+    "MySQLBatchIdAllocator",
     "MySQLBatchItemRepository",
     "MySQLBatchRepository",
     "MySQLBuildLockRepository",
@@ -60,4 +63,5 @@ __all__ = [
     "SourceLeaseConflictError",
     "SourceSyncTaskLeaseConflictError",
     "SourceSyncTaskStageConflictError",
+    "allocate_batch_id",
 ]

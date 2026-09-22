@@ -7,6 +7,7 @@ from pathlib import Path
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 RESUME_INDEX_DDL = PROJECT_ROOT / "sql" / "020_create_resume_index_tables.sql"
 RESUME_CDC_MIGRATION = PROJECT_ROOT / "sql" / "021_add_resume_cdc_control_tables.sql"
+BATCH_ID_SEQUENCE_MIGRATION = PROJECT_ROOT / "sql" / "022_add_global_batch_id_sequence.sql"
 
 EXPECTED_CONTROL_TABLES = {
     "expert_index_batch",
@@ -18,6 +19,7 @@ EXPECTED_CONTROL_TABLES = {
     "expert_index_batch_item",
     "expert_index_cdc_event",
     "expert_index_cdc_checkpoint",
+    "expert_index_batch_id_sequence",
 }
 RESUME_SOURCE_TABLES = {
     "resume",
@@ -172,3 +174,25 @@ def test_resume_cdc_migration_is_resume_only_and_replay_safe() -> None:
         assert f"'{expert_source_table}'" not in migration
     for source_table in RESUME_SOURCE_TABLES:
         assert f"ALTER TABLE {source_table}" not in migration
+
+
+def test_global_batch_id_sequence_migration_uses_all_persisted_watermarks() -> None:
+    """统一序列必须覆盖 Poll、全量、任务、CDC 和 Checkpoint 历史编号。"""
+
+    migration = BATCH_ID_SEQUENCE_MIGRATION.read_text(encoding="utf-8")
+
+    assert "CREATE TABLE IF NOT EXISTS expert_index_batch_id_sequence" in migration
+    assert "PRIMARY KEY (sequence_name)" in migration
+    for watermark in (
+        "MAX(id) FROM expert_index_batch",
+        "MAX(batch_id) FROM expert_index_batch_source",
+        "MAX(batch_id) FROM expert_index_batch_item",
+        "MAX(batch_id) FROM expert_index_sync_task",
+        "MAX(batch_id) FROM expert_index_sync_dead_letter",
+        "MAX(last_batch_id) FROM expert_index_source_checkpoint",
+        "MAX(local_batch_id) FROM expert_index_cdc_event",
+        "MAX(last_local_batch_id) FROM expert_index_cdc_checkpoint",
+    ):
+        assert watermark in migration
+    assert "GREATEST(last_value, VALUES(last_value))" in migration
+    assert "DROP " not in migration.upper()

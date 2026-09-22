@@ -98,10 +98,11 @@ def test_initializer_executes_only_against_resume_index() -> None:
     assert factory.calls[0]["database"] == "resume_index"
     assert factory.calls[0]["autocommit"] is False
     assert result.schema_name == "resume_index"
-    assert result.statements_executed == 9
-    assert len(connection.cursor_instance.statements) == 9
+    assert result.statements_executed == 11
+    assert len(connection.cursor_instance.statements) == 11
     assert all(
         "CREATE TABLE IF NOT EXISTS expert_index_" in statement
+        or statement.startswith("INSERT INTO expert_index_batch_id_sequence")
         for statement in connection.cursor_instance.statements
     )
     assert connection.commit_count == 1

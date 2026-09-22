@@ -1,19 +1,22 @@
 """CDC 本地批次号分配器。
 
 Canal ``batch_id`` 只在当前连接内有效，不能写入业务 Checkpoint。该模块使用 Index
-MySQL 命名锁保证同一 destination 只有一个 CDC Worker，并从已落库 Event/Checkpoint
-恢复本地批次号，空 batch 不产生数据库行。
+MySQL 命名锁保证同一 destination 只有一个 CDC Worker，并通过全链路共享的 MySQL
+序列分配本地批次号，避免与全量、单条和 Poll 批次发生编号碰撞。
 """
 
 from __future__ import annotations
 
 import hashlib
+import logging
 import threading
 
 import pymysql
 
 from ..config import DatabaseConfig, require_index_database
-from ..constants import CDC_LOCAL_BATCH_ID_BASE, MAX_UNSIGNED_BIGINT
+from ..repositories.batch_id import allocate_batch_id
+
+log = logging.getLogger(__name__)
 
 
 class CdcWorkerAlreadyRunningError(RuntimeError):
@@ -36,28 +39,28 @@ class MySQLCdcLocalBatchIdProvider:
         self._lock_name = _lock_name(destination)
         try:
             self._acquire_worker_lock()
-            # 历史版本从低位连续分配 CDC 编号，可能与后续 Poll 自增 ID 撞号。
-            # 新版本固定切到无符号 BIGINT 高位空间；若数据库中已经存在高位 CDC
-            # 编号，则从当前最大值继续，保证 Worker 重启后仍保持单调递增。
-            self._next_id = max(
-                CDC_LOCAL_BATCH_ID_BASE,
-                self._load_max_id() + 1,
-            )
         except Exception:
             self.close()
             raise
 
     def __call__(self) -> int:
-        """返回下一个本地批次号；仅非空 Canal batch 会实际使用该号码。"""
+        """从全链路共享序列返回下一个本地批次号。"""
 
         with self._mutex:
             if self._connection is None:
                 raise RuntimeError("CDC 本地批次号分配器已关闭")
-            value = self._next_id
-            if value > MAX_UNSIGNED_BIGINT:
-                raise OverflowError("CDC 本地批次号已超出无符号 BIGINT 上限")
-            self._next_id += 1
-            return value
+            try:
+                with self._connection.cursor() as cursor:
+                    batch_id = allocate_batch_id(cursor)
+                self._connection.commit()
+                return batch_id
+            except Exception:
+                self._connection.rollback()
+                log.exception(
+                    "CDC Batch ID allocation failed for destination %s",
+                    self.destination,
+                )
+                raise
 
     def close(self) -> None:
         """释放 destination 运行锁和 Index 连接。"""
@@ -85,43 +88,6 @@ class MySQLCdcLocalBatchIdProvider:
             raise CdcWorkerAlreadyRunningError(
                 f"destination={self.destination!r} 已有 CDC Worker 运行"
             )
-
-    def _load_max_id(self) -> int:
-        """读取所有历史批次编号，恢复已启用的 CDC 高位序列。"""
-
-        max_ids: list[int] = []
-        with self._connection.cursor() as cursor:
-            cursor.execute(
-                """
-                SELECT COALESCE(MAX(local_batch_id), 0) AS max_id
-                FROM expert_index_cdc_event
-                WHERE destination=%s
-                """,
-                (self.destination,),
-            )
-            event_row = cursor.fetchone() or {}
-            max_ids.append(int(event_row.get("max_id", 0)))
-            cursor.execute(
-                """
-                SELECT COALESCE(last_local_batch_id, 0) AS max_id
-                FROM expert_index_cdc_checkpoint
-                WHERE destination=%s
-                """,
-                (self.destination,),
-            )
-            checkpoint_row = cursor.fetchone() or {}
-            max_ids.append(int(checkpoint_row.get("max_id", 0)))
-            # Poll 和 CDC 共用 Sync Task 的 batch_id/source 唯一键；同时纳入
-            # 已创建但尚未产生 Task 的全量/增量批次，保证新编号不会碰撞。
-            for table, column in (
-                ("expert_index_batch", "id"),
-                ("expert_index_batch_source", "batch_id"),
-                ("expert_index_sync_task", "batch_id"),
-            ):
-                cursor.execute(f"SELECT COALESCE(MAX({column}), 0) AS max_id FROM {table}")
-                row = cursor.fetchone() or {}
-                max_ids.append(int(row.get("max_id", 0)))
-        return max(max_ids, default=0)
 
 
 def _lock_name(destination: str) -> str:

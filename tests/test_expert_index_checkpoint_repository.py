@@ -651,7 +651,7 @@ def test_create_incremental_batch_source_scan_is_atomic(
             ),
             None,
         ],
-        rowcounts=[0, 0, 1, 1],
+        rowcounts=[0, 0, 1, 1, 1],
         lastrowid=901,
     )
     connection = ScriptedConnection(cursor)
@@ -673,13 +673,16 @@ def test_create_incremental_batch_source_scan_is_atomic(
         checkpoint_lock_version=0,
     )
     unfinished_sql, unfinished_params = cursor.executed[1]
-    batch_sql, batch_params = cursor.executed[2]
-    source_sql, source_params = cursor.executed[3]
+    sequence_sql, sequence_params = cursor.executed[2]
+    batch_sql, batch_params = cursor.executed[3]
+    source_sql, source_params = cursor.executed[4]
     assert "status IN ('pending', 'running', 'failed')" in unfinished_sql
     assert "FOR UPDATE" in unfinished_sql
     assert unfinished_params == ("experts",)
-    assert "VALUES (%s, 'incremental', 'running')" in batch_sql
-    assert batch_params == ("incremental-experts-20260825-001",)
+    assert "UPDATE `expert_index_batch_id_sequence`" in sequence_sql
+    assert sequence_params == ("global", (1 << 64) - 1)
+    assert "VALUES (%s, %s, 'incremental', 'running')" in batch_sql
+    assert batch_params == (901, "incremental-experts-20260825-001")
     assert "'pending', 0, 0, 0, 0" in source_sql
     assert source_params == (
         901,

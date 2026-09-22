@@ -13,6 +13,7 @@ from typing import Any
 import pymysql
 
 from ..config import DatabaseConfig, require_index_database
+from .batch_id import allocate_batch_id
 
 
 class BatchNotResumableError(RuntimeError):
@@ -82,25 +83,25 @@ class MySQLBatchRepository:
         connection = pymysql.connect(**self.config.as_kwargs())
         try:
             with connection.cursor() as cursor:
+                batch_id = allocate_batch_id(cursor)
                 if run_mode == "full":
                     cursor.execute(
                         """
                         INSERT INTO expert_index_batch(
-                            batch_no, run_mode, data_version, status,
+                            id, batch_no, run_mode, data_version, status,
                             cursor_id, upper_bound_id
-                        ) VALUES (%s, 'full', %s, 'running', 0, %s)
+                        ) VALUES (%s, %s, 'full', %s, 'running', 0, %s)
                         """,
-                        (batch_no, data_version, upper_bound_id),
+                        (batch_id, batch_no, data_version, upper_bound_id),
                     )
                 else:
                     cursor.execute(
                         """
-                        INSERT INTO expert_index_batch(batch_no, run_mode, status)
-                        VALUES (%s, %s, 'running')
+                        INSERT INTO expert_index_batch(id, batch_no, run_mode, status)
+                        VALUES (%s, %s, %s, 'running')
                         """,
-                        (batch_no, run_mode),
+                        (batch_id, batch_no, run_mode),
                     )
-                batch_id = int(cursor.lastrowid)
             connection.commit()
             return batch_id
         finally:

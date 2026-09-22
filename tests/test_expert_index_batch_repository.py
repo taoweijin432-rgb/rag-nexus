@@ -36,6 +36,7 @@ class RecordingCursor:
         self.one = one
         self.rows = rows or []
         self.lastrowid = 801
+        self.rowcount = 1
         self.executed: list[tuple[str, tuple[object, ...] | None]] = []
 
     def __enter__(self) -> Self:
@@ -531,11 +532,14 @@ def test_full_batch_start_persists_version_cursor_and_upper_bound(
         upper_bound_id=999,
     )
 
-    sql, params = cursor.executed[0]
+    sequence_sql, sequence_params = cursor.executed[0]
+    sql, params = cursor.executed[1]
     assert batch_id == 801
+    assert "UPDATE `expert_index_batch_id_sequence`" in sequence_sql
+    assert sequence_params == ("global", (1 << 64) - 1)
     assert "data_version, status, cursor_id, upper_bound_id" in sql
-    assert "VALUES (%s, 'full', %s, 'running', 0, %s)" in sql
-    assert params == ("full_repository_test", "20260814_01", 999)
+    assert "VALUES (%s, %s, 'full', %s, 'running', 0, %s)" in sql
+    assert params == (801, "full_repository_test", "20260814_01", 999)
     assert connection.commit_count == 1
     assert connection.closed is True
 

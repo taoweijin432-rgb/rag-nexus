@@ -2,10 +2,18 @@
 
 from __future__ import annotations
 
-# Poll/全量批次继续使用 MySQL 自增低位空间；CDC 使用无符号 BIGINT 高位空间，
-# 避免未写入 expert_index_batch 的 CDC 本地批次号与后续 Poll 自增 ID 撞号。
-CDC_LOCAL_BATCH_ID_BASE = 1 << 63
+# 所有全量、单条、Poll 和 CDC 批次共享同一数据库序列，不能各自推算下一个编号。
+BATCH_ID_SEQUENCE_TABLE = "expert_index_batch_id_sequence"
+BATCH_ID_SEQUENCE_NAME_COLUMN = "sequence_name"
+BATCH_ID_SEQUENCE_VALUE_COLUMN = "last_value"
+GLOBAL_BATCH_ID_SEQUENCE_NAME = "global"
 MAX_UNSIGNED_BIGINT = (1 << 64) - 1
 
 
-__all__ = ["CDC_LOCAL_BATCH_ID_BASE", "MAX_UNSIGNED_BIGINT"]
+__all__ = [
+    "BATCH_ID_SEQUENCE_NAME_COLUMN",
+    "BATCH_ID_SEQUENCE_TABLE",
+    "BATCH_ID_SEQUENCE_VALUE_COLUMN",
+    "GLOBAL_BATCH_ID_SEQUENCE_NAME",
+    "MAX_UNSIGNED_BIGINT",
+]

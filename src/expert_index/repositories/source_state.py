@@ -17,6 +17,7 @@ from ..models import (
     SourceCheckpoint,
     SourceScanCursor,
 )
+from .batch_id import allocate_batch_id
 
 
 class SourceCheckpointNotInitializedError(RuntimeError):
@@ -517,16 +518,14 @@ class MySQLSourceStateRepository:
                         f"来源表 {source_table} 已存在未完成 Batch Source"
                     )
 
+                batch_id = allocate_batch_id(cursor)
                 cursor.execute(
                     """
-                    INSERT INTO expert_index_batch(batch_no, run_mode, status)
-                    VALUES (%s, 'incremental', 'running')
+                    INSERT INTO expert_index_batch(id, batch_no, run_mode, status)
+                    VALUES (%s, %s, 'incremental', 'running')
                     """,
-                    (batch_no,),
+                    (batch_id, batch_no),
                 )
-                batch_id = int(cursor.lastrowid)
-                if batch_id < 1:
-                    raise RuntimeError("incremental 批次创建后未返回有效 ID")
                 checkpoint_lock_version = int(checkpoint_row["lock_version"])
                 cursor.execute(
                     """
