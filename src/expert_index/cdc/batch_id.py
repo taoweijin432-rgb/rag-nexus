@@ -13,6 +13,7 @@ import threading
 import pymysql
 
 from ..config import DatabaseConfig, require_index_database
+from ..constants import CDC_LOCAL_BATCH_ID_BASE, MAX_UNSIGNED_BIGINT
 
 
 class CdcWorkerAlreadyRunningError(RuntimeError):
@@ -35,7 +36,13 @@ class MySQLCdcLocalBatchIdProvider:
         self._lock_name = _lock_name(destination)
         try:
             self._acquire_worker_lock()
-            self._next_id = self._load_max_id() + 1
+            # 历史版本从低位连续分配 CDC 编号，可能与后续 Poll 自增 ID 撞号。
+            # 新版本固定切到无符号 BIGINT 高位空间；若数据库中已经存在高位 CDC
+            # 编号，则从当前最大值继续，保证 Worker 重启后仍保持单调递增。
+            self._next_id = max(
+                CDC_LOCAL_BATCH_ID_BASE,
+                self._load_max_id() + 1,
+            )
         except Exception:
             self.close()
             raise
@@ -47,9 +54,9 @@ class MySQLCdcLocalBatchIdProvider:
             if self._connection is None:
                 raise RuntimeError("CDC 本地批次号分配器已关闭")
             value = self._next_id
+            if value > MAX_UNSIGNED_BIGINT:
+                raise OverflowError("CDC 本地批次号已超出无符号 BIGINT 上限")
             self._next_id += 1
-            if value < 1:
-                raise RuntimeError("CDC 本地批次号溢出")
             return value
 
     def close(self) -> None:
@@ -80,7 +87,7 @@ class MySQLCdcLocalBatchIdProvider:
             )
 
     def _load_max_id(self) -> int:
-        """读取所有 Index 批次来源中的最大编号，避免与 Poll 批次键冲突。"""
+        """读取所有历史批次编号，恢复已启用的 CDC 高位序列。"""
 
         max_ids: list[int] = []
         with self._connection.cursor() as cursor:

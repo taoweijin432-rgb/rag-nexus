@@ -4,13 +4,17 @@ from __future__ import annotations
 
 from typing import Self
 
+import pytest
+
 from expert_index.cdc.batch_id import MySQLCdcLocalBatchIdProvider
 from expert_index.config import DatabaseConfig, DatabaseRole
+from expert_index.constants import CDC_LOCAL_BATCH_ID_BASE, MAX_UNSIGNED_BIGINT
 
 
 class _Cursor:
-    def __init__(self) -> None:
+    def __init__(self, *, persisted_max_id: int = 0) -> None:
         self.result: dict[str, int] = {}
+        self.persisted_max_id = persisted_max_id
 
     def __enter__(self) -> Self:
         return self
@@ -23,7 +27,7 @@ class _Cursor:
         if "get_lock" in normalized:
             self.result = {"acquired": 1}
         elif "max(local_batch_id)" in normalized or "last_local_batch_id" in normalized:
-            self.result = {"max_id": 0}
+            self.result = {"max_id": self.persisted_max_id}
         elif "max(id)" in normalized and "expert_index_batch" in normalized:
             self.result = {"max_id": 7}
         elif "max(batch_id)" in normalized and "expert_index_batch_source" in normalized:
@@ -38,8 +42,8 @@ class _Cursor:
 
 
 class _Connection:
-    def __init__(self) -> None:
-        self.cursor_obj = _Cursor()
+    def __init__(self, *, persisted_max_id: int = 0) -> None:
+        self.cursor_obj = _Cursor(persisted_max_id=persisted_max_id)
 
     def cursor(self) -> _Cursor:
         return self.cursor_obj
@@ -48,8 +52,8 @@ class _Connection:
         return None
 
 
-def test_provider_starts_after_existing_index_batch_ids(monkeypatch) -> None:
-    """CDC 首个本地批次号不得复用已有全量/Poll 批次号。"""
+def test_provider_uses_high_namespace_after_legacy_batch_ids(monkeypatch) -> None:
+    """历史低位编号存在时，CDC 必须切换到独立高位命名空间。"""
 
     connection = _Connection()
     monkeypatch.setattr(
@@ -59,5 +63,37 @@ def test_provider_starts_after_existing_index_batch_ids(monkeypatch) -> None:
     config = DatabaseConfig("127.0.0.1", 3306, "index", "", "expert_test", DatabaseRole.INDEX)
 
     provider = MySQLCdcLocalBatchIdProvider(config, destination="company_expert")
-    assert provider() == 8
+    assert provider() == CDC_LOCAL_BATCH_ID_BASE
+    provider.close()
+
+
+def test_provider_resumes_after_persisted_high_batch_id(monkeypatch) -> None:
+    """Worker 重启后必须从已落库的高位 CDC 编号继续递增。"""
+
+    persisted_max_id = CDC_LOCAL_BATCH_ID_BASE + 17
+    connection = _Connection(persisted_max_id=persisted_max_id)
+    monkeypatch.setattr(
+        "expert_index.cdc.batch_id.pymysql.connect",
+        lambda **_kwargs: connection,
+    )
+    config = DatabaseConfig("127.0.0.1", 3306, "index", "", "expert_test", DatabaseRole.INDEX)
+
+    provider = MySQLCdcLocalBatchIdProvider(config, destination="company_expert")
+    assert provider() == persisted_max_id + 1
+    provider.close()
+
+
+def test_provider_rejects_unsigned_bigint_overflow(monkeypatch) -> None:
+    """CDC 高位序列耗尽时必须失败关闭，不能产生数据库不可写编号。"""
+
+    connection = _Connection(persisted_max_id=MAX_UNSIGNED_BIGINT)
+    monkeypatch.setattr(
+        "expert_index.cdc.batch_id.pymysql.connect",
+        lambda **_kwargs: connection,
+    )
+    config = DatabaseConfig("127.0.0.1", 3306, "index", "", "expert_test", DatabaseRole.INDEX)
+
+    provider = MySQLCdcLocalBatchIdProvider(config, destination="company_expert")
+    with pytest.raises(OverflowError, match="无符号 BIGINT"):
+        provider()
     provider.close()
