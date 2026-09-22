@@ -194,5 +194,5 @@ def test_global_batch_id_sequence_migration_uses_all_persisted_watermarks() -> N
         "MAX(last_local_batch_id) FROM expert_index_cdc_checkpoint",
     ):
         assert watermark in migration
-    assert "GREATEST(last_value, VALUES(last_value))" in migration
+    assert "GREATEST(current_value, VALUES(current_value))" in migration
     assert "DROP " not in migration.upper()

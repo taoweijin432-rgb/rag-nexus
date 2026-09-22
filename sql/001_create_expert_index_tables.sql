@@ -409,14 +409,14 @@ CREATE TABLE IF NOT EXISTS expert_index_batch_item (
 -- 所有构建入口共享同一 Batch ID 序列；CDC 不再自行推算可能与 Poll 撞号的编号。
 CREATE TABLE IF NOT EXISTS expert_index_batch_id_sequence (
     sequence_name VARCHAR(64) NOT NULL COMMENT '批次序列名称，当前固定为 global',
-    last_value BIGINT UNSIGNED NOT NULL COMMENT '最后一次已分配的全局 Batch ID',
+    current_value BIGINT UNSIGNED NOT NULL COMMENT '最后一次已分配的全局 Batch ID',
     created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
     updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6)
         ON UPDATE CURRENT_TIMESTAMP(6),
     PRIMARY KEY (sequence_name)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
-INSERT INTO expert_index_batch_id_sequence(sequence_name, last_value)
+INSERT INTO expert_index_batch_id_sequence(sequence_name, current_value)
 SELECT
     'global',
     GREATEST(
@@ -429,4 +429,4 @@ SELECT
         COALESCE((SELECT MAX(local_batch_id) FROM expert_index_cdc_event), 0)
     )
 ON DUPLICATE KEY UPDATE
-    last_value=GREATEST(last_value, VALUES(last_value));
+    current_value=GREATEST(current_value, VALUES(current_value));

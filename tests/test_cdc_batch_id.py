@@ -18,11 +18,11 @@ class _Cursor:
     def __init__(
         self,
         *,
-        last_value: int = 70_193,
+        current_value: int = 70_193,
         sequence_available: bool = True,
     ) -> None:
         self.result: dict[str, int] = {}
-        self.last_value = last_value
+        self.current_value = current_value
         self.sequence_available = sequence_available
         self.lastrowid = 0
         self.rowcount = 0
@@ -41,9 +41,9 @@ class _Cursor:
             self.result = {"acquired": 1}
             return
         if "expert_index_batch_id_sequence" in normalized:
-            if self.sequence_available and self.last_value < MAX_UNSIGNED_BIGINT:
-                self.last_value += 1
-                self.lastrowid = self.last_value
+            if self.sequence_available and self.current_value < MAX_UNSIGNED_BIGINT:
+                self.current_value += 1
+                self.lastrowid = self.current_value
                 self.rowcount = 1
             else:
                 self.lastrowid = 0
@@ -62,11 +62,11 @@ class _Connection:
     def __init__(
         self,
         *,
-        last_value: int = 70_193,
+        current_value: int = 70_193,
         sequence_available: bool = True,
     ) -> None:
         self.cursor_obj = _Cursor(
-            last_value=last_value,
+            current_value=current_value,
             sequence_available=sequence_available,
         )
         self.commit_count = 0
@@ -147,7 +147,7 @@ def test_provider_rolls_back_when_shared_sequence_is_missing(monkeypatch) -> Non
 def test_provider_rejects_unsigned_bigint_overflow(monkeypatch) -> None:
     """共享序列耗尽时必须失败，不能产生数据库不可写编号。"""
 
-    connection = _Connection(last_value=MAX_UNSIGNED_BIGINT)
+    connection = _Connection(current_value=MAX_UNSIGNED_BIGINT)
     monkeypatch.setattr(
         "expert_index.cdc.batch_id.pymysql.connect",
         lambda **_kwargs: connection,
