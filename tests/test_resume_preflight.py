@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 from types import SimpleNamespace
 from typing import Any
 
 import pytest
 
+from expert_index.cdc import CdcWorkerSummary
 from resume_index.cli import build_parser, main
 from resume_index.config import ResumeSettings
 from resume_index.pipeline import ResumeBuildResult, ResumeVectorSyncSummary
@@ -125,6 +127,7 @@ def test_resume_cli_exposes_only_resume_commands() -> None:
         "build-batch",
         "incremental-once",
         "incremental-worker",
+        "cdc-worker",
         "resume-batch",
         "retry-batch",
     }
@@ -155,6 +158,70 @@ def test_resume_cli_exposes_full_build_worker_count() -> None:
 
     assert build_args.worker_count == 4
     assert resume_args.worker_count == 3
+
+
+def test_resume_cli_exposes_incremental_source_worker_count() -> None:
+    """Resume Poll 单轮和常驻入口都应显式暴露来源表级并发度。"""
+
+    parser = build_parser()
+    once_args = parser.parse_args(
+        [
+            "incremental-once",
+            "--worker-id",
+            "resume-worker",
+            "--cycle-id",
+            "cycle-1",
+            "--max-attempts",
+            "4",
+            "--retry-delay-seconds",
+            "30",
+            "--task-lease-seconds",
+            "300",
+            "--worker-count",
+            "2",
+        ]
+    )
+    worker_args = parser.parse_args(
+        [
+            "incremental-worker",
+            "--worker-id",
+            "resume-worker",
+            "--max-attempts",
+            "4",
+            "--retry-delay-seconds",
+            "30",
+            "--task-lease-seconds",
+            "300",
+            "--worker-count",
+            "4",
+        ]
+    )
+
+    assert once_args.worker_count == 2
+    assert worker_args.worker_count == 4
+
+
+def test_resume_cli_exposes_cdc_worker_contract() -> None:
+    args = build_parser().parse_args(
+        [
+            "cdc-worker",
+            "--worker-id",
+            "resume-cdc-worker",
+            "--max-attempts",
+            "4",
+            "--retry-delay-seconds",
+            "30",
+            "--task-lease-seconds",
+            "300",
+            "--max-cycles",
+            "1",
+        ]
+    )
+
+    assert args.command == "cdc-worker"
+    assert args.worker_id == "resume-cdc-worker"
+    assert args.batch_size == 100
+    assert args.task_lease_seconds == 300
 
 
 def test_cli_prints_safe_json_summary(
@@ -325,6 +392,8 @@ def test_cli_incremental_once_uses_resume_poll_runtime(
             "30",
             "--task-lease-seconds",
             "120",
+            "--worker-count",
+            "2",
         ]
     )
 
@@ -333,6 +402,7 @@ def test_cli_incremental_once_uses_resume_poll_runtime(
         "max_attempts": 3,
         "retry_delay_seconds": 30,
         "task_lease_seconds": 120,
+        "source_worker_count": 2,
         "worker_id": "resume-worker-1",
         "cycle_id": "resume-cycle-1",
     }
@@ -340,3 +410,67 @@ def test_cli_incremental_once_uses_resume_poll_runtime(
         "cycle_id": "resume-cycle-1",
         "success_count": 2,
     }
+
+
+def test_cli_cdc_worker_uses_resume_entrypoint(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    settings = _settings()
+    captured: dict[str, object] = {}
+    summary = CdcWorkerSummary(
+        cycles=1,
+        empty_count=1,
+        acked_count=0,
+        rolled_back_count=0,
+        not_ready_count=0,
+        error_count=0,
+        stop_reason="max_cycles",
+    )
+
+    def run_worker(
+        received_settings: ResumeSettings,
+        args: argparse.Namespace,
+    ) -> CdcWorkerSummary:
+        captured.update(
+            settings=received_settings,
+            worker_id=args.worker_id,
+            batch_size=args.batch_size,
+            max_attempts=args.max_attempts,
+            retry_delay_seconds=args.retry_delay_seconds,
+            task_lease_seconds=args.task_lease_seconds,
+        )
+        return summary
+
+    monkeypatch.setattr("resume_index.cli.ResumeSettings.from_env", lambda: settings)
+    monkeypatch.setattr("resume_index.cli._run_resume_cdc_worker", run_worker)
+    monkeypatch.delenv("PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION", raising=False)
+
+    main(
+        [
+            "cdc-worker",
+            "--worker-id",
+            "resume-cdc-worker",
+            "--batch-size",
+            "50",
+            "--max-attempts",
+            "4",
+            "--retry-delay-seconds",
+            "30",
+            "--task-lease-seconds",
+            "300",
+            "--max-cycles",
+            "1",
+        ]
+    )
+
+    assert captured == {
+        "settings": settings,
+        "worker_id": "resume-cdc-worker",
+        "batch_size": 50,
+        "max_attempts": 4,
+        "retry_delay_seconds": 30,
+        "task_lease_seconds": 300,
+    }
+    assert json.loads(capsys.readouterr().out)["stop_reason"] == "max_cycles"
+    assert os.environ["PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION"] == "python"

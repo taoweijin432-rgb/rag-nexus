@@ -333,7 +333,8 @@ def test_initial_schema_only_creates_local_control_tables() -> None:
 
     schema = _read(INITIAL_SCHEMA)
 
-    assert schema.count("CREATE TABLE IF NOT EXISTS") == 8
+    assert schema.count("CREATE TABLE IF NOT EXISTS") == 9
+    assert "CREATE TABLE IF NOT EXISTS expert_index_batch_id_sequence" in schema
     for removed_table in (
         "expert_index_stage",
         "expert_index_employment_stage",

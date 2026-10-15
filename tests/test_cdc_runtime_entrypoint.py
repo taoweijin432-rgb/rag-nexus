@@ -68,6 +68,30 @@ def test_protocol_baseline_requires_explicit_ack_gate() -> None:
     assert "ack_replay_unconfirmed" in baseline.unresolved
 
 
+def test_protocol_baseline_accepts_explicit_non_expert_contract() -> None:
+    """公共协议门禁可校验独立 Resume destination，而非放宽为任意配置。"""
+
+    destination = "company_resume"
+    subscription = (
+        r"expert\.(resume|resume_work_experience|resume_project_experience|"
+        r"resume_education_experience)"
+    )
+    settings = _settings(
+        destination=destination,
+        subscription=subscription,
+    )
+
+    baseline = build_cdc_protocol_baseline(
+        settings,
+        expected_destination=destination,
+        expected_subscription=subscription,
+    )
+
+    assert baseline.destination == destination
+    assert baseline.subscription == subscription
+    assert baseline.production_ready is True
+
+
 def test_cli_exposes_cdc_worker_command() -> None:
     """正式入口要求显式 Worker 和重试/租约参数。"""
 

@@ -14,12 +14,7 @@ from .ingest import (
     CdcBatchReceiver,
     CdcBatchReceiveResult,
 )
-from .protocol import (
-    CANAL_DESTINATION,
-    CanalBatch,
-    CanalClientPort,
-    CanalProtocolBaseline,
-)
+from .protocol import CanalBatch, CanalClientPort, CanalProtocolBaseline
 
 _BINLOG_FILE_PATTERN = re.compile(r"^(?P<prefix>.*?)(?P<sequence>\d+)$")
 CdcBatchRunStatus = Literal["empty", "rolled_back", "not_ready", "acked"]
@@ -120,8 +115,10 @@ class CdcBatchCommitRequest:
     events: tuple[CdcEventCommitIdentity, ...]
 
     def __post_init__(self) -> None:
-        if self.destination != CANAL_DESTINATION:
-            raise ValueError("destination 与冻结值不一致")
+        if not isinstance(self.destination, str) or not self.destination.strip():
+            raise ValueError("destination 必须是非空字符串")
+        if len(self.destination) > 128:
+            raise ValueError("destination 长度不能超过 128")
         _require_positive_integer("local_batch_id", self.local_batch_id)
         event_ids = tuple(event.cdc_event_id for event in self.events)
         if len(set(event_ids)) != len(event_ids):

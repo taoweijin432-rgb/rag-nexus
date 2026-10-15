@@ -5,7 +5,11 @@ from __future__ import annotations
 import pytest
 
 from expert_index.config import DatabaseBoundaryError, DatabaseRole
-from resume_index.config import ResumeSettings
+from resume_index.config import (
+    RESUME_CANAL_DESTINATION,
+    RESUME_CANAL_SUBSCRIPTION,
+    ResumeSettings,
+)
 
 
 def _environment() -> dict[str, str]:
@@ -47,6 +51,9 @@ def test_from_env_builds_explicit_resume_roles_and_targets() -> None:
     assert settings.index_db.database == "resume_index"
     assert settings.milvus_collection_name == "resume_candidates_v15_contract"
     assert settings.incremental_scan.enabled is False
+    assert settings.cdc_runtime.enabled is False
+    assert settings.cdc_runtime.destination == RESUME_CANAL_DESTINATION
+    assert settings.cdc_runtime.subscription == RESUME_CANAL_SUBSCRIPTION
 
 
 def test_resume_incremental_settings_use_only_resume_prefix() -> None:
@@ -72,6 +79,79 @@ def test_resume_incremental_settings_use_only_resume_prefix() -> None:
     assert processing.source_db is settings.source_db
     assert processing.index_db is settings.index_db
     assert processing.incremental_scan is settings.incremental_scan
+
+
+def test_resume_cdc_settings_use_only_resume_prefix() -> None:
+    environment = _environment()
+    environment.update(
+        {
+            "RESUME_CDC_ENABLED": "1",
+            "RESUME_CANAL_HOST": "resume-canal.internal",
+            "RESUME_CANAL_PORT": "11112",
+            "RESUME_CANAL_DESTINATION": RESUME_CANAL_DESTINATION,
+            "RESUME_CANAL_CLIENT_ID": "2002",
+            "RESUME_CANAL_SUBSCRIPTION": RESUME_CANAL_SUBSCRIPTION,
+            "RESUME_CANAL_USERNAME": "resume_consumer",
+            "RESUME_CANAL_PASSWORD": "resume-secret",
+            "RESUME_CANAL_SERVER_VERSION": "1.1.8",
+            "RESUME_CANAL_SERVER_MODE": "tcp",
+            "RESUME_CANAL_TCP_PORT": "11112",
+            "RESUME_CDC_SOURCE_CONNECTED": "1",
+            "RESUME_CDC_PROBE_BATCH_ID": "17",
+            "RESUME_CDC_PROBE_ENTRY_COUNT": "8",
+            "RESUME_CDC_ACK_CONFIRMED": "1",
+            "RESUME_CDC_PROTOCOL_READY": "1",
+            # Expert 配置故意冲突，证明 Resume 不读取这些值。
+            "CDC_ENABLED": "0",
+            "CANAL_HOST": "expert-canal.internal",
+            "CANAL_DESTINATION": "company_expert",
+            "CANAL_CLIENT_ID": "2001",
+        }
+    )
+
+    settings = ResumeSettings.from_env(environment)
+
+    assert settings.cdc_runtime.enabled is True
+    assert settings.cdc_runtime.host == "resume-canal.internal"
+    assert settings.cdc_runtime.port == 11112
+    assert settings.cdc_runtime.client_id == "2002"
+    assert settings.cdc_runtime.probe_batch_id == 17
+    assert settings.cdc_runtime.probe_entry_count == 8
+    assert settings.cdc_runtime.source_connected is True
+    assert settings.cdc_runtime.ack_confirmed is True
+    assert settings.cdc_runtime.protocol_ready is True
+    assert settings.to_processing_settings().cdc_runtime is settings.cdc_runtime
+
+
+def test_enabled_resume_cdc_requires_explicit_client_id() -> None:
+    environment = _environment()
+    environment["RESUME_CDC_ENABLED"] = "1"
+
+    with pytest.raises(ValueError, match="CANAL_CLIENT_ID"):
+        ResumeSettings.from_env(environment)
+
+
+@pytest.mark.parametrize(
+    ("name", "value", "message"),
+    [
+        ("RESUME_CANAL_DESTINATION", "company_expert", "DESTINATION"),
+        (
+            "RESUME_CANAL_SUBSCRIPTION",
+            r"expert\.(experts|experts_work_experience)",
+            "SUBSCRIPTION",
+        ),
+    ],
+)
+def test_resume_cdc_rejects_cross_chain_contract(
+    name: str,
+    value: str,
+    message: str,
+) -> None:
+    environment = _environment()
+    environment[name] = value
+
+    with pytest.raises(DatabaseBoundaryError, match=message):
+        ResumeSettings.from_env(environment)
 
 
 @pytest.mark.parametrize(

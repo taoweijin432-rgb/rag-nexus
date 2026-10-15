@@ -181,6 +181,25 @@ def test_cdc_persistence_reuses_event_and_task_on_replay(monkeypatch: pytest.Mon
     assert connection.rollbacks == 0
 
 
+def test_cdc_persistence_uses_explicit_destination(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Resume 等独立链路的 Event 身份和持久化不能回退到 Expert destination。"""
+
+    connection = _Connection()
+    monkeypatch.setattr(
+        "expert_index.repositories.cdc_event.pymysql.connect",
+        lambda **_kwargs: connection,
+    )
+    repository = MySQLCdcBatchPersistence(
+        _index_config(),
+        destination="company_resume",
+    )
+
+    repository.persist_batch([_plan()])
+
+    assert connection.cursor_obj.event is not None
+    assert connection.cursor_obj.event["destination"] == "company_resume"
+
+
 def test_cdc_persistence_rejects_same_position_with_different_locator(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

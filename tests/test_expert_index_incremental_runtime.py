@@ -91,6 +91,7 @@ def test_cli_exposes_one_shot_incremental_command() -> None:
 
     assert args.command == "incremental-once"
     assert args.task_lease_seconds == 180
+    assert not hasattr(args, "worker_count")
 
 
 def test_runtime_builder_keeps_disabled_scan_before_downstream_assembly() -> None:

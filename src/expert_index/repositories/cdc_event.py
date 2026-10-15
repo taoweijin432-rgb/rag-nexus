@@ -14,6 +14,7 @@ from ..cdc.ingest import (
     CdcTaskPlan,
     CdcTaskReceipt,
 )
+from ..cdc.protocol import CANAL_DESTINATION
 from ..config import DatabaseConfig, require_index_database
 from ..models import NewSourceSyncTask
 
@@ -21,11 +22,21 @@ from ..models import NewSourceSyncTask
 class MySQLCdcBatchPersistence(CdcBatchPersistencePort):
     """在一个 Index MySQL 事务中幂等写入 CDC Event 并创建/复用 Sync Task。"""
 
-    def __init__(self, config: DatabaseConfig) -> None:
+    def __init__(
+        self,
+        config: DatabaseConfig,
+        *,
+        destination: str = CANAL_DESTINATION,
+    ) -> None:
         """保存并校验 Index 数据库配置；绝不接受 Source 角色连接。"""
 
         require_index_database(config)
+        if not isinstance(destination, str) or not destination.strip():
+            raise ValueError("destination 必须是非空字符串")
+        if len(destination) > 128:
+            raise ValueError("destination 长度不能超过 128")
         self.config = config
+        self.destination = destination
 
     def persist_batch(self, plans: Sequence[CdcTaskPlan]) -> tuple[CdcTaskReceipt, ...]:
         """原子提交一批 Event/Task，任何身份冲突都回滚整批。"""
@@ -52,7 +63,9 @@ class MySQLCdcBatchPersistence(CdcBatchPersistencePort):
                 receipts: list[CdcTaskReceipt] = []
                 for plan in plans:
                     event_id, event_status, existing_task_id, is_new = _insert_or_verify_event(
-                        cursor, plan
+                        cursor,
+                        plan,
+                        destination=self.destination,
                     )
                     if event_status == "success":
                         if existing_task_id is None:
@@ -97,7 +110,12 @@ class MySQLCdcBatchPersistence(CdcBatchPersistencePort):
             connection.close()
 
 
-def _insert_or_verify_event(cursor: Any, plan: CdcTaskPlan) -> tuple[int, str, int | None, bool]:
+def _insert_or_verify_event(
+    cursor: Any,
+    plan: CdcTaskPlan,
+    *,
+    destination: str,
+) -> tuple[int, str, int | None, bool]:
     """按新身份或旧 position 唯一键锁定 Event，并核验不可变定位字段。"""
 
     event = plan.event
@@ -112,7 +130,7 @@ def _insert_or_verify_event(cursor: Any, plan: CdcTaskPlan) -> tuple[int, str, i
           AND binlog_position=%s AND row_index=%s
         FOR UPDATE
         """,
-        ("company_expert", event.logfile_name, event.logfile_offset, event.row_index),
+        (destination, event.logfile_name, event.logfile_offset, event.row_index),
     )
     existing = cursor.fetchone()
     if existing is None:
@@ -131,7 +149,7 @@ def _insert_or_verify_event(cursor: Any, plan: CdcTaskPlan) -> tuple[int, str, i
         )
         existing = cursor.fetchone()
     if existing is not None:
-        _verify_event_identity(existing, plan)
+        _verify_event_identity(existing, plan, destination=destination)
         if existing.get("cdc_event_id") is None:
             cursor.execute(
                 "UPDATE expert_index_cdc_event SET cdc_event_id=%s WHERE id=%s",
@@ -162,7 +180,7 @@ def _insert_or_verify_event(cursor: Any, plan: CdcTaskPlan) -> tuple[int, str, i
                 plan.cdc_event_id,
                 plan.task.batch_id,
                 plan.task.policy_version,
-                "company_expert",
+                destination,
                 event.logfile_name,
                 event.logfile_offset,
                 event.row_index,
@@ -192,7 +210,7 @@ def _insert_or_verify_event(cursor: Any, plan: CdcTaskPlan) -> tuple[int, str, i
         existing = cursor.fetchone()
         if existing is None:
             raise CdcPersistenceConflictError("CDC Event 唯一身份写入冲突") from exc
-        _verify_event_identity(existing, plan)
+        _verify_event_identity(existing, plan, destination=destination)
         return (
             int(existing["id"]),
             str(existing["status"]),
@@ -202,13 +220,18 @@ def _insert_or_verify_event(cursor: Any, plan: CdcTaskPlan) -> tuple[int, str, i
     return int(cursor.lastrowid), "pending", None, True
 
 
-def _verify_event_identity(existing: dict[str, Any], plan: CdcTaskPlan) -> None:
+def _verify_event_identity(
+    existing: dict[str, Any],
+    plan: CdcTaskPlan,
+    *,
+    destination: str,
+) -> None:
     """拒绝同一 position/cdc_event_id 对应不同不可变事件内容。"""
 
     event = plan.event
     expected = {
         "cdc_event_id": plan.cdc_event_id,
-        "destination": "company_expert",
+        "destination": destination,
         "binlog_file": event.logfile_name,
         "binlog_position": event.logfile_offset,
         "row_index": event.row_index,

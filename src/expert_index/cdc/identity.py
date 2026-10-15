@@ -14,15 +14,21 @@ from .parser import CanalChangeEvent
 from .protocol import CANAL_DESTINATION
 
 
-def build_cdc_event_id(event: CanalChangeEvent) -> str:
+def build_cdc_event_id(
+    event: CanalChangeEvent,
+    *,
+    destination: str = CANAL_DESTINATION,
+) -> str:
     """按已确认的 destination、server、Binlog 位点和行序号生成 SHA-256 身份。"""
 
     if not isinstance(event, CanalChangeEvent):
         raise TypeError("event 必须是 CanalChangeEvent")
     if event.server_id is None or event.server_id < 0:
         raise ValueError("CDC 事件缺少有效 server_id")
+    if not isinstance(destination, str) or not destination.strip():
+        raise ValueError("destination 必须是非空字符串")
     identity = {
-        "destination": CANAL_DESTINATION,
+        "destination": destination,
         "server_id": event.server_id,
         "logfile_name": event.logfile_name,
         "logfile_offset": event.logfile_offset,

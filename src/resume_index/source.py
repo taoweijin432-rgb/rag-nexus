@@ -26,6 +26,7 @@ from expert_index.models import (
     ScopedCurrentFacts,
     SourceChangeCandidate,
     SourceScanCursor,
+    impact_scope_from_target,
 )
 
 from .dataset import RESUME_SPEC
@@ -374,6 +375,55 @@ class MySQLResumeSourceAdapter:
             with connection.cursor() as cursor:
                 self._begin_consistent_read(cursor)
                 facts = self._read_scoped_facts(cursor, request)
+            connection.rollback()
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+        return facts
+
+    def read_cdc_education_delete_facts(
+        self,
+        resume_id: int,
+    ) -> ScopedCurrentFacts | None:
+        """重读教育经历物理删除后的 Resume Profile 当前事实。
+
+        物理删除事件中已无法再次读取触发行，因此这里只在同一个只读一致性快照中
+        读取人物主档和剩余有效教育经历。主档也已物理删除时返回 ``None``，由公共
+        CDC Delete Processor 将影响范围提升为整个人物；逻辑删除主档则保留生命周期
+        事实并返回空教育集合。本方法不读取工作、项目，也不执行任何写入。
+
+        :param resume_id: Resume 全链路唯一人物身份。
+        :return: Profile 范围当前事实；人物主档物理不存在时返回 ``None``。
+        """
+
+        _require_positive_integer(resume_id, "resume_id")
+        connection = pymysql.connect(**self.config.as_kwargs(autocommit=False))
+        try:
+            with connection.cursor() as cursor:
+                self._begin_consistent_read(cursor)
+                scope = impact_scope_from_target(
+                    target_type="profile",
+                    expert_id=resume_id,
+                    dataset_spec=self.dataset_spec,
+                )
+                try:
+                    profile = self._load_profile_row(cursor, resume_id)
+                except ResumeNotFoundError:
+                    facts = None
+                else:
+                    educations = (
+                        ()
+                        if profile.deleted_at is not None
+                        else tuple(self._load_educations(cursor, resume_id))
+                    )
+                    facts = ScopedCurrentFacts(
+                        scope=scope,
+                        expert=profile,
+                        educations=educations,
+                    )
+            # 只读事务仍以 rollback 明确收口，避免连接复用时残留事务状态。
             connection.rollback()
         except Exception:
             connection.rollback()

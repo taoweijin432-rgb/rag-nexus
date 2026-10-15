@@ -436,6 +436,92 @@ def test_poll_deleted_employment_returns_trigger_and_parent_lifecycle(
     )
 
 
+def test_cdc_education_delete_reads_profile_and_remaining_educations(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """教育物理删除后只重读人物与剩余教育，并保持只读事务边界。"""
+
+    when = datetime(2026, 9, 2, 10, 0, 0)  # noqa: DTZ001
+    cursor = ScriptedCursor(
+        {
+            "FROM resume ": [_profile_row()],
+            "FROM resume_education_experience": [
+                [
+                    {
+                        "id": 83002,
+                        "internal_person_id": 70001,
+                        "school_name": "示例大学",
+                        "major": "信息管理",
+                        "business_updated_at": when,
+                        "created_at": when,
+                        "deleted_at": None,
+                    }
+                ]
+            ],
+        }
+    )
+    connection = FakeConnection(cursor)
+    monkeypatch.setattr(
+        "resume_index.source.pymysql.connect",
+        lambda **_kwargs: connection,
+    )
+
+    facts = MySQLResumeSourceAdapter(_source_config()).read_cdc_education_delete_facts(70001)
+
+    assert facts is not None
+    assert facts.scope.scope_type == "profile"
+    assert facts.scope.expert_id == 70001
+    assert facts.expert.id == 70001
+    assert tuple(education.id for education in facts.educations) == (83002,)
+    assert not facts.employments and not facts.projects
+    assert connection.rollback_count == 1
+    assert connection.closed is True
+
+
+def test_cdc_education_delete_returns_none_when_profile_is_physically_missing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """人物主档也被物理删除时，由上层把教育删除提升为整个人物范围。"""
+
+    cursor = ScriptedCursor({"FROM resume ": [None]})
+    connection = FakeConnection(cursor)
+    monkeypatch.setattr(
+        "resume_index.source.pymysql.connect",
+        lambda **_kwargs: connection,
+    )
+
+    facts = MySQLResumeSourceAdapter(_source_config()).read_cdc_education_delete_facts(70001)
+
+    assert facts is None
+    assert not any("FROM resume_education_experience" in sql for sql, _params in cursor.executed)
+    assert connection.rollback_count == 1
+    assert connection.closed is True
+
+
+def test_cdc_education_delete_keeps_logically_deleted_profile_without_children(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """人物逻辑删除时保留生命周期事实，但不再加载剩余教育正文。"""
+
+    profile = _profile_row()
+    profile["lifecycle_deleted_at"] = datetime(2026, 9, 2, 12, 0, 0)  # noqa: DTZ001
+    cursor = ScriptedCursor({"FROM resume ": [profile]})
+    connection = FakeConnection(cursor)
+    monkeypatch.setattr(
+        "resume_index.source.pymysql.connect",
+        lambda **_kwargs: connection,
+    )
+
+    facts = MySQLResumeSourceAdapter(_source_config()).read_cdc_education_delete_facts(70001)
+
+    assert facts is not None
+    assert facts.expert_deleted is True
+    assert not facts.educations
+    assert not any("FROM resume_education_experience" in sql for sql, _params in cursor.executed)
+    assert connection.rollback_count == 1
+    assert connection.closed is True
+
+
 def test_adapter_rejects_non_resume_spec() -> None:
     from expert_index.dataset import EXPERT_SPEC
 
