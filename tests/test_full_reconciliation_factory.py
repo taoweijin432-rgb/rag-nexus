@@ -25,6 +25,7 @@ from rag_vector_store.chunking.contract_pipeline import ContractEmbeddingWorker
 from rag_vector_store.config import MilvusSettings
 from rag_vector_store.ingestion.vector_ingestion import VectorIngestionService
 from rag_vector_store.milvus.repository_v15 import EXPERT_V15_PROFILE
+from rag_vector_store.milvus.repository_v16 import ContractMilvusV16VectorRepository
 
 
 class FakeEmbeddingModel:
@@ -104,6 +105,19 @@ def test_factory_consistent_config_without_explicit_repository() -> None:
     assert service.repository.settings.collection_name == (
         "expert_candidates_v15_contract_dev"
     )
+
+
+def test_factory_uses_v16_profile_for_full_reconciliation() -> None:
+    service = create_full_vector_reconciliation_service(
+        embedding_worker=_fake_worker(),
+        milvus_settings=MilvusSettings(
+            collection_name="expert_candidates_v16_contract",
+            expert_storage_profile="v16",
+        ),
+    )
+
+    assert isinstance(service.repository, ContractMilvusV16VectorRepository)
+    assert service.ingestion.repository is service.repository
 
 
 def test_factory_schema_mode_mismatch_fail_closed(

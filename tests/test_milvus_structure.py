@@ -6,7 +6,11 @@ import pytest
 from pydantic import SecretStr
 
 import rag_vector_store
-from rag_vector_store.config import DEFAULT_MILVUS_COLLECTION_NAME, MilvusSettings
+from rag_vector_store.config import (
+    DEFAULT_MILVUS_COLLECTION_NAME,
+    EXPERT_V16_COLLECTION_NAME,
+    MilvusSettings,
+)
 
 
 def test_contract_schema_mode_is_the_only_runtime_mode() -> None:
@@ -91,6 +95,30 @@ def test_default_collection_is_the_formal_v15_contract() -> None:
         {"MILVUS_COLLECTION_NAME": "custom_collection"}
     )
     assert overridden.collection_name == "custom_collection"
+
+
+def test_expert_storage_profile_defaults_v15_and_binds_v16_collection() -> None:
+    assert MilvusSettings().expert_storage_profile == "v15"
+    assert MilvusSettings.from_env({}).expert_storage_profile == "v15"
+
+    settings = MilvusSettings.from_env(
+        {
+            "EXPERT_MILVUS_STORAGE_PROFILE": "v16",
+            "MILVUS_COLLECTION_NAME": EXPERT_V16_COLLECTION_NAME,
+        }
+    )
+
+    assert settings.expert_storage_profile == "v16"
+    assert settings.collection_name == "expert_candidates_v16_contract"
+    with pytest.raises(ValueError, match="expert_candidates_v16_contract"):
+        MilvusSettings.from_env(
+            {
+                "EXPERT_MILVUS_STORAGE_PROFILE": "v16",
+                "MILVUS_COLLECTION_NAME": "wrong_collection",
+            }
+        )
+    with pytest.raises(ValueError, match="必须是 v16"):
+        MilvusSettings(collection_name=EXPERT_V16_COLLECTION_NAME)
 
 
 @pytest.mark.parametrize(

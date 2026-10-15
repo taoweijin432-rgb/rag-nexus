@@ -295,7 +295,7 @@ class FakeTaskRepo:
         )
         return self.state
 
-    def mark_source_sync_task_rejected(
+    def mark_source_sync_task_rejected_with_dlq(
         self, task_id: int, attempt_token: str, *,
         error_stage: str, error_code: str,
         error_type: str | None = None, safe_error_message: str | None = None,
@@ -311,7 +311,7 @@ class FakeTaskRepo:
         )
         return self.state
 
-    def mark_source_sync_task_retryable(
+    def mark_source_sync_task_retryable_with_dlq(
         self, task_id: int, attempt_token: str, *,
         error_stage: str, error_code: str,
         max_attempts: int, retry_delay_seconds: int,

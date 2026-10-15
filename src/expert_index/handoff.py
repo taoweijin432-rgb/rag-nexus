@@ -9,8 +9,7 @@
 - 只读 P3/P4 产物（``SourceSyncTask`` + ``attempt_token`` + ``PreparedChunkSet``），
   复用 ``contract_bridge`` 做无损转换，不复制 Bridge、不重排 Chunk、不重算三 Hash、
   不重新 Embedding、不读 previous state、不调 Consumer/Milvus/Embedding。
-- 正式链路不复用本机兼容包装：``rag_vector_store/incremental`` 的 ``V15WorkItemConsumer``
-  是 Work Item 兼容包装层；正式可复用的 Work-Item 无关核心是 ``ContractConsumerCore``。
+- 正式下游由 ``ScopeConsumer`` 调用 ``ContractConsumerCore``，不经过已退役的 Work Item 链路。
   P5.1 上游 Handoff 不 import、不依赖下游任何 Consumer 类型，只定义上游交付契约；
   P5.2 范围 Consumer 必须复用/扩展 ``ContractConsumerCore``，不得复制三 Hash、
   metadata-only、重新激活等判定逻辑。
@@ -19,7 +18,7 @@
   不持久化 Artifact、不写公共状态表、不推进任务阶段或 Checkpoint。
 - 空 desired set 合法（携带合法 scope 的显式空列表），表示该范围当前应为空，不当作 Skip。
 
-本模块只提供模型与构建器；Artifact 持久化、阶段流转、真实范围 Consumer 均为后续工作。
+本模块只提供模型与构建器；Artifact 和阶段流转由 HandoffOrchestrator 负责。
 """
 
 from __future__ import annotations

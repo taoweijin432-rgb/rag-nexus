@@ -24,7 +24,7 @@ from expert_index.repositories import (
     MySQLSourceSyncTaskRepository,
 )
 from expert_index.schema_initializer import MySQLSchemaInitializer
-from expert_index.test_fixture import ensure_complete_test_expert
+from tests.support.expert_source_fixture import ensure_complete_test_expert
 
 
 def _config(
@@ -198,7 +198,7 @@ def test_fixture_rejects_non_isolated_target_before_connect(
     def unexpected_connect(**_kwargs: Any) -> None:
         raise AssertionError("边界校验失败时不应连接 MySQL")
 
-    monkeypatch.setattr("expert_index.test_fixture.pymysql.connect", unexpected_connect)
+    monkeypatch.setattr("tests.support.expert_source_fixture.pymysql.connect", unexpected_connect)
 
     with pytest.raises(DatabaseBoundaryError):
         ensure_complete_test_expert(config)
@@ -211,7 +211,7 @@ def test_fixture_keeps_write_capability_for_explicit_isolated_test_database(
 
     connection = _FixtureConnection()
     monkeypatch.setattr(
-        "expert_index.test_fixture.pymysql.connect",
+        "tests.support.expert_source_fixture.pymysql.connect",
         lambda **_kwargs: connection,
     )
 

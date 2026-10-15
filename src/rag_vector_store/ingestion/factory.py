@@ -1,7 +1,8 @@
 """Expert/Resume 双领域向量服务工厂。
 
 工厂在构造期绑定领域 Adapter、Repository Profile 和 RowMapper，运行时不允许
-通过请求数据切换 Collection 或身份空间。V15 是唯一正式物理 Schema。
+通过请求数据切换 Collection 或身份空间。Expert 可由构造配置选择 V15/V16，
+Resume 仍固定使用 V15。
 """
 
 from __future__ import annotations
@@ -12,16 +13,31 @@ from ..chunking.contract_pipeline import (
     EXPECTED_EMBEDDING_DIMENSION,
     ContractValidator,
 )
-from ..config import MilvusSettings
+from ..config import (
+    EXPERT_V16_COLLECTION_NAME,
+    EXPERT_V16_EXTERNAL_FORMAL_COLLECTION_NAME,
+    MilvusSettings,
+)
 from ..core.embedding import DomainEmbeddingWorker
 from ..core.ingestion import DomainIngestionService
 from ..domains import ExpertContractAdapter, ResumeContractAdapter
 from ..embedding_adapters.company_cloud import CompanyCloudEmbeddingModel
 from ..milvus.contract_v15 import MilvusV15RowMapper, ResumeMilvusV15RowMapper
+from ..milvus.contract_v16 import MilvusV16RowMapper
+from ..milvus.contract_v16_external import MilvusV16ExternalRowMapper
+from ..milvus.repository import ContractMilvusRepositoryBase
 from ..milvus.repository_v15 import (
     EXPERT_V15_PROFILE,
     RESUME_V15_PROFILE,
     ContractMilvusV15VectorRepository,
+)
+from ..milvus.repository_v16 import (
+    EXPERT_V16_PROFILE,
+    ContractMilvusV16VectorRepository,
+)
+from ..milvus.repository_v16_external import (
+    EXPERT_V16_EXTERNAL_PROFILE,
+    ContractMilvusV16ExternalVectorRepository,
 )
 from ..model_space import FORMAL_EMBEDDING_MODEL_SPACE_ID
 from .vector_ingestion import ResumeVectorIngestionService, VectorIngestionService
@@ -124,8 +140,12 @@ def _build_repository(
     milvus_settings: MilvusSettings,
     expected_dimension: int,
     profile: Any,
-) -> ContractMilvusV15VectorRepository:
-    return ContractMilvusV15VectorRepository(
+) -> ContractMilvusRepositoryBase:
+    repository_cls = {
+        MilvusV16RowMapper: ContractMilvusV16VectorRepository,
+        MilvusV16ExternalRowMapper: ContractMilvusV16ExternalVectorRepository,
+    }.get(profile.row_mapper_cls, ContractMilvusV15VectorRepository)
+    return repository_cls(
         milvus_settings,
         vector_dimension=expected_dimension,
         allow_collection_creation=False,
@@ -138,7 +158,7 @@ def _build_service(
     domain_name: str,
     embedding_model: CompanyCloudEmbeddingModel | None,
     milvus_settings: MilvusSettings | None,
-    repository: ContractMilvusV15VectorRepository | None,
+    repository: ContractMilvusRepositoryBase | None,
     embedding_worker: Any | None,
     validator: ContractValidator | None,
     row_mapper: Any | None,
@@ -171,7 +191,11 @@ def _build_service(
             profile=profile,
         )
     if row_mapper is None:
-        row_mapper = mapper_cls(adapter)
+        row_mapper = (
+            repository.row_mapper
+            if mapper_cls is MilvusV16ExternalRowMapper
+            else mapper_cls(adapter)
+        )
     else:
         _require_mapper(
             row_mapper,
@@ -179,6 +203,9 @@ def _build_service(
             expected_cls=mapper_cls,
             adapter=adapter,
         )
+    if (mapper_cls is MilvusV16ExternalRowMapper
+            and row_mapper.tokenizer.config != repository.tokenizer.config):
+        raise ValueError("生命周期与 Repository 的分词配置不一致")
     _require_alignment(
         repository=repository,
         mapper=row_mapper,
@@ -205,18 +232,36 @@ def create_vector_ingestion_service(
     *,
     embedding_model: CompanyCloudEmbeddingModel | None = None,
     milvus_settings: MilvusSettings | None = None,
-    repository: ContractMilvusV15VectorRepository | None = None,
+    repository: ContractMilvusRepositoryBase | None = None,
     embedding_worker: Any | None = None,
     validator: ContractValidator | None = None,
     row_mapper: Any | None = None,
     expected_dimension: int = EXPECTED_EMBEDDING_DIMENSION,
     formal_model_space_id: str = FORMAL_EMBEDDING_MODEL_SPACE_ID,
 ) -> VectorIngestionService:
-    """构造固定 Expert Profile 的向量服务。"""
+    """按构造配置绑定 Expert V15 或 V16 Profile。"""
 
     validator = validator or getattr(embedding_worker, "validator", None) or ContractValidator()
     eligibility_validator = getattr(embedding_worker, "eligibility_validator", None)
     adapter = ExpertContractAdapter(validator, eligibility_validator)
+    if repository is not None:
+        profile = repository.profile
+        if (
+            profile.owner_field != "expert_id"
+            or profile.vector_doc_id_prefix != "expert:"
+            or profile.row_mapper_cls not in {
+                MilvusV15RowMapper, MilvusV16RowMapper, MilvusV16ExternalRowMapper
+            }
+        ):
+            raise ValueError("显式 Repository 与 Expert Profile 不一致")
+    else:
+        milvus_settings = milvus_settings or MilvusSettings.from_env()
+        profile = {
+            "v15": EXPERT_V15_PROFILE,
+            "v16": EXPERT_V16_PROFILE,
+            "v16_external_formal": EXPERT_V16_EXTERNAL_PROFILE,
+        }[milvus_settings.expert_storage_profile]
+    mapper_cls = profile.row_mapper_cls
     return _build_service(
         domain_name="Expert",
         embedding_model=embedding_model,
@@ -228,8 +273,8 @@ def create_vector_ingestion_service(
         expected_dimension=expected_dimension,
         formal_model_space_id=formal_model_space_id,
         adapter=adapter,
-        profile=EXPERT_V15_PROFILE,
-        mapper_cls=MilvusV15RowMapper,
+        profile=profile,
+        mapper_cls=mapper_cls,
         service_cls=VectorIngestionService,
     )
 
@@ -247,6 +292,17 @@ def create_resume_vector_ingestion_service(
 ) -> ResumeVectorIngestionService:
     """构造固定 Resume Profile 的向量服务。"""
 
+    if repository is None:
+        milvus_settings = milvus_settings or MilvusSettings.from_env()
+        if (milvus_settings.collection_name in {
+                EXPERT_V16_COLLECTION_NAME, EXPERT_V16_EXTERNAL_FORMAL_COLLECTION_NAME,
+            }
+                or milvus_settings.collection_name.startswith("expert_candidates_v16_extjieba_")):
+            raise ValueError("Resume Factory 拒绝绑定 Expert V16 Collection")
+        if milvus_settings.expert_storage_profile != "v15":
+            milvus_settings = milvus_settings.model_copy(
+                update={"expert_storage_profile": "v15"}
+            )
     validator = validator or getattr(embedding_worker, "validator", None) or ContractValidator()
     eligibility_validator = getattr(embedding_worker, "eligibility_validator", None)
     adapter = ResumeContractAdapter(validator, eligibility_validator)

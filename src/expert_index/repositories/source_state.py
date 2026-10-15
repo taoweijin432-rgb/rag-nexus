@@ -17,6 +17,7 @@ from ..models import (
     SourceCheckpoint,
     SourceScanCursor,
 )
+from .checkpoint_mapping import source_checkpoint_from_row
 
 
 class SourceCheckpointNotInitializedError(RuntimeError):
@@ -72,7 +73,7 @@ class MySQLSourceStateRepository:
                 row = cursor.fetchone()
             if row is None:
                 return None
-            return _source_checkpoint_from_row(row, expected_source_table=source_table)
+            return source_checkpoint_from_row(row, expected_source_table=source_table)
         finally:
             connection.close()
 
@@ -891,7 +892,7 @@ def _read_source_checkpoint(cursor: Any, source_table: str) -> SourceCheckpoint:
     row = cursor.fetchone()
     if row is None:
         raise RuntimeError("Checkpoint 在 lease 状态写入后不存在")
-    return _source_checkpoint_from_row(row, expected_source_table=source_table)
+    return source_checkpoint_from_row(row, expected_source_table=source_table)
 
 
 def _read_batch_source_scan_by_id(cursor: Any, row_id: int) -> BatchSourceScan:
@@ -916,29 +917,6 @@ def _read_batch_source_scan_by_id(cursor: Any, row_id: int) -> BatchSourceScan:
     if row is None:
         raise RuntimeError("Batch Source 在临时游标更新后不存在")
     return _batch_source_scan_from_row(row)
-
-
-def _source_checkpoint_from_row(
-    row: dict[str, Any],
-    *,
-    expected_source_table: str,
-) -> SourceCheckpoint:
-    """把数据库 Checkpoint 行转换为显式领域模型。"""
-
-    if row.get("source_table") != expected_source_table:
-        raise RuntimeError("Checkpoint 查询结果与请求来源表不一致")
-    return SourceCheckpoint(
-        source_table=expected_source_table,
-        last_updated_at=row["last_updated_at"],
-        last_id=int(row["last_id"]),
-        last_batch_id=(
-            int(row["last_batch_id"]) if row.get("last_batch_id") is not None else None
-        ),
-        last_success_time=row.get("last_success_time"),
-        lock_version=int(row["lock_version"]),
-        lease_owner=row.get("lease_owner"),
-        lease_until=row.get("lease_until"),
-    )
 
 
 def _batch_source_scan_from_row(row: dict[str, Any]) -> BatchSourceScan:

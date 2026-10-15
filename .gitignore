@@ -9,3 +9,16 @@ __pycache__/
 tools/canal-probe/target/
 dist/
 *.egg-info/
+.DS_Store
+
+# 本地模型资产仅忽略根目录，不遮蔽 src 下的同名业务包。
+/models/
+skills/
+reports/
+
+# 正式词典由部署环境单独提供，不进入 Git 或构建产物。
+/assets/tokenization/
+
+# 部署说明和 Python 版本选择仅保留本地，不纳入发布。
+/DEPLOY_V16.md
+/.python-version

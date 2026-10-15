@@ -5,9 +5,8 @@
 流程混在一起。
 
 V14 专属的 ``index_specs``（含 3 个 INVERTED scalar index）已随 V14 物理形态
-退役；当前唯一正式索引集合为 V15 的 ``index_specs_v15``（仅 1 个 embedding
-向量索引）。通用 ``IndexSpec`` / ``vector_index_spec`` / ``build_index_params``
-仍保留，供 V15 复用。
+退役；V15 使用单个 Dense 索引，Expert V16 使用固定的 Dense HNSW 与 Sparse
+BM25 双索引。通用 ``IndexSpec`` / ``build_index_params`` 供两个 Profile 复用。
 """
 
 from __future__ import annotations
@@ -23,9 +22,8 @@ from ..config import MilvusSettings
 class IndexSpec:
     """一个 Milvus Index 的声明，不包含任何 Client 操作。
 
-    向量索引携带 metric 和构建参数；scalar 索引只声明字段和类型。V15 精简
-    Collection 只有一个向量索引（``embedding_vector``）；V14 的 3 个 INVERTED
-    scalar index 已退役。
+    向量索引携带 metric 和构建参数；scalar 索引只声明字段和类型。V14 的 3 个
+    INVERTED scalar index 已退役。
     """
 
     field_name: str
@@ -80,6 +78,32 @@ def index_specs_v15(settings: MilvusSettings) -> tuple[IndexSpec, ...]:
     """
 
     return (vector_index_spec(settings),)
+
+
+def index_specs_v16(settings: MilvusSettings) -> tuple[IndexSpec, ...]:
+    """返回 Expert V16 固定 Dense 与 BM25 稀疏索引声明。"""
+
+    del settings
+    return (
+        IndexSpec(
+            field_name="dense_embedding",
+            index_name="dense_embedding_hnsw",
+            index_type="HNSW",
+            metric_type="COSINE",
+            params={"M": 16, "efConstruction": 200},
+        ),
+        IndexSpec(
+            field_name="sparse_embedding",
+            index_name="sparse_embedding_bm25",
+            index_type="SPARSE_INVERTED_INDEX",
+            metric_type="BM25",
+            params={
+                "inverted_index_algo": "DAAT_MAXSCORE",
+                "bm25_k1": 1.2,
+                "bm25_b": 0.75,
+            },
+        ),
+    )
 
 
 def build_index_params(

@@ -106,7 +106,7 @@ def compare_contract_indexes(
     for index_name in sorted(set(expected).intersection(actual_names)):
         description = descriptions[index_name]
         expected_index = expected[index_name]
-        if expected_index["field_name"] == "embedding":
+        if expected_index["metric_type"]:
             actual = index_summary(description, expected_index["params"])
             comparable_expected = {
                 "field_name": expected_index["field_name"],
@@ -268,13 +268,16 @@ def index_summary(
 
 
 def normalized_index_param(value: Any) -> object:
-    """将服务端字符串数字转换为整数，便于与配置比较。"""
+    """将服务端字符串数字转换为数值，便于与配置比较。"""
 
     if isinstance(value, str):
         try:
             return int(value)
         except ValueError:
-            return value
+            try:
+                return float(value)
+            except ValueError:
+                return value
     return value
 
 

@@ -78,27 +78,6 @@ ROLE_RULES: tuple[tuple[tuple[str, ...], str, str], ...] = (
     (("架构师",), "solution_architecture", "expert"),
 )
 
-# 行业和主题规则是早期可审计词典，目前 V1.3 的 Stage 构建明确不调用它们；对应
-# Metadata 字段暂时输出空集合。保留常量和 _codes 辅助函数，供产品确定来源后复用。
-INDUSTRY_RULES: dict[str, tuple[str, ...]] = {
-    "artificial_intelligence": ("人工智能", "大模型", "aigc", "ai应用"),
-    "automotive": ("汽车", "整车", "新能源车"),
-    "ecommerce": ("电商", "电子商务", "gmv", "直播带货"),
-    "environmental_protection": ("环保", "环境治理", "废水", "废气"),
-    "finance": ("金融", "银行", "保险", "证券"),
-    "hydrogen_energy": ("氢能", "燃料电池", "制氢"),
-    "software": ("软件", "java", "云计算", "信息系统"),
-}
-
-TOPIC_RULES: dict[str, tuple[str, ...]] = {
-    "cost_reduction": ("降本", "成本下降", "降低成本"),
-    "gmv": ("gmv", "成交总额"),
-    "project_delivery": ("项目交付", "项目管理", "交付管理"),
-    "quality_management": ("质量管理", "质量体系", "良率"),
-    "research_and_development": ("研发", "技术开发", "实验"),
-    "user_growth": ("用户增长", "获客", "转化率"),
-}
-
 
 def clean_text(value: Any) -> str:
     """按固定顺序把任意源值清洗成可安全进入 Stage 的文本。
@@ -364,17 +343,6 @@ def _labeled_sections(text: str, labels: tuple[str, ...]) -> dict[str, str]:
         if cleaned:
             result[match.group(1)] = cleaned
     return result
-
-
-def _codes(texts: Iterable[str], rules: dict[str, tuple[str, ...]]) -> tuple[str, ...]:
-    """从来源文本提取有关键词证据的代码，并去重排序后稳定输出。
-
-    当前 V1.3 的 Employment/Project 构建没有调用本函数，行业和主题字段暂时为空；
-    它只作为后续产品确认词典来源后的确定性实现基础，不能视为当前生效规则。
-    """
-
-    evidence = "\n".join(texts).lower()
-    return tuple(sorted(code for code, words in rules.items() if any(word.lower() in evidence for word in words)))
 
 
 def normalize_aggregate(

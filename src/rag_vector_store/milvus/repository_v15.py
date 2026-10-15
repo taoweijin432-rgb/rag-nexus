@@ -1,6 +1,6 @@
 """V15 精简 Contract Collection 的 Milvus Repository 实现。
 
-V15 是当前唯一正式物理 profile，直接继承通用基类 ``ContractMilvusRepositoryBase``，
+V15 是当前默认生产物理 profile，通过共享 metadata 层继承 ``ContractMilvusRepositoryBase``，
 整体替换其持久化 profile 类属性（不复制任何 CRUD 逻辑，也不在方法内按版本分支）：
     * Schema：``v15_milvus_field_specs``（4 字段）+ ``build_v15_schema``；
     * 行映射：``MilvusV15RowMapper``（4 字段 + flat metadata JSON）；
@@ -44,7 +44,6 @@ Embedding、Task State；不创建真实 Collection（是否创建由调用方�
 
 from __future__ import annotations
 
-import json
 from collections.abc import Mapping, Sequence
 from typing import Any
 
@@ -52,13 +51,12 @@ from ..config import MilvusSettings
 from ..core.hash_state import read_hash_field
 from ..core.storage import VectorRepositoryProfile
 from ..domains import ExpertContractAdapter, ResumeContractAdapter
-from .compatibility import compare_model_space
 from .contract_v15 import (
     MilvusV15RowMapper,
     ResumeMilvusV15RowMapper,
 )
 from .indexes import index_specs_v15
-from .repository import ContractMilvusRepositoryBase
+from .repository_metadata import MetadataModelSpaceRepository
 from .schemas.contract_v15 import build_v15_schema, v15_milvus_field_specs
 
 __all__ = [
@@ -95,17 +93,11 @@ RESUME_V15_PROFILE = VectorRepositoryProfile(
     owner_output_fields=("vector_doc_id",),
 )
 
-# 限量采样行数：V15 Collection 规模增长后，upsert 前的既有 model-space
-# 一致性检查不再全表扫描，改为采样前若干行校验。当前正式数据向量空间一致，
-# 采样校验既避免隧道链路下的全表扫描超时，又保留 fail-closed 的方向性
-# （采样到不一致即拒绝）。
-_MODEL_SPACE_SAMPLE_LIMIT = 500
-
 # V15 不存在的一级字段（已进入 flat metadata JSON）：禁止作为一级 output field。
 _V15_FORBIDDEN_TOP_LEVEL_FIELDS = ("expert_id", "content_hash", "metadata_hash")
 
 
-class ContractMilvusV15VectorRepository(ContractMilvusRepositoryBase):
+class ContractMilvusV15VectorRepository(MetadataModelSpaceRepository):
     """V15 精简 Contract Collection 的 Repository 类型。
 
     构造参数、initialize / upsert_batch / get_by_vector_doc_id /
@@ -132,118 +124,6 @@ class ContractMilvusV15VectorRepository(ContractMilvusRepositoryBase):
             allow_collection_creation=allow_collection_creation,
             profile=profile,
         )
-
-    def _model_space_from_row(
-        self,
-        row: Mapping[str, Any],
-    ) -> dict[str, object]:
-        """从 V15 行的 flat metadata JSON 提取模型空间字段。
-
-        与基类的区别：V15 的 ``embedding_model_alias`` /
-        ``embedding_model_version`` / ``embedding_dim`` 位于 metadata JSON 内，
-        而不是一级字段；提取失败（缺少合法 metadata 对象）一律 fail-closed。
-        """
-
-        flat = row.get("metadata")
-        if not isinstance(flat, Mapping):
-            raise TypeError("Milvus V15 行缺少合法 metadata JSON 对象")
-        if self.profile.owner_field == "resume_id":
-            if "resume_id" not in flat:
-                raise ValueError(
-                    "Resume Collection 既有 Entity 缺少 metadata['resume_id']，"
-                    "拒绝与新 Resume 数据混写"
-                )
-            if "expert_id" in flat:
-                raise ValueError(
-                    "Resume Collection 既有 Entity 不得包含 metadata['expert_id']"
-                )
-        return {
-            "embedding_model_alias": flat.get("embedding_model_alias"),
-            "embedding_model_version": flat.get("embedding_model_version"),
-            "embedding_dim": flat.get("embedding_dim"),
-        }
-
-    def _validate_existing_model_space(
-        self,
-        record: Any,
-    ) -> None:
-        """在 upsert 前采样校验既有 Entity 的模型空间一致性（V15 版本）。
-
-        与基类的区别：V15 不再对整个 Collection 做全表
-        ``query_iterator(limit=-1)`` 扫描——该扫描会随 Collection 行数线性
-        增长，在 SSH 隧道 + 远端 Milvus 链路下达到数十秒级超时，导致 upsert
-        在写入前卡死（已写入约 7 万行时复现）。改为限量采样前
-        ``_MODEL_SPACE_SAMPLE_LIMIT`` 行校验 model-space 一致性。
-
-        语义变化（已与业务确认）：
-            - 由“验证全部历史行”放宽为“限量采样验证”；
-            - 当前正式数据向量空间一致，采样校验足以阻止异空间混写；
-            - 采样到任一不一致行仍 fail-closed，拒绝本次 upsert。
-
-        缓存语义与基类一致：同一 Repository 生命周期内、同一 model space
-        采样通过后才写缓存；采样中发现不一致或查询异常时不写缓存，下次
-        同名 model space 仍会重新采样。model space 任一字段变化会使缓存失效。
-        """
-
-        requested = {
-            "embedding_model_alias": record.embedding_model_alias,
-            "embedding_model_version": record.embedding_model_version,
-            "embedding_dim": record.embedding_dim,
-        }
-        if self._validated_model_space == requested:
-            return
-
-        client = self._get_client()
-        stats = client.get_collection_stats(
-            collection_name=self.settings.collection_name,
-        )
-        row_count_raw = stats.get("row_count") if isinstance(stats, Mapping) else None
-        try:
-            row_count = int(row_count_raw)
-        except (TypeError, ValueError) as error:
-            raise TypeError("Milvus Collection stats 缺少合法 row_count") from error
-        if row_count < 0:
-            raise ValueError("Milvus Collection stats 的 row_count 不能为负数")
-        if row_count == 0:
-            self._validated_model_space = requested
-            return
-        if row_count <= _MODEL_SPACE_SAMPLE_LIMIT:
-            sample_filter = self.profile.full_scan_filter
-        else:
-            # 目标候选数约为上限的两倍，再由 limit 截断到500条；最低比例避免
-            # 超大 Collection 因浮点下溢形成空采样。
-            factor = min(
-                1.0,
-                max(0.000001, (_MODEL_SPACE_SAMPLE_LIMIT * 2) / row_count),
-            )
-            sample_filter = f"RANDOM_SAMPLE({factor:.12g})"
-
-        rows = client.query(
-            collection_name=self.settings.collection_name,
-            filter=sample_filter,
-            output_fields=["vector_doc_id", *self.profile.model_space_fields],
-            limit=_MODEL_SPACE_SAMPLE_LIMIT,
-            consistency_level="Strong",
-            **self._timeout_kwargs(),
-        )
-        if not isinstance(rows, list) or not all(
-            isinstance(row, Mapping) for row in rows
-        ):
-            raise TypeError("Milvus model-space 采样查询返回了非法 Entity 批次")
-        if rows:
-            difference = compare_model_space(
-                [self._model_space_from_row(row) for row in rows],
-                embedding_model_alias=record.embedding_model_alias,
-                embedding_model_version=record.embedding_model_version,
-                embedding_dimension=record.embedding_dim,
-            )
-            if not difference.compatible:
-                raise ValueError(
-                    "Milvus Collection 已有 Entity 与当前 Embedding model-space 不一致: "
-                    f"{json.dumps(difference.as_dict(), ensure_ascii=False, sort_keys=True)}"
-                )
-        # 采样校验通过后才写入缓存，使后续相同 model space 跳过采样查询。
-        self._validated_model_space = requested
 
     def query_by_owner_id(
         self,

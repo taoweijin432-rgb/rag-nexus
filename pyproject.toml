@@ -16,6 +16,7 @@ dependencies = [
 [project.optional-dependencies]
 # CDC 运行时才需要；普通 Poll/全量构建不强制安装旧版 Canal SDK。
 cdc = ["canal-python==0.4"]
+tokenization = ["jieba==0.42.1"]
 
 [dependency-groups]
 dev = [

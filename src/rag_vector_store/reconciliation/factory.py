@@ -1,8 +1,8 @@
 """FullVectorReconciliationService 的生产配置工厂。
 
-调用方无需手工组装 ``ContractMilvusV15VectorRepository`` 与
-``VectorIngestionService``，只调用 ``create_full_vector_reconciliation_service()``
-即可从环境变量或注入组件组装完整服务。
+调用方无需手工组装具体版本的 Repository 与 ``VectorIngestionService``，只调用
+``create_full_vector_reconciliation_service()`` 即可从环境变量或注入组件组装
+完整服务。Expert 的 V15/V16 选择与增量工厂共享同一构造配置。
 
 一致性保证：
     本工厂复用 ``create_vector_ingestion_service()`` 构建 ``VectorIngestionService``，
@@ -23,6 +23,8 @@
 
 from __future__ import annotations
 
+from typing import Any
+
 from ..chunking.contract_pipeline import (
     EXPECTED_EMBEDDING_DIMENSION,
     ContractEmbeddingWorker,
@@ -32,8 +34,7 @@ from ..chunking.contract_pipeline import (
 from ..config import MilvusSettings
 from ..embedding_adapters.company_cloud import CompanyCloudEmbeddingModel
 from ..ingestion.factory import create_vector_ingestion_service
-from ..milvus.contract_v15 import MilvusV15RowMapper
-from ..milvus.repository_v15 import ContractMilvusV15VectorRepository
+from ..milvus.repository import ContractMilvusRepositoryBase
 from ..model_space import FORMAL_EMBEDDING_MODEL_SPACE_ID
 from .full_reconciliation import (
     _DELETE_BATCH_SIZE,
@@ -45,10 +46,10 @@ def create_full_vector_reconciliation_service(
     *,
     embedding_model: CompanyCloudEmbeddingModel | None = None,
     milvus_settings: MilvusSettings | None = None,
-    repository: ContractMilvusV15VectorRepository | None = None,
+    repository: ContractMilvusRepositoryBase | None = None,
     embedding_worker: ContractEmbeddingWorker | None = None,
     validator: ContractValidator | None = None,
-    row_mapper: MilvusV15RowMapper | None = None,
+    row_mapper: Any | None = None,
     eligibility_validator: EmbeddingEligibilityValidator | None = None,
     expected_dimension: int = EXPECTED_EMBEDDING_DIMENSION,
     formal_model_space_id: str = FORMAL_EMBEDDING_MODEL_SPACE_ID,
@@ -59,7 +60,8 @@ def create_full_vector_reconciliation_service(
     依赖链：
         ``CompanyCloudEmbeddingModel.from_env()`` -> ``DomainEmbeddingWorker``
         -> ``DomainIngestionService``；``MilvusSettings.from_env()`` ->
-        V15 Milvus Repository。全部经由 ``create_vector_ingestion_service()`` 构建，随后以其内部同一 repository
+        构造期选定的 V15/V16 Milvus Repository。全部经由
+        ``create_vector_ingestion_service()`` 构建，随后以其内部同一 repository
         组装 ``FullVectorReconciliationService``。
 
     允许通过关键字注入部分或全部依赖用于测试 / 自定义组装，未注入项自动从环境读取；

@@ -12,7 +12,7 @@ from dataclasses import dataclass
 
 import pymysql
 
-from .config import DatabaseBoundaryError, DatabaseConfig, DatabaseRole
+from expert_index.config import DatabaseBoundaryError, DatabaseConfig, DatabaseRole
 
 # 固定唯一编号使重复执行具有幂等性，也让清理测试数据时可以精确定位。
 TEST_EXPERT_SERIAL = "TST2026081100000001"

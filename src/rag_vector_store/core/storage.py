@@ -42,6 +42,8 @@ class VectorRepositoryProfile(Generic[EmbeddedT]):
     vector_doc_id_prefix: str
     owner_filter_fn: Callable[[Any], str]
     owner_output_fields: tuple[str, ...]
+    dense_vector_field: str = "embedding"
+    non_retrievable_fields: tuple[str, ...] = ()
 
 
 __all__ = ["VectorRepositoryProfile", "VectorRowMapper"]

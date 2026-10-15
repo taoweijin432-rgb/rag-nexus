@@ -35,13 +35,13 @@ from expert_index.normalize import (
     sha256_value,
 )
 from expert_index.source import MySQLSourceAdapter
-from expert_index.test_fixture import (
+from expert_index.validators import validate_chunks
+from tests.support.expert_source_fixture import (
     EDUCATION_FIXTURES,
     PROJECT_FIXTURES,
     TEST_EXPERT_SERIAL,
     WORK_FIXTURES,
 )
-from expert_index.validators import validate_chunks
 
 
 def _settings() -> Settings:

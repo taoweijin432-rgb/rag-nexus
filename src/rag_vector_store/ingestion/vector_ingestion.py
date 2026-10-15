@@ -336,7 +336,7 @@ class VectorIngestionService:
                ``content_hash`` / ``chunk_text`` 必须与 existing 实体完全一致，
                否则属于调用方误用（正文/主键已变化），立即抛 ``VectorContractError``；
             4. 安全门：旧 Entity 存在 / model_space 一致 / embedding_dim 一致；
-            5. 通过 → ``MilvusV15RowMapper.from_row`` 复用旧向量 + 新 metadata upsert；
+            5. 通过 → 当前 Profile 的 RowMapper 复用旧向量 + 新 metadata upsert；
             6. model_space/dim 安全门失败 → 该条 ``status=failed``、
                ``recommendation="call_upsert"``，不调用 Embedding、不静默降级。
         """

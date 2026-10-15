@@ -17,31 +17,22 @@ from expert_index.repositories import (
     SourceLeaseConflictError,
 )
 
+# 同时支持直接脚本和 python -m scripts.<入口>，不改变 SQL 解析规则。
+if __package__:
+    from .sql_files import load_sql_statements
+else:
+    from sql_files import load_sql_statements
+
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 TEST_SCHEMA = "expert_demo_p3_lease_verify"
 CONTROL_MIGRATION = PROJECT_ROOT / "sql/012_complete_incremental_control_tables.sql"
 LOOKUP_INDEX_MIGRATION = PROJECT_ROOT / "sql/013_add_incremental_scan_lookup_index.sql"
 
 
-def _statements(path: Path) -> list[str]:
-    """返回 SQL 文件内按顺序排列的可执行语句。"""
-
-    statements: list[str] = []
-    for raw_statement in path.read_text(encoding="utf-8").split(";"):
-        statement = "\n".join(
-            line
-            for line in raw_statement.splitlines()
-            if not line.lstrip().startswith("--")
-        ).strip()
-        if statement:
-            statements.append(statement)
-    return statements
-
-
 def _execute_file(cursor: Any, path: Path) -> None:
     """在当前临时 Schema 中按顺序执行一份迁移文件。"""
 
-    for statement in _statements(path):
+    for statement in load_sql_statements(path):
         cursor.execute(statement)
 
 

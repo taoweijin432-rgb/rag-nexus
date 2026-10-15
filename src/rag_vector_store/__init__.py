@@ -10,6 +10,11 @@ from importlib import import_module
 from typing import TYPE_CHECKING, Any
 
 _LAZY_EXPORTS: dict[str, tuple[str, str]] = {
+    "JiebaIndexConfig": (".tokenization.jieba_index", "JiebaIndexConfig"),
+    "JiebaIndexTokenizer": (".tokenization.jieba_index", "JiebaIndexTokenizer"),
+    "ContractMilvusV16ExternalVectorRepository": (
+        ".milvus.repository_v16_external", "ContractMilvusV16ExternalVectorRepository"
+    ),
     # expert_contracts
     "EXPERT_CHUNK_CONTRACT_VERSION": ("expert_contracts", "EXPERT_CHUNK_CONTRACT_VERSION"),
     "ContractPreparedChunk": ("expert_contracts", "ContractPreparedChunk"),
@@ -87,6 +92,7 @@ _LAZY_EXPORTS: dict[str, tuple[str, str]] = {
         "V15_VECTOR_DOC_ID_MAX_BYTES",
     ),
     "ContractV15RowMapper": (".milvus.contract_v15", "ContractV15RowMapper"),
+    "ContractV16RowMapper": (".milvus.contract_v16", "ContractV16RowMapper"),
     "MilvusV15Entity": (".milvus.contract_v15", "MilvusV15Entity"),
     "MilvusV15RowMapper": (".milvus.contract_v15", "MilvusV15RowMapper"),
     "ResumeMilvusV15RowMapper": (
@@ -101,6 +107,12 @@ _LAZY_EXPORTS: dict[str, tuple[str, str]] = {
         ".milvus.repository_v15",
         "ContractMilvusV15VectorRepository",
     ),
+    "ContractMilvusV16VectorRepository": (
+        ".milvus.repository_v16",
+        "ContractMilvusV16VectorRepository",
+    ),
+    "MilvusV16Entity": (".milvus.contract_v16", "MilvusV16Entity"),
+    "MilvusV16RowMapper": (".milvus.contract_v16", "MilvusV16RowMapper"),
     "MilvusFieldSpec": (".milvus.schemas", "MilvusFieldSpec"),
     # model space and shared models
     "FORMAL_EMBEDDING_DIMENSION": (".model_space", "FORMAL_EMBEDDING_DIMENSION"),
@@ -153,8 +165,11 @@ __all__ = [
     "ContractEmbeddingWorker",
     "ContractMilvusRepositoryBase",
     "ContractMilvusV15VectorRepository",
+    "ContractMilvusV16ExternalVectorRepository",
+    "ContractMilvusV16VectorRepository",
     "ContractPreparedChunk",
     "ContractV15RowMapper",
+    "ContractV16RowMapper",
     "ContractValidationError",
     "ContractValidator",
     "EmbeddedContractPreparedChunk",
@@ -167,10 +182,14 @@ __all__ = [
     "ExpertChunkVersions",
     "FullVectorReconciliationResult",
     "FullVectorReconciliationService",
+    "JiebaIndexConfig",
+    "JiebaIndexTokenizer",
     "MilvusFieldSpec",
     "MilvusSettings",
     "MilvusV15Entity",
     "MilvusV15RowMapper",
+    "MilvusV16Entity",
+    "MilvusV16RowMapper",
     "MutationResult",
     "ProfileSummaryMetadata",
     "ProjectMetadata",
@@ -274,8 +293,15 @@ if TYPE_CHECKING:
         MilvusV15RowMapper,
         ResumeMilvusV15RowMapper,
     )
+    from .milvus.contract_v16 import (
+        ContractV16RowMapper,
+        MilvusV16Entity,
+        MilvusV16RowMapper,
+    )
     from .milvus.repository import ContractMilvusRepositoryBase
     from .milvus.repository_v15 import ContractMilvusV15VectorRepository
+    from .milvus.repository_v16 import ContractMilvusV16VectorRepository
+    from .milvus.repository_v16_external import ContractMilvusV16ExternalVectorRepository
     from .milvus.schemas import MilvusFieldSpec
     from .model_space import (
         FORMAL_EMBEDDING_DIMENSION,
@@ -292,3 +318,4 @@ if TYPE_CHECKING:
         FullVectorReconciliationService,
         create_full_vector_reconciliation_service,
     )
+    from .tokenization.jieba_index import JiebaIndexConfig, JiebaIndexTokenizer

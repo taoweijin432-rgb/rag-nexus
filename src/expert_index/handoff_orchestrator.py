@@ -173,13 +173,6 @@ class TaskRepositoryPort(Protocol):
         next_stage: str,
     ) -> SourceSyncTask: ...
 
-    def mark_source_sync_task_success(
-        self,
-        task_id: int,
-        attempt_token: str,
-        *,
-        result_code: str,
-    ) -> SourceSyncTask: ...
 
     def finalize_source_sync_task_success(
         self,
@@ -191,29 +184,6 @@ class TaskRepositoryPort(Protocol):
         artifact_payload_hash: str,
     ) -> SourceSyncTask: ...
 
-    def mark_source_sync_task_rejected(
-        self,
-        task_id: int,
-        attempt_token: str,
-        *,
-        error_stage: str,
-        error_code: str,
-        error_type: str | None = None,
-        safe_error_message: str | None = None,
-    ) -> SourceSyncTask: ...
-
-    def mark_source_sync_task_retryable(
-        self,
-        task_id: int,
-        attempt_token: str,
-        *,
-        error_stage: str,
-        error_code: str,
-        max_attempts: int,
-        retry_delay_seconds: int,
-        error_type: str | None = None,
-        safe_error_message: str | None = None,
-    ) -> SourceSyncTask: ...
 
     def mark_source_sync_task_rejected_with_dlq(
         self,
@@ -333,6 +303,10 @@ class HandoffOrchestrator:
             raise ValueError("retry_delay_seconds 必须是正整数")
         if isinstance(lease_seconds, bool) or not isinstance(lease_seconds, int) or lease_seconds < 1:
             raise ValueError("lease_seconds 必须是正整数")
+        for method in ("mark_source_sync_task_rejected_with_dlq",
+                       "mark_source_sync_task_retryable_with_dlq"):
+            if not callable(getattr(task_repo, method, None)):
+                raise TypeError(f"task_repo 缺少正式原子接口 {method}")
         self._task_repo = task_repo
         self._artifact_repo = artifact_repo
         self._builder = builder
@@ -903,13 +877,7 @@ class HandoffOrchestrator:
         safe_error_message: str | None,
     ) -> HandoffOrchestrationResult:
         try:
-            # P6.1 生产 Repository 将 Task 与 DLQ 放在同一事务；旧 Fake 继续走兼容接口。
-            mark_rejected = getattr(
-                self._task_repo, "mark_source_sync_task_rejected_with_dlq", None
-            )
-            if not callable(mark_rejected):
-                mark_rejected = self._task_repo.mark_source_sync_task_rejected
-            mark_rejected(
+            self._task_repo.mark_source_sync_task_rejected_with_dlq(
                 task.task_id,
                 attempt_token,
                 error_stage=error_stage,
@@ -936,13 +904,7 @@ class HandoffOrchestrator:
         safe_error_message: str | None,
     ) -> HandoffOrchestrationResult:
         try:
-            # 兼容尚未升级的测试 Fake；正式 MySQL Repository 使用原子 DLQ 版本。
-            mark_retryable = getattr(
-                self._task_repo, "mark_source_sync_task_retryable_with_dlq", None
-            )
-            if not callable(mark_retryable):
-                mark_retryable = self._task_repo.mark_source_sync_task_retryable
-            updated = mark_retryable(
+            updated = self._task_repo.mark_source_sync_task_retryable_with_dlq(
                 task.task_id,
                 attempt_token,
                 error_stage=error_stage,
@@ -1112,15 +1074,6 @@ def _rebuild_request(
         contracts=contracts,
         payload_hash=payload_hash,
     )
-
-
-def _single_line_truncate(value: str, limit: int = 512) -> str:
-    """归一为单行并截断到限制长度。"""
-
-    flat = " ".join(value.splitlines())
-    if len(flat) > limit:
-        flat = flat[:limit]
-    return flat
 
 
 @dataclass(frozen=True)

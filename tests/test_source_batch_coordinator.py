@@ -208,11 +208,11 @@ class FakeFailureRepository:
     rejected_calls: list = field(default_factory=list)
     retryable_calls: list = field(default_factory=list)
 
-    def mark_source_sync_task_rejected(self, task_id, attempt_token, **kwargs):
+    def mark_source_sync_task_rejected_with_dlq(self, task_id, attempt_token, **kwargs):
         self.rejected_calls.append((task_id, attempt_token, kwargs))
         return type("UpdatedTask", (), {"sync_status": "dead"})()
 
-    def mark_source_sync_task_retryable(self, task_id, attempt_token, **kwargs):
+    def mark_source_sync_task_retryable_with_dlq(self, task_id, attempt_token, **kwargs):
         self.retryable_calls.append((task_id, attempt_token, kwargs))
         return type("UpdatedTask", (), {"sync_status": self.retry_status})()
 

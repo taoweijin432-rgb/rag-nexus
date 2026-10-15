@@ -244,7 +244,7 @@ class FakeTaskRepo:
                              result_code=task_result_code, completed_at=TASK_UPDATED)
         return self.state
 
-    def mark_source_sync_task_rejected(self, task_id, attempt_token, *,
+    def mark_source_sync_task_rejected_with_dlq(self, task_id, attempt_token, *,
                                         error_stage, error_code,
                                         error_type=None, safe_error_message=None):
         self.rejected_calls.append({
@@ -257,7 +257,7 @@ class FakeTaskRepo:
                              completed_at=TASK_UPDATED)
         return self.state
 
-    def mark_source_sync_task_retryable(self, task_id, attempt_token, *,
+    def mark_source_sync_task_retryable_with_dlq(self, task_id, attempt_token, *,
                                          error_stage, error_code,
                                          max_attempts, retry_delay_seconds,
                                          error_type=None, safe_error_message=None):

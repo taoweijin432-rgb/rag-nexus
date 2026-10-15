@@ -82,6 +82,35 @@ def test_resume_factory_uses_resume_profile() -> None:
     assert service.repository.profile.vector_doc_id_prefix == "resume:"
 
 
+def test_resume_factory_rejects_expert_v16_settings() -> None:
+    with pytest.raises(ValueError, match="Expert V16 Collection"):
+        create_resume_vector_ingestion_service(
+            milvus_settings=MilvusSettings(
+                collection_name="expert_candidates_v16_contract",
+                expert_storage_profile="v16",
+            ),
+            embedding_worker=resume_worker(),
+        )
+
+
+def test_resume_factory_forces_v15_profile_for_resume_collection() -> None:
+    expert_v16 = MilvusSettings(
+        collection_name="expert_candidates_v16_contract",
+        expert_storage_profile="v16",
+    )
+    resume_settings = expert_v16.model_copy(
+        update={"collection_name": "resume_candidates_v15_contract"}
+    )
+
+    service = create_resume_vector_ingestion_service(
+        milvus_settings=resume_settings,
+        embedding_worker=resume_worker(),
+    )
+
+    assert service.repository.settings.expert_storage_profile == "v15"
+    assert service.repository.profile is RESUME_V15_PROFILE
+
+
 def test_resume_factory_rejects_expert_worker() -> None:
     with pytest.raises(ValueError, match="跨领域"):
         create_resume_vector_ingestion_service(

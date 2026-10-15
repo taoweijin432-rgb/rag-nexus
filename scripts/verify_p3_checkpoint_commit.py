@@ -12,26 +12,17 @@ import pymysql
 from expert_index.checkpoint import CheckpointManager, SourceBatchNotReadyError
 from expert_index.config import DatabaseConfig, DatabaseRole, Settings
 
+# 同时支持直接脚本和 python -m scripts.<入口>，不改变 SQL 解析规则。
+if __package__:
+    from .sql_files import load_sql_statements
+else:
+    from sql_files import load_sql_statements
+
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 TEST_SCHEMA = "expert_demo_p3_7_checkpoint_verify"
 BASE_SCHEMA = PROJECT_ROOT / "sql/001_create_expert_index_tables.sql"
 START_TIME = "2026-08-13 22:00:00.000000"
 UPPER_TIME = "2026-08-25 10:00:00.000000"
-
-
-def _statements(path: Path) -> list[str]:
-    """返回 SQL 文件内按顺序排列的可执行语句。"""
-
-    statements: list[str] = []
-    for raw_statement in path.read_text(encoding="utf-8").split(";"):
-        statement = "\n".join(
-            line
-            for line in raw_statement.splitlines()
-            if not line.lstrip().startswith("--")
-        ).strip()
-        if statement:
-            statements.append(statement)
-    return statements
 
 
 def _temporary_config(base: DatabaseConfig) -> DatabaseConfig:
@@ -318,7 +309,7 @@ def main() -> None:
             )
             created = True
             cursor.execute(f"USE `{TEST_SCHEMA}`")
-            for statement in _statements(BASE_SCHEMA):
+            for statement in load_sql_statements(BASE_SCHEMA):
                 cursor.execute(statement)
             _verify_checkpoint_commit(_temporary_config(base), connection)
             print(

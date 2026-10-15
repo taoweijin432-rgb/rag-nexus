@@ -8,8 +8,8 @@ Repository 是 Milvus Client 的唯一业务访问入口，负责连接生命周
 本类是**通用基类**，只承载与具体物理 Schema 无关的 CRUD / Schema / Index /
 Model Space / 删除保护编排逻辑。具体的持久化 profile（字段集合、Schema
 builder、索引集合、RowMapper、全量扫描 filter、模型空间字段）由子类整体
-提供，禁止在方法内部按版本分支。当前唯一正式子类是
-``ContractMilvusV15VectorRepository``（V15 精简 4 字段 Schema）。
+提供，禁止在方法内部按版本分支。V15 是默认生产 Profile；V16 Expert Profile
+只有在构造配置显式选择后才会生效。
 
 旧的 V14 25 字段物理形态（``MilvusRowMapper`` / ``contract_milvus_field_specs`` /
 ``index_specs`` 等）已退役；其代码与专属测试已删除，但真实 V14 Collection
@@ -36,7 +36,7 @@ from .compatibility import (
     compare_schema_specs,
     field_map,
 )
-from .indexes import build_index_params, vector_index_spec
+from .indexes import build_index_params
 
 _PRIMARY_KEY_QUERY_BATCH_SIZE = 200
 
@@ -83,6 +83,7 @@ class ContractMilvusRepositoryBase:
         client: Any | None = None,
         allow_collection_creation: bool = False,
         profile: VectorRepositoryProfile[Any],
+        row_mapper: Any | None = None,
     ) -> None:
         if settings.schema_mode != "contract":
             raise ValueError(
@@ -97,7 +98,9 @@ class ContractMilvusRepositoryBase:
         if not isinstance(profile, VectorRepositoryProfile):
             raise TypeError("profile 必须是 VectorRepositoryProfile")
         self._profile = profile
-        self._contract_row_mapper = profile.row_mapper_cls()
+        if row_mapper is not None and not isinstance(row_mapper, profile.row_mapper_cls):
+            raise TypeError("注入的 RowMapper 与 Repository Profile 不一致")
+        self._contract_row_mapper = row_mapper if row_mapper is not None else profile.row_mapper_cls()
         self._contract_adapter = profile.contract_adapter_cls()
         self._lock = Lock()
         # 模型空间一致性缓存：同一 Repository 生命周期内，同一个
@@ -114,6 +117,11 @@ class ContractMilvusRepositoryBase:
         """返回当前实例唯一、不可变的持久化 Profile。"""
 
         return self._profile
+
+    @property
+    def row_mapper(self) -> Any:
+        """生命周期更新与写入共用构造期绑定的映射器。"""
+        return self._contract_row_mapper
 
     def contract_schema_summary(
         self,
@@ -143,9 +151,10 @@ class ContractMilvusRepositoryBase:
     def expected_index_summary(self) -> dict[str, object]:
         """返回当前配置要求的向量索引定义。"""
 
-        return vector_index_spec(self.settings).summary(
-            include_name=False
-        )
+        specs = self.profile.index_specs_fn(self.settings)
+        if not specs:
+            raise ValueError("Repository Profile 必须声明至少一个索引")
+        return specs[0].summary(include_name=False)
 
     def expected_contract_indexes(self) -> list[dict[str, object]]:
         """返回正式契约 Collection 的向量和高频标量索引定义。"""
@@ -165,7 +174,7 @@ class ContractMilvusRepositoryBase:
         active_client = self._get_client() if client is None else client
         collection_name = self.settings.collection_name
         index_names = list(
-            active_client.list_indexes(collection_name=collection_name)
+            active_client.list_indexes(collection_name=collection_name, **self._timeout_kwargs())
         )
         descriptions: dict[str, Mapping[str, Any]] = {}
         for index_name in sorted(
@@ -178,6 +187,7 @@ class ContractMilvusRepositoryBase:
             description = active_client.describe_index(
                 collection_name=collection_name,
                 index_name=index_name,
+                **self._timeout_kwargs(),
             )
             descriptions[index_name] = description
         return compare_contract_indexes_definition(
@@ -191,14 +201,14 @@ class ContractMilvusRepositoryBase:
         *,
         expected_dimension: int | None = None,
     ) -> dict[str, object]:
-        """Full Sync 删除 stale vectors 前的 Collection 安全 preflight（fail-closed）。
+        """Full Sync 逻辑下线 stale vectors 前的 Collection 安全 preflight（fail-closed）。
 
         该方法只对当前 Repository 已绑定的 ``settings.collection_name`` 做只读
         检查，不接收调用方传入的任意 Collection 名。普通 CRUD 不应、也无需
-        调用它；只有 Full Sync 在准备物理删除 stale vectors 前必须显式通过，
+        调用它；只有 Full Sync 在准备逻辑下线 stale vectors 前必须显式通过，
         否则 fail-closed。
 
-        检查项（任一项失败即抛异常，不执行任何删除）：
+        检查项（任一项失败即抛异常，不执行任何下线写入）：
             1. 授权：当前 ``collection_name`` 必须在
                ``destructive_maintenance_collections``（默认空，即默认不允许任何
                destructive cleanup）；历史 / 受保护 Collection 因此天然被拒绝。
@@ -226,13 +236,15 @@ class ContractMilvusRepositoryBase:
             )
 
         active_client = self._get_client()
-        if not active_client.has_collection(collection_name=collection_name):
+        if not active_client.has_collection(
+            collection_name=collection_name, **self._timeout_kwargs(),
+        ):
             raise RuntimeError(
                 f"Collection {collection_name!r} 不存在，无法执行 destructive maintenance"
             )
 
         description = active_client.describe_collection(
-            collection_name=collection_name
+            collection_name=collection_name, **self._timeout_kwargs(),
         )
 
         fields = description.get("fields", [])
@@ -252,10 +264,11 @@ class ContractMilvusRepositoryBase:
                 f"Collection {collection_name!r} 的 auto_id 必须为 False，"
                 "禁止 destructive maintenance"
             )
-        embedding_field = field_map(description).get("embedding")
+        dense_field_name = self.profile.dense_vector_field
+        embedding_field = field_map(description).get(dense_field_name)
         if embedding_field is None:
             raise ValueError(
-                f"Collection {collection_name!r} 缺少向量字段 embedding"
+                f"Collection {collection_name!r} 缺少向量字段 {dense_field_name}"
             )
         params = embedding_field.get("params")
         embedding_dim = (
@@ -263,7 +276,8 @@ class ContractMilvusRepositoryBase:
         )
         if embedding_dim != dimension:
             raise ValueError(
-                f"Collection {collection_name!r} 的 embedding 维度 {embedding_dim!r} "
+                f"Collection {collection_name!r} 的 {dense_field_name} 维度 "
+                f"{embedding_dim!r} "
                 f"与期望维度 {dimension} 不一致"
             )
 
@@ -284,7 +298,7 @@ class ContractMilvusRepositoryBase:
             "schema_compatible": True,
             "primary_key": "vector_doc_id",
             "auto_id": False,
-            "embedding_field": "embedding",
+            "embedding_field": dense_field_name,
             "embedding_dim": dimension,
         }
 
@@ -306,10 +320,12 @@ class ContractMilvusRepositoryBase:
 
             client = self._get_client()
             collection_name = self.settings.collection_name
-            if client.has_collection(collection_name=collection_name):
+            if client.has_collection(collection_name=collection_name, **self._timeout_kwargs()):
                 # 先校验物理契约，再允许任何 upsert/search 继续；不能用“维度相同”
                 # 代替完整 Schema 和模型空间检查。
-                description = client.describe_collection(collection_name=collection_name)
+                description = client.describe_collection(
+                    collection_name=collection_name, **self._timeout_kwargs(),
+                )
                 self._validate_existing_collection(description)
                 self._validate_existing_indexes(client)
             else:
@@ -324,6 +340,7 @@ class ContractMilvusRepositoryBase:
                     collection_name=collection_name,
                     schema=schema,
                     index_params=index_params,
+                    **self._timeout_kwargs(),
                 )
             self._initialized = True
 
@@ -426,9 +443,10 @@ class ContractMilvusRepositoryBase:
         dimension = self._resolve_vector_dimension(None)
         output_fields = [
             spec.name for spec in self.profile.schema_field_specs(dimension)
+            if spec.name not in self.profile.non_retrievable_fields
         ]
         if not include_embedding:
-            output_fields.remove("embedding")
+            output_fields.remove(self.profile.dense_vector_field)
 
         requested = set(cleaned)
         found: dict[str, dict[str, Any]] = {}
@@ -594,13 +612,13 @@ class ContractMilvusRepositoryBase:
         inactive 分区（inactive 只作统计审计，不参与差异分类）。
 
         默认实现不可用：活动状态字段的位置由具体 Schema Profile 决定
-        （V14 为一级标量列，已退役；V15 位于 flat metadata JSON），
+        （V15 位于 metadata JSON；V16 还需校验一级镜像），
         因此基类不提供通用实现，子类必须覆盖。
         """
 
         raise NotImplementedError(
             "当前 Repository Profile 不支持活动状态扫描；"
-            "list_all_vector_activity_states 仅由 V15 Repository 实现"
+            "list_all_vector_activity_states 必须由具体存储 Profile 实现"
         )
 
     def close(self) -> None:

@@ -156,10 +156,10 @@ class PreparationFailureHandler:
             or retry_delay_seconds < 1
         ):
             raise ValueError("retry_delay_seconds 必须是正整数")
-        if not callable(getattr(task_repository, "mark_source_sync_task_rejected", None)):
-            raise TypeError("task_repository 缺少 mark_source_sync_task_rejected")
-        if not callable(getattr(task_repository, "mark_source_sync_task_retryable", None)):
-            raise TypeError("task_repository 缺少 mark_source_sync_task_retryable")
+        if not callable(getattr(task_repository, "mark_source_sync_task_rejected_with_dlq", None)):
+            raise TypeError("task_repository 缺少 mark_source_sync_task_rejected_with_dlq")
+        if not callable(getattr(task_repository, "mark_source_sync_task_retryable_with_dlq", None)):
+            raise TypeError("task_repository 缺少 mark_source_sync_task_retryable_with_dlq")
         self._task_repo = task_repository
         self._max_attempts = max_attempts
         self._retry_delay_seconds = retry_delay_seconds
@@ -187,14 +187,7 @@ class PreparationFailureHandler:
         error_type = type(error).__name__
         try:
             if deterministic:
-                mark_rejected = getattr(
-                    self._task_repo,
-                    "mark_source_sync_task_rejected_with_dlq",
-                    None,
-                )
-                if not callable(mark_rejected):
-                    mark_rejected = self._task_repo.mark_source_sync_task_rejected
-                mark_rejected(
+                self._task_repo.mark_source_sync_task_rejected_with_dlq(
                     task.task_id,
                     attempt_token,
                     error_stage=error_stage,
@@ -209,14 +202,7 @@ class PreparationFailureHandler:
                     error_stage=error_stage,
                 )
 
-            mark_retryable = getattr(
-                self._task_repo,
-                "mark_source_sync_task_retryable_with_dlq",
-                None,
-            )
-            if not callable(mark_retryable):
-                mark_retryable = self._task_repo.mark_source_sync_task_retryable
-            updated = mark_retryable(
+            updated = self._task_repo.mark_source_sync_task_retryable_with_dlq(
                 task.task_id,
                 attempt_token,
                 error_stage=error_stage,

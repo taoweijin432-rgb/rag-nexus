@@ -18,7 +18,7 @@ from pathlib import Path
 
 from .config import Settings
 from .incremental_runtime import build_incremental_runtime
-from .incremental_worker import IncrementalWorker, IncrementalWorkerConfig
+from .incremental_worker import IncrementalWorkerConfig, run_incremental_worker
 from .pipeline import ExpertIndexPipeline
 from .schema_initializer import MySQLSchemaInitializer
 
@@ -196,7 +196,7 @@ def main(argv: list[str] | None = None) -> None:
             retry_delay_seconds=args.retry_delay_seconds,
             task_lease_seconds=args.task_lease_seconds,
         )
-        result = IncrementalWorker(
+        result = run_incremental_worker(
             runtime,
             args.worker_id,
             config=IncrementalWorkerConfig(
@@ -204,7 +204,7 @@ def main(argv: list[str] | None = None) -> None:
                 error_sleep_seconds=args.error_sleep_seconds,
                 max_cycles=args.max_cycles,
             ),
-        ).run()
+        )
         print(json.dumps(asdict(result), ensure_ascii=False, sort_keys=True))
     elif args.command == "cdc-worker":
         result = _run_cdc_worker(settings, args)
